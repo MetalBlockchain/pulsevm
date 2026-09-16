@@ -38,13 +38,13 @@ use spdlog::{
     warn,
 };
 use tokio::{
+    io::{
+        AsyncRead,
+        AsyncWrite,
+    },
     sync::{
         RwLock,
         mpsc,
-        watch::{
-            self,
-            Sender,
-        },
     },
     task::JoinHandle,
 };
@@ -68,10 +68,19 @@ pub struct Session {
     controller: Arc<RwLock<Controller>>,
     current_request: Option<GetBlocksRequestV0>,
     to_send_block_num: u32,
-    // streaming control
-    stream_cancel: Option<Sender<()>>,
-    stream_handle: Option<JoinHandle<()>>,
 }
+
+// Keep task ownership inside the session future, including when that future is
+// cancelled while Session itself stays alive. See docs/state-history-sessions.md.
+struct SessionTask(JoinHandle<()>);
+
+impl Drop for SessionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Convert the log's internal inclusive range into the SHiP protocol's
 /// `[begin, end)` range. Disabled and empty logs advertise `(0, 0)`.
@@ -88,29 +97,30 @@ impl Session {
             controller,
             current_request: None,
             to_send_block_num: 0,
-            stream_cancel: None,
-            stream_handle: None,
         }
     }
 
-    pub async fn start(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
+    pub async fn start<S>(&mut self, stream: S) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let ws = accept_async(stream).await?;
+        let mut stream_handle: Option<SessionTask> = None;
 
         // Split socket once; dedicate a writer task fed by mpsc
         let (mut sink, mut reader) = ws.split();
         let (tx_out, mut rx_out) = mpsc::channel::<Message>(128);
 
-        let writer = tokio::spawn(async move {
+        let mut writer = SessionTask(tokio::spawn(async move {
             while let Some(msg) = rx_out.recv().await {
-                if let Err(e) = sink.send(msg).await {
-                    eprintln!("writer: send failed: {e}");
-                    break;
+                match tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(msg)).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
                 }
             }
-            // Try to finish the close handshake gracefully
-            let _ = sink.flush().await;
-            let _ = sink.close().await;
-        });
+            // A peer that stops reading must not keep the session alive forever.
+            let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.close()).await;
+        }));
 
         // ABI must be the first frame sent
         tx_out.send(Message::Text(SHIP_ABI.to_string())).await.ok();
@@ -118,7 +128,13 @@ impl Session {
         // messages-in-flight budget (incremented by ACKs)
         let in_flight_budget = Arc::new(AtomicI64::new(0));
 
-        while let Some(msg) = reader.next().await {
+        while let Some(msg) = tokio::select! {
+            result = &mut writer.0 => {
+                result?;
+                return Ok(());
+            }
+            message = reader.next() => message,
+        } {
             let msg = msg?;
             match msg {
                 Message::Binary(b) => {
@@ -144,21 +160,12 @@ impl Session {
                             } else {
                                 request.max_messages_in_flight as i64
                             };
+                            // Stop the old producer before resetting the shared window.
+                            if let Some(mut handle) = stream_handle.take() {
+                                handle.0.abort();
+                                let _ = (&mut handle.0).await;
+                            }
                             in_flight_budget.store(window, Ordering::SeqCst);
-
-                            // Cancel any previous stream
-                            if let Some(tx) = &self.stream_cancel {
-                                let _ = tx.send(());
-                            }
-                            if let Some(handle) = self.stream_handle.take() {
-                                // Immediate stop; comment if you prefer graceful await
-                                handle.abort();
-                                let _ = handle.await;
-                            }
-
-                            // New cancel channel for this stream
-                            let (stop_tx, stop_rx) = watch::channel(());
-                            self.stream_cancel = Some(stop_tx);
 
                             // Spawn background producer
                             let ctrl = self.controller.clone();
@@ -166,15 +173,10 @@ impl Session {
                             let tx_clone = tx_out.clone();
                             let budget = in_flight_budget.clone();
 
-                            self.stream_handle = Some(tokio::spawn(async move {
+                            stream_handle = Some(SessionTask(tokio::spawn(async move {
                                 let mut next = start_from;
 
                                 loop {
-                                    // cooperative cancel
-                                    if stop_rx.has_changed().unwrap_or(false) {
-                                        break;
-                                    }
-
                                     // backpressure window
                                     let current = budget.load(Ordering::SeqCst);
                                     if current <= 0 {
@@ -238,13 +240,8 @@ impl Session {
                                             tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
                                     }
-
-                                    // react quickly to cancellation
-                                    if stop_rx.has_changed().unwrap_or(false) {
-                                        break;
-                                    }
                                 }
-                            }));
+                            })));
                         }
                         RequestType::GetBlocksAckRequestV0 => {
                             let request = GetBlocksAckRequestV0::read(&b, &mut 1).map_err(|e| {
@@ -271,18 +268,14 @@ impl Session {
             }
         }
 
-        // Shut down any active stream
-        if let Some(tx) = &self.stream_cancel {
-            let _ = tx.send(());
+        if let Some(mut handle) = stream_handle.take() {
+            handle.0.abort();
+            let _ = (&mut handle.0).await;
         }
-        if let Some(h) = self.stream_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-
-        // Drop the tx to end the writer; then await it
         drop(tx_out);
-        let _ = writer.await;
+        // Allow a normal close to drain, but bound shutdown if the peer is stalled.
+        // On any error or cancellation, the local guards abort both tasks instead.
+        let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, &mut writer.0).await;
 
         Ok(())
     }
@@ -478,6 +471,122 @@ mod tests {
     use super::*;
     use pulsevm_core::id::Id;
     use std::str::FromStr;
+
+    async fn wait_for_controller_owners(controller: &Arc<RwLock<Controller>>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(controller) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session producer retained the controller after shutdown");
+    }
+
+    #[tokio::test]
+    async fn session_tasks_stop_on_malformed_requests_disconnect_and_cancellation() {
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::client_async;
+
+        for ending in 0..8 {
+            let controller = Arc::new(RwLock::new(Controller::new()));
+            let (server_io, client_io) = tokio::io::duplex(4096);
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let server_controller = controller.clone();
+            let server = tokio::spawn(async move {
+                let mut session =
+                    Session::new("127.0.0.1:8080".parse().unwrap(), server_controller);
+                let result = tokio::select! {
+                    result = session.start(server_io) => Some(result),
+                    _ = cancel_rx => None,
+                };
+                // Retain Session to prove that cancelling start itself owns cleanup.
+                (result, session)
+            });
+            let (mut client, _) = client_async("ws://localhost", client_io).await.unwrap();
+            assert!(matches!(
+                client.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            let request = GetBlocksRequestV0 {
+                start_block_num: u32::MAX,
+                end_block_num: 0,
+                max_messages_in_flight: 1,
+                have_positions: vec![],
+                irreversible_only: true,
+                fetch_block: false,
+                fetch_traces: false,
+                fetch_deltas: false,
+            };
+            let mut bytes = vec![1];
+            bytes.extend(request.pack().unwrap());
+            client.send(Message::Binary(bytes.clone())).await.unwrap();
+            if ending == 7 {
+                // Replacing a stream must also stop its predecessor.
+                client.send(Message::Binary(bytes)).await.unwrap();
+            }
+            // A pong is a processing barrier: the get-blocks requests above have
+            // been handled and their background producer has been spawned.
+            client.send(Message::Ping(vec![42])).await.unwrap();
+            assert!(matches!(
+                client.next().await.unwrap().unwrap(),
+                Message::Pong(_)
+            ));
+
+            match ending {
+                0 => client.send(Message::Binary(vec![255])).await.unwrap(),
+                1 => client.send(Message::Binary(vec![])).await.unwrap(),
+                2 => client.send(Message::Binary(vec![1])).await.unwrap(),
+                3 => client.send(Message::Binary(vec![2])).await.unwrap(),
+                4 | 7 => client.send(Message::Close(None)).await.unwrap(),
+                5 => {
+                    cancel_tx.send(()).unwrap();
+                }
+                6 => {
+                    drop(client);
+                }
+                _ => unreachable!(),
+            }
+            let (result, session) = tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .expect("session did not terminate")
+                .unwrap();
+            if ending < 4 {
+                assert!(result.as_ref().unwrap().is_err());
+            }
+            if ending == 5 {
+                assert!(result.is_none());
+            }
+            wait_for_controller_owners(&controller, 2).await;
+            drop(session);
+            assert_eq!(Arc::strong_count(&controller), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_stops_when_the_peer_does_not_read() {
+        let controller = Arc::new(RwLock::new(Controller::new()));
+        let (server_io, client_io) = tokio::io::duplex(256);
+        let server_controller = controller.clone();
+        let server = tokio::spawn(async move {
+            Session::new("127.0.0.1:8080".parse().unwrap(), server_controller)
+                .start(server_io)
+                .await
+        });
+        let (_client, _) = tokio_tungstenite::client_async("ws://localhost", client_io)
+            .await
+            .unwrap();
+        // The ABI exceeds the duplex buffer. Keep the socket open without reading
+        // it; the writer and close attempt must both obey their deadline.
+        tokio::task::yield_now().await;
+        tokio::time::advance(SOCKET_WRITE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!server.is_finished());
+        tokio::time::timeout(SOCKET_WRITE_TIMEOUT * 3, server)
+            .await
+            .expect("stalled socket kept its session alive")
+            .unwrap()
+            .unwrap();
+        assert_eq!(Arc::strong_count(&controller), 1);
+    }
 
     fn block_id(block_num: u32) -> Id {
         let mut bytes = [0u8; 32];
