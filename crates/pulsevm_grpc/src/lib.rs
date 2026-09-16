@@ -6,6 +6,8 @@ mod io {
     }
 }
 
+pub use io::prometheus::client as prometheus;
+
 pub mod vm {
     tonic::include_proto!("vm");
 

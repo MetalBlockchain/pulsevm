@@ -1756,6 +1756,18 @@ impl Controller {
 
         self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)?;
         self.ensure_protocol_version_supported(self.last_accepted_block.block_num())?;
+        let ram_usage_monitor_max_series = self
+            .node_config
+            .as_ref()
+            .map_or(0, |config| config.ram_usage_monitor_max_series);
+        if ram_usage_monitor_max_series > 0 {
+            self.db
+                .enable_ram_usage_monitor(ram_usage_monitor_max_series)?;
+            info!(
+                "continuous contract RAM monitoring enabled with {} labelled series",
+                ram_usage_monitor_max_series
+            );
+        }
         Ok(())
     }
 

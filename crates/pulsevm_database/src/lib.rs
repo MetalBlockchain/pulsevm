@@ -3,6 +3,7 @@ mod database;
 mod dependency;
 mod objects;
 mod pod;
+mod ram_monitor;
 mod snapshot;
 mod xpr_import;
 
@@ -15,9 +16,12 @@ pub use crate::pod::{
 
 pub use crate::{
     database::{
+        AccountRamBillingBreakdown,
+        AccountRamBillingProfile,
         BlockReadSnapshot,
         ContractPrimaryKey,
         ContractPrimaryOverlay,
+        ContractTableRamBilling,
         Database,
         DbRead,
         PermissionInfo,
@@ -52,6 +56,12 @@ pub use crate::{
         PermissionObject,
         SharedAuthority,
         TableObject,
+    },
+    ram_monitor::{
+        MAX_RAM_MONITOR_SERIES,
+        RamUsageMonitorSnapshot,
+        RamUsageSeriesKey,
+        RamUsageSeriesSnapshot,
     },
     snapshot::{
         SNAPSHOT_VERSION,

@@ -168,6 +168,60 @@ The report contains the checkpoint revision, whole-state root, and SHA-256 for
 each canonical Arena table. Run it again after a bounded SHiP replay to identify
 which table changed and to compare independent conversion runs.
 
+### Profile contract RAM billing
+
+`ram_usage_profiler` explains the chain's logical RAM accounting; it does not
+measure the node process's resident memory. It ranks contract state by
+`(code, scope, table, payer)`, splits primary-value and secondary-index charges,
+and can reconcile one payer's stored `ram_usage` with all live billed objects.
+
+Build it once and run it against an Arena directory containing a durable
+`arena_state.bin` checkpoint:
+
+```bash
+cargo build --release --locked -p pulsevm_database --example ram_usage_profiler
+
+target/release/examples/ram_usage_profiler \
+  /data/xpr-arena-replay --limit 25
+
+target/release/examples/ram_usage_profiler \
+  /data/xpr-arena-replay --payer protonnz --limit 50 --json \
+  > /tmp/protonnz-ram.json
+```
+
+The report includes checkpoint size and modification time, load/scan duration,
+and the checkpoint revision. In payer mode, `residual_bytes` is stored RAM minus
+the reconstructed total; zero means the accounting reconciles. The profiler
+loads the latest durable checkpoint and performs a full read-only contract-state
+scan, so run it occasionally on a replica or at low priority beside a busy node,
+for example with `nice -n 19 ionice -c3`. It does not observe uncheckpointed
+in-memory blocks.
+
+For continuous production monitoring, opt in through the VM chain config:
+
+```json
+{
+  "ram_usage_monitor_max_series": 1024
+}
+```
+
+The node performs one exact scan at startup, then updates rollback-aware
+in-memory counters on every contract-table write. MetalGo's metrics endpoint
+exports current accepted bytes plus cumulative allocated bytes, freed bytes,
+and operations under `pulsevm_contract_ram_*`, labelled by `code`, `scope`,
+`table`, and `payer`. Rejected transactions and forked blocks never appear.
+The series limit is capped at 4096; additional keys are combined into an exact
+`overflow="true"` series so contract-created labels cannot grow node memory
+without bound. A value of zero (the default) leaves the monitor disabled and
+adds only relaxed atomic checks to contract-table writes.
+
+These metrics support continuous Grafana-style timelines and allocation/refund
+rates (for example `rate(pulsevm_contract_ram_allocated_bytes_total[5m])`).
+They measure logical billed chain RAM, not Rust heap allocations or process RSS.
+Current usage is reseeded after a restart or state sync; cumulative workload
+counters are process-local and reset on either event. If an exact state-sync
+reseed fails, the node disables the monitor instead of exposing stale metrics.
+
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and
 revision before restoring the Arena checkpoint. It also generates a distinct

@@ -56,6 +56,11 @@ pub struct NodeConfig {
     // producer would tune it down.
     #[serde(default = "default_max_transaction_time_ms")]
     pub max_transaction_time_ms: u32,
+    /// Maximum number of `(code, scope, table, payer)` RAM usage series exposed
+    /// through the VM metrics endpoint. Zero disables continuous monitoring.
+    /// The database applies a hard upper bound to prevent unbounded labels.
+    #[serde(default)]
+    pub ram_usage_monitor_max_series: usize,
 }
 
 fn default_db_size() -> u64 {
@@ -91,5 +96,15 @@ mod tests {
         assert_eq!(cfg.system_account, Name::from_str("pulse").unwrap());
         assert!(cfg.native_system_contract);
         assert!(cfg.state_history_enabled);
+        assert_eq!(cfg.ram_usage_monitor_max_series, 0);
+    }
+
+    #[test]
+    fn ram_usage_monitor_series_limit_is_configurable() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","ram_usage_monitor_max_series":512}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ram_usage_monitor_max_series, 512);
     }
 }
