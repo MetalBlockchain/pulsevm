@@ -112,6 +112,8 @@ trait AbstractTable: Send + Sync {
     fn pack_into(&self, out: &mut Vec<u8>);
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn pack_delta(&self, out: &mut Vec<u8>);
+    fn has_unflushed_allocation(&self) -> bool;
+    fn has_unflushed_blob_patch(&self) -> bool;
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn mark_flushed(&mut self);
     fn hash_state(&self, hasher: &mut sha2::Sha256);
@@ -162,6 +164,12 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     fn pack_delta(&self, out: &mut Vec<u8>) {
         Table::pack_delta(self, out)
     }
+    fn has_unflushed_allocation(&self) -> bool {
+        Table::has_unflushed_allocation(self)
+    }
+    fn has_unflushed_blob_patch(&self) -> bool {
+        Table::has_unflushed_blob_patch(self)
+    }
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         Table::apply_delta(self, bytes)
     }
@@ -194,9 +202,96 @@ pub struct Db {
     by_type_id: Vec<Option<(TypeId, usize)>>,
 }
 
+/// A transaction-local Arena delta plus the table allocation domains it
+/// consumes. Two deltas from the same snapshot cannot be directly rebased when
+/// these domains overlap: they may have selected identical row ids or blob
+/// offsets even when their logical keys are independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbDelta {
+    bytes: Vec<u8>,
+    allocation_domains: Vec<u16>,
+    contains_blob_patches: bool,
+}
+
+impl DbDelta {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn allocation_domains(&self) -> &[u16] {
+        &self.allocation_domains
+    }
+}
+
 impl Db {
     pub fn new() -> Self {
         Db::default()
+    }
+
+    /// Serialize current live state without changing persistence dirty markers.
+    /// This is valid inside an outer controller undo session and supplies a
+    /// frozen prefix for independent transaction workers.
+    pub fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
+        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.revision().to_le_bytes());
+        out.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
+        for pos in ordered {
+            let table = &self.tables[pos];
+            out.extend_from_slice(&table.type_id_num().to_le_bytes());
+            let len_at = out.len();
+            out.extend_from_slice(&0u64.to_le_bytes());
+            let start = out.len();
+            table.pack_into(&mut out);
+            let len = (out.len() - start) as u64;
+            out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+        }
+        out
+    }
+
+    /// Load an in-memory execution snapshot into a freshly registered Arena.
+    pub fn load_snapshot_bytes(&mut self, data: &[u8]) -> Result<(), DbError> {
+        self.load_snapshot(data)
+    }
+
+    /// Export writes since the Arena was loaded or marked flushed.
+    pub fn delta_bytes(&self) -> DbDelta {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&self.revision().to_le_bytes());
+        frame.extend_from_slice(&(self.tables.len() as u64).to_le_bytes());
+        let mut allocation_domains = Vec::new();
+        let mut contains_blob_patches = false;
+        for table in &self.tables {
+            frame.extend_from_slice(&table.type_id_num().to_le_bytes());
+            let len_at = frame.len();
+            frame.extend_from_slice(&0u64.to_le_bytes());
+            let start = frame.len();
+            table.pack_delta(&mut frame);
+            let len = (frame.len() - start) as u64;
+            frame[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+            if table.has_unflushed_allocation() {
+                allocation_domains.push(table.type_id_num());
+            }
+            contains_blob_patches |= table.has_unflushed_blob_patch();
+        }
+        DbDelta {
+            bytes: frame,
+            allocation_domains,
+            contains_blob_patches,
+        }
+    }
+
+    /// Apply a transaction delta after the caller has validated logical and
+    /// allocator-domain conflicts.
+    pub fn apply_delta_bytes(&mut self, delta: &DbDelta) -> Result<(), DbError> {
+        if delta.contains_blob_patches {
+            return Err(DbError::Corrupted(
+                "execution delta contains a reused blob-span patch".into(),
+            ));
+        }
+        self.apply_frame(&delta.bytes)
     }
 
     /// Registers the table for `T`. A freshly created table is brought up to the
@@ -392,22 +487,7 @@ impl Db {
     /// leaves the previous checkpoint intact. Marks the tables flushed, so a
     /// following [`Db::flush_delta`] only records changes made after this.
     pub fn checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
-        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
-        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&self.revision().to_le_bytes());
-        out.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
-        for pos in ordered {
-            let table = &self.tables[pos];
-            out.extend_from_slice(&table.type_id_num().to_le_bytes());
-            let len_at = out.len();
-            out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
-            let start = out.len();
-            table.pack_into(&mut out);
-            let len = (out.len() - start) as u64;
-            out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
-        }
+        let out = self.snapshot_bytes();
         write_atomic(path.as_ref(), &out)?;
         for table in &mut self.tables {
             table.mark_flushed();
@@ -428,12 +508,16 @@ impl Db {
     /// table ids remain a hard error so a checkpoint is never partially read.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
         let data = std::fs::read(path.as_ref()).map_err(|e| DbError::Io(e.to_string()))?;
+        self.load_snapshot(&data)
+    }
+
+    fn load_snapshot(&mut self, data: &[u8]) -> Result<(), DbError> {
         let mut pos = 0usize;
-        let revision = read_i64(&data, &mut pos)?;
-        let count = read_u64(&data, &mut pos)? as usize;
+        let revision = read_i64(data, &mut pos)?;
+        let count = read_u64(data, &mut pos)? as usize;
         for _ in 0..count {
-            let type_id = read_u16(&data, &mut pos)?;
-            let len = read_u64(&data, &mut pos)? as usize;
+            let type_id = read_u16(data, &mut pos)?;
+            let len = read_u64(data, &mut pos)? as usize;
             let end = pos
                 .checked_add(len)
                 .filter(|end| *end <= data.len())
@@ -448,6 +532,11 @@ impl Db {
                 })?;
             self.tables[table_pos].load_from(&data[pos..end])?;
             pos = end;
+        }
+        if pos != data.len() {
+            return Err(DbError::Corrupted(
+                "trailing bytes in execution snapshot".into(),
+            ));
         }
         self.set_revision(revision)?;
         Ok(())
@@ -533,6 +622,11 @@ impl Db {
                 })?;
             self.tables[table_pos].apply_delta(&frame[pos..end])?;
             pos = end;
+        }
+        if pos != frame.len() {
+            return Err(DbError::Corrupted(
+                "trailing bytes in execution delta".into(),
+            ));
         }
         Ok(())
     }

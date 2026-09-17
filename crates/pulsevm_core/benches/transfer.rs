@@ -1,6 +1,7 @@
 use chrono::Utc;
 use criterion::{
     Criterion,
+    Throughput,
     black_box,
     criterion_group,
     criterion_main,
@@ -327,6 +328,53 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
     admission_group.finish();
+
+    // Full authorization + TransactionContext + deployed token WASM against
+    // independent Arena forks of one frozen block prefix. Worker=1 is the exact
+    // same machinery without concurrency; 2/4/8 show scaling and include fork
+    // construction, dependency capture, and physical-delta extraction costs.
+    let parallel_batch = (0..16)
+        .map(|index| {
+            call_contract(
+                &private_key,
+                Name::from_str("pulse.token").unwrap(),
+                Name::from_str("transfer").unwrap(),
+                &Transfer {
+                    from: Name::from_str("alice").unwrap(),
+                    to: Name::from_str("bob").unwrap(),
+                    quantity: Asset {
+                        amount: 1,
+                        symbol: Symbol::from_str("4,EOS").unwrap(),
+                    },
+                    memo: format!("parallel-{index}"),
+                },
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(
+                    Name::from_str("alice").unwrap().as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut parallel_group = c.benchmark_group("wasm_parallel_execution");
+    parallel_group.throughput(Throughput::Elements(parallel_batch.len() as u64));
+    for workers in [1usize, 2, 4, 8] {
+        parallel_group.bench_function(format!("workers_{workers}"), |b| {
+            b.iter(|| {
+                black_box(
+                    controller
+                        .benchmark_parallel_transactions(
+                            black_box(&parallel_batch),
+                            black_box(&pending_block_timestamp),
+                            workers,
+                        )
+                        .unwrap(),
+                )
+            })
+        });
+    }
+    parallel_group.finish();
 
     let mut nonce = 0u64;
     c.bench_function("transfer", |b| {

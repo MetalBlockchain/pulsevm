@@ -892,6 +892,30 @@ pub use speculation::{
     SpeculativeWave,
 };
 
+/// Frozen live state used to construct independent full-database transaction
+/// workers. The bytes are shared by all workers in a batch; each worker builds
+/// its own Arena and therefore never takes the canonical database lock while
+/// executing WASM.
+#[derive(Clone)]
+pub struct ExecutionSnapshot {
+    arena: Arc<[u8]>,
+    system_accounts: SystemAccountNames,
+    native_system_contract: bool,
+    protocol_records: Vec<ProtocolActivationRecord>,
+}
+
+/// Physical transaction patch produced by a full-database execution fork.
+pub struct ExecutionDelta {
+    arena: crate::backend::DbDelta,
+}
+
+impl ExecutionDelta {
+    /// Arena table ids whose row-id or blob-offset allocators advanced.
+    pub fn allocation_domains(&self) -> &[u16] {
+        self.arena.allocation_domains()
+    }
+}
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
@@ -1113,6 +1137,76 @@ impl Database {
         let mut database = self.clone();
         database.dependency_recorder = Some(tracker.recorder());
         (database, tracker)
+    }
+
+    /// Freeze the current live block prefix for independent transaction workers.
+    pub fn execution_snapshot(&self) -> Result<ExecutionSnapshot, ChainError> {
+        let protocol_records = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol record lock poisoned".into()))?
+            .clone();
+        Ok(ExecutionSnapshot {
+            arena: Arc::from(self.backend.execution_snapshot()),
+            system_accounts: self.system_accounts(),
+            native_system_contract: self.native_system_contract,
+            protocol_records,
+        })
+    }
+
+    /// Construct an isolated full database from a frozen execution snapshot.
+    /// The returned tracker observes the worker's complete Database facade path;
+    /// callers must still reject reports not explicitly marked complete.
+    pub fn fork_execution_snapshot(
+        snapshot: &ExecutionSnapshot,
+    ) -> Result<(Self, DependencyTracker), ChainError> {
+        let backend = crate::backend::ChainDatabase::from_execution_snapshot(&snapshot.arena)
+            .map_err(|error| {
+                ChainError::InternalError(format!("load execution snapshot: {error:?}"))
+            })?;
+        let system_accounts = Arc::new(OnceLock::new());
+        system_accounts.set(snapshot.system_accounts).map_err(|_| {
+            ChainError::InternalError("execution snapshot system account initialized twice".into())
+        })?;
+        let tracker = DependencyTracker::new();
+        Ok((
+            Database {
+                path: String::new(),
+                backend,
+                system_accounts,
+                native_system_contract: snapshot.native_system_contract,
+                native_system_contract_locked: true,
+                protocol_records: Arc::new(Mutex::new(snapshot.protocol_records.clone())),
+                dependency_recorder: Some(tracker.recorder()),
+                speculation_epoch: Arc::new(OnceLock::new()),
+                speculation_freeze: Arc::new(AtomicBool::new(false)),
+                speculation_coordinator: Arc::new(AtomicBool::new(false)),
+                authority_cache: Arc::new(Mutex::new(HashMap::new())),
+                xpr_native_replay: Arc::new(AtomicBool::new(false)),
+                xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+                xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
+                ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
+            },
+            tracker,
+        ))
+    }
+
+    /// Export all Arena writes made since a worker fork was created.
+    pub fn execution_delta(&self) -> ExecutionDelta {
+        ExecutionDelta {
+            arena: self.backend.execution_delta(),
+        }
+    }
+
+    /// Apply a validated worker patch inside the canonical transaction session.
+    pub fn apply_execution_delta(&self, delta: &ExecutionDelta) -> Result<(), ChainError> {
+        self.backend
+            .apply_execution_delta(&delta.arena)
+            .map_err(|error| {
+                ChainError::InternalError(format!("apply execution delta: {error:?}"))
+            })?;
+        self.bump_speculation_epoch();
+        Ok(())
     }
 
     fn dependency_exact_read(

@@ -19,6 +19,7 @@ mod table;
 
 pub use db::{
     Db,
+    DbDelta,
     DbError,
 };
 pub use object::{

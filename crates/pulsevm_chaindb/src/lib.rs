@@ -26,6 +26,7 @@ use std::{
 
 mod history;
 
+pub use pulsevm_arena::DbDelta;
 use pulsevm_arena::{
     ArenaObject,
     BlobRef,
@@ -1686,6 +1687,31 @@ impl ChainDatabase {
         Ok(ChainDatabase {
             inner: Arc::new(RwLock::new(db)),
         })
+    }
+
+    /// Capture the current live Arena state for transaction-local worker forks.
+    /// The source's dirty markers and undo stack are not changed.
+    pub fn execution_snapshot(&self) -> Vec<u8> {
+        self.read().snapshot_bytes()
+    }
+
+    /// Build an independent Arena from an in-memory execution snapshot.
+    pub fn from_execution_snapshot(snapshot: &[u8]) -> Result<Self, DbError> {
+        let mut db = build_registered_db()?;
+        db.load_snapshot_bytes(snapshot)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(db)),
+        })
+    }
+
+    /// Export the writes made by an independent transaction worker.
+    pub fn execution_delta(&self) -> DbDelta {
+        self.read().delta_bytes()
+    }
+
+    /// Apply a validated worker delta inside the caller's active undo session.
+    pub fn apply_execution_delta(&self, delta: &DbDelta) -> Result<(), DbError> {
+        self.lock().apply_delta_bytes(delta)
     }
 
     fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Db> {
@@ -6495,6 +6521,56 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn execution_forks_rebase_independent_fixed_rows_and_undo() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_index64_object(1, 2, 3, 9, 10, 100)
+            .unwrap();
+        canonical
+            .create_index64_object(1, 2, 3, 9, 20, 200)
+            .unwrap();
+        let before = canonical.state_root();
+        let snapshot = canonical.execution_snapshot();
+
+        let first = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        first.update_index64_object(1, 2, 3, 10, 9, 101).unwrap();
+        let first_delta = first.execution_delta();
+        assert!(first_delta.allocation_domains().is_empty());
+
+        let second = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        second.update_index64_object(1, 2, 3, 20, 9, 201).unwrap();
+        let second_delta = second.execution_delta();
+        assert!(second_delta.allocation_domains().is_empty());
+
+        canonical.start_undo_session();
+        canonical.apply_execution_delta(&first_delta).unwrap();
+        canonical.apply_execution_delta(&second_delta).unwrap();
+        assert_eq!(canonical.idx64_find_primary(1, 2, 3, 10), Some(101));
+        assert_eq!(canonical.idx64_find_primary(1, 2, 3, 20), Some(201));
+        canonical.undo();
+        assert_eq!(canonical.state_root(), before);
+    }
+
+    #[test]
+    fn execution_delta_reports_row_and_blob_allocator_domains() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"old")
+            .unwrap();
+        let snapshot = canonical.execution_snapshot();
+
+        let update = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        update
+            .update_key_value_object(1, 2, 3, 10, 9, b"new value")
+            .unwrap();
+        assert!(!update.execution_delta().allocation_domains().is_empty());
+
+        let create = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        create.create_index64_object(1, 2, 3, 9, 20, 200).unwrap();
+        assert!(!create.execution_delta().allocation_domains().is_empty());
     }
 
     /// The read primitives the arena serves to a contract — point read, forward

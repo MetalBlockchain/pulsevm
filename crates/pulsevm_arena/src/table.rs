@@ -290,6 +290,8 @@ pub struct Table<T: ArenaObject> {
     blob_patches: Vec<BlobRef>,
     /// Blob bytes already written to the log; the tail beyond this is new.
     flushed_blob_len: usize,
+    /// Primary slab length at the same snapshot/flush boundary.
+    flushed_next_id: usize,
 }
 
 impl<T: ArenaObject> Default for Table<T> {
@@ -324,6 +326,7 @@ impl<T: ArenaObject> Table<T> {
             free: HashMap::new(),
             blob_patches: Vec::new(),
             flushed_blob_len: 0,
+            flushed_next_id: 0,
         }
     }
 
@@ -863,6 +866,7 @@ impl<T: ArenaObject> Table<T> {
             return Err(TableError::Corrupted("trailing bytes in table snapshot"));
         }
         self.flushed_blob_len = self.blobs.len();
+        self.flushed_next_id = self.primary.len();
         Ok(())
     }
 
@@ -904,6 +908,14 @@ impl<T: ArenaObject> Table<T> {
         out.extend_from_slice(tail);
     }
 
+    pub(crate) fn has_unflushed_allocation(&self) -> bool {
+        self.primary.len() > self.flushed_next_id || self.blobs.len() > self.flushed_blob_len
+    }
+
+    pub(crate) fn has_unflushed_blob_patch(&self) -> bool {
+        !self.blob_patches.is_empty()
+    }
+
     /// Replays a delta produced by [`Table::pack_delta`] onto the current state.
     pub(crate) fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         let obj_size = std::mem::size_of::<T>();
@@ -919,11 +931,22 @@ impl<T: ArenaObject> Table<T> {
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.take(id) {
+            let old = self.primary.take(id);
+            if let Some(old) = old {
                 for index in &mut self.secondaries {
                     index.erase(&old);
                 }
                 self.row_count -= 1;
+                if tag == 1 {
+                    self.on_modify(id as i64, old);
+                } else if let Some(state) = self.undo_stack.back_mut()
+                    && (id as i64) < state.old_next_id
+                {
+                    if !state.removed_values.contains_key(&(id as i64)) {
+                        state.removed_order.push(id as i64);
+                    }
+                    state.removed_values.insert(id as i64, old);
+                }
             }
             if tag == 1 {
                 let end = pos
@@ -944,6 +967,7 @@ impl<T: ArenaObject> Table<T> {
                 self.primary.insert(id, obj);
                 self.row_count += 1;
             }
+            self.mark_dirty(id as i64);
         }
         // In-place patches (into bytes appended by earlier frames), then the tail.
         let patch_count = read_u64(bytes, &mut pos)?;
@@ -970,7 +994,6 @@ impl<T: ArenaObject> Table<T> {
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in delta"));
         }
-        self.flushed_blob_len = self.blobs.len();
         Ok(())
     }
 
@@ -981,6 +1004,7 @@ impl<T: ArenaObject> Table<T> {
         self.dirty.clear();
         self.blob_patches.clear();
         self.flushed_blob_len = self.blobs.len();
+        self.flushed_next_id = self.primary.len();
     }
 
     /// Feeds this table's committed content into the state hasher: the live rows

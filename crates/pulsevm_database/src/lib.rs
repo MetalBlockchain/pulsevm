@@ -27,6 +27,8 @@ pub use crate::{
         ContractTableRamBilling,
         Database,
         DbRead,
+        ExecutionDelta,
+        ExecutionSnapshot,
         PermissionInfo,
         SnapshotVersion,
         SpeculativeBatchResult,

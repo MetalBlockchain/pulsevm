@@ -210,15 +210,37 @@ implementation authoritatively. The returned report compares ordered outputs
 and Arena state roots while the database always retains the serial result, even
 when parity fails.
 
-The bounded executor is not yet wired into general block execution. It is safe
-for its closed exact contract-row task surface, while an arbitrary WASM
-transaction still reaches secondary indexes and system state outside that
-overlay. Before controller integration, every transaction database mutation
-must be routed through the typed overlay, the mutation-epoch bypass audit must
-cover lifecycle/state-replacement methods, and global receipt/resource
-singletons need an ordered rebase strategy. An Arena MVCC/COW read view would
-eventually replace the controller freeze invariant, but a full state clone per
-block is explicitly not an acceptable substitute.
+### Full-transaction shadow workers
+
+The controller now has a default-off full execution gate. Set
+`PULSEVM_PARALLEL_EXECUTION_WORKERS` to a value from 1 through 64 to execute all
+explicit packed receipts concurrently after the serial block prelude and
+`onblock`. Each worker runs the ordinary signature/authority checks,
+`TransactionContext`, native/WASM dispatch, deterministic resource validation,
+trace construction, dependency capture, and delta extraction. Deferred/id-only
+receipts remain on the serial path.
+
+Workers are built from one immutable in-memory Arena snapshot and never share
+the canonical Arena lock while executing. The snapshot is serialized once;
+each worker loads an independent registered Arena. This is intentionally a
+correctness-first rollout substrate rather than the final memory design. A
+copy-on-write Arena fork should replace per-worker materialization after commit
+parity is established.
+
+The Arena can export an apply-ready physical delta from each fork. Deltas also
+identify allocation domains (per-table row ids and blob offsets): two results
+from the same prefix that allocate in the same domain cannot be naively rebased,
+even if their logical contract keys differ. Independent fixed-row deltas can be
+applied in canonical order inside an undo session, and regression tests prove
+that undo restores the exact pre-apply state root.
+
+This gate is currently shadow-only. Canonical serial execution still produces
+the accepted state and receipts, while the node logs worker successes, failures,
+allocator-bound results, action counts, estimated dependency waves, and elapsed
+time. This is necessary because global action/receiver/auth sequences,
+transaction dedupe allocation, resource accumulators, and RAM changes must be
+rebased in receipt order before a worker delta can replace serial execution.
+Worker failures and panics cannot affect block validity.
 
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred
@@ -243,6 +265,18 @@ the timed path consumes the coordinator's outputs, outcomes, wave count, and
 state root. The independent case measures useful parallelism; the mixed and
 hot-key cases guard fallback and serial-escape behavior. These are database
 coordinator microbenchmarks, not end-to-end WASM or node-throughput claims.
+
+The core transfer benchmark measures the complete deployed-token WASM path on
+one frozen prefix with 1, 2, 4, and 8 workers:
+
+```sh
+cargo bench -p pulsevm_core --bench transfer --locked -- wasm_parallel_execution
+```
+
+The one-worker case is the exact same snapshot/fork/authorization/WASM/delta
+pipeline and is therefore the serial comparison. Add `--quick` for a smoke
+sample. This includes snapshot materialization and delta extraction; it does not
+claim ordered-commit throughput while the controller gate remains shadow-only.
 
 ## Expected performance
 
