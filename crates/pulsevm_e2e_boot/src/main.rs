@@ -8,7 +8,8 @@
 //! Usage:
 //!   pulsevm-e2e-boot --url <chain-rpc-url> --private-key <PVT_K1_...> \
 //!                    --token-wasm <path/to/pulse_token.wasm> \
-//!                    --token-abi <path/to/pulse_token.abi>
+//!                    --token-abi <path/to/pulse_token.abi> \
+//!                    [--parallel-pairs <count>]
 
 use std::{
     str::FromStr,
@@ -99,10 +100,12 @@ struct Args {
     private_key: String,
     token_wasm: String,
     token_abi: String,
+    parallel_pairs: usize,
 }
 
 fn parse_args() -> Result<Args> {
     let (mut url, mut private_key, mut token_wasm, mut token_abi) = (None, None, None, None);
+    let mut parallel_pairs = 0;
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         let mut take = || argv.next().context(format!("{flag} requires a value"));
@@ -111,20 +114,44 @@ fn parse_args() -> Result<Args> {
             "--private-key" => private_key = Some(take()?),
             "--token-wasm" => token_wasm = Some(take()?),
             "--token-abi" => token_abi = Some(take()?),
+            "--parallel-pairs" => {
+                parallel_pairs = take()?
+                    .parse()
+                    .context("--parallel-pairs must be an integer")?;
+            }
             other => bail!("unknown argument: {other}"),
         }
+    }
+    if parallel_pairs > 26 {
+        bail!("--parallel-pairs cannot exceed 26");
     }
     Ok(Args {
         url: url.context("--url is required")?,
         private_key: private_key.context("--private-key is required")?,
         token_wasm: token_wasm.context("--token-wasm is required")?,
         token_abi: token_abi.context("--token-abi is required")?,
+        parallel_pairs,
     })
 }
 
 /// How long to wait for a submitted transaction to land in a block.
 const INCLUSION_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn pack_transaction(
+    chain_id: &Id,
+    key: &PrivateKey,
+    actions: Vec<Action>,
+) -> Result<PackedTransaction> {
+    let mut txn = Transaction::default();
+    txn.header.expiration = TimePointSec::now() + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS;
+    txn.actions = actions;
+
+    let signed = txn
+        .sign(key, chain_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    PackedTransaction::from_signed_transaction(signed).map_err(|e| anyhow::anyhow!("{e}"))
+}
 
 /// Signs `actions` as one transaction, submits it, and waits for it to be
 /// included in a block before returning the tx id.
@@ -149,15 +176,7 @@ async fn push(
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .head_block_num;
 
-    let mut txn = Transaction::default();
-    txn.header.expiration = TimePointSec::now() + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS;
-    txn.actions = actions;
-
-    let signed = txn
-        .sign(key, chain_id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let packed =
-        PackedTransaction::from_signed_transaction(signed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let packed = pack_transaction(chain_id, key, actions)?;
     let response = client
         .issue_tx(&packed)
         .await
@@ -187,11 +206,87 @@ async fn push(
     Ok(response.tx_id.to_string())
 }
 
+/// Submits independent transactions concurrently so the mempool places them in
+/// one production window. Returning IDs in input order keeps the JSON report
+/// deterministic even though the HTTP requests may complete in any order.
+async fn push_batch(
+    client: Arc<PulseVmClient>,
+    chain_id: &Id,
+    key: &PrivateKey,
+    action_sets: Vec<Vec<Action>>,
+) -> Result<Vec<String>> {
+    let before = client
+        .get_info()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .head_block_num;
+    let packed = action_sets
+        .into_iter()
+        .map(|actions| pack_transaction(chain_id, key, actions))
+        .collect::<Result<Vec<_>>>()?;
+    let transaction_count = packed.len();
+
+    let mut requests = tokio::task::JoinSet::new();
+    for (index, transaction) in packed.into_iter().enumerate() {
+        let client = Arc::clone(&client);
+        requests.spawn(async move {
+            let response = client
+                .issue_tx(&transaction)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok::<_, anyhow::Error>((index, response.tx_id.to_string()))
+        });
+    }
+
+    let mut transaction_ids = vec![None; transaction_count];
+    while let Some(result) = requests.join_next().await {
+        let (index, transaction_id) = result.context("joining transaction submission")??;
+        transaction_ids[index] = Some(transaction_id);
+    }
+
+    let deadline = Instant::now() + INCLUSION_TIMEOUT;
+    loop {
+        let head = client
+            .get_info()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .head_block_num;
+        if head > before {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "transaction batch was not included within {:?} (head block stuck at {})",
+                INCLUSION_TIMEOUT,
+                head
+            );
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+
+    transaction_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, transaction_id)| {
+            transaction_id.with_context(|| format!("batch transaction {index} produced no id"))
+        })
+        .collect()
+}
+
+fn parallel_account(prefix: &str, index: usize) -> Result<Name> {
+    let suffix = char::from(
+        b'a'.checked_add(u8::try_from(index).context("parallel account index overflow")?)
+            .context("parallel account suffix overflow")?,
+    );
+    Name::from_str(&format!("{prefix}{suffix}"))
+        .map_err(|e| anyhow::anyhow!("encoding parallel account name: {e}"))
+}
+
 /// Builds a `newaccount` action granting `key` both owner and active authority.
 fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> {
     let authority = |k: &PublicKey| Authority {
         threshold: 1,
-        keys: vec![KeyWeight::new(k.clone().into_k1(), 1)],
+        keys: vec![KeyWeight::new((*k).into_k1(), 1)],
         accounts: vec![],
         waits: vec![],
     };
@@ -204,8 +299,8 @@ fn new_account(creator: Name, account: Name, key: &PublicKey) -> Result<Action> 
             permission: ACTIVE_NAME.into(),
         }],
         data: NewAccount {
-            creator: creator.into(),
-            name: account.into(),
+            creator,
+            name: account,
             owner: authority(key),
             active: authority(key),
         }
@@ -253,8 +348,8 @@ fn contract_action<T: pulsevm_serialization::Write + pulsevm_serialization::NumB
     data: T,
 ) -> Result<Action> {
     Ok(Action {
-        account: contract.into(),
-        name: action.into(),
+        account: contract,
+        name: action,
         authorization: vec![PermissionLevel {
             actor: actor.into(),
             permission: ACTIVE_NAME.into(),
@@ -274,7 +369,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("parsing private key: {e}"))?;
     let public_key = key.get_public_key();
 
-    let client = PulseVmClient::new(&args.url);
+    let client = Arc::new(PulseVmClient::new(&args.url));
     let info = client
         .get_info()
         .await
@@ -282,7 +377,7 @@ async fn main() -> Result<()> {
     let chain_id =
         Id::from_str(&info.chain_id).map_err(|e| anyhow::anyhow!("parsing chain id: {e}"))?;
 
-    let system: Name = PULSE_NAME.into();
+    let system: Name = PULSE_NAME;
     let token: Name = name!("pulse.token").into();
     let alice: Name = name!("alice").into();
     let bob: Name = name!("bob").into();
@@ -322,7 +417,7 @@ async fn main() -> Result<()> {
                 permission: ACTIVE_NAME.into(),
             }],
             data: SetCode {
-                account: token.into(),
+                account: token,
                 vm_type: 0,
                 vm_version: 0,
                 code: Arc::new(Bytes::new(wasm)),
@@ -359,7 +454,7 @@ async fn main() -> Result<()> {
                 permission: ACTIVE_NAME.into(),
             }],
             data: SetAbi {
-                account: token.into(),
+                account: token,
                 abi: Arc::new(abi_bytes),
             }
             .try_into()
@@ -407,7 +502,7 @@ async fn main() -> Result<()> {
             token,
             IssueToken {
                 to: token,
-                quantity: issued.clone(),
+                quantity: issued,
                 memo: "e2e issue".to_string(),
             },
         )?],
@@ -429,7 +524,7 @@ async fn main() -> Result<()> {
             TransferToken {
                 from: token,
                 to: alice,
-                quantity: funded.clone(),
+                quantity: funded,
                 memo: "e2e funding".to_string(),
             },
         )?],
@@ -449,7 +544,7 @@ async fn main() -> Result<()> {
             TransferToken {
                 from: alice,
                 to: bob,
-                quantity: sent.clone(),
+                quantity: sent,
                 memo: "e2e transfer".to_string(),
             },
         )?],
@@ -457,6 +552,82 @@ async fn main() -> Result<()> {
     .await
     .context("transferring tokens")?;
     steps.push(serde_json::json!({ "step": "transfer", "from": alice.to_string(), "to": bob.to_string(), "quantity": sent.to_string(), "tx": tx }));
+
+    // Optionally create disjoint token-account pairs, fund each sender, and
+    // submit all pair transfers concurrently. Distinct authorizers and table
+    // scopes make this a real optimistic-parallel workload rather than merely
+    // concurrent admission of transactions that must serialize.
+    if args.parallel_pairs > 0 {
+        let pair_funding = Asset::from_str("10.0000 PULSE")
+            .map_err(|e| anyhow::anyhow!("parsing parallel funding: {e}"))?;
+        let pair_transfer = Asset::from_str("1.0000 PULSE")
+            .map_err(|e| anyhow::anyhow!("parsing parallel transfer: {e}"))?;
+        let mut pairs = Vec::with_capacity(args.parallel_pairs);
+
+        for index in 0..args.parallel_pairs {
+            let sender = parallel_account("sender", index)?;
+            let receiver = parallel_account("receiver", index)?;
+            for account in [sender, receiver] {
+                push(
+                    &client,
+                    &chain_id,
+                    &key,
+                    vec![new_account(system, account, &public_key)?],
+                )
+                .await
+                .with_context(|| format!("creating parallel account {account}"))?;
+            }
+            push(
+                &client,
+                &chain_id,
+                &key,
+                vec![contract_action(
+                    token,
+                    name!("transfer").into(),
+                    token,
+                    TransferToken {
+                        from: token,
+                        to: sender,
+                        quantity: pair_funding,
+                        memo: format!("fund parallel sender {index}"),
+                    },
+                )?],
+            )
+            .await
+            .with_context(|| format!("funding parallel sender {sender}"))?;
+            pairs.push((sender, receiver));
+        }
+
+        let action_sets = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (sender, receiver))| {
+                Ok(vec![contract_action(
+                    token,
+                    name!("transfer").into(),
+                    *sender,
+                    TransferToken {
+                        from: *sender,
+                        to: *receiver,
+                        quantity: pair_transfer,
+                        memo: format!("parallel transfer {index}"),
+                    },
+                )?])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let transaction_ids = push_batch(Arc::clone(&client), &chain_id, &key, action_sets)
+            .await
+            .context("submitting parallel transfer batch")?;
+        for ((sender, receiver), transaction_id) in pairs.into_iter().zip(transaction_ids) {
+            steps.push(serde_json::json!({
+                "step": "parallel_transfer",
+                "from": sender.to_string(),
+                "to": receiver.to_string(),
+                "quantity": pair_transfer.to_string(),
+                "tx": transaction_id,
+            }));
+        }
+    }
 
     // Producer election, end to end. Create a second producer account, deploy the
     // setprods forwarder onto `pulse`, then propose a schedule that adds the new
@@ -488,7 +659,7 @@ async fn main() -> Result<()> {
                 permission: ACTIVE_NAME.into(),
             }],
             data: SetCode {
-                account: system.into(),
+                account: system,
                 vm_type: 0,
                 vm_version: 0,
                 code: Arc::new(Bytes::new(setprods_contract_wasm()?)),
@@ -504,11 +675,11 @@ async fn main() -> Result<()> {
     let proposed = vec![
         ProducerKey {
             producer_name: system,
-            block_signing_key: public_key.clone(),
+            block_signing_key: public_key,
         },
         ProducerKey {
             producer_name: producerb,
-            block_signing_key: public_key.clone(),
+            block_signing_key: public_key,
         },
     ];
     let tx = push(

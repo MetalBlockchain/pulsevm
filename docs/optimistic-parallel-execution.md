@@ -239,10 +239,20 @@ The regression suite includes:
 - two independent real-WASM transactions that both commit optimistically;
 - producer and validator execution of the same conflict-heavy block, with one
   optimistic commit, one serial fallback, and identical final state.
+- a five-validator MetalGo E2E block containing eight independent token
+  transfers, with all eight committed optimistically, zero fallbacks, identical
+  sender/receiver balances, and converged heads on every node.
 
 Before release, run the workspace/all-target gates and the frozen replay corpus.
 Multi-node E2E remains required when the pinned MetalGo binary and replay
-fixtures are available.
+fixtures are available. The focused optimistic-path E2E can be run with:
+
+```sh
+cd tests/e2e
+METALGO_PATH=/path/to/metalgo \
+PULSEVM_PLUGIN_DIR=/path/to/plugin-directory \
+go test -v -count=1 -run '^TestParallelBlockExecution$' ./...
+```
 
 ## Benchmarks
 
