@@ -1707,6 +1707,10 @@ impl ChainDatabase {
         self.read().estimated_heap_bytes()
     }
 
+    pub fn execution_private_bytes(&self) -> usize {
+        self.read().execution_private_bytes()
+    }
+
     /// Build an independent Arena from an in-memory execution snapshot.
     pub fn from_execution_snapshot(snapshot: &[u8]) -> Result<Self, DbError> {
         let mut db = build_registered_db()?;

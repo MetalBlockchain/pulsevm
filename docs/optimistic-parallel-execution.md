@@ -66,15 +66,18 @@ Worker completion order is never observed. Only twice the effective worker
 count may be dispatched or buffered at once. If at least 75% of the first
 `max(workers, 4)` ordered attempts fall back, the remaining speculation is
 cancelled and the suffix runs serially. A panic recreates the affected worker
-fork; it cannot modify canonical state or invalidate a block.
+fork; a terminated pool thread is reaped and replaced before the next submit.
+Neither failure can modify canonical state or invalidate a block.
 
 ## Dependencies and phantom protection
 
 Dependency keys cover contract primary rows and all five secondary-index
 families (`idx64`, `idx128`, `idx256`, `idx_double`, and `idx_long_double`).
-Point lookups use stable logical row keys. Bounds, iteration, and absent reads
-also record conservative whole-index ranges, so an earlier insert, remove, or
-secondary re-key cannot create an unobserved phantom.
+Point lookups use stable logical row keys. Primary lower/upper/previous/last
+positioning records the exact inclusive key interval that could change its
+result. Full primary scans and secondary bounds/iteration retain conservative
+whole-index ranges, so an earlier insert, remove, or secondary re-key cannot
+create an unobserved phantom.
 
 System keys cover accounts, code, ABI, permissions and links, permission usage,
 chain configuration, producer schedules, protocol features, resource limits
@@ -101,6 +104,7 @@ The authoritative journal currently supports:
 - account CPU/NET usage and RAM deltas/checks;
 - permission last-used updates;
 - input-transaction dedupe records;
+- deferred-transaction create and removal by transaction or sender id;
 - action receiver/global/authorization sequence allocation.
 
 At worker completion, PulseVM independently derives the write-event multiset
@@ -108,8 +112,8 @@ explained by those operations and requires exact key and occurrence-count
 equality with the database recorder's observed writes. Counting events prevents
 an unsupported mutation from hiding behind a supported operation that happens
 to touch the same key. A native action such as `newaccount`, `setcode`, `setabi`,
-authority mutation, producer proposal, deferred-transaction mutation, protocol
-activation, or any future unjournaled write therefore cannot be committed
+authority mutation, producer proposal, protocol activation, or any future
+unjournaled write therefore cannot be committed
 optimistically; it falls back to serial execution.
 
 This closed-write check is deliberately conservative. Adding a new mutating
@@ -148,11 +152,13 @@ authorizer conservatively sends the remaining suffix through the serial path.
 
 `PULSEVM_PARALLEL_EXECUTION_MEMORY_MB` bounds worker memory. The default is 1024
 MiB and the accepted maximum is 65536 MiB. The controller subtracts the shared
-snapshot estimate, then reserves four times the live Arena estimate plus 8 MiB
-of runtime overhead per worker. This intentionally assumes hostile transactions
-may detach large tables or indexes. It also caps workers by available CPUs and
-task count. Production block execution requires at least two effective workers;
-otherwise it uses the serial path without changing behavior.
+snapshot estimate and reserves 8 MiB of runtime overhead per worker. During
+execution each worker reports its actual detached primary pages, secondary
+overlay entries, and blob-tail capacity. Crossing the configured limit cancels
+new speculative work and sends the suffix through the serial path. Worker count
+is also capped by available CPUs and task count. Production block execution
+requires at least two effective workers; otherwise it uses the serial path
+without changing behavior.
 
 `PULSEVM_PARALLEL_EXECUTION_TASKS_PER_WORKER` controls the minimum useful work
 per worker. It defaults to four and accepts values from 1 through 1024. For
@@ -161,10 +167,17 @@ larger host. This avoids paying fork and scheduling overhead for idle capacity;
 the explicit benchmark API overrides it to measure requested worker counts.
 
 Snapshot creation is pointer-level COW cloning rather than serialization and
-index rebuilding. Primary storage detaches by fixed-size page. Blob arenas and
-individual secondary indexes detach independently on their first mutation.
+index rebuilding. Primary storage detaches by fixed-size page. Blob arenas keep
+an immutable shared prefix and a private append tail. Ordered and hash secondary
+indexes retain their immutable base and record only sparse key changes in each
+worker; ordered iteration merges both views without materializing the tree.
 When pruning leaves fewer than two useful production tasks, PulseVM avoids the
 snapshot and dependency recorder entirely and runs the batch serially.
+
+After three sustained high-contention batches, the node skips most speculative
+batches and probes periodically. Successful probes decay the score and restore
+normal parallel execution. This policy is node-local and cannot affect block
+validity.
 
 ## Failure and consensus properties
 
@@ -172,7 +185,7 @@ snapshot and dependency recorder entirely and runs the batch serially.
 - Every journal replay is enclosed by a child undo session and is squashed or
   undone exactly once.
 - Worker Arenas never share iterator caches or mutable storage with canonical
-  execution; shared storage is immutable and detached with `Arc::make_mut`.
+  execution; shared storage is immutable and worker changes are private.
 - Subjective wall-clock deadlines are disabled for first-time block validation;
   queueing and host speed cannot decide validity.
 - Authorization and deterministic receipt measurement are still required for a
@@ -196,6 +209,11 @@ Compiled WASM modules use a small thread-local handle cache ahead of the shared
 LRU, avoiding its write lock on hot actions. A per-code-hash single-flight gate
 ensures concurrent first use compiles one LLVM module while waiters reuse the
 result. Compilation itself remains outside the shared cache lock.
+
+Recovered transaction keys use a bounded LRU keyed by chain id and packed
+digest, allowing mempool admission, block production, and validation to reuse
+the same cryptographic result. Recovery on cache misses remains outside the
+cache lock so unrelated signatures execute concurrently.
 
 `PULSEVM_DEPENDENCY_TELEMETRY` emits full serial dependency reports.
 `PULSEVM_PARALLEL_WAVE_TELEMETRY` emits conflict-wave estimates. Both are
@@ -248,8 +266,8 @@ cargo bench -p pulsevm_core --bench transfer --locked -- wasm_parallel_execution
 ```
 
 Use `-- --quick` for a smoke sample. The returned benchmark result exposes
-transaction/action counts, effective workers, snapshot bytes, and
-optimistic-commit/fallback counts, ensuring the timed path is consumed.
+transaction/action counts, effective workers, snapshot bytes, detached bytes,
+and optimistic-commit/fallback counts, ensuring the timed path is consumed.
 Independent rows show useful scaling; the hot-key case guards adaptive fallback
 cost and prevents optimistic throughput claims from hiding contention.
 

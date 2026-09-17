@@ -13,6 +13,7 @@ use std::{
         ErrorKind,
         Write as IoWrite,
     },
+    num::NonZeroUsize,
     path::Path,
     str::FromStr,
     sync::{
@@ -32,6 +33,9 @@ use std::{
         Instant,
     },
 };
+
+use lru::LruCache;
+use pulsevm_crypto::AuthorityPublicKey;
 
 use crate::{
     ACTIVE_NAME,
@@ -177,6 +181,66 @@ static PARALLEL_EXECUTION_TASKS_PER_WORKER: LazyLock<usize> = LazyLock::new(|| {
 });
 static XPR_BATCHED_REPLAY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("PULSEVM_XPR_BATCHED_REPLAY").as_deref() == Ok("1"));
+
+const RECOVERED_KEY_CACHE_ENTRIES: usize = 8_192;
+type RecoveredKeyCacheEntries = LruCache<([u8; 32], [u8; 32]), Arc<BTreeSet<AuthorityPublicKey>>>;
+
+/// Bounded node-local cache for the expensive recoverable-signature operation.
+/// The packed digest commits to the signature vector as well as the packed
+/// transaction, while the chain id commits to the signing domain.
+#[derive(Clone)]
+struct RecoveredKeyCache {
+    entries: Arc<Mutex<RecoveredKeyCacheEntries>>,
+}
+
+impl Default for RecoveredKeyCache {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(RECOVERED_KEY_CACHE_ENTRIES).unwrap_or(NonZeroUsize::MIN),
+            ))),
+        }
+    }
+}
+
+impl RecoveredKeyCache {
+    fn recover(
+        &self,
+        packed_transaction: &PackedTransaction,
+        signed_transaction: &SignedTransaction,
+        chain_id: &Id,
+    ) -> Result<Arc<BTreeSet<AuthorityPublicKey>>, ChainError> {
+        let packed_digest = packed_transaction.packed_digest().map_err(|error| {
+            ChainError::SerializationError(format!(
+                "failed to obtain packed transaction digest: {error}"
+            ))
+        })?;
+        let key = (chain_id.0.0, packed_digest.0);
+        if let Some(keys) = self
+            .entries
+            .lock()
+            .map_err(|_| ChainError::InternalError("recovered-key cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(keys);
+        }
+
+        // Do cryptography outside the lock: unrelated transactions must remain
+        // recoverable in parallel. Duplicate work on a simultaneous cache miss
+        // is bounded by the execution worker count and converges on one entry.
+        let recovered = Arc::new(signed_transaction.recovered_authority_keys(chain_id)?);
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ChainError::InternalError("recovered-key cache lock poisoned".into()))?;
+        if let Some(existing) = entries.get(&key).cloned() {
+            return Ok(existing);
+        }
+        entries.put(key, Arc::clone(&recovered));
+        Ok(recovered)
+    }
+}
 static XPR_TRACE_ACTION_RECEIPTS_BLOCK: LazyLock<Option<u32>> = LazyLock::new(|| {
     std::env::var("XPR_REPLAY_TRACE_ACTION_RECEIPTS_BLOCK")
         .ok()
@@ -687,6 +751,9 @@ struct ParallelExecutionBatch {
     cursor: Mutex<ParallelExecutionCursor>,
     cursor_changed: Condvar,
     sender: mpsc::SyncSender<ParallelTransactionOutcome>,
+    detached_bytes: AtomicUsize,
+    reserved_bytes: usize,
+    memory_limit_bytes: usize,
 }
 
 struct ParallelExecutionCursor {
@@ -721,6 +788,26 @@ impl ParallelExecutionBatch {
         }
     }
 
+    fn observe_private_bytes(&self, reported: &mut usize, current: usize) {
+        if current > *reported {
+            let total = self
+                .detached_bytes
+                .fetch_add(current - *reported, Ordering::Relaxed)
+                .saturating_add(current - *reported);
+            *reported = current;
+            if self.reserved_bytes.saturating_add(total) > self.memory_limit_bytes {
+                self.cancel();
+            }
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cursor
+            .lock()
+            .map(|cursor| cursor.cancelled)
+            .unwrap_or(true)
+    }
+
     fn cancel(&self) {
         if let Ok(mut cursor) = self.cursor.lock() {
             cursor.cancelled = true;
@@ -732,6 +819,8 @@ impl ParallelExecutionBatch {
 enum ParallelWorkerCommand {
     Execute(Arc<ParallelExecutionBatch>),
     Stop,
+    #[cfg(test)]
+    Crash,
 }
 
 struct ParallelPoolWorker {
@@ -757,6 +846,10 @@ struct ParallelExecutionHandle {
 }
 
 impl ParallelExecutionHandle {
+    fn is_cancelled(&self) -> bool {
+        self.batch.is_cancelled()
+    }
+
     fn outcome_for(
         &mut self,
         receipt_index: usize,
@@ -767,6 +860,9 @@ impl ParallelExecutionHandle {
         if let Some(outcome) = self.buffered.remove(&receipt_index) {
             self.batch.release_one();
             return Some(outcome);
+        }
+        if self.batch.is_cancelled() {
+            return None;
         }
         while self.remaining > 0 {
             let outcome = self.receiver.recv().ok()?;
@@ -788,26 +884,46 @@ impl Drop for ParallelExecutionHandle {
 }
 
 impl ParallelExecutionPool {
+    fn spawn_worker(index: usize) -> Result<ParallelPoolWorker, ChainError> {
+        let (sender, receiver) = mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name(format!("pulsevm-exec-{index}"))
+            .spawn(move || parallel_worker_loop(receiver))
+            .map_err(|error| {
+                ChainError::InternalError(format!(
+                    "cannot start parallel execution worker: {error}"
+                ))
+            })?;
+        Ok(ParallelPoolWorker {
+            sender,
+            join: Some(join),
+        })
+    }
+
     fn ensure_workers(&self, count: usize) -> Result<(), ChainError> {
         let mut workers = self
             .workers
             .lock()
             .map_err(|_| ChainError::InternalError("parallel worker pool lock poisoned".into()))?;
+        let mut live = Vec::with_capacity(workers.len().max(count));
+        for mut worker in workers.drain(..) {
+            if worker
+                .join
+                .as_ref()
+                .map(|join| join.is_finished())
+                .unwrap_or(true)
+            {
+                if let Some(join) = worker.join.take() {
+                    let _ = join.join();
+                }
+            } else {
+                live.push(worker);
+            }
+        }
+        *workers = live;
         while workers.len() < count {
             let index = workers.len();
-            let (sender, receiver) = mpsc::channel();
-            let join = std::thread::Builder::new()
-                .name(format!("pulsevm-exec-{index}"))
-                .spawn(move || parallel_worker_loop(receiver))
-                .map_err(|error| {
-                    ChainError::InternalError(format!(
-                        "cannot start parallel execution worker: {error}"
-                    ))
-                })?;
-            workers.push(ParallelPoolWorker {
-                sender,
-                join: Some(join),
-            });
+            workers.push(Self::spawn_worker(index)?);
         }
         Ok(())
     }
@@ -818,18 +934,34 @@ impl ParallelExecutionPool {
         worker_count: usize,
     ) -> Result<usize, ChainError> {
         self.ensure_workers(worker_count)?;
-        let workers = self
+        let mut workers = self
             .workers
             .lock()
             .map_err(|_| ChainError::InternalError("parallel worker pool lock poisoned".into()))?;
         let mut submitted = 0usize;
-        for worker in workers.iter().take(worker_count) {
-            if worker
+        let mut worker_index = 0usize;
+        let mut replacements = 0usize;
+        while submitted < worker_count {
+            if worker_index >= workers.len() {
+                if replacements >= worker_count {
+                    break;
+                }
+                let index = workers.len();
+                workers.push(Self::spawn_worker(index)?);
+                replacements = replacements.saturating_add(1);
+            }
+            if workers[worker_index]
                 .sender
                 .send(ParallelWorkerCommand::Execute(Arc::clone(&batch)))
                 .is_ok()
             {
                 submitted = submitted.saturating_add(1);
+                worker_index = worker_index.saturating_add(1);
+            } else {
+                let mut dead = workers.remove(worker_index);
+                if let Some(join) = dead.join.take() {
+                    let _ = join.join();
+                }
             }
         }
         Ok(submitted)
@@ -854,10 +986,14 @@ impl Drop for ParallelExecutionPool {
 
 fn parallel_worker_loop(receiver: mpsc::Receiver<ParallelWorkerCommand>) {
     while let Ok(command) = receiver.recv() {
-        let ParallelWorkerCommand::Execute(batch) = command else {
-            break;
+        let batch = match command {
+            ParallelWorkerCommand::Execute(batch) => batch,
+            ParallelWorkerCommand::Stop => break,
+            #[cfg(test)]
+            ParallelWorkerCommand::Crash => panic!("injected parallel worker failure"),
         };
         let mut worker = batch.executor.worker().map_err(|error| error.to_string());
+        let mut reported_private_bytes = 0usize;
         while let Some(task_index) = batch.claim() {
             let Some((receipt_index, transaction, resource_mode, subjective_bill)) =
                 batch.tasks.get(task_index)
@@ -889,6 +1025,12 @@ fn parallel_worker_loop(receiver: mpsc::Receiver<ParallelWorkerCommand>) {
                     Err("parallel transaction worker panicked".to_string())
                 }
             };
+            if let Ok(worker) = worker.as_ref() {
+                batch.observe_private_bytes(
+                    &mut reported_private_bytes,
+                    worker.database.execution_private_bytes(),
+                );
+            }
             if batch
                 .sender
                 .send(ParallelTransactionOutcome {
@@ -911,6 +1053,7 @@ pub struct ParallelExecutionBenchmark {
     pub actions: usize,
     pub effective_workers: usize,
     pub snapshot_bytes: usize,
+    pub detached_bytes: usize,
     pub optimistic_commits: usize,
     pub serial_fallbacks: usize,
     pub speculation_cancelled: bool,
@@ -921,6 +1064,7 @@ struct ParallelTransactionExecutor {
     snapshot: ExecutionSnapshot,
     wasm_runtime: WasmRuntime,
     chain_id: Id,
+    recovered_key_cache: RecoveredKeyCache,
     protocol_context: ProtocolExecutionContext,
     pending_block_timestamp: BlockTimestamp,
     block_status: BlockStatus,
@@ -979,10 +1123,15 @@ impl ParallelTransactionExecutor {
             .validate(&self.pending_block_timestamp)?;
 
         if self.authorization_check == AuthorizationCheck::Required {
+            let recovered_keys = self.recovered_key_cache.recover(
+                packed_transaction,
+                signed_transaction,
+                &self.chain_id,
+            )?;
             AuthorizationManager::check_authorization(
                 database,
                 &signed_transaction.transaction().actions,
-                &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+                &recovered_keys,
                 &BTreeSet::new(),
                 seconds(signed_transaction.transaction().header.delay_sec.into()),
                 &BTreeSet::new(),
@@ -1078,6 +1227,7 @@ pub struct Controller {
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
     chain_id: Id,
+    recovered_key_cache: RecoveredKeyCache,
     // The genesis-derived chain id (`sha256(pack(genesis))`), which is what the
     // `global_property` state-history record commits to — distinct from
     // `chain_id`, the id AvalancheGo configured the node with (equal in
@@ -1098,6 +1248,8 @@ pub struct Controller {
     parallel_execution_pool: ParallelExecutionPool,
     parallel_transactions_committed: u64,
     parallel_transactions_fallback: u64,
+    parallel_contention_score: AtomicUsize,
+    parallel_contention_probes: AtomicUsize,
 
     // Consensus-critical upgrade schedule supplied in `upgrade_bytes` at VM
     // initialization. MetalGo sources it from each node's chain configuration,
@@ -1169,6 +1321,7 @@ pub struct Controller {
 pub struct MempoolAdmissionState {
     db: Database,
     chain_id: Id,
+    recovered_key_cache: RecoveredKeyCache,
     protocol_upgrade_schedule: ProtocolUpgradeSchedule,
 }
 
@@ -1267,10 +1420,15 @@ impl MempoolAdmissionState {
             return Err(ChainError::DatabaseError("duplicate tx".into()));
         }
 
+        let recovered_keys = self.recovered_key_cache.recover(
+            packed_transaction,
+            signed_transaction,
+            &self.chain_id,
+        )?;
         AuthorizationManager::check_authorization(
             &self.db,
             &transaction.actions,
-            &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+            &recovered_keys,
             &BTreeSet::new(),
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
@@ -1597,6 +1755,7 @@ impl Controller {
             db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+            recovered_key_cache: RecoveredKeyCache::default(),
             genesis_chain_id: Id::default(),
             state: vm::State::Unspecified,
 
@@ -1613,6 +1772,8 @@ impl Controller {
             parallel_execution_pool: ParallelExecutionPool::default(),
             parallel_transactions_committed: 0,
             parallel_transactions_fallback: 0,
+            parallel_contention_score: AtomicUsize::new(0),
+            parallel_contention_probes: AtomicUsize::new(0),
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
             db_path: None,
             snapshot_cache: None,
@@ -2763,12 +2924,15 @@ impl Controller {
                 }
                 None
             };
-            if parallel_outcomes.is_some()
-                && speculation_is_counterproductive(
-                    optimistic_committed,
-                    optimistic_fallbacks,
-                    parallel_worker_count,
-                )
+            if parallel_outcomes
+                .as_ref()
+                .is_some_and(ParallelExecutionHandle::is_cancelled)
+                || parallel_outcomes.is_some()
+                    && speculation_is_counterproductive(
+                        optimistic_committed,
+                        optimistic_fallbacks,
+                        parallel_worker_count,
+                    )
             {
                 parallel_outcomes.take();
                 speculation_cancelled = true;
@@ -2835,6 +2999,11 @@ impl Controller {
         }
 
         if parallel_enabled {
+            self.update_parallel_contention(
+                optimistic_committed,
+                optimistic_fallbacks,
+                parallel_worker_count,
+            );
             self.parallel_transactions_committed = self
                 .parallel_transactions_committed
                 .saturating_add(optimistic_committed as u64);
@@ -3596,6 +3765,16 @@ impl Controller {
         if requested_workers == 0 || *XPR_BATCHED_REPLAY_ENABLED {
             return None;
         }
+        const CONTENTION_DISABLE_SCORE: usize = 3;
+        const CONTENTION_PROBE_INTERVAL: usize = 8;
+        if self.parallel_contention_score.load(Ordering::Relaxed) >= CONTENTION_DISABLE_SCORE
+            && !self
+                .parallel_contention_probes
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(CONTENTION_PROBE_INTERVAL)
+        {
+            return None;
+        }
         if tasks.is_empty() {
             return None;
         }
@@ -3622,11 +3801,9 @@ impl Controller {
         let snapshot_elapsed = snapshot_started.elapsed();
         let snapshot_bytes = snapshot.byte_len();
         const WORKER_OVERHEAD_BYTES: usize = 8 * 1024 * 1024;
-        let estimated_worker_bytes = snapshot
-            .byte_len()
-            .saturating_mul(4)
-            .saturating_add(WORKER_OVERHEAD_BYTES)
-            .max(1);
+        // The snapshot is shared. Reserve fixed runtime/transaction overhead up
+        // front, then account actual detached Arena bytes as workers mutate.
+        let estimated_worker_bytes = WORKER_OVERHEAD_BYTES;
         let memory_workers = self
             .parallel_execution_memory_bytes
             .saturating_sub(snapshot.byte_len())
@@ -3647,6 +3824,7 @@ impl Controller {
             snapshot,
             wasm_runtime: self.wasm_runtime.clone(),
             chain_id: self.chain_id,
+            recovered_key_cache: self.recovered_key_cache.clone(),
             protocol_context,
             pending_block_timestamp: *pending_block_timestamp,
             block_status: *block_status,
@@ -3673,6 +3851,10 @@ impl Controller {
             }),
             cursor_changed: Condvar::new(),
             sender,
+            detached_bytes: AtomicUsize::new(0),
+            reserved_bytes: snapshot_bytes
+                .saturating_add(worker_count.saturating_mul(WORKER_OVERHEAD_BYTES)),
+            memory_limit_bytes: self.parallel_execution_memory_bytes,
         });
         let submitted = match self
             .parallel_execution_pool
@@ -3700,6 +3882,26 @@ impl Controller {
             snapshot_elapsed,
             dispatch_window,
         })
+    }
+
+    fn update_parallel_contention(&self, commits: usize, fallbacks: usize, workers: usize) {
+        let attempts = commits.saturating_add(fallbacks);
+        if attempts < workers.max(4) {
+            return;
+        }
+        if fallbacks.saturating_mul(2) >= attempts {
+            let _ = self.parallel_contention_score.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |score| Some(score.saturating_add(1).min(8)),
+            );
+        } else if commits.saturating_mul(2) > attempts {
+            let _ = self.parallel_contention_score.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |score| Some(score.saturating_sub(1)),
+            );
+        }
     }
 
     fn execute_parallel_block(
@@ -4321,12 +4523,15 @@ impl Controller {
                 }
                 None
             };
-            if parallel_outcomes.is_some()
-                && speculation_is_counterproductive(
-                    optimistic_committed,
-                    optimistic_fallbacks,
-                    parallel_worker_count,
-                )
+            if parallel_outcomes
+                .as_ref()
+                .is_some_and(ParallelExecutionHandle::is_cancelled)
+                || parallel_outcomes.is_some()
+                    && speculation_is_counterproductive(
+                        optimistic_committed,
+                        optimistic_fallbacks,
+                        parallel_worker_count,
+                    )
             {
                 parallel_outcomes.take();
                 speculation_cancelled = true;
@@ -4568,6 +4773,11 @@ impl Controller {
             transactions_started.map_or(Duration::ZERO, |started| started.elapsed());
 
         if parallel_enabled {
+            self.update_parallel_contention(
+                optimistic_committed,
+                optimistic_fallbacks,
+                parallel_worker_count,
+            );
             self.parallel_transactions_committed = self
                 .parallel_transactions_committed
                 .saturating_add(optimistic_committed as u64);
@@ -4727,6 +4937,7 @@ impl Controller {
         MempoolAdmissionState {
             db: self.db.clone(),
             chain_id: self.chain_id.clone(),
+            recovered_key_cache: self.recovered_key_cache.clone(),
             protocol_upgrade_schedule: self.protocol_upgrade_schedule.clone(),
         }
     }
@@ -4795,6 +5006,7 @@ impl Controller {
             snapshot,
             wasm_runtime: self.wasm_runtime.clone(),
             chain_id: self.chain_id,
+            recovered_key_cache: self.recovered_key_cache.clone(),
             protocol_context,
             pending_block_timestamp: *pending_block_timestamp,
             block_status: BlockStatus::Benchmarking,
@@ -4964,12 +5176,20 @@ impl Controller {
                 report.actions = report
                     .actions
                     .saturating_add(result.trace.action_traces.len());
-                if outcomes.is_some()
-                    && speculation_is_counterproductive(
-                        report.optimistic_commits,
-                        report.serial_fallbacks,
-                        effective_workers,
-                    )
+                if let Some(active) = &outcomes {
+                    report.detached_bytes = report
+                        .detached_bytes
+                        .max(active.batch.detached_bytes.load(Ordering::Relaxed));
+                }
+                if outcomes
+                    .as_ref()
+                    .is_some_and(ParallelExecutionHandle::is_cancelled)
+                    || outcomes.is_some()
+                        && speculation_is_counterproductive(
+                            report.optimistic_commits,
+                            report.serial_fallbacks,
+                            effective_workers,
+                        )
                 {
                     outcomes.take();
                     report.speculation_cancelled = true;
@@ -5312,10 +5532,15 @@ impl Controller {
             // receipt accounting. Only a transaction already validated by this
             // node (or a trusted offline migration receipt) may skip it.
             if authorization_check == AuthorizationCheck::Required {
+                let recovered_keys = self.recovered_key_cache.recover(
+                    packed_transaction,
+                    signed_transaction,
+                    &self.chain_id,
+                )?;
                 AuthorizationManager::check_authorization(
                     &mut execution_db,
                     &signed_transaction.transaction().actions,
-                    &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+                    &recovered_keys,
                     &BTreeSet::new(),
                     seconds(signed_transaction.transaction().header.delay_sec.into()),
                     &BTreeSet::new(),
@@ -6529,6 +6754,65 @@ mod tests {
             controller.db.preactivate_protocol_feature(*feature)?;
         }
         controller.db.activate_protocol_features(features, 1)
+    }
+
+    #[test]
+    fn parallel_pool_replaces_a_dead_worker() -> Result<(), ChainError> {
+        let pool = ParallelExecutionPool::default();
+        pool.ensure_workers(1)?;
+        let join = {
+            let mut workers = pool.workers.lock().map_err(|_| {
+                ChainError::InternalError("parallel worker pool lock poisoned".into())
+            })?;
+            workers[0]
+                .sender
+                .send(ParallelWorkerCommand::Crash)
+                .map_err(|error| ChainError::InternalError(error.to_string()))?;
+            workers[0].join.take()
+        };
+        if let Some(join) = join {
+            let _ = join.join();
+        }
+        pool.ensure_workers(1)?;
+        let workers = pool
+            .workers
+            .lock()
+            .map_err(|_| ChainError::InternalError("parallel worker pool lock poisoned".into()))?;
+        assert_eq!(workers.len(), 1);
+        assert!(workers[0].join.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_key_cache_is_bounded_to_packed_bytes_and_chain() -> Result<(), ChainError> {
+        let cache = RecoveredKeyCache::default();
+        let packed = PackedTransaction::from_signed_transaction(SignedTransaction::default())?;
+        let signed = packed.get_signed_transaction();
+        let first = cache.recover(&packed, signed, &Id::default())?;
+        let second = cache.recover(&packed, signed, &Id::default())?;
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let other_chain = Id::new([1; 32]);
+        let other = cache.recover(&packed, signed, &other_chain)?;
+        assert!(!Arc::ptr_eq(&first, &other));
+        Ok(())
+    }
+
+    #[test]
+    fn historical_contention_policy_learns_and_recovers() {
+        let controller = Controller::new();
+        for _ in 0..3 {
+            controller.update_parallel_contention(1, 7, 4);
+        }
+        assert_eq!(
+            controller.parallel_contention_score.load(Ordering::Relaxed),
+            3
+        );
+        controller.update_parallel_contention(8, 0, 4);
+        assert_eq!(
+            controller.parallel_contention_score.load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
@@ -8550,6 +8834,7 @@ mod tests {
             snapshot: controller.db.execution_snapshot()?,
             wasm_runtime: controller.wasm_runtime.clone(),
             chain_id,
+            recovered_key_cache: controller.recovered_key_cache.clone(),
             protocol_context,
             pending_block_timestamp: timestamp.clone(),
             block_status: status,
@@ -8853,6 +9138,7 @@ mod tests {
             snapshot: controller.db.execution_snapshot()?,
             wasm_runtime: controller.wasm_runtime.clone(),
             chain_id,
+            recovered_key_cache: controller.recovered_key_cache.clone(),
             protocol_context,
             pending_block_timestamp: timestamp.clone(),
             block_status: status,

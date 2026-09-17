@@ -54,6 +54,7 @@ use crate::{
     U256,
     dependency::{
         ContractIndex,
+        ContractPrimaryRangeKey,
         ContractRangeKey,
         ContractRowKey,
         DependencyKey,
@@ -973,6 +974,18 @@ pub enum ExecutionOperation {
         id: [u8; 32],
         expiration: u32,
     },
+    DeferredCreate {
+        transaction: crate::backend::DeferredTransaction,
+    },
+    DeferredRemoveById {
+        trx_id: [u8; 32],
+        sender: Option<(u64, u128)>,
+    },
+    DeferredRemoveBySender {
+        sender: u64,
+        sender_id: u128,
+        trx_id: Option<[u8; 32]>,
+    },
     ActionSequences {
         receiver: u64,
         auth_actors: Vec<u64>,
@@ -1036,6 +1049,41 @@ impl ExecutionOperation {
             }
             Self::RecordTransaction { id, .. } => {
                 write(DependencyKey::System(SystemKey::Transaction(*id)));
+            }
+            Self::DeferredCreate { transaction } => {
+                write(DependencyKey::System(SystemKey::DeferredTransaction(
+                    transaction.trx_id,
+                )));
+                write(DependencyKey::System(SystemKey::DeferredSender {
+                    sender: transaction.sender,
+                    sender_id: transaction.sender_id,
+                }));
+            }
+            Self::DeferredRemoveById { trx_id, sender } => {
+                write(DependencyKey::System(SystemKey::DeferredTransaction(
+                    *trx_id,
+                )));
+                if let Some((sender, sender_id)) = sender {
+                    write(DependencyKey::System(SystemKey::DeferredSender {
+                        sender: *sender,
+                        sender_id: *sender_id,
+                    }));
+                }
+            }
+            Self::DeferredRemoveBySender {
+                sender,
+                sender_id,
+                trx_id,
+            } => {
+                write(DependencyKey::System(SystemKey::DeferredSender {
+                    sender: *sender,
+                    sender_id: *sender_id,
+                }));
+                if let Some(trx_id) = trx_id {
+                    write(DependencyKey::System(SystemKey::DeferredTransaction(
+                        *trx_id,
+                    )));
+                }
             }
             Self::ActionSequences {
                 receiver,
@@ -1340,6 +1388,11 @@ impl Database {
         })
     }
 
+    /// Current Arena heap privately detached by this execution worker.
+    pub fn execution_private_bytes(&self) -> usize {
+        self.backend.execution_private_bytes()
+    }
+
     /// Construct an isolated full database from a frozen execution snapshot.
     /// The returned tracker observes the worker's complete Database facade path;
     /// callers must still reject reports not explicitly marked complete.
@@ -1507,6 +1560,39 @@ impl Database {
                 )?,
                 ExecutionOperation::RecordTransaction { id, expiration } => {
                     self.record_transaction(id, *expiration)?;
+                }
+                ExecutionOperation::DeferredCreate { transaction } => {
+                    self.xpr_import_deferred_transaction(
+                        transaction.sender,
+                        transaction.sender_id,
+                        transaction.payer,
+                        transaction.trx_id,
+                        transaction.delay_until,
+                        transaction.expiration,
+                        transaction.published,
+                        &transaction.packed_trx,
+                    )?;
+                }
+                ExecutionOperation::DeferredRemoveById { trx_id, sender } => {
+                    let removed = self.arena_remove_deferred_transaction(*trx_id)?;
+                    if removed != sender.is_some() {
+                        return Err(ChainError::DatabaseError(
+                            "deferred transaction changed before journal replay".into(),
+                        ));
+                    }
+                }
+                ExecutionOperation::DeferredRemoveBySender {
+                    sender,
+                    sender_id,
+                    trx_id,
+                } => {
+                    let removed =
+                        self.arena_remove_deferred_transaction_by_sender_id(*sender, *sender_id)?;
+                    if removed.as_ref().map(|row| row.trx_id) != *trx_id {
+                        return Err(ChainError::DatabaseError(
+                            "deferred sender id changed before journal replay".into(),
+                        ));
+                    }
                 }
                 ExecutionOperation::ActionSequences {
                     receiver,
@@ -1704,6 +1790,24 @@ impl Database {
             recorder.range_read(RangeDependency::Contract(ContractRangeKey::new(
                 code, scope, table, index,
             )));
+        }
+    }
+
+    fn dependency_primary_range_read(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        lower: u64,
+        upper: u64,
+    ) {
+        self.capture_xpr_read_only_contract(code);
+        if lower <= upper
+            && let Some(recorder) = &self.dependency_recorder
+        {
+            recorder.range_read(RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(code, scope, table, lower, upper),
+            ));
         }
     }
 
@@ -2291,8 +2395,9 @@ impl Database {
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
     /// All return `None`
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_lower_bound(code, scope, table, key)
+        let result = self.backend.kv_lower_bound(code, scope, table, key);
+        self.dependency_primary_range_read(code, scope, table, key, result.unwrap_or(u64::MAX));
+        result
     }
 
     pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
@@ -2305,20 +2410,45 @@ impl Database {
     }
 
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_upper_bound(code, scope, table, key)
+        let result = self.backend.kv_upper_bound(code, scope, table, key);
+        if let Some(lower) = key.checked_add(1) {
+            self.dependency_primary_range_read(
+                code,
+                scope,
+                table,
+                lower,
+                result.unwrap_or(u64::MAX),
+            );
+        }
+        result
     }
 
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_prev(code, scope, table, key)
+        let result = self.backend.kv_prev(code, scope, table, key);
+        if let Some(upper) = key.checked_sub(1) {
+            self.dependency_primary_range_read(
+                code,
+                scope,
+                table,
+                result.unwrap_or(u64::MIN),
+                upper,
+            );
+        }
+        result
     }
 
     /// Largest primary in the table — db_previous_i64's landing when stepping
     /// back from the end iterator. `None` if empty.
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_last(code, scope, table)
+        let result = self.backend.kv_last(code, scope, table);
+        self.dependency_primary_range_read(
+            code,
+            scope,
+            table,
+            result.unwrap_or(u64::MIN),
+            u64::MAX,
+        );
+        result
     }
 
     /// Arena idx64 secondary-index positioning, updating db_idx64_find_secondary
@@ -4044,7 +4174,20 @@ impl Database {
             )
             .map_err(|e| {
                 ChainError::InternalError(format!("XPR import deferred transaction: {e:?}"))
-            })
+            })?;
+        self.record_execution_operation(ExecutionOperation::DeferredCreate {
+            transaction: crate::backend::DeferredTransaction {
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                delay_until,
+                expiration,
+                published,
+                packed_trx: packed_trx.to_vec(),
+            },
+        });
+        Ok(())
     }
 
     /// Pending migrated deferred transaction count. Controllers must only
@@ -4086,17 +4229,21 @@ impl Database {
 
     pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
         self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
-        if let Some(row) = self.backend.deferred_transaction(trx_id) {
-            self.dependency_system_write(SystemKey::DeferredSender {
-                sender: row.sender,
-                sender_id: row.sender_id,
-            });
+        let sender = self
+            .backend
+            .deferred_transaction(trx_id)
+            .map(|row| (row.sender, row.sender_id));
+        if let Some((sender, sender_id)) = sender {
+            self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
         }
-        self.backend
+        let removed = self
+            .backend
             .remove_deferred_transaction(trx_id)
             .map_err(|e| {
                 ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
-            })
+            })?;
+        self.record_execution_operation(ExecutionOperation::DeferredRemoveById { trx_id, sender });
+        Ok(removed)
     }
 
     pub fn arena_remove_deferred_transaction_by_sender_id(
@@ -4116,6 +4263,11 @@ impl Database {
         if let Some(row) = &removed {
             self.dependency_system_write(SystemKey::DeferredTransaction(row.trx_id));
         }
+        self.record_execution_operation(ExecutionOperation::DeferredRemoveBySender {
+            sender,
+            sender_id,
+            trx_id: removed.as_ref().map(|row| row.trx_id),
+        });
         Ok(removed)
     }
 
@@ -8206,12 +8358,9 @@ mod tests {
         );
         assert_eq!(
             report.range_reads(),
-            &BTreeSet::from([RangeDependency::Contract(ContractRangeKey::new(
-                code,
-                scope,
-                table,
-                ContractIndex::Primary,
-            ))])
+            &BTreeSet::from([RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(code, scope, table, 0, primary,),
+            )])
         );
         assert_eq!(
             report.writes(),
@@ -8510,6 +8659,32 @@ mod tests {
 
         assert!(worker.finish_execution_journal(&tracker).is_none());
         assert!(!tracker.snapshot().is_complete());
+    }
+
+    #[test]
+    fn deferred_create_and_remove_are_replayable_journal_operations() {
+        let mut canonical = Database::default();
+        let snapshot = canonical.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        worker
+            .xpr_import_deferred_transaction(1, 2, 3, [4; 32], 5, 6, 7, &[8, 9])
+            .unwrap();
+        let journal = worker.finish_execution_journal(&tracker).unwrap();
+        canonical.apply_execution_journal(&journal).unwrap();
+        assert_eq!(
+            canonical
+                .arena_deferred_transaction([4; 32])
+                .unwrap()
+                .packed_trx,
+            vec![8, 9]
+        );
+
+        let snapshot = canonical.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        assert!(worker.arena_remove_deferred_transaction([4; 32]).unwrap());
+        let journal = worker.finish_execution_journal(&tracker).unwrap();
+        canonical.apply_execution_journal(&journal).unwrap();
+        assert!(canonical.arena_deferred_transaction([4; 32]).is_none());
     }
 }
 

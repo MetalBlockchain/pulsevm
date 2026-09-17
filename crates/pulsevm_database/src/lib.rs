@@ -49,6 +49,7 @@ pub use crate::{
     dependency::{
         CommittedWriteIndex,
         ContractIndex,
+        ContractPrimaryRangeKey,
         ContractRangeKey,
         ContractRowKey,
         DependencyKey,

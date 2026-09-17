@@ -100,6 +100,7 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
 trait AbstractTable: Send + Sync {
     fn execution_fork_box(&self) -> Box<dyn AbstractTable>;
     fn estimated_heap_bytes(&self) -> usize;
+    fn execution_private_bytes(&self) -> usize;
     fn start_undo_session(&mut self) -> i64;
     fn revision(&self) -> i64;
     fn set_revision(&mut self, revision: i64) -> Result<(), TableError>;
@@ -129,6 +130,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn estimated_heap_bytes(&self) -> usize {
         Table::estimated_heap_bytes(self)
+    }
+    fn execution_private_bytes(&self) -> usize {
+        Table::execution_private_bytes(self)
     }
     fn start_undo_session(&mut self) -> i64 {
         Table::start_undo_session(self)
@@ -252,6 +256,13 @@ impl Db {
     pub fn estimated_heap_bytes(&self) -> usize {
         self.tables.iter().fold(0usize, |total, table| {
             total.saturating_add(table.estimated_heap_bytes())
+        })
+    }
+
+    /// Current heap bytes detached from the shared execution snapshot.
+    pub fn execution_private_bytes(&self) -> usize {
+        self.tables.iter().fold(0usize, |total, table| {
+            total.saturating_add(table.execution_private_bytes())
         })
     }
 

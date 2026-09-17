@@ -75,6 +75,39 @@ pub struct ContractRangeKey {
     pub index: ContractIndex,
 }
 
+/// Inclusive primary-key interval whose contents or absence affected an
+/// iterator-positioning result. Writes outside the interval cannot change that
+/// observation and therefore need not force serial fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContractPrimaryRangeKey {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub lower: u64,
+    pub upper: u64,
+}
+
+impl ContractPrimaryRangeKey {
+    pub(crate) const fn new(code: u64, scope: u64, table: u64, lower: u64, upper: u64) -> Self {
+        Self {
+            code,
+            scope,
+            table,
+            lower,
+            upper,
+        }
+    }
+
+    fn contains(&self, row: ContractRowKey) -> bool {
+        row.index == ContractIndex::Primary
+            && self.code == row.code
+            && self.scope == row.scope
+            && self.table == row.table
+            && self.lower <= row.primary
+            && row.primary <= self.upper
+    }
+}
+
 impl ContractRangeKey {
     pub(crate) const fn new(code: u64, scope: u64, table: u64, index: ContractIndex) -> Self {
         Self {
@@ -148,6 +181,7 @@ pub enum DependencyKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RangeDependency {
     Contract(ContractRangeKey),
+    ContractPrimary(ContractPrimaryRangeKey),
     System(SystemRangeKey),
 }
 
@@ -174,6 +208,7 @@ pub struct TransactionDependencies {
 pub struct CommittedWriteIndex {
     exact: BTreeSet<DependencyKey>,
     contract_ranges: BTreeSet<ContractRangeKey>,
+    contract_primary_writes: BTreeSet<(u64, u64, u64, u64)>,
     permission_owners: BTreeSet<u64>,
     deferred_queue_dirty: bool,
 }
@@ -188,6 +223,14 @@ impl CommittedWriteIndex {
                 self.contract_ranges.insert(ContractRangeKey::new(
                     row.code, row.scope, row.table, row.index,
                 ));
+                if row.index == ContractIndex::Primary {
+                    self.contract_primary_writes.insert((
+                        row.code,
+                        row.scope,
+                        row.table,
+                        row.primary,
+                    ));
+                }
             }
             DependencyKey::System(SystemKey::Permission { owner, .. }) => {
                 self.permission_owners.insert(owner);
@@ -215,6 +258,14 @@ impl CommittedWriteIndex {
             .any(|key| self.exact.contains(key))
             || dependencies.range_reads.iter().any(|range| match range {
                 RangeDependency::Contract(range) => self.contract_ranges.contains(range),
+                RangeDependency::ContractPrimary(range) => self
+                    .contract_primary_writes
+                    .range(
+                        (range.code, range.scope, range.table, range.lower)
+                            ..=(range.code, range.scope, range.table, range.upper),
+                    )
+                    .next()
+                    .is_some(),
                 RangeDependency::System(SystemRangeKey::PermissionsByOwner(owner)) => {
                     self.permission_owners.contains(owner)
                 }
@@ -272,7 +323,9 @@ impl TransactionDependencies {
                             write.table,
                             write.index,
                         )),
-                    ),
+                    ) || self.range_reads.iter().any(|range| {
+                        matches!(range, RangeDependency::ContractPrimary(range) if range.contains(*write))
+                    }),
                     DependencyKey::System(SystemKey::Permission { owner, .. }) => {
                         self.range_reads.contains(&RangeDependency::System(
                             SystemRangeKey::PermissionsByOwner(*owner),
@@ -359,6 +412,9 @@ fn dependencies_observe_write(
                     write.table,
                     write.index,
                 )))
+                || dependencies.range_reads.iter().any(|range| {
+                    matches!(range, RangeDependency::ContractPrimary(range) if range.contains(write))
+                })
         }
         DependencyKey::System(SystemKey::Permission { owner, .. }) => {
             dependencies.range_reads.contains(&RangeDependency::System(
@@ -506,6 +562,30 @@ mod tests {
         assert_eq!(report.range_reads, BTreeSet::from([range]));
         assert_eq!(report.writes, BTreeSet::from([row]));
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn primary_interval_ignores_writes_that_cannot_change_positioning() {
+        let dependencies = TransactionDependencies {
+            exact_reads: BTreeSet::new(),
+            range_reads: BTreeSet::from([RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(1, 2, 3, 10, 20),
+            )]),
+            writes: BTreeSet::new(),
+            complete: true,
+        };
+        let outside =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 21));
+        let inside =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 15));
+
+        assert!(dependencies.can_optimistically_commit_after(&BTreeSet::from([outside])));
+        assert!(!dependencies.can_optimistically_commit_after(&BTreeSet::from([inside])));
+        let mut index = CommittedWriteIndex::default();
+        index.insert(outside);
+        assert!(dependencies.can_optimistically_commit_after_index(&index));
+        index.insert(inside);
+        assert!(!dependencies.can_optimistically_commit_after_index(&index));
     }
 
     #[test]
