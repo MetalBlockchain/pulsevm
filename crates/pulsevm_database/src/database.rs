@@ -878,8 +878,13 @@ pub use speculation::{
     ContractPrimaryKey,
     ContractPrimaryOverlay,
     SnapshotVersion,
+    SpeculativeBatchResult,
+    SpeculativeCandidate,
     SpeculativeCommitOutcome,
     SpeculativeFallbackReason,
+    SpeculativeShadowResult,
+    SpeculativeTask,
+    SpeculativeTaskOutcome,
     SpeculativeTransaction,
     SpeculativeWave,
 };
@@ -913,6 +918,10 @@ pub struct Database {
     /// Guards the currently supported live contract-primary write surface while
     /// a speculative wave owns the canonical controller handle.
     speculation_freeze: Arc<AtomicBool>,
+    /// Serializes wave creation and high-level batch ownership across cloned
+    /// handles. Unlike the write freeze, a batch keeps this set while it opens
+    /// fresh waves around serial fallbacks.
+    speculation_coordinator: Arc<AtomicBool>,
     /// Cache decoded authorities by their complete canonical blob so permission
     /// updates cannot return stale authority data.
     authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
@@ -1082,6 +1091,7 @@ impl Database {
             dependency_recorder: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            speculation_coordinator: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
@@ -8043,6 +8053,7 @@ impl Default for Database {
             dependency_recorder: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            speculation_coordinator: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),

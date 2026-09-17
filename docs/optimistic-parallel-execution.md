@@ -143,6 +143,11 @@ before and after touching Arena; any write through an instrumented alias makes
 the snapshot stale and prevents commit. Nodes that never start a wave do not
 install the atomic epoch and retain the normal write path.
 
+A shared coordinator token serializes wave and batch ownership across cloned
+database handles. A low-level wave holds it for its complete lifetime, while a
+batch holds it across fallback-driven wave restarts and shadow rollback/replay;
+a competing clone fails before opening an Arena session.
+
 Worker overlays currently expose only exact contract-primary get/create/update/
 remove operations. Writes remain private ordered logical operations keyed by
 `(code, scope, table, primary)`; they never contain Arena object ids or blob
@@ -154,12 +159,50 @@ this slice and must mark the worker result incomplete for serial re-execution.
 After any serial fallback, the conservative implementation invalidates the
 remaining wave rather than letting results from the old prefix commit.
 
-This API is not wired into block execution. Before that integration, every
-transaction database mutation must be routed through the typed overlay, the
-mutation-epoch bypass audit must cover lifecycle/state-replacement methods, and
-global receipt/resource singletons need an ordered rebase strategy. An Arena
-MVCC/COW read view would eventually replace the controller freeze invariant,
-but a full state clone per block is explicitly not an acceptable substitute.
+### Bounded ordered executor
+
+`Database::execute_speculative_batch` turns the contract-primary overlay into a
+usable default-off executor for callers that can express a unit of work as a
+`SpeculativeTask`. It uses at most the caller-supplied non-zero worker count,
+stores results by canonical task index, and visits them only in that order.
+Worker completion order is therefore unobservable.
+
+Each worker result contains its private changeset and output. The coordinator
+publishes that output only after ordered conflict validation and atomic Arena
+apply succeed. A worker error, panic, incomplete dependency set, apply failure,
+or dependency conflict discards the speculative output and invokes the task's
+authoritative serial implementation in a normal per-transaction undo session.
+It then starts a new snapshot and re-speculates the uncommitted suffix; no result
+from the stale wave can commit. The entire batch has an enclosing undo session,
+so an error from the serial implementation restores the pre-batch state.
+An unexpected canonical mutation through an aliased database handle is treated
+more strictly: the coordinator aborts and rolls back the whole batch rather than
+executing serially on a contaminated prefix.
+
+The executor deliberately mirrors the controller's block/per-transaction undo
+nesting. This is required even for logically equivalent primary-row updates:
+Arena's blob-span reuse depends on session boundaries and is included in its
+state fingerprint. Differential tests compare ordered outputs and full Arena
+state roots against the serial reference across a deterministic conflict-heavy
+workload. Additional tests cover actual simultaneous workers, fallback/restart,
+worker errors and panics, and whole-batch rollback.
+
+`Database::execute_speculative_shadow_batch` provides the matching shadow gate
+for the same task surface. It runs and fingerprints the optimistic batch inside
+an undo session, restores the exact starting state, and then runs the serial
+implementation authoritatively. The returned report compares ordered outputs
+and Arena state roots while the database always retains the serial result, even
+when parity fails.
+
+The bounded executor is not yet wired into general block execution. It is safe
+for its closed contract-primary task surface, while an arbitrary WASM
+transaction still reaches secondary indexes and system state outside that
+overlay. Before controller integration, every transaction database mutation
+must be routed through the typed overlay, the mutation-epoch bypass audit must
+cover lifecycle/state-replacement methods, and global receipt/resource
+singletons need an ordered rebase strategy. An Arena MVCC/COW read view would
+eventually replace the controller freeze invariant, but a full state clone per
+block is explicitly not an acceptable substitute.
 
 Required gates include unit tests for exact keys and range phantoms, inline
 actions, authorization changes, contract upgrades, RAM exhaustion, deferred
