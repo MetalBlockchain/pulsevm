@@ -433,21 +433,37 @@ pub fn record_block(block_num: u32, timing: BlockTiming) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::MutexGuard;
 
-    struct ProfilingGuard;
+    static TEST_PROFILE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProfilingGuard {
+        _serial: MutexGuard<'static, ()>,
+    }
 
     impl ProfilingGuard {
         fn enable() -> Self {
-            *PROFILE.lock().unwrap() = ReplayProfile::default();
+            let serial = TEST_PROFILE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut profile = PROFILE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *profile = ReplayProfile::default();
+            PROFILE.clear_poison();
             TEST_ENABLED.set(true);
-            Self
+            Self { _serial: serial }
         }
     }
 
     impl Drop for ProfilingGuard {
         fn drop(&mut self) {
             TEST_ENABLED.set(false);
-            *PROFILE.lock().unwrap() = ReplayProfile::default();
+            let mut profile = PROFILE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *profile = ReplayProfile::default();
+            PROFILE.clear_poison();
         }
     }
 
@@ -507,20 +523,29 @@ mod tests {
         record_read_only_wasm_finish(false, true);
         record_read_only_wasm_finish(false, false);
 
-        {
+        let observed = {
             let profile = PROFILE.lock().unwrap();
-            assert_eq!(profile.transaction_paths["native"].calls, 2);
-            assert_eq!(profile.transaction_paths["native"].nanos, 24_000);
-            assert_eq!(profile.native_declines["shape"], 2);
-            assert_eq!(profile.native_code_declines[&([1; 32], [2; 32])], 1);
-            assert_eq!(profile.native_bot.calls, 1);
-            assert_eq!(profile.native_onblock.calls, 1);
-            assert_eq!(profile.read_only_wasm.hits, 1);
-            assert_eq!(profile.read_only_wasm.misses, 1);
-            assert_eq!(profile.read_only_wasm.promotions, 1);
-            assert_eq!(profile.read_only_wasm.inline_declines, 1);
-            assert_eq!(profile.read_only_wasm.mutation_declines, 1);
-        }
+            (
+                profile.transaction_paths["native"].calls,
+                profile.transaction_paths["native"].nanos,
+                profile.native_declines["shape"],
+                profile.native_code_declines[&([1; 32], [2; 32])],
+                profile.native_bot.calls,
+                profile.native_onblock.calls,
+                profile.read_only_wasm,
+            )
+        };
+        assert_eq!(observed.0, 2);
+        assert_eq!(observed.1, 24_000);
+        assert_eq!(observed.2, 2);
+        assert_eq!(observed.3, 1);
+        assert_eq!(observed.4, 1);
+        assert_eq!(observed.5, 1);
+        assert_eq!(observed.6.hits, 1);
+        assert_eq!(observed.6.misses, 1);
+        assert_eq!(observed.6.promotions, 1);
+        assert_eq!(observed.6.inline_declines, 1);
+        assert_eq!(observed.6.mutation_declines, 1);
 
         record_block(
             *REPORT_INTERVAL,
@@ -535,12 +560,17 @@ mod tests {
             },
         );
 
-        let profile = PROFILE.lock().unwrap();
-        assert_eq!(profile.blocks, 0);
-        assert!(profile.transaction_paths.is_empty());
-        assert!(profile.native_declines.is_empty());
-        assert!(profile.native_code_declines.is_empty());
-        assert!(profile.wasm.is_empty());
+        let observed = {
+            let profile = PROFILE.lock().unwrap();
+            (
+                profile.blocks,
+                profile.transaction_paths.is_empty(),
+                profile.native_declines.is_empty(),
+                profile.native_code_declines.is_empty(),
+                profile.wasm.is_empty(),
+            )
+        };
+        assert_eq!(observed, (0, true, true, true, true));
     }
 
     #[test]
@@ -554,8 +584,10 @@ mod tests {
             },
         );
 
-        let profile = PROFILE.lock().unwrap();
-        assert_eq!(profile.blocks, 1);
-        assert_eq!(profile.block.total, 17_000);
+        let observed = {
+            let profile = PROFILE.lock().unwrap();
+            (profile.blocks, profile.block.total)
+        };
+        assert_eq!(observed, (1, 17_000));
     }
 }

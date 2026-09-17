@@ -499,8 +499,8 @@ pub struct TransactionResult {
     // Set if a `set_proposed_producers` ran in this transaction; the controller
     // activates it when the block is accepted.
     pub proposed_schedule: Option<Vec<ProducerKey>>,
-    /// Observation-only dependency report populated when parallel-wave
-    /// telemetry is enabled. It never feeds transaction execution or hashing.
+    /// Logical database dependencies used by ordered optimistic commit and by
+    /// optional conflict telemetry. They never feed transaction hashing.
     pub dependencies: Option<TransactionDependencies>,
 }
 

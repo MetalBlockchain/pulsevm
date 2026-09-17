@@ -294,6 +294,14 @@ impl Db {
         self.apply_frame(&delta.bytes)
     }
 
+    /// Declare the current state as the baseline for a subsequent execution
+    /// delta. Reusable workers call this after undoing one transaction.
+    pub fn reset_delta_baseline(&mut self) {
+        for table in &mut self.tables {
+            table.mark_flushed();
+        }
+    }
+
     /// Registers the table for `T`. A freshly created table is brought up to the
     /// revision range of the already-registered tables, so every table shares
     /// one undo stack depth.

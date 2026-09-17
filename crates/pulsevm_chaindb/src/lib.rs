@@ -1709,6 +1709,10 @@ impl ChainDatabase {
         self.read().delta_bytes()
     }
 
+    pub fn reset_execution_delta_baseline(&self) {
+        self.lock().reset_delta_baseline();
+    }
+
     /// Apply a validated worker delta inside the caller's active undo session.
     pub fn apply_execution_delta(&self, delta: &DbDelta) -> Result<(), DbError> {
         self.lock().apply_delta_bytes(delta)

@@ -1,10 +1,10 @@
 //! Transaction-local database dependency recording.
 //!
-//! This is the observation-only first stage of optimistic execution. A
-//! recorder is attached to a cloned [`crate::Database`] handle, so all clones
+//! A recorder is attached to a cloned [`crate::Database`] handle, so all clones
 //! made for inline actions and WASM host functions share one transaction-local
-//! report while unrelated transactions do not. Recording never participates in
-//! a database result and is absent from the default execution path.
+//! report while unrelated transactions do not. Full execution workers use the
+//! completed report to validate ordered logical-journal commit; ordinary serial
+//! execution can also enable the same recorder for telemetry and fallback.
 
 use std::{
     collections::BTreeSet,
@@ -91,6 +91,10 @@ impl ContractRangeKey {
 pub enum SystemKey {
     Account(u64),
     AccountMetadata(u64),
+    /// Receipt-only receiver/auth sequence counters stored in account metadata.
+    /// These are rebased in canonical action order and must not hide semantic
+    /// metadata writes such as code, ABI, or privilege changes.
+    AccountSequence(u64),
     Permission {
         owner: u64,
         name: u64,
@@ -149,10 +153,10 @@ pub enum RangeDependency {
 
 /// Dependencies observed while executing one serial transaction.
 ///
-/// Serial telemetry leaves `complete` false. The closed, typed speculative
-/// overlay marks it true only when execution used exclusively supported logical
-/// operations; any unsupported path keeps the report incomplete. An optimistic
-/// commit implementation must reject incomplete reports.
+/// Serial telemetry leaves `complete` false. A speculative overlay or full
+/// transaction worker marks it true only when execution used exclusively
+/// supported logical operations; any unsupported path keeps the report
+/// incomplete. Ordered commit always rejects incomplete reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionDependencies {
     exact_reads: BTreeSet<DependencyKey>,
@@ -223,12 +227,17 @@ impl TransactionDependencies {
         })
     }
 
-    /// Safe ordered-commit gate for a future optimistic executor.
+    /// Safe ordered-commit gate for the optimistic executor.
     ///
     /// Keeping the completeness check next to conflict validation prevents a
     /// partially instrumented report from being accidentally treated as valid.
     pub fn can_optimistically_commit_after(&self, prior_writes: &BTreeSet<DependencyKey>) -> bool {
-        self.complete && !self.conflicts_with_prior_writes(prior_writes)
+        self.complete
+            && !prior_writes
+                .iter()
+                .copied()
+                .filter(|key| !is_ordered_commit_bookkeeping(*key))
+                .any(|write| dependencies_observe_write(self, write))
     }
 
     /// Whether two transactions that execute from the same block-prefix
@@ -257,12 +266,9 @@ fn is_ordered_commit_bookkeeping(key: DependencyKey) -> bool {
     matches!(
         key,
         DependencyKey::System(
-            SystemKey::AccountMetadata(_)
+            SystemKey::AccountSequence(_)
                 | SystemKey::GlobalActionSequence
-                | SystemKey::PermissionUsage { .. }
-                | SystemKey::ResourceUsage(_)
                 | SystemKey::ResourceState
-                | SystemKey::Transaction(_)
         )
     )
 }
@@ -399,6 +405,10 @@ impl DependencyTracker {
         self.recorder.snapshot()
     }
 
+    pub(crate) fn mark_complete(&self) {
+        self.recorder.mark_complete();
+    }
+
     pub(crate) fn recorder(&self) -> DependencyRecorder {
         self.recorder.clone()
     }
@@ -427,6 +437,39 @@ mod tests {
         assert_eq!(report.range_reads, BTreeSet::from([range]));
         assert_eq!(report.writes, BTreeSet::from([row]));
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn ordered_commit_only_excludes_field_safe_bookkeeping() {
+        let account = 7;
+        let transaction = [9; 32];
+        let dependencies = TransactionDependencies {
+            exact_reads: BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountMetadata(account)),
+                DependencyKey::System(SystemKey::Transaction(transaction)),
+            ]),
+            range_reads: BTreeSet::new(),
+            writes: BTreeSet::new(),
+            complete: true,
+        };
+
+        assert!(
+            dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountSequence(account)),
+                DependencyKey::System(SystemKey::GlobalActionSequence),
+                DependencyKey::System(SystemKey::ResourceState),
+            ]))
+        );
+        assert!(
+            !dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountMetadata(account)),
+            ]))
+        );
+        assert!(
+            !dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::Transaction(transaction)),
+            ]))
+        );
     }
 
     #[test]
@@ -530,8 +573,8 @@ mod tests {
             DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 11));
         let bookkeeping = BTreeSet::from([
             DependencyKey::System(SystemKey::GlobalActionSequence),
-            DependencyKey::System(SystemKey::AccountMetadata(1)),
-            DependencyKey::System(SystemKey::ResourceUsage(7)),
+            DependencyKey::System(SystemKey::AccountSequence(1)),
+            DependencyKey::System(SystemKey::ResourceState),
         ]);
         let first = TransactionDependencies {
             writes: BTreeSet::from([row_a])
