@@ -2,7 +2,7 @@
 //!
 //! A [`SpeculativeWave`] borrows the canonical [`Database`] mutably, which
 //! establishes the controller-side freeze boundary. Read snapshots expose only
-//! immutable operations, while each worker records primary-table mutations as
+//! immutable operations, while each worker records contract-table mutations as
 //! logical keys and values. Nothing assigns Arena object ids until ordered
 //! apply invokes the canonical database APIs.
 
@@ -31,13 +31,21 @@ use std::{
 use pulsevm_error::ChainError;
 
 use super::Database;
-use crate::dependency::{
-    ContractIndex,
-    ContractRowKey,
-    DependencyKey,
-    DependencyTracker,
-    TransactionDependencies,
+use crate::{
+    Float128,
+    U256,
+    dependency::{
+        ContractIndex,
+        ContractRowKey,
+        DependencyKey,
+        DependencyTracker,
+        TransactionDependencies,
+    },
 };
+
+/// Bound wasted work when a batch is too conflict-heavy for optimistic
+/// execution. The suffix still runs through the authoritative serial path.
+const MAX_SPECULATIVE_RESTARTS: usize = 2;
 
 /// Stable version of the canonical state frozen for one speculative wave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +63,40 @@ pub struct ContractPrimaryKey {
     pub scope: u64,
     pub table: u64,
     pub primary: u64,
+}
+
+/// Value stored by one Antelope contract secondary-index row.
+///
+/// Float keys are kept in their canonical raw-bit representation. This avoids
+/// host floating-point comparisons in the optimistic layer and matches the
+/// values crossing the WASM database intrinsic boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractSecondaryValue {
+    Idx64(u64),
+    Idx128(u128),
+    Idx256([u8; 32]),
+    IdxDouble(u64),
+    IdxLongDouble((u64, u64)),
+}
+
+impl ContractSecondaryValue {
+    const fn index(self) -> ContractIndex {
+        match self {
+            Self::Idx64(_) => ContractIndex::Idx64,
+            Self::Idx128(_) => ContractIndex::Idx128,
+            Self::Idx256(_) => ContractIndex::Idx256,
+            Self::IdxDouble(_) => ContractIndex::IdxDouble,
+            Self::IdxLongDouble(_) => ContractIndex::IdxLongDouble,
+        }
+    }
+}
+
+/// Transaction-visible secondary row, including the payer needed for RAM
+/// accounting when a later operation changes ownership or removes the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractSecondaryRow {
+    pub payer: u64,
+    pub value: ContractSecondaryValue,
 }
 
 impl ContractPrimaryKey {
@@ -92,6 +134,7 @@ pub enum SpeculativeFallbackReason {
     SpeculativeExecutionFailed(String),
     WorkerPanicked,
     ApplyFailed(String),
+    SerialEscapeHatch,
     SerialFallbackRequired,
     WaveInvalidated,
 }
@@ -208,10 +251,11 @@ impl BlockReadSnapshot {
         self.version
     }
 
-    pub fn transaction(&self) -> ContractPrimaryOverlay {
-        ContractPrimaryOverlay {
+    pub fn transaction(&self) -> ContractTableOverlay {
+        ContractTableOverlay {
             snapshot: self.clone(),
             visible: BTreeMap::new(),
+            secondary_visible: BTreeMap::new(),
             operations: Vec::new(),
             tracker: DependencyTracker::new(),
             invalid: None,
@@ -241,6 +285,82 @@ impl BlockReadSnapshot {
         }
         Ok(value)
     }
+
+    fn secondary_get(
+        &self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> Result<Option<ContractSecondaryRow>, SpeculativeFallbackReason> {
+        if self.mutation_epoch() != self.version.mutation_epoch {
+            return Err(SpeculativeFallbackReason::MutationEpochAdvanced);
+        }
+        let row = match index {
+            ContractIndex::Idx64 => self
+                .database
+                .arena_idx64_find_primary(key.code, key.scope, key.table, key.primary)
+                .zip(
+                    self.database
+                        .arena_idx64_payer(key.code, key.scope, key.table, key.primary),
+                )
+                .map(|(value, payer)| ContractSecondaryRow {
+                    payer,
+                    value: ContractSecondaryValue::Idx64(value),
+                }),
+            ContractIndex::Idx128 => self
+                .database
+                .arena_idx128_find_primary(key.code, key.scope, key.table, key.primary)
+                .zip(
+                    self.database
+                        .arena_idx128_payer(key.code, key.scope, key.table, key.primary),
+                )
+                .map(|(value, payer)| ContractSecondaryRow {
+                    payer,
+                    value: ContractSecondaryValue::Idx128(value),
+                }),
+            ContractIndex::Idx256 => self
+                .database
+                .arena_idx256_find_primary(key.code, key.scope, key.table, key.primary)
+                .zip(
+                    self.database
+                        .arena_idx256_payer(key.code, key.scope, key.table, key.primary),
+                )
+                .map(|(value, payer)| ContractSecondaryRow {
+                    payer,
+                    value: ContractSecondaryValue::Idx256(value),
+                }),
+            ContractIndex::IdxDouble => self
+                .database
+                .arena_idx_double_find_primary(key.code, key.scope, key.table, key.primary)
+                .zip(self.database.arena_idx_double_payer(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                ))
+                .map(|(value, payer)| ContractSecondaryRow {
+                    payer,
+                    value: ContractSecondaryValue::IdxDouble(value),
+                }),
+            ContractIndex::IdxLongDouble => self
+                .database
+                .arena_idx_long_double_find_primary(key.code, key.scope, key.table, key.primary)
+                .zip(self.database.arena_idx_long_double_payer(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                ))
+                .map(|(value, payer)| ContractSecondaryRow {
+                    payer,
+                    value: ContractSecondaryValue::IdxLongDouble(value),
+                }),
+            ContractIndex::Table | ContractIndex::Primary => None,
+        };
+        if self.mutation_epoch() != self.version.mutation_epoch {
+            return Err(SpeculativeFallbackReason::MutationEpochAdvanced);
+        }
+        Ok(row)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -258,23 +378,41 @@ enum LogicalOperation {
     Remove {
         key: ContractPrimaryKey,
     },
+    SecondaryCreate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    },
+    SecondaryUpdate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    },
+    SecondaryRemove {
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    },
 }
 
-/// Transaction-private primary-table overlay.
+/// Transaction-private contract-row overlay.
 ///
-/// Only this closed CRUD surface can produce a complete report. Future
-/// adapters must call [`Self::mark_unsupported_mutation`] before falling back
-/// when execution reaches a system table, secondary index, or other operation
-/// that is not represented here.
-pub struct ContractPrimaryOverlay {
+/// Exact primary and secondary CRUD plus conservative range dependencies can
+/// produce a complete report. Future adapters must call
+/// [`Self::mark_unsupported_mutation`] before falling back when execution
+/// reaches a system table or another operation not represented here.
+pub struct ContractTableOverlay {
     snapshot: BlockReadSnapshot,
     visible: BTreeMap<ContractPrimaryKey, Option<Vec<u8>>>,
+    secondary_visible: BTreeMap<(ContractIndex, ContractPrimaryKey), Option<ContractSecondaryRow>>,
     operations: Vec<LogicalOperation>,
     tracker: DependencyTracker,
     invalid: Option<SpeculativeFallbackReason>,
 }
 
-impl ContractPrimaryOverlay {
+/// Backward-compatible name for the original primary-only overlay API.
+pub type ContractPrimaryOverlay = ContractTableOverlay;
+
+impl ContractTableOverlay {
     pub fn get(
         &mut self,
         key: ContractPrimaryKey,
@@ -340,6 +478,132 @@ impl ContractPrimaryOverlay {
         Ok(())
     }
 
+    /// Read one secondary row by primary key from the transaction's private
+    /// view. `Table` and `Primary` are rejected because they are not secondary
+    /// index families.
+    pub fn secondary_get(
+        &mut self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> Result<Option<ContractSecondaryRow>, SpeculativeFallbackReason> {
+        if !Self::is_secondary_index(index) {
+            self.invalid
+                .get_or_insert(SpeculativeFallbackReason::UnsupportedMutation);
+            return Err(SpeculativeFallbackReason::UnsupportedMutation);
+        }
+        self.tracker
+            .recorder()
+            .exact_read(Self::secondary_dependency_key(key, index));
+        if let Some(value) = self.secondary_visible.get(&(index, key)) {
+            return Ok(*value);
+        }
+        match self.snapshot.secondary_get(key, index) {
+            Ok(value) => Ok(value),
+            Err(reason) => {
+                self.invalid.get_or_insert_with(|| reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    /// Create a secondary row. The index family is carried by `value`, so a
+    /// key cannot be committed into an index with a mismatched representation.
+    pub fn secondary_create(
+        &mut self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        let index = value.index();
+        if self
+            .secondary_get(key, index)
+            .map_err(Self::snapshot_error)?
+            .is_some()
+        {
+            return self.execution_error(format!(
+                "speculative create found existing {index:?} row {key:?}"
+            ));
+        }
+        self.record_secondary_write(key, index, true);
+        self.secondary_visible
+            .insert((index, key), Some(ContractSecondaryRow { payer, value }));
+        self.operations
+            .push(LogicalOperation::SecondaryCreate { key, payer, value });
+        Ok(())
+    }
+
+    pub fn secondary_update(
+        &mut self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        let index = value.index();
+        if self
+            .secondary_get(key, index)
+            .map_err(Self::snapshot_error)?
+            .is_none()
+        {
+            return self.execution_error(format!(
+                "speculative update did not find {index:?} row {key:?}"
+            ));
+        }
+        self.record_secondary_write(key, index, false);
+        self.secondary_visible
+            .insert((index, key), Some(ContractSecondaryRow { payer, value }));
+        self.operations
+            .push(LogicalOperation::SecondaryUpdate { key, payer, value });
+        Ok(())
+    }
+
+    pub fn secondary_remove(
+        &mut self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> Result<(), ChainError> {
+        if !Self::is_secondary_index(index) {
+            return self.execution_error(format!("{index:?} is not a contract secondary index"));
+        }
+        if self
+            .secondary_get(key, index)
+            .map_err(Self::snapshot_error)?
+            .is_none()
+        {
+            return self.execution_error(format!(
+                "speculative remove did not find {index:?} row {key:?}"
+            ));
+        }
+        self.record_secondary_write(key, index, true);
+        self.secondary_visible.insert((index, key), None);
+        self.operations
+            .push(LogicalOperation::SecondaryRemove { key, index });
+        Ok(())
+    }
+
+    /// Declare an ordering/absence observation in one contract index.
+    ///
+    /// Host adapters call this before lower/upper-bound and iterator movement.
+    /// The dependency deliberately covers the whole index: any earlier insert,
+    /// remove, or re-key then forces serial replay, preventing phantoms.
+    pub fn record_index_range_read(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+    ) {
+        self.tracker
+            .recorder()
+            .range_read(crate::dependency::RangeDependency::Contract(
+                crate::dependency::ContractRangeKey {
+                    code,
+                    scope,
+                    table,
+                    index,
+                },
+            ));
+    }
+
     pub fn mark_unsupported_mutation(&mut self) {
         self.invalid
             .get_or_insert(SpeculativeFallbackReason::UnsupportedMutation);
@@ -363,6 +627,43 @@ impl ContractPrimaryOverlay {
             recorder.write(key.table_dependency_key());
         }
         recorder.write(key.dependency_key());
+    }
+
+    fn record_secondary_write(
+        &self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+        changes_table_metadata: bool,
+    ) {
+        let recorder = self.tracker.recorder();
+        if changes_table_metadata {
+            recorder.write(key.table_dependency_key());
+        }
+        recorder.write(Self::secondary_dependency_key(key, index));
+    }
+
+    const fn secondary_dependency_key(
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> DependencyKey {
+        DependencyKey::Contract(ContractRowKey {
+            code: key.code,
+            scope: key.scope,
+            table: key.table,
+            index,
+            primary: key.primary,
+        })
+    }
+
+    const fn is_secondary_index(index: ContractIndex) -> bool {
+        matches!(
+            index,
+            ContractIndex::Idx64
+                | ContractIndex::Idx128
+                | ContractIndex::Idx256
+                | ContractIndex::IdxDouble
+                | ContractIndex::IdxLongDouble
+        )
     }
 
     fn snapshot_error(reason: SpeculativeFallbackReason) -> ChainError {
@@ -653,6 +954,7 @@ impl Database {
         let mut outputs = Vec::with_capacity(tasks.len());
         let mut outcomes = Vec::with_capacity(tasks.len());
         let mut waves = 0usize;
+        let mut restarts = 0usize;
         let mut next = 0usize;
 
         while next < tasks.len() {
@@ -665,6 +967,7 @@ impl Database {
                 ));
             }
             let mut restarted = false;
+            let mut escape_to_serial = false;
 
             for (offset, candidate) in candidates.into_iter().enumerate() {
                 let index = next + offset;
@@ -678,6 +981,8 @@ impl Database {
                         outputs.push(output);
                         outcomes.push(SpeculativeTaskOutcome::RetriedSerial(reason));
                         next = index + 1;
+                        restarts = restarts.saturating_add(1);
+                        escape_to_serial = restarts >= MAX_SPECULATIVE_RESTARTS;
                         restarted = true;
                         break;
                     }
@@ -707,10 +1012,25 @@ impl Database {
                         outputs.push(output);
                         outcomes.push(SpeculativeTaskOutcome::RetriedSerial(reason));
                         next = index + 1;
+                        restarts = restarts.saturating_add(1);
+                        escape_to_serial = restarts >= MAX_SPECULATIVE_RESTARTS;
                         restarted = true;
                         break;
                     }
                 }
+            }
+
+            drop(wave);
+
+            if escape_to_serial {
+                for task in &tasks[next..] {
+                    outputs.push(execute_serial_task(self, task)?);
+                    outcomes.push(SpeculativeTaskOutcome::RetriedSerial(
+                        SpeculativeFallbackReason::SerialEscapeHatch,
+                    ));
+                }
+                next = tasks.len();
+                continue;
             }
 
             if !restarted {
@@ -930,6 +1250,179 @@ impl SpeculativeWave<'_> {
                 key.table,
                 key.primary,
             ),
+            LogicalOperation::SecondaryCreate { key, payer, value } => {
+                self.apply_secondary_create(*key, *payer, *value)
+            }
+            LogicalOperation::SecondaryUpdate { key, payer, value } => {
+                self.apply_secondary_update(*key, *payer, *value)
+            }
+            LogicalOperation::SecondaryRemove { key, index } => {
+                self.apply_secondary_remove(*key, *index)
+            }
+        }
+    }
+
+    fn apply_secondary_create(
+        &self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        match value {
+            ContractSecondaryValue::Idx64(value) => {
+                self.canonical.create_index64_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    value,
+                )
+            }
+            ContractSecondaryValue::Idx128(value) => {
+                self.canonical.create_index128_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    value,
+                )
+            }
+            ContractSecondaryValue::Idx256(value) => {
+                self.canonical.create_index256_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    U256 { value },
+                )
+            }
+            ContractSecondaryValue::IdxDouble(value) => {
+                self.canonical.create_idx_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    value,
+                )
+            }
+            ContractSecondaryValue::IdxLongDouble((lo, hi)) => {
+                self.canonical.create_idx_long_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    Float128 { lo, hi },
+                )
+            }
+        }
+    }
+
+    fn apply_secondary_update(
+        &self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        match value {
+            ContractSecondaryValue::Idx64(value) => {
+                self.canonical.update_index64_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    value,
+                )
+            }
+            ContractSecondaryValue::Idx128(value) => {
+                self.canonical.update_index128_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    value,
+                )
+            }
+            ContractSecondaryValue::Idx256(value) => {
+                self.canonical.update_index256_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    U256 { value },
+                )
+            }
+            ContractSecondaryValue::IdxDouble(value) => {
+                self.canonical.update_idx_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    value,
+                )
+            }
+            ContractSecondaryValue::IdxLongDouble((lo, hi)) => {
+                self.canonical.update_idx_long_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    Float128 { lo, hi },
+                )
+            }
+        }
+    }
+
+    fn apply_secondary_remove(
+        &self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> Result<(), ChainError> {
+        match index {
+            ContractIndex::Idx64 => self.canonical.remove_index64_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::Idx128 => self.canonical.remove_index128_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::Idx256 => self.canonical.remove_index256_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::IdxDouble => self.canonical.remove_idx_double_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::IdxLongDouble => {
+                self.canonical.remove_idx_long_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                )
+            }
+            ContractIndex::Table | ContractIndex::Primary => Err(ChainError::DatabaseError(
+                format!("{index:?} is not a secondary index"),
+            )),
         }
     }
 }
@@ -1043,6 +1536,111 @@ mod tests {
             .create_key_value_object_standalone(1, 2, 11, 8, 1, b"second")
             .unwrap();
         assert_eq!(speculative.arena_state_root(), serial.arena_state_root());
+    }
+
+    #[test]
+    fn secondary_overlay_applies_every_index_family_with_serial_parity() {
+        let keys = [
+            ContractPrimaryKey::new(1, 2, 30, 1),
+            ContractPrimaryKey::new(1, 2, 30, 2),
+            ContractPrimaryKey::new(1, 2, 30, 3),
+            ContractPrimaryKey::new(1, 2, 30, 4),
+            ContractPrimaryKey::new(1, 2, 30, 5),
+        ];
+        let values = [
+            ContractSecondaryValue::Idx64(10),
+            ContractSecondaryValue::Idx128(20),
+            ContractSecondaryValue::Idx256([30; 32]),
+            ContractSecondaryValue::IdxDouble(40),
+            ContractSecondaryValue::IdxLongDouble((50, 51)),
+        ];
+        let mut speculative = Database::default();
+        let serial = Database::default();
+
+        let mut wave = speculative.begin_speculative_wave().unwrap();
+        let mut overlay = wave.snapshot().transaction();
+        for (offset, (key, value)) in keys.iter().zip(values).enumerate() {
+            let payer = 100 + offset as u64;
+            overlay.secondary_create(*key, payer, value).unwrap();
+            assert_eq!(
+                overlay.secondary_get(*key, value.index()).unwrap(),
+                Some(ContractSecondaryRow { payer, value })
+            );
+        }
+        assert_eq!(
+            wave.try_apply(overlay.finish()),
+            SpeculativeCommitOutcome::Applied
+        );
+        drop(wave);
+
+        serial.arena_start_undo_session();
+        serial
+            .create_index64_object_standalone(1, 2, 30, 100, 1, 10)
+            .unwrap();
+        serial
+            .create_index128_object_standalone(1, 2, 30, 101, 2, 20)
+            .unwrap();
+        serial
+            .create_index256_object_standalone(1, 2, 30, 102, 3, U256 { value: [30; 32] })
+            .unwrap();
+        serial
+            .create_idx_double_object_standalone(1, 2, 30, 103, 4, 40)
+            .unwrap();
+        serial
+            .create_idx_long_double_object_standalone(1, 2, 30, 104, 5, Float128 { lo: 50, hi: 51 })
+            .unwrap();
+        serial.arena_squash();
+
+        assert_eq!(speculative.arena_state_root(), serial.arena_state_root());
+
+        let mut wave = speculative.begin_speculative_wave().unwrap();
+        let mut overlay = wave.snapshot().transaction();
+        overlay
+            .secondary_update(keys[0], 200, ContractSecondaryValue::Idx64(11))
+            .unwrap();
+        overlay
+            .secondary_remove(keys[1], ContractIndex::Idx128)
+            .unwrap();
+        assert_eq!(
+            wave.try_apply(overlay.finish()),
+            SpeculativeCommitOutcome::Applied
+        );
+        drop(wave);
+
+        serial.arena_start_undo_session();
+        serial
+            .update_index64_object_standalone(1, 2, 30, 1, 200, 11)
+            .unwrap();
+        serial
+            .remove_index128_object_standalone(1, 2, 30, 2)
+            .unwrap();
+        serial.arena_squash();
+        assert_eq!(speculative.arena_state_root(), serial.arena_state_root());
+    }
+
+    #[test]
+    fn secondary_range_read_rejects_a_rekey_phantom() {
+        let key = ContractPrimaryKey::new(1, 2, 30, 1);
+        let mut db = Database::default();
+        db.create_index64_object_standalone(1, 2, 30, 1, 1, 10)
+            .unwrap();
+        let mut wave = db.begin_speculative_wave().unwrap();
+
+        let mut rekey = wave.snapshot().transaction();
+        rekey
+            .secondary_update(key, 1, ContractSecondaryValue::Idx64(20))
+            .unwrap();
+        let mut iterator = wave.snapshot().transaction();
+        iterator.record_index_range_read(1, 2, 30, ContractIndex::Idx64);
+
+        assert_eq!(
+            wave.try_apply(rekey.finish()),
+            SpeculativeCommitOutcome::Applied
+        );
+        assert_eq!(
+            wave.try_apply(iterator.finish()),
+            SpeculativeCommitOutcome::RetrySerial(SpeculativeFallbackReason::DependencyConflict)
+        );
     }
 
     #[test]
@@ -1316,6 +1914,30 @@ mod tests {
         assert_eq!(
             db.arena_kv_get(1, 2, 5, 6),
             Some(41u64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn conflict_storm_uses_the_bounded_serial_escape_hatch() {
+        let key = ContractPrimaryKey::new(1, 2, 3, 4);
+        let mut db = seeded(&[(key, &0u64.to_le_bytes())]);
+        let tasks = [IncrementTask { key }; 12];
+
+        let result = db
+            .execute_speculative_batch(&tasks, NonZeroUsize::new(4).unwrap())
+            .unwrap();
+
+        assert_eq!(result.outputs(), &(1u64..=12).collect::<Vec<_>>());
+        assert_eq!(result.waves(), MAX_SPECULATIVE_RESTARTS);
+        assert_eq!(
+            result.outcomes().last(),
+            Some(&SpeculativeTaskOutcome::RetriedSerial(
+                SpeculativeFallbackReason::SerialEscapeHatch,
+            ))
+        );
+        assert_eq!(
+            db.arena_kv_get(key.code, key.scope, key.table, key.primary),
+            Some(12u64.to_le_bytes().to_vec())
         );
     }
 

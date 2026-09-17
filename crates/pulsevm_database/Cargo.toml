@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "session"
 harness = false
+
+[[bench]]
+name = "optimistic_execution"
+harness = false

@@ -148,16 +148,23 @@ database handles. A low-level wave holds it for its complete lifetime, while a
 batch holds it across fallback-driven wave restarts and shadow rollback/replay;
 a competing clone fails before opening an Arena session.
 
-Worker overlays currently expose only exact contract-primary get/create/update/
-remove operations. Writes remain private ordered logical operations keyed by
-`(code, scope, table, primary)`; they never contain Arena object ids or blob
-references. Ordered apply validates snapshot version, completeness, and prior
-writes, then invokes the live logical database API inside a nested undo session,
-so Arena assigns ids in canonical transaction/operation order. Secondary
-indices, range iteration, and every system-state operation are unsupported in
-this slice and must mark the worker result incomplete for serial re-execution.
-After any serial fallback, the conservative implementation invalidates the
-remaining wave rather than letting results from the old prefix commit.
+Worker overlays expose exact contract-primary and secondary-index
+get/create/update/remove operations. All five secondary families use canonical
+raw values: idx64, idx128, idx256, double bits, and long-double word pairs.
+Writes remain private ordered logical operations keyed by
+`(code, scope, table, index, primary)`; they never contain Arena object ids or
+blob references. Ordered apply validates snapshot version, completeness, and
+prior writes, then invokes the live logical database API inside a nested undo
+session, so Arena assigns ids in canonical transaction/operation order.
+
+Adapters can record a conservative whole-index range dependency before a
+lower/upper-bound or iterator observation. Any earlier insert, removal, or
+secondary re-key in that index then forces serial replay, including absent-read
+phantoms. Producing iterator results from the private overlay and every
+system-state operation remain unsupported in this slice and must mark the
+worker result incomplete for serial re-execution. After any serial fallback,
+the conservative implementation invalidates the remaining wave rather than
+letting results from the old prefix commit.
 
 ### Bounded ordered executor
 
@@ -179,6 +186,12 @@ An unexpected canonical mutation through an aliased database handle is treated
 more strictly: the coordinator aborts and rolls back the whole batch rather than
 executing serially on a contaminated prefix.
 
+Repeated suffix invalidation is bounded. After two restarted waves, the
+coordinator stops speculating and executes the remaining suffix serially. This
+node-local escape hatch preserves canonical order and results while preventing
+a hot key or consistently unsupported task from causing quadratic
+re-execution.
+
 The executor deliberately mirrors the controller's block/per-transaction undo
 nesting. This is required even for logically equivalent primary-row updates:
 Arena's blob-span reuse depends on session boundaries and is included in its
@@ -195,7 +208,7 @@ and Arena state roots while the database always retains the serial result, even
 when parity fails.
 
 The bounded executor is not yet wired into general block execution. It is safe
-for its closed contract-primary task surface, while an arbitrary WASM
+for its closed exact contract-row task surface, while an arbitrary WASM
 transaction still reaches secondary indexes and system state outside that
 overlay. Before controller integration, every transaction database mutation
 must be routed through the typed overlay, the mutation-epoch bypass audit must
@@ -210,6 +223,23 @@ creation/cancellation, soft/hard failures, and traps; randomized serial-vs-
 parallel differential tests; the 512-position parity gate; the complete XPR
 history replay; state/trace/Merkle comparison; crash recovery; and a live
 five-node network with mixed serial and parallel validators.
+
+## Microbenchmarks
+
+The database crate includes a Criterion benchmark for 64 deterministic,
+CPU-bound tasks under three dependency shapes: independent rows, a 25% hot-key
+mix, and one fully contended hot key. Each scenario compares the serial
+reference with one, two, four, and eight optimistic workers:
+
+```sh
+cargo bench -p pulsevm_database --bench optimistic_execution --locked
+```
+
+Use `-- --quick` for a smoke sample. Criterion reports elements per second and
+the timed path consumes the coordinator's outputs, outcomes, wave count, and
+state root. The independent case measures useful parallelism; the mixed and
+hot-key cases guard fallback and serial-escape behavior. These are database
+coordinator microbenchmarks, not end-to-end WASM or node-throughput claims.
 
 ## Expected performance
 
