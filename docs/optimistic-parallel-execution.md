@@ -160,11 +160,14 @@ session, so Arena assigns ids in canonical transaction/operation order.
 Adapters can record a conservative whole-index range dependency before a
 lower/upper-bound or iterator observation. Any earlier insert, removal, or
 secondary re-key in that index then forces serial replay, including absent-read
-phantoms. Producing iterator results from the private overlay and every
-system-state operation remain unsupported in this slice and must mark the
-worker result incomplete for serial re-execution. After any serial fallback,
-the conservative implementation invalidates the remaining wave rather than
-letting results from the old prefix commit.
+phantoms. The overlay can materialize every secondary family in canonical
+`(secondary, primary)` order after merging private creates, re-keys, and
+removals, which gives a future host adapter the source for find/bound/iterator
+results. The WASM host adapter itself and every system-state operation remain
+unsupported in this slice and must mark the worker result incomplete for serial
+re-execution. After any serial fallback, the conservative implementation
+invalidates the remaining wave rather than letting results from the old prefix
+commit.
 
 ### Bounded ordered executor
 

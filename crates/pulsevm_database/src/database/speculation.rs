@@ -89,6 +89,42 @@ impl ContractSecondaryValue {
             Self::IdxLongDouble(_) => ContractIndex::IdxLongDouble,
         }
     }
+
+    fn cmp_same_index(self, other: Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Idx64(left), Self::Idx64(right)) => Some(left.cmp(&right)),
+            (Self::Idx128(left), Self::Idx128(right)) => Some(left.cmp(&right)),
+            (Self::Idx256(left), Self::Idx256(right)) => {
+                let words = |value: [u8; 32]| {
+                    let mut low = [0; 16];
+                    let mut high = [0; 16];
+                    low.copy_from_slice(&value[..16]);
+                    high.copy_from_slice(&value[16..]);
+                    (u128::from_le_bytes(low), u128::from_le_bytes(high))
+                };
+                Some(words(left).cmp(&words(right)))
+            }
+            (Self::IdxDouble(left), Self::IdxDouble(right)) => {
+                let canonical = |bits| {
+                    let value = f64::from_bits(bits);
+                    if value == 0.0 { 0.0 } else { value }
+                };
+                Some(canonical(left).total_cmp(&canonical(right)))
+            }
+            (Self::IdxLongDouble(left), Self::IdxLongDouble(right)) => {
+                let ordering_key = |(lo, hi): (u64, u64)| {
+                    let bits = ((hi as u128) << 64) | lo as u128;
+                    let sign_mask = 1u128 << 127;
+                    let bits = if bits & !sign_mask == 0 { 0 } else { bits };
+                    let mut key = bits as i128;
+                    key ^= (((key >> 127) as u128) >> 1) as i128;
+                    key
+                };
+                Some(ordering_key(left).cmp(&ordering_key(right)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Transaction-visible secondary row, including the payer needed for RAM
@@ -361,6 +397,95 @@ impl BlockReadSnapshot {
         }
         Ok(row)
     }
+
+    fn secondary_rows(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+    ) -> Result<Vec<(u64, ContractSecondaryRow)>, SpeculativeFallbackReason> {
+        if self.mutation_epoch() != self.version.mutation_epoch {
+            return Err(SpeculativeFallbackReason::MutationEpochAdvanced);
+        }
+        let rows = match index {
+            ContractIndex::Idx64 => self
+                .database
+                .arena_idx64_range_with_payer(code, scope, table)
+                .into_iter()
+                .map(|(value, primary, payer)| {
+                    (
+                        primary,
+                        ContractSecondaryRow {
+                            payer,
+                            value: ContractSecondaryValue::Idx64(value),
+                        },
+                    )
+                })
+                .collect(),
+            ContractIndex::Idx128 => self
+                .database
+                .arena_idx128_range_with_payer(code, scope, table)
+                .into_iter()
+                .map(|(value, primary, payer)| {
+                    (
+                        primary,
+                        ContractSecondaryRow {
+                            payer,
+                            value: ContractSecondaryValue::Idx128(value),
+                        },
+                    )
+                })
+                .collect(),
+            ContractIndex::Idx256 => self
+                .database
+                .arena_idx256_range_with_payer(code, scope, table)
+                .into_iter()
+                .map(|(value, primary, payer)| {
+                    (
+                        primary,
+                        ContractSecondaryRow {
+                            payer,
+                            value: ContractSecondaryValue::Idx256(value),
+                        },
+                    )
+                })
+                .collect(),
+            ContractIndex::IdxDouble => self
+                .database
+                .arena_idx_double_range_with_payer(code, scope, table)
+                .into_iter()
+                .map(|(value, primary, payer)| {
+                    (
+                        primary,
+                        ContractSecondaryRow {
+                            payer,
+                            value: ContractSecondaryValue::IdxDouble(value),
+                        },
+                    )
+                })
+                .collect(),
+            ContractIndex::IdxLongDouble => self
+                .database
+                .arena_idx_long_double_range_with_payer(code, scope, table)
+                .into_iter()
+                .map(|(value, primary, payer)| {
+                    (
+                        primary,
+                        ContractSecondaryRow {
+                            payer,
+                            value: ContractSecondaryValue::IdxLongDouble(value),
+                        },
+                    )
+                })
+                .collect(),
+            ContractIndex::Table | ContractIndex::Primary => Vec::new(),
+        };
+        if self.mutation_epoch() != self.version.mutation_epoch {
+            return Err(SpeculativeFallbackReason::MutationEpochAdvanced);
+        }
+        Ok(rows)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -602,6 +727,56 @@ impl ContractTableOverlay {
                     index,
                 },
             ));
+    }
+
+    /// Materialize one secondary index as observed by this transaction in
+    /// canonical `(secondary, primary)` order.
+    ///
+    /// Private creates, updates, and removals are merged over the frozen
+    /// snapshot. Calling this also records the conservative whole-index range
+    /// dependency required for phantom-safe iterator and bound queries.
+    pub fn secondary_rows(
+        &mut self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        index: ContractIndex,
+    ) -> Result<Vec<(u64, ContractSecondaryRow)>, SpeculativeFallbackReason> {
+        if !Self::is_secondary_index(index) {
+            self.invalid
+                .get_or_insert(SpeculativeFallbackReason::UnsupportedMutation);
+            return Err(SpeculativeFallbackReason::UnsupportedMutation);
+        }
+        self.record_index_range_read(code, scope, table, index);
+        let mut rows = match self.snapshot.secondary_rows(code, scope, table, index) {
+            Ok(rows) => rows.into_iter().collect::<BTreeMap<_, _>>(),
+            Err(reason) => {
+                self.invalid.get_or_insert_with(|| reason.clone());
+                return Err(reason);
+            }
+        };
+        for ((visible_index, key), row) in &self.secondary_visible {
+            if *visible_index != index
+                || key.code != code
+                || key.scope != scope
+                || key.table != table
+            {
+                continue;
+            }
+            if let Some(row) = row {
+                rows.insert(key.primary, *row);
+            } else {
+                rows.remove(&key.primary);
+            }
+        }
+        let mut rows = rows.into_iter().collect::<Vec<_>>();
+        rows.sort_by(|(left_primary, left), (right_primary, right)| {
+            left.value
+                .cmp_same_index(right.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_primary.cmp(right_primary))
+        });
+        Ok(rows)
     }
 
     pub fn mark_unsupported_mutation(&mut self) {
@@ -1631,7 +1806,18 @@ mod tests {
             .secondary_update(key, 1, ContractSecondaryValue::Idx64(20))
             .unwrap();
         let mut iterator = wave.snapshot().transaction();
-        iterator.record_index_range_read(1, 2, 30, ContractIndex::Idx64);
+        assert_eq!(
+            iterator
+                .secondary_rows(1, 2, 30, ContractIndex::Idx64)
+                .unwrap(),
+            vec![(
+                1,
+                ContractSecondaryRow {
+                    payer: 1,
+                    value: ContractSecondaryValue::Idx64(10),
+                },
+            )]
+        );
 
         assert_eq!(
             wave.try_apply(rekey.finish()),
@@ -1641,6 +1827,63 @@ mod tests {
             wave.try_apply(iterator.finish()),
             SpeculativeCommitOutcome::RetrySerial(SpeculativeFallbackReason::DependencyConflict)
         );
+    }
+
+    #[test]
+    fn secondary_range_merges_private_rows_in_canonical_order() {
+        let mut db = Database::default();
+        db.create_idx_double_object_standalone(1, 2, 30, 10, 1, (-1.0f64).to_bits())
+            .unwrap();
+        db.create_idx_double_object_standalone(1, 2, 30, 20, 2, 2.0f64.to_bits())
+            .unwrap();
+        let wave = db.begin_speculative_wave().unwrap();
+        let mut overlay = wave.snapshot().transaction();
+
+        overlay
+            .secondary_update(
+                ContractPrimaryKey::new(1, 2, 30, 2),
+                21,
+                ContractSecondaryValue::IdxDouble((-2.0f64).to_bits()),
+            )
+            .unwrap();
+        overlay
+            .secondary_create(
+                ContractPrimaryKey::new(1, 2, 30, 3),
+                30,
+                ContractSecondaryValue::IdxDouble((-1.0f64).to_bits()),
+            )
+            .unwrap();
+        overlay
+            .secondary_remove(
+                ContractPrimaryKey::new(1, 2, 30, 1),
+                ContractIndex::IdxDouble,
+            )
+            .unwrap();
+
+        assert_eq!(
+            overlay
+                .secondary_rows(1, 2, 30, ContractIndex::IdxDouble)
+                .unwrap(),
+            vec![
+                (
+                    2,
+                    ContractSecondaryRow {
+                        payer: 21,
+                        value: ContractSecondaryValue::IdxDouble((-2.0f64).to_bits()),
+                    },
+                ),
+                (
+                    3,
+                    ContractSecondaryRow {
+                        payer: 30,
+                        value: ContractSecondaryValue::IdxDouble((-1.0f64).to_bits()),
+                    },
+                ),
+            ]
+        );
+        let transaction = overlay.finish();
+        assert!(transaction.dependencies().is_complete());
+        assert_eq!(transaction.dependencies().range_read_count(), 1);
     }
 
     #[test]

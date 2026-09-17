@@ -5132,6 +5132,115 @@ impl ChainDatabase {
             .collect()
     }
 
+    /// Every idx128 row in `(secondary_key, primary_key)` order, including the
+    /// secondary row's RAM payer.
+    pub fn idx128_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u128, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex128Row>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdx128BySecondary>()
+            .range((
+                Bound::Included((t_id, u128::MIN, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u64::MAX)),
+            ))
+            .map(|(&(_, secondary, primary), row)| (secondary, primary, row.payer))
+            .collect()
+    }
+
+    /// Every idx256 row in chainbase `(word0, word1, primary_key)` order.
+    pub fn idx256_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<([u8; 32], u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex256Row>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdx256BySecondary>()
+            .range((
+                Bound::Included((t_id, u128::MIN, u128::MIN, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u128::MAX, u64::MAX)),
+            ))
+            .map(|(&(_, word0, word1, primary), row)| {
+                (join_key256(word0, word1), primary, row.payer)
+            })
+            .collect()
+    }
+
+    /// Every idx_double row in the same software-float order as iterator
+    /// traversal. Secondary values are returned as their exact stored bits.
+    pub fn idx_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndexDoubleRow>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdxDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, DoubleKey(f64::NEG_INFINITY), u64::MIN)),
+                Bound::Included((t_id, DoubleKey(f64::INFINITY), u64::MAX)),
+            ))
+            .map(|(&(_, _, primary), row)| (row.secondary_key.to_bits(), primary, row.payer))
+            .collect()
+    }
+
+    /// Every idx_long_double row in the same software-float order as iterator
+    /// traversal, returned as exact `(lo, hi)` words.
+    pub fn idx_long_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<((u64, u64), u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndexLongDoubleRow>() else {
+            return Vec::new();
+        };
+        let min_key = LongDoubleKey {
+            lo: 0,
+            hi: 0xFFFF_0000_0000_0000,
+        };
+        let max_key = LongDoubleKey {
+            lo: 0,
+            hi: 0x7FFF_0000_0000_0000,
+        };
+        tbl.get_index::<ContractIdxLongDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, min_key, u64::MIN)),
+                Bound::Included((t_id, max_key, u64::MAX)),
+            ))
+            .map(|(&(_, _, primary), row)| ((row.sec_lo, row.sec_hi), primary, row.payer))
+            .collect()
+    }
+
     /// idx128 secondary-index positioning, same semantics as the idx64 family but
     /// over a `u128` secondary key: `(primary, secondary)` of the landing row,
     /// in `(secondary, primary)` order.
@@ -6945,6 +7054,10 @@ mod tests {
         s.update_index128_object(code, scope, table, 5, p1, 101)
             .unwrap();
         assert_eq!(s.idx128_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx128_range_with_payer(code, scope, table),
+            vec![(101, 5, p1)]
+        );
         s.remove_index128_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx128_payer(code, scope, table, 5), None);
 
@@ -6956,6 +7069,10 @@ mod tests {
         s.update_index256_object(code, scope, table, 5, p1, key)
             .unwrap();
         assert_eq!(s.idx256_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx256_range_with_payer(code, scope, table),
+            vec![(key, 5, p1)]
+        );
         s.remove_index256_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx256_payer(code, scope, table, 5), None);
 
@@ -6966,6 +7083,10 @@ mod tests {
         s.update_idx_double_object(code, scope, table, 5, p1, 2.0f64.to_bits())
             .unwrap();
         assert_eq!(s.idx_double_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx_double_range_with_payer(code, scope, table),
+            vec![(2.0f64.to_bits(), 5, p1)]
+        );
         s.remove_idx_double_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx_double_payer(code, scope, table, 5), None);
 
@@ -6976,6 +7097,10 @@ mod tests {
         s.update_idx_long_double_object(code, scope, table, 5, p1, (0, 2))
             .unwrap();
         assert_eq!(s.idx_long_double_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx_long_double_range_with_payer(code, scope, table),
+            vec![((0, 2), 5, p1)]
+        );
         s.remove_idx_long_double_object(code, scope, table, 5)
             .unwrap();
         assert_eq!(s.idx_long_double_payer(code, scope, table, 5), None);

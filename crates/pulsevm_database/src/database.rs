@@ -1541,6 +1541,43 @@ impl Database {
         }
     }
 
+    pub fn arena_idx128_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u128, u64, u64)> {
+        self.backend.idx128_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx256_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<([u8; 32], u64, u64)> {
+        self.backend.idx256_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        self.backend.idx_double_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx_long_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<((u64, u64), u64, u64)> {
+        self.backend
+            .idx_long_double_range_with_payer(code, scope, table)
+    }
+
     /// The account's creation-date block-timestamp slot, for the RPC account
     /// formatter's `created` field. `None` when absent.
     pub fn arena_account_creation_date(&self, account_name: u64) -> Option<u32> {
