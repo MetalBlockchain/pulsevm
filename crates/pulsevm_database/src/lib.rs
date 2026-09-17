@@ -47,6 +47,7 @@ pub use crate::{
         restore_snapshot,
     },
     dependency::{
+        CommittedWriteIndex,
         ContractIndex,
         ContractRangeKey,
         ContractRowKey,

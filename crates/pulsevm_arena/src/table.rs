@@ -6,6 +6,7 @@ use std::{
         VecDeque,
     },
     ops::Bound,
+    sync::Arc,
 };
 
 use crate::object::{
@@ -124,12 +125,13 @@ impl DirtyPages {
     }
 }
 
+#[derive(Clone)]
 struct PrimaryPage<T> {
     slots: Box<[Option<T>]>,
     live: usize,
 }
 
-impl<T> PrimaryPage<T> {
+impl<T: Clone> PrimaryPage<T> {
     fn new() -> Self {
         Self {
             slots: std::iter::repeat_with(|| None)
@@ -146,12 +148,13 @@ impl<T> PrimaryPage<T> {
 /// `Option<T>` for every historical id made a small checkpoint expand to tens
 /// of gigabytes. Fixed-size pages retain O(1) lookup and deterministic id-order
 /// iteration while allocating row slots only near live ids.
+#[derive(Clone)]
 struct PagedPrimary<T> {
-    pages: Vec<Option<PrimaryPage<T>>>,
+    pages: Vec<Option<Arc<PrimaryPage<T>>>>,
     len: usize,
 }
 
-impl<T> PagedPrimary<T> {
+impl<T: Clone> PagedPrimary<T> {
     fn new() -> Self {
         Self {
             pages: Vec::new(),
@@ -171,6 +174,7 @@ impl<T> PagedPrimary<T> {
             if first_slot != 0
                 && let Some(Some(page)) = self.pages.get_mut(first_page)
             {
+                let page = Arc::make_mut(page);
                 for slot in &mut page.slots[first_slot..] {
                     if slot.take().is_some() {
                         page.live -= 1;
@@ -203,6 +207,7 @@ impl<T> PagedPrimary<T> {
         self.pages
             .get_mut(id / PRIMARY_PAGE_SIZE)
             .and_then(Option::as_mut)
+            .map(Arc::make_mut)
             .and_then(|page| page.slots[id % PRIMARY_PAGE_SIZE].as_mut())
     }
 
@@ -212,7 +217,8 @@ impl<T> PagedPrimary<T> {
         if self.pages.len() <= page_id {
             self.pages.resize_with(page_id + 1, || None);
         }
-        let page = self.pages[page_id].get_or_insert_with(PrimaryPage::new);
+        let page = self.pages[page_id].get_or_insert_with(|| Arc::new(PrimaryPage::new()));
+        let page = Arc::make_mut(page);
         let slot = &mut page.slots[id % PRIMARY_PAGE_SIZE];
         let was_absent = slot.is_none();
         *slot = Some(obj);
@@ -234,7 +240,7 @@ impl<T> PagedPrimary<T> {
             return None;
         }
         let page_id = id / PRIMARY_PAGE_SIZE;
-        let page = self.pages.get_mut(page_id)?.as_mut()?;
+        let page = Arc::make_mut(self.pages.get_mut(page_id)?.as_mut()?);
         let obj = page.slots[id % PRIMARY_PAGE_SIZE].take()?;
         page.live -= 1;
         if page.live == 0 {
@@ -264,7 +270,7 @@ pub struct Table<T: ArenaObject> {
     primary: PagedPrimary<T>,
     /// Append-only byte arena for variable-length fields, addressed by
     /// [`BlobRef`]. Grows within a session and is truncated back on undo.
-    blobs: Vec<u8>,
+    blobs: Arc<Vec<u8>>,
     secondaries: Vec<Box<dyn SecondaryIndex<T>>>,
     tag_positions: HashMap<TypeId, usize>,
     undo_stack: VecDeque<UndoState<T>>,
@@ -315,7 +321,7 @@ impl<T: ArenaObject> Table<T> {
         }
         Table {
             primary: PagedPrimary::new(),
-            blobs: Vec::new(),
+            blobs: Arc::new(Vec::new()),
             secondaries,
             tag_positions,
             undo_stack: VecDeque::new(),
@@ -330,6 +336,50 @@ impl<T: ArenaObject> Table<T> {
         }
     }
 
+    /// Shallow copy-on-write view used by parallel transaction workers. Live
+    /// primary pages, blob bytes, and secondary maps remain shared until this
+    /// fork mutates them; undo and persistence bookkeeping start empty.
+    pub(crate) fn execution_fork(&self) -> Self {
+        Self {
+            primary: self.primary.clone(),
+            blobs: Arc::clone(&self.blobs),
+            secondaries: self
+                .secondaries
+                .iter()
+                .map(|index| index.fork_box())
+                .collect(),
+            tag_positions: self.tag_positions.clone(),
+            undo_stack: VecDeque::new(),
+            row_count: self.row_count,
+            revision: self.revision,
+            dirty: Vec::new(),
+            in_dirty: DirtyPages::new(),
+            free: HashMap::new(),
+            blob_patches: Vec::new(),
+            flushed_blob_len: self.blobs.len(),
+            flushed_next_id: self.primary.len(),
+        }
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let primary = self
+            .primary
+            .pages
+            .iter()
+            .flatten()
+            .count()
+            .saturating_mul(PRIMARY_PAGE_SIZE)
+            .saturating_mul(std::mem::size_of::<Option<T>>());
+        let secondary = self
+            .secondaries
+            .iter()
+            .map(|index| index.len().saturating_mul(48))
+            .sum::<usize>();
+        primary
+            .saturating_add(self.blobs.len())
+            .saturating_add(secondary)
+    }
+
     /// Appends `bytes` to the blob arena and returns a [`BlobRef`] to them, for
     /// a variable-length field. Call during `create`/`modify`, then store the
     /// ref on the object. Empty input yields the default empty ref.
@@ -341,7 +391,7 @@ impl<T: ArenaObject> Table<T> {
         // Reuse an abandoned span of the exact size before growing the arena.
         if let Some(off) = self.free.get_mut(&len).and_then(|offs| offs.pop()) {
             let start = off as usize;
-            self.blobs[start..start + bytes.len()].copy_from_slice(bytes);
+            Arc::make_mut(&mut self.blobs)[start..start + bytes.len()].copy_from_slice(bytes);
             let r = BlobRef { off, len };
             // This overwrote bytes inside the already-flushed region; log it so a
             // WAL replay reproduces them (the tail-only delta would not).
@@ -356,7 +406,7 @@ impl<T: ArenaObject> Table<T> {
             return r;
         }
         let off = self.blobs.len() as u32;
-        self.blobs.extend_from_slice(bytes);
+        Arc::make_mut(&mut self.blobs).extend_from_slice(bytes);
         BlobRef { off, len }
     }
 
@@ -661,7 +711,7 @@ impl<T: ArenaObject> Table<T> {
         } = state;
         // Drop every blob appended during the session; restored objects only
         // reference bytes from before it started.
-        self.blobs.truncate(old_blob_len);
+        Arc::make_mut(&mut self.blobs).truncate(old_blob_len);
         // The session's allocations are reverted, so its reused spans are free
         // again; the spans it abandoned stay live (their rows are being restored).
         for r in reused {
@@ -860,7 +910,7 @@ impl<T: ArenaObject> Table<T> {
             .checked_add(blob_len)
             .filter(|end| *end <= bytes.len())
             .ok_or(TableError::Corrupted("blob arena extends past snapshot"))?;
-        self.blobs.extend_from_slice(&bytes[pos..end]);
+        Arc::make_mut(&mut self.blobs).extend_from_slice(&bytes[pos..end]);
         pos = end;
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in table snapshot"));
@@ -981,7 +1031,7 @@ impl<T: ArenaObject> Table<T> {
             if off + len > self.blobs.len() {
                 return Err(TableError::Corrupted("delta patch out of range"));
             }
-            self.blobs[off..off + len].copy_from_slice(&bytes[pos..end]);
+            Arc::make_mut(&mut self.blobs)[off..off + len].copy_from_slice(&bytes[pos..end]);
             pos = end;
         }
         let blob_len = read_u64(bytes, &mut pos)? as usize;
@@ -989,7 +1039,7 @@ impl<T: ArenaObject> Table<T> {
             .checked_add(blob_len)
             .filter(|end| *end <= bytes.len())
             .ok_or(TableError::Corrupted("delta blob extends past record"))?;
-        self.blobs.extend_from_slice(&bytes[pos..end]);
+        Arc::make_mut(&mut self.blobs).extend_from_slice(&bytes[pos..end]);
         pos = end;
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in delta"));
@@ -1018,7 +1068,7 @@ impl<T: ArenaObject> Table<T> {
             hasher.update(obj.as_bytes());
         }
         hasher.update((self.blobs.len() as u64).to_le_bytes());
-        hasher.update(&self.blobs);
+        hasher.update(self.blobs.as_slice());
     }
 }
 

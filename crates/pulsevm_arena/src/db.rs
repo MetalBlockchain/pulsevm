@@ -98,6 +98,8 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
 /// Type-erased view of a `Table<T>` so the database can drive the shared
 /// revision/undo lifecycle across a heterogeneous set of tables.
 trait AbstractTable: Send + Sync {
+    fn execution_fork_box(&self) -> Box<dyn AbstractTable>;
+    fn estimated_heap_bytes(&self) -> usize;
     fn start_undo_session(&mut self) -> i64;
     fn revision(&self) -> i64;
     fn set_revision(&mut self, revision: i64) -> Result<(), TableError>;
@@ -122,6 +124,12 @@ trait AbstractTable: Send + Sync {
 }
 
 impl<T: ArenaObject> AbstractTable for Table<T> {
+    fn execution_fork_box(&self) -> Box<dyn AbstractTable> {
+        Box::new(Table::execution_fork(self))
+    }
+    fn estimated_heap_bytes(&self) -> usize {
+        Table::estimated_heap_bytes(self)
+    }
     fn start_undo_session(&mut self) -> i64 {
         Table::start_undo_session(self)
     }
@@ -226,6 +234,25 @@ impl DbDelta {
 impl Db {
     pub fn new() -> Self {
         Db::default()
+    }
+
+    /// Create a shallow copy-on-write database view for an isolated execution
+    /// worker. The live rows remain shared; the fork has no undo history.
+    pub fn execution_fork(&self) -> Self {
+        Self {
+            tables: self
+                .tables
+                .iter()
+                .map(|table| table.execution_fork_box())
+                .collect(),
+            by_type_id: self.by_type_id.clone(),
+        }
+    }
+
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.tables.iter().fold(0usize, |total, table| {
+            total.saturating_add(table.estimated_heap_bytes())
+        })
     }
 
     /// Serialize current live state without changing persistence dirty markers.

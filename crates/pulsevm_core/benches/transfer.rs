@@ -432,6 +432,30 @@ fn criterion_benchmark(c: &mut Criterion) {
         .collect::<Vec<_>>();
     let mut parallel_group = c.benchmark_group("wasm_parallel_execution");
     parallel_group.throughput(Throughput::Elements(hot_batch.len() as u64));
+    parallel_group.bench_function("serial_hot", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .benchmark_serial_transactions(
+                        black_box(&hot_batch),
+                        black_box(&pending_block_timestamp),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    parallel_group.bench_function("serial_independent", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .benchmark_serial_transactions(
+                        black_box(&independent_batch),
+                        black_box(&pending_block_timestamp),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
     for workers in [1usize, 2, 4, 8] {
         parallel_group.bench_function(format!("speculation_hot/workers_{workers}"), |b| {
             b.iter(|| {

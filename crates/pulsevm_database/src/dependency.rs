@@ -165,6 +165,66 @@ pub struct TransactionDependencies {
     complete: bool,
 }
 
+/// Incremental index of canonical writes committed after a worker snapshot.
+///
+/// Ordered validation walks the candidate's bounded dependency set instead of
+/// rescanning every write accumulated by the block. Range summaries preserve
+/// the same conservative phantom rules as [`dependencies_observe_write`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommittedWriteIndex {
+    exact: BTreeSet<DependencyKey>,
+    contract_ranges: BTreeSet<ContractRangeKey>,
+    permission_owners: BTreeSet<u64>,
+    deferred_queue_dirty: bool,
+}
+
+impl CommittedWriteIndex {
+    pub fn insert(&mut self, write: DependencyKey) {
+        if is_ordered_commit_bookkeeping(write) {
+            return;
+        }
+        match write {
+            DependencyKey::Contract(row) => {
+                self.contract_ranges.insert(ContractRangeKey::new(
+                    row.code, row.scope, row.table, row.index,
+                ));
+            }
+            DependencyKey::System(SystemKey::Permission { owner, .. }) => {
+                self.permission_owners.insert(owner);
+            }
+            DependencyKey::System(SystemKey::DeferredTransaction(_))
+            | DependencyKey::System(SystemKey::DeferredSender { .. }) => {
+                self.deferred_queue_dirty = true;
+            }
+            DependencyKey::System(_) => {}
+        }
+        self.exact.insert(write);
+    }
+
+    pub fn extend(&mut self, writes: impl IntoIterator<Item = DependencyKey>) {
+        for write in writes {
+            self.insert(write);
+        }
+    }
+
+    pub fn conflicts(&self, dependencies: &TransactionDependencies) -> bool {
+        dependencies
+            .exact_reads
+            .iter()
+            .chain(&dependencies.writes)
+            .any(|key| self.exact.contains(key))
+            || dependencies.range_reads.iter().any(|range| match range {
+                RangeDependency::Contract(range) => self.contract_ranges.contains(range),
+                RangeDependency::System(SystemRangeKey::PermissionsByOwner(owner)) => {
+                    self.permission_owners.contains(owner)
+                }
+                RangeDependency::System(SystemRangeKey::DeferredDueQueue) => {
+                    self.deferred_queue_dirty
+                }
+            })
+    }
+}
+
 impl TransactionDependencies {
     pub fn exact_reads(&self) -> &BTreeSet<DependencyKey> {
         &self.exact_reads
@@ -238,6 +298,15 @@ impl TransactionDependencies {
                 .copied()
                 .filter(|key| !is_ordered_commit_bookkeeping(*key))
                 .any(|write| dependencies_observe_write(self, write))
+    }
+
+    /// Indexed equivalent of [`Self::can_optimistically_commit_after`] for the
+    /// ordered block hot path.
+    pub fn can_optimistically_commit_after_index(
+        &self,
+        prior_writes: &CommittedWriteIndex,
+    ) -> bool {
+        self.complete && !prior_writes.conflicts(self)
     }
 
     /// Whether two transactions that execute from the same block-prefix
@@ -563,6 +632,59 @@ mod tests {
                 SystemKey::Account(17)
             ),]))
         );
+    }
+
+    #[test]
+    fn indexed_ordered_conflicts_match_write_set_validation() {
+        let row = DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Idx64, 4));
+        let permission = DependencyKey::System(SystemKey::Permission { owner: 7, name: 8 });
+        let deferred = DependencyKey::System(SystemKey::DeferredTransaction([9; 32]));
+        let bookkeeping = DependencyKey::System(SystemKey::GlobalActionSequence);
+        let writes = BTreeSet::from([row, permission, deferred, bookkeeping]);
+        let mut index = CommittedWriteIndex::default();
+        index.extend(writes.iter().copied());
+
+        let cases =
+            [
+                TransactionDependencies {
+                    exact_reads: BTreeSet::from([row]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::Contract(
+                        ContractRangeKey::new(1, 2, 3, ContractIndex::Idx64),
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::System(
+                        SystemRangeKey::PermissionsByOwner(7),
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::System(
+                        SystemRangeKey::DeferredDueQueue,
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    exact_reads: BTreeSet::from([bookkeeping]),
+                    complete: true,
+                    ..Default::default()
+                },
+            ];
+
+        for dependencies in cases {
+            assert_eq!(
+                dependencies.can_optimistically_commit_after(&writes),
+                dependencies.can_optimistically_commit_after_index(&index),
+            );
+        }
     }
 
     #[test]

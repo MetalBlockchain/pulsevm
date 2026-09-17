@@ -13,6 +13,7 @@ use std::{
         Hasher,
     },
     marker::PhantomData,
+    sync::Arc,
 };
 
 use zerocopy::{
@@ -142,6 +143,7 @@ pub trait IndexedBy<T: ArenaObject>: Send + Sync + 'static {
 /// Object-safe interface used by [`Table`] to maintain a secondary index
 /// without knowing its key type.
 pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>>;
     fn tag(&self) -> TypeId;
     fn index_name(&self) -> &'static str;
     /// Inserts the object's key -> id in a single tree operation; returns
@@ -165,19 +167,26 @@ pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
 
 /// Concrete secondary index: an ordered map from `Tag::Key` to object id.
 pub struct KeyIndex<T: ArenaObject, Tag: IndexedBy<T>> {
-    pub(crate) map: BTreeMap<Tag::Key, i64>,
+    pub(crate) map: Arc<BTreeMap<Tag::Key, i64>>,
     _marker: PhantomData<fn() -> (T, Tag)>,
 }
 
 /// Creates the boxed index registered from [`ArenaObject::secondary_indices`].
 pub fn key_index<T: ArenaObject, Tag: IndexedBy<T>>() -> Box<dyn SecondaryIndex<T>> {
     Box::new(KeyIndex::<T, Tag> {
-        map: BTreeMap::new(),
+        map: Arc::new(BTreeMap::new()),
         _marker: PhantomData,
     })
 }
 
 impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>> {
+        Box::new(Self {
+            map: Arc::clone(&self.map),
+            _marker: PhantomData,
+        })
+    }
+
     fn tag(&self) -> TypeId {
         TypeId::of::<Tag>()
     }
@@ -187,7 +196,7 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
     }
 
     fn try_insert(&mut self, obj: &T) -> bool {
-        match self.map.entry(Tag::key(obj)) {
+        match Arc::make_mut(&mut self.map).entry(Tag::key(obj)) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(obj.id().raw());
                 true
@@ -202,13 +211,14 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
         if old_key == new_key {
             return true;
         }
-        match self.map.entry(new_key) {
+        let map = Arc::make_mut(&mut self.map);
+        match map.entry(new_key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(old.id().raw());
             }
             std::collections::btree_map::Entry::Occupied(_) => return false,
         }
-        let removed = self.map.remove(&old_key);
+        let removed = map.remove(&old_key);
         debug_assert_eq!(
             removed,
             Some(old.id().raw()),
@@ -219,7 +229,7 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
     }
 
     fn erase(&mut self, obj: &T) {
-        let removed = self.map.remove(&Tag::key(obj));
+        let removed = Arc::make_mut(&mut self.map).remove(&Tag::key(obj));
         debug_assert_eq!(
             removed,
             Some(obj.id().raw()),
@@ -233,13 +243,14 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
         // far cheaper than inserting each row into an empty map. Row position is
         // the object id.
         let mut live = 0usize;
-        self.map = rows
-            .iter()
-            .map(|(id, obj)| {
-                live += 1;
-                (Tag::key(obj), *id)
-            })
-            .collect();
+        self.map = Arc::new(
+            rows.iter()
+                .map(|(id, obj)| {
+                    live += 1;
+                    (Tag::key(obj), *id)
+                })
+                .collect(),
+        );
         // Unique index: a dropped entry means two rows collided on a key.
         self.map.len() == live
     }
@@ -261,7 +272,7 @@ pub struct HashKeyIndex<T: ArenaObject, Tag: IndexedBy<T>>
 where
     Tag::Key: Hash + Eq,
 {
-    pub(crate) map: HashMap<Tag::Key, i64>,
+    pub(crate) map: Arc<HashMap<Tag::Key, i64>>,
     _marker: PhantomData<fn() -> (T, Tag)>,
 }
 
@@ -272,7 +283,7 @@ where
     Tag::Key: Hash + Eq,
 {
     Box::new(HashKeyIndex::<T, Tag> {
-        map: HashMap::new(),
+        map: Arc::new(HashMap::new()),
         _marker: PhantomData,
     })
 }
@@ -281,6 +292,13 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for HashKeyIndex<T, Ta
 where
     Tag::Key: Hash + Eq,
 {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>> {
+        Box::new(Self {
+            map: Arc::clone(&self.map),
+            _marker: PhantomData,
+        })
+    }
+
     fn tag(&self) -> TypeId {
         TypeId::of::<Tag>()
     }
@@ -290,7 +308,7 @@ where
     }
 
     fn try_insert(&mut self, obj: &T) -> bool {
-        match self.map.entry(Tag::key(obj)) {
+        match Arc::make_mut(&mut self.map).entry(Tag::key(obj)) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(obj.id().raw());
                 true
@@ -305,13 +323,14 @@ where
         if old_key == new_key {
             return true;
         }
-        match self.map.entry(new_key) {
+        let map = Arc::make_mut(&mut self.map);
+        match map.entry(new_key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(old.id().raw());
             }
             std::collections::hash_map::Entry::Occupied(_) => return false,
         }
-        let removed = self.map.remove(&old_key);
+        let removed = map.remove(&old_key);
         debug_assert_eq!(
             removed,
             Some(old.id().raw()),
@@ -322,7 +341,7 @@ where
     }
 
     fn erase(&mut self, obj: &T) {
-        let removed = self.map.remove(&Tag::key(obj));
+        let removed = Arc::make_mut(&mut self.map).remove(&Tag::key(obj));
         debug_assert_eq!(
             removed,
             Some(obj.id().raw()),
@@ -333,13 +352,14 @@ where
 
     fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool {
         let mut live = 0usize;
-        self.map = rows
-            .iter()
-            .map(|(id, obj)| {
-                live += 1;
-                (Tag::key(obj), *id)
-            })
-            .collect();
+        self.map = Arc::new(
+            rows.iter()
+                .map(|(id, obj)| {
+                    live += 1;
+                    (Tag::key(obj), *id)
+                })
+                .collect(),
+        );
         self.map.len() == live
     }
 

@@ -2,6 +2,7 @@ use core::fmt;
 use std::{
     borrow::Cow,
     collections::{
+        BTreeMap,
         BTreeSet,
         HashMap,
         HashSet,
@@ -16,13 +17,16 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
+        Condvar,
         LazyLock,
+        Mutex,
         atomic::{
             AtomicUsize,
             Ordering,
         },
         mpsc,
     },
+    thread::JoinHandle,
     time::{
         Duration,
         Instant,
@@ -151,9 +155,8 @@ static PARALLEL_EXECUTION_WORKERS: LazyLock<usize> = LazyLock::new(|| {
         })
         .min(64)
 });
-/// Conservative cap for materialized worker Arenas. Decoded tables and their
-/// indexes are larger than the snapshot bytes, so budget four snapshot bytes
-/// per worker unless an operator explicitly chooses another ceiling.
+/// Conservative cap for the shared copy-on-write snapshot and private pages,
+/// blobs, indexes, WASM stores, and transaction state detached by workers.
 static PARALLEL_EXECUTION_MEMORY_BYTES: LazyLock<usize> = LazyLock::new(|| {
     const DEFAULT_MIB: usize = 1024;
     const MAX_MIB: usize = 64 * 1024;
@@ -163,6 +166,14 @@ static PARALLEL_EXECUTION_MEMORY_BYTES: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_MIB)
         .min(MAX_MIB)
         .saturating_mul(1024 * 1024)
+});
+static PARALLEL_EXECUTION_TASKS_PER_WORKER: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("PULSEVM_PARALLEL_EXECUTION_TASKS_PER_WORKER")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+        .min(1024)
 });
 static XPR_BATCHED_REPLAY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("PULSEVM_XPR_BATCHED_REPLAY").as_deref() == Ok("1"));
@@ -180,8 +191,8 @@ use pulsevm_crypto::{
 use pulsevm_database::{
     Authority,
     BlockTimestamp,
+    CommittedWriteIndex,
     Database,
-    DependencyKey,
     ElasticLimitParameters,
     ExecutionJournal,
     ExecutionSnapshot,
@@ -232,6 +243,24 @@ fn deferred_onerror_payload(sender_id: u128, packed_trx: &[u8]) -> Result<Vec<u8
     append_varuint32(&mut data, packed_trx.len())?;
     data.extend_from_slice(packed_trx);
     Ok(data)
+}
+
+fn speculation_is_counterproductive(commits: usize, fallbacks: usize, workers: usize) -> bool {
+    let attempts = commits.saturating_add(fallbacks);
+    attempts >= workers.max(4) && fallbacks.saturating_mul(4) >= attempts.saturating_mul(3)
+}
+
+/// Every ordinary transaction bills at least its first authorizer's resource
+/// usage row. Two such transactions executed from the same prefix therefore
+/// have a guaranteed ordered conflict; only the first is useful speculation.
+fn first_speculation_for_authorizer(
+    transaction: &PackedTransaction,
+    scheduled: &mut BTreeSet<u64>,
+) -> bool {
+    transaction
+        .get_transaction()
+        .first_authorizer()
+        .is_none_or(|authorizer| scheduled.insert(authorizer))
 }
 
 fn retire_deferred_transaction(
@@ -645,14 +674,246 @@ struct ParallelTransactionOutcome {
     outcome: Result<ParallelTransactionCandidate, String>,
 }
 
+type ParallelTransactionTask = (
+    usize,
+    PackedTransaction,
+    TransactionResourceMode,
+    SubjectiveBill,
+);
+
+struct ParallelExecutionBatch {
+    executor: ParallelTransactionExecutor,
+    tasks: Arc<Vec<ParallelTransactionTask>>,
+    cursor: Mutex<ParallelExecutionCursor>,
+    cursor_changed: Condvar,
+    sender: mpsc::SyncSender<ParallelTransactionOutcome>,
+}
+
+struct ParallelExecutionCursor {
+    next: usize,
+    dispatch_limit: usize,
+    cancelled: bool,
+}
+
+impl ParallelExecutionBatch {
+    fn claim(&self) -> Option<usize> {
+        let mut cursor = self.cursor.lock().ok()?;
+        loop {
+            if cursor.cancelled || cursor.next >= self.tasks.len() {
+                return None;
+            }
+            if cursor.next < cursor.dispatch_limit {
+                let index = cursor.next;
+                cursor.next = cursor.next.saturating_add(1);
+                return Some(index);
+            }
+            cursor = self.cursor_changed.wait(cursor).ok()?;
+        }
+    }
+
+    fn release_one(&self) {
+        if let Ok(mut cursor) = self.cursor.lock() {
+            cursor.dispatch_limit = cursor
+                .dispatch_limit
+                .saturating_add(1)
+                .min(self.tasks.len());
+            self.cursor_changed.notify_one();
+        }
+    }
+
+    fn cancel(&self) {
+        if let Ok(mut cursor) = self.cursor.lock() {
+            cursor.cancelled = true;
+            self.cursor_changed.notify_all();
+        }
+    }
+}
+
+enum ParallelWorkerCommand {
+    Execute(Arc<ParallelExecutionBatch>),
+    Stop,
+}
+
+struct ParallelPoolWorker {
+    sender: mpsc::Sender<ParallelWorkerCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct ParallelExecutionPool {
+    workers: Mutex<Vec<ParallelPoolWorker>>,
+}
+
+struct ParallelExecutionHandle {
+    batch: Arc<ParallelExecutionBatch>,
+    receiver: mpsc::Receiver<ParallelTransactionOutcome>,
+    buffered: BTreeMap<usize, Result<ParallelTransactionCandidate, String>>,
+    scheduled_receipts: BTreeSet<usize>,
+    remaining: usize,
+    worker_count: usize,
+    snapshot_bytes: usize,
+    snapshot_elapsed: Duration,
+    dispatch_window: usize,
+}
+
+impl ParallelExecutionHandle {
+    fn outcome_for(
+        &mut self,
+        receipt_index: usize,
+    ) -> Option<Result<ParallelTransactionCandidate, String>> {
+        if !self.scheduled_receipts.contains(&receipt_index) {
+            return None;
+        }
+        if let Some(outcome) = self.buffered.remove(&receipt_index) {
+            self.batch.release_one();
+            return Some(outcome);
+        }
+        while self.remaining > 0 {
+            let outcome = self.receiver.recv().ok()?;
+            self.remaining = self.remaining.saturating_sub(1);
+            if outcome.receipt_index == receipt_index {
+                self.batch.release_one();
+                return Some(outcome.outcome);
+            }
+            self.buffered.insert(outcome.receipt_index, outcome.outcome);
+        }
+        None
+    }
+}
+
+impl Drop for ParallelExecutionHandle {
+    fn drop(&mut self) {
+        self.batch.cancel();
+    }
+}
+
+impl ParallelExecutionPool {
+    fn ensure_workers(&self, count: usize) -> Result<(), ChainError> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| ChainError::InternalError("parallel worker pool lock poisoned".into()))?;
+        while workers.len() < count {
+            let index = workers.len();
+            let (sender, receiver) = mpsc::channel();
+            let join = std::thread::Builder::new()
+                .name(format!("pulsevm-exec-{index}"))
+                .spawn(move || parallel_worker_loop(receiver))
+                .map_err(|error| {
+                    ChainError::InternalError(format!(
+                        "cannot start parallel execution worker: {error}"
+                    ))
+                })?;
+            workers.push(ParallelPoolWorker {
+                sender,
+                join: Some(join),
+            });
+        }
+        Ok(())
+    }
+
+    fn submit(
+        &self,
+        batch: Arc<ParallelExecutionBatch>,
+        worker_count: usize,
+    ) -> Result<usize, ChainError> {
+        self.ensure_workers(worker_count)?;
+        let workers = self
+            .workers
+            .lock()
+            .map_err(|_| ChainError::InternalError("parallel worker pool lock poisoned".into()))?;
+        let mut submitted = 0usize;
+        for worker in workers.iter().take(worker_count) {
+            if worker
+                .sender
+                .send(ParallelWorkerCommand::Execute(Arc::clone(&batch)))
+                .is_ok()
+            {
+                submitted = submitted.saturating_add(1);
+            }
+        }
+        Ok(submitted)
+    }
+}
+
+impl Drop for ParallelExecutionPool {
+    fn drop(&mut self) {
+        let Ok(workers) = self.workers.get_mut() else {
+            return;
+        };
+        for worker in workers.iter() {
+            let _ = worker.sender.send(ParallelWorkerCommand::Stop);
+        }
+        for worker in workers {
+            if let Some(join) = worker.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+fn parallel_worker_loop(receiver: mpsc::Receiver<ParallelWorkerCommand>) {
+    while let Ok(command) = receiver.recv() {
+        let ParallelWorkerCommand::Execute(batch) = command else {
+            break;
+        };
+        let mut worker = batch.executor.worker().map_err(|error| error.to_string());
+        while let Some(task_index) = batch.claim() {
+            let Some((receipt_index, transaction, resource_mode, subjective_bill)) =
+                batch.tasks.get(task_index)
+            else {
+                break;
+            };
+            let attempted = match worker.as_mut() {
+                Ok(worker) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.execute(transaction, *resource_mode, *subjective_bill)
+                })),
+                Err(error) => {
+                    if batch
+                        .sender
+                        .send(ParallelTransactionOutcome {
+                            receipt_index: *receipt_index,
+                            outcome: Err(error.clone()),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let outcome = match attempted {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => {
+                    worker = batch.executor.worker().map_err(|error| error.to_string());
+                    Err("parallel transaction worker panicked".to_string())
+                }
+            };
+            if batch
+                .sender
+                .send(ParallelTransactionOutcome {
+                    receipt_index: *receipt_index,
+                    outcome,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+}
+
 /// Observable work completed by the end-to-end ordered execution benchmark.
 /// The benchmark always rolls canonical state back before returning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParallelExecutionBenchmark {
     pub transactions: usize,
     pub actions: usize,
+    pub effective_workers: usize,
+    pub snapshot_bytes: usize,
     pub optimistic_commits: usize,
     pub serial_fallbacks: usize,
+    pub speculation_cancelled: bool,
 }
 
 #[derive(Clone)]
@@ -833,6 +1094,8 @@ pub struct Controller {
     parallel_execution_workers: usize,
     parallel_execution_cpu_limit: usize,
     parallel_execution_memory_bytes: usize,
+    parallel_execution_tasks_per_worker: usize,
+    parallel_execution_pool: ParallelExecutionPool,
     parallel_transactions_committed: u64,
     parallel_transactions_fallback: u64,
 
@@ -1346,6 +1609,8 @@ impl Controller {
                 .map(|value| value.get())
                 .unwrap_or(1),
             parallel_execution_memory_bytes: *PARALLEL_EXECUTION_MEMORY_BYTES,
+            parallel_execution_tasks_per_worker: *PARALLEL_EXECUTION_TASKS_PER_WORKER,
+            parallel_execution_pool: ParallelExecutionPool::default(),
             parallel_transactions_committed: 0,
             parallel_transactions_fallback: 0,
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
@@ -2399,10 +2664,14 @@ impl Controller {
                 }
             }
         };
+        let mut scheduled_authorizers = BTreeSet::new();
         let parallel_tasks = ordinary_transactions
             .iter()
             .enumerate()
-            .map(|(index, transaction)| {
+            .filter_map(|(index, transaction)| {
+                if !first_speculation_for_authorizer(transaction, &mut scheduled_authorizers) {
+                    return None;
+                }
                 let subjective_bill = transaction
                     .get_transaction()
                     .first_authorizer()
@@ -2415,16 +2684,16 @@ impl Controller {
                         )
                     })
                     .unwrap_or_default();
-                (
+                Some((
                     index,
                     transaction.clone(),
                     TransactionResourceMode::Measure,
                     subjective_bill,
-                )
+                ))
             })
             .collect();
         let parallel_started = Instant::now();
-        let parallel_outcomes = self.execute_parallel_transactions(
+        let mut parallel_outcomes = self.start_parallel_transactions(
             parallel_tasks,
             &timestamp,
             &block_status,
@@ -2432,28 +2701,39 @@ impl Controller {
             AuthorizationCheck::Required,
             2,
         );
-        let parallel_enabled = !parallel_outcomes.is_empty();
-        let mut parallel_outcomes = parallel_outcomes.into_iter().peekable();
-        let mut optimistic_prior_writes = BTreeSet::<DependencyKey>::new();
+        let parallel_enabled = parallel_outcomes.is_some();
+        let parallel_worker_count = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.worker_count);
+        let parallel_snapshot_bytes = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.snapshot_bytes);
+        let parallel_snapshot_us = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.snapshot_elapsed.as_micros());
+        let parallel_dispatch_window = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.dispatch_window);
+        let mut optimistic_prior_writes = CommittedWriteIndex::default();
         let mut optimistic_prefix_complete = true;
+        let mut subjective_invalidated_accounts = BTreeSet::<u64>::new();
         let mut optimistic_committed = 0usize;
         let mut optimistic_fallbacks = 0usize;
+        let mut speculation_cancelled = false;
 
         for (transaction_index, transaction) in ordinary_transactions.into_iter().enumerate() {
-            let parallel_outcome = if parallel_outcomes
-                .peek()
-                .is_some_and(|outcome| outcome.receipt_index == transaction_index)
-            {
-                parallel_outcomes.next().map(|outcome| outcome.outcome)
-            } else {
-                None
-            };
-            let optimistic_result = if optimistic_prefix_complete {
+            let parallel_outcome = parallel_outcomes
+                .as_mut()
+                .and_then(|outcomes| outcomes.outcome_for(transaction_index));
+            let authorizer = transaction.get_transaction().first_authorizer();
+            let subjective_bill_is_current = authorizer
+                .is_none_or(|account| !subjective_invalidated_accounts.contains(&account));
+            let optimistic_result = if optimistic_prefix_complete && subjective_bill_is_current {
                 match parallel_outcome {
                     Some(Ok(candidate))
                         if candidate
                             .dependencies
-                            .can_optimistically_commit_after(&optimistic_prior_writes) =>
+                            .can_optimistically_commit_after_index(&optimistic_prior_writes) =>
                     {
                         match self.commit_parallel_candidate(candidate) {
                             Ok(result) => {
@@ -2483,6 +2763,17 @@ impl Controller {
                 }
                 None
             };
+            if parallel_outcomes.is_some()
+                && speculation_is_counterproductive(
+                    optimistic_committed,
+                    optimistic_fallbacks,
+                    parallel_worker_count,
+                )
+            {
+                parallel_outcomes.take();
+                speculation_cancelled = true;
+            }
+            let track_ordered_dependencies = parallel_outcomes.is_some();
 
             let (transaction_result, committed_optimistically) =
                 if let Some(result) = optimistic_result {
@@ -2490,13 +2781,14 @@ impl Controller {
                 } else {
                     db.arena_start_undo_session();
                     (
-                        self.execute_transaction_with_protocol(
+                        self.execute_transaction_with_protocol_tracking(
                             &transaction,
                             protocol_context,
                             &timestamp,
                             &block_status,
                             TransactionResourceMode::Measure,
                             AuthorizationCheck::Required,
+                            track_ordered_dependencies,
                         ),
                         false,
                     )
@@ -2509,7 +2801,7 @@ impl Controller {
                     }
 
                     // Add the transaction to the block
-                    if parallel_enabled {
+                    if track_ordered_dependencies {
                         if let Some(dependencies) = &result.dependencies {
                             optimistic_prior_writes.extend(dependencies.writes().iter().copied());
                         } else {
@@ -2530,9 +2822,14 @@ impl Controller {
 
                     db.arena_undo(); // the serial fallback's failed tx leaves no trace
                     // A subjective failure bill is node-local state outside
-                    // Arena. Remaining workers did not observe it, so use the
-                    // serial path for the rest of this producer batch.
-                    optimistic_prefix_complete = false;
+                    // Arena, but it is scoped to the first authorizer. Preserve
+                    // independent candidates and invalidate only later workers
+                    // that started with this account's old bill.
+                    if let Some(account) = authorizer {
+                        subjective_invalidated_accounts.insert(account);
+                    } else {
+                        optimistic_prefix_complete = false;
+                    }
                 }
             }
         }
@@ -2545,12 +2842,18 @@ impl Controller {
                 .parallel_transactions_fallback
                 .saturating_add(optimistic_fallbacks as u64);
             info!(
-                "parallel producer execution block={} transactions={} committed={} fallbacks={} prefix_complete={} elapsed_us={}",
+                "parallel producer execution block={} workers={} window={} snapshot_bytes={} snapshot_us={} transactions={} committed={} fallbacks={} speculation_cancelled={} prefix_complete={} subjective_invalidations={} elapsed_us={}",
                 block_height,
+                parallel_worker_count,
+                parallel_dispatch_window,
+                parallel_snapshot_bytes,
+                parallel_snapshot_us,
                 transaction_receipts.len(),
                 optimistic_committed,
                 optimistic_fallbacks,
+                speculation_cancelled,
                 optimistic_prefix_complete,
+                subjective_invalidated_accounts.len(),
                 parallel_started.elapsed().as_micros(),
             );
         }
@@ -3280,50 +3583,65 @@ impl Controller {
     /// bounded pool of reusable isolated Arena forks. All workers see the same
     /// serial block prefix; their logical journals are considered later in
     /// canonical order and stale or unsupported results fall back to serial.
-    fn execute_parallel_transactions(
+    fn start_parallel_transactions(
         &self,
-        tasks: Vec<(
-            usize,
-            PackedTransaction,
-            TransactionResourceMode,
-            SubjectiveBill,
-        )>,
+        tasks: Vec<ParallelTransactionTask>,
         pending_block_timestamp: &BlockTimestamp,
         block_status: &BlockStatus,
         protocol_context: ProtocolExecutionContext,
         authorization_check: AuthorizationCheck,
         minimum_workers: usize,
-    ) -> Vec<ParallelTransactionOutcome> {
+    ) -> Option<ParallelExecutionHandle> {
         let requested_workers = self.parallel_execution_workers;
         if requested_workers == 0 || *XPR_BATCHED_REPLAY_ENABLED {
-            return Vec::new();
+            return None;
         }
         if tasks.is_empty() {
-            return Vec::new();
+            return None;
         }
+        let available_workers = self.parallel_execution_cpu_limit;
+        let workload_workers = tasks
+            .len()
+            .div_ceil(self.parallel_execution_tasks_per_worker)
+            .max(minimum_workers);
+        let workers_before_memory = requested_workers
+            .min(tasks.len())
+            .min(available_workers)
+            .min(workload_workers);
+        if workers_before_memory < minimum_workers {
+            return None;
+        }
+        let snapshot_started = Instant::now();
         let snapshot = match self.db.execution_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!("parallel execution snapshot failed; using serial path: {error}");
-                return Vec::new();
+                return None;
             }
         };
-        let available_workers = self.parallel_execution_cpu_limit;
-        let estimated_worker_bytes = snapshot.byte_len().saturating_mul(4).max(1);
-        let memory_workers = self.parallel_execution_memory_bytes / estimated_worker_bytes;
-        let worker_count = requested_workers
-            .min(tasks.len())
-            .min(available_workers)
-            .min(memory_workers);
+        let snapshot_elapsed = snapshot_started.elapsed();
+        let snapshot_bytes = snapshot.byte_len();
+        const WORKER_OVERHEAD_BYTES: usize = 8 * 1024 * 1024;
+        let estimated_worker_bytes = snapshot
+            .byte_len()
+            .saturating_mul(4)
+            .saturating_add(WORKER_OVERHEAD_BYTES)
+            .max(1);
+        let memory_workers = self
+            .parallel_execution_memory_bytes
+            .saturating_sub(snapshot.byte_len())
+            / estimated_worker_bytes;
+        let worker_count = workers_before_memory.min(memory_workers);
         if worker_count < minimum_workers {
             debug!(
-                "parallel execution disabled: requested={} cpus={} memory_workers={} snapshot_bytes={}",
+                "parallel execution disabled: requested={} cpus={} memory_workers={} workload_workers={} snapshot_bytes={}",
                 requested_workers,
                 available_workers,
                 memory_workers,
+                workload_workers,
                 snapshot.byte_len(),
             );
-            return Vec::new();
+            return None;
         }
         let executor = ParallelTransactionExecutor {
             snapshot,
@@ -3341,67 +3659,46 @@ impl Controller {
                 .map(|schedule| (schedule.producers.clone(), schedule.version)),
             max_transaction_time_ms: self.max_transaction_time_ms(),
         };
+        let scheduled_receipts = tasks.iter().map(|task| task.0).collect();
         let tasks = Arc::new(tasks);
-        let next = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::channel();
-        std::thread::scope(|scope| {
-            for _ in 0..worker_count {
-                let tasks = Arc::clone(&tasks);
-                let next = Arc::clone(&next);
-                let sender = sender.clone();
-                let executor = executor.clone();
-                scope.spawn(move || {
-                    let mut worker = executor.worker().map_err(|error| error.to_string());
-                    loop {
-                        let task_index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((receipt_index, transaction, resource_mode, subjective_bill)) =
-                            tasks.get(task_index)
-                        else {
-                            break;
-                        };
-                        let attempted = match worker.as_mut() {
-                            Ok(worker) => {
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    worker.execute(transaction, *resource_mode, *subjective_bill)
-                                }))
-                            }
-                            Err(error) => {
-                                let outcome = Err(error.clone());
-                                if sender
-                                    .send(ParallelTransactionOutcome {
-                                        receipt_index: *receipt_index,
-                                        outcome,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
-                        };
-                        let outcome = match attempted {
-                            Ok(result) => result.map_err(|error| error.to_string()),
-                            Err(_) => {
-                                worker = executor.worker().map_err(|error| error.to_string());
-                                Err("parallel transaction worker panicked".to_string())
-                            }
-                        };
-                        if sender
-                            .send(ParallelTransactionOutcome {
-                                receipt_index: *receipt_index,
-                                outcome,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
+        let dispatch_window = worker_count.saturating_mul(2).max(worker_count);
+        let (sender, receiver) = mpsc::sync_channel(dispatch_window);
+        let batch = Arc::new(ParallelExecutionBatch {
+            executor,
+            tasks: Arc::clone(&tasks),
+            cursor: Mutex::new(ParallelExecutionCursor {
+                next: 0,
+                dispatch_limit: dispatch_window.min(tasks.len()),
+                cancelled: false,
+            }),
+            cursor_changed: Condvar::new(),
+            sender,
+        });
+        let submitted = match self
+            .parallel_execution_pool
+            .submit(Arc::clone(&batch), worker_count)
+        {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                warn!("parallel execution worker pool failed; using serial path: {error}");
+                batch.cancel();
+                return None;
             }
-            drop(sender);
-            let mut outcomes = receiver.into_iter().collect::<Vec<_>>();
-            outcomes.sort_by_key(|outcome| outcome.receipt_index);
-            outcomes
+        };
+        if submitted < minimum_workers {
+            batch.cancel();
+            return None;
+        }
+        Some(ParallelExecutionHandle {
+            batch,
+            receiver,
+            buffered: BTreeMap::new(),
+            scheduled_receipts,
+            remaining: tasks.len(),
+            worker_count: submitted,
+            snapshot_bytes,
+            snapshot_elapsed,
+            dispatch_window,
         })
     }
 
@@ -3412,13 +3709,17 @@ impl Controller {
         protocol_context: ProtocolExecutionContext,
         authorization_check: AuthorizationCheck,
         resource_mode: BlockResourceMode,
-    ) -> Vec<ParallelTransactionOutcome> {
+    ) -> Option<ParallelExecutionHandle> {
+        let mut scheduled_authorizers = BTreeSet::new();
         let tasks = block
             .transactions
             .iter()
             .enumerate()
             .filter_map(|(receipt_index, receipt)| {
-                let transaction = receipt.packed_trx()?.clone();
+                let transaction = receipt.packed_trx()?;
+                if !first_speculation_for_authorizer(transaction, &mut scheduled_authorizers) {
+                    return None;
+                }
                 let resource_mode = match resource_mode {
                     BlockResourceMode::ValidateReceipts => {
                         TransactionResourceMode::ValidateReceipt {
@@ -3435,13 +3736,13 @@ impl Controller {
                 };
                 Some((
                     receipt_index,
-                    transaction,
+                    transaction.clone(),
                     resource_mode,
                     SubjectiveBill::default(),
                 ))
             })
             .collect();
-        self.execute_parallel_transactions(
+        self.start_parallel_transactions(
             tasks,
             block.timestamp(),
             block_status,
@@ -3841,62 +4142,60 @@ impl Controller {
         // agreement with what the producer folded into the header.
 
         let parallel_started = Instant::now();
-        let parallel_outcomes = self.execute_parallel_block(
+        let mut parallel_outcomes = self.execute_parallel_block(
             block,
             block_status,
             protocol_context,
             authorization_check,
             resource_mode,
         );
-        if !parallel_outcomes.is_empty() {
-            let mut reports = Vec::new();
-            let mut successful = 0usize;
-            let mut failed = 0usize;
-            let mut committable = 0usize;
-            let mut action_traces = 0usize;
-            for outcome in &parallel_outcomes {
-                match &outcome.outcome {
-                    Ok(candidate) => {
-                        successful += 1;
-                        committable += usize::from(candidate.journal.is_some());
-                        action_traces += candidate.result.trace.action_traces.len();
-                        reports.push(candidate.dependencies.clone());
-                    }
-                    Err(_) => failed += 1,
-                }
-            }
-            let estimate = estimate_parallel_waves(&reports);
-            info!(
-                "parallel execution block={} configured_workers={} explicit={} successful={} failed={} committable={} action_traces={} waves={} max_width={} elapsed_us={}",
-                block.block_num(),
-                self.parallel_execution_workers.min(parallel_outcomes.len()),
-                parallel_outcomes.len(),
-                successful,
-                failed,
-                committable,
-                action_traces,
-                estimate.waves,
-                estimate.max_width,
-                parallel_started.elapsed().as_micros(),
-            );
-        }
-        let parallel_enabled = !parallel_outcomes.is_empty();
-        let mut parallel_outcomes = parallel_outcomes.into_iter().peekable();
-        let mut optimistic_prior_writes = BTreeSet::<DependencyKey>::new();
+        let parallel_enabled = parallel_outcomes.is_some();
+        let parallel_worker_count = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.worker_count);
+        let parallel_task_count = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.batch.tasks.len());
+        let parallel_snapshot_bytes = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.snapshot_bytes);
+        let parallel_snapshot_us = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.snapshot_elapsed.as_micros());
+        let parallel_dispatch_window = parallel_outcomes
+            .as_ref()
+            .map_or(0, |outcomes| outcomes.dispatch_window);
+        let mut parallel_reports = Vec::new();
+        let mut parallel_successful = 0usize;
+        let mut parallel_failed = 0usize;
+        let mut parallel_committable = 0usize;
+        let mut parallel_action_traces = 0usize;
+        let mut optimistic_prior_writes = CommittedWriteIndex::default();
         let mut optimistic_prefix_complete = true;
         let mut optimistic_committed = 0usize;
         let mut optimistic_fallbacks = 0usize;
+        let mut speculation_cancelled = false;
 
         let transactions_started = replay_profiling.then(Instant::now);
         for (receipt_index, receipt) in block.transactions.iter().enumerate() {
-            let parallel_outcome = if parallel_outcomes
-                .peek()
-                .is_some_and(|outcome| outcome.receipt_index == receipt_index)
-            {
-                parallel_outcomes.next().map(|outcome| outcome.outcome)
-            } else {
-                None
-            };
+            let parallel_outcome = receipt.packed_trx().and_then(|_| {
+                parallel_outcomes
+                    .as_mut()
+                    .and_then(|outcomes| outcomes.outcome_for(receipt_index))
+            });
+            if let Some(outcome) = &parallel_outcome {
+                match outcome {
+                    Ok(candidate) => {
+                        parallel_successful = parallel_successful.saturating_add(1);
+                        parallel_committable = parallel_committable
+                            .saturating_add(usize::from(candidate.journal.is_some()));
+                        parallel_action_traces = parallel_action_traces
+                            .saturating_add(candidate.result.trace.action_traces.len());
+                        parallel_reports.push(candidate.dependencies.clone());
+                    }
+                    Err(_) => parallel_failed = parallel_failed.saturating_add(1),
+                }
+            }
             let transaction_resource_mode = match resource_mode {
                 BlockResourceMode::ValidateReceipts => TransactionResourceMode::ValidateReceipt {
                     cpu_us: receipt.cpu_usage_us(),
@@ -3992,7 +4291,7 @@ impl Controller {
                     Some(Ok(candidate))
                         if candidate
                             .dependencies
-                            .can_optimistically_commit_after(&optimistic_prior_writes) =>
+                            .can_optimistically_commit_after_index(&optimistic_prior_writes) =>
                     {
                         match self.commit_parallel_candidate(candidate) {
                             Ok(result) => {
@@ -4022,6 +4321,17 @@ impl Controller {
                 }
                 None
             };
+            if parallel_outcomes.is_some()
+                && speculation_is_counterproductive(
+                    optimistic_committed,
+                    optimistic_fallbacks,
+                    parallel_worker_count,
+                )
+            {
+                parallel_outcomes.take();
+                speculation_cancelled = true;
+            }
+            let track_ordered_dependencies = parallel_outcomes.is_some();
             let (result, reproduced_receipt) = if let Some(result) = optimistic_result {
                 (result, receipt.clone())
             } else if let Some(deferred) = deferred {
@@ -4104,6 +4414,7 @@ impl Controller {
                             transaction_resource_mode,
                             AuthorizationCheck::AlreadyValidated,
                             true,
+                            false,
                         )?
                     }
                     crate::chain::transaction::TransactionStatus::SoftFail => {
@@ -4177,13 +4488,14 @@ impl Controller {
                         receipt.transaction_id()
                     ))
                 })?;
-                let result = self.execute_transaction_with_protocol(
+                let result = self.execute_transaction_with_protocol_tracking(
                     transaction,
                     protocol_context,
                     timestamp,
                     block_status,
                     transaction_resource_mode,
                     authorization_check,
+                    track_ordered_dependencies,
                 )?;
                 (result, receipt.clone())
             };
@@ -4237,7 +4549,7 @@ impl Controller {
             if result.proposed_schedule.is_some() {
                 proposed_schedule = result.proposed_schedule;
             }
-            if parallel_enabled {
+            if track_ordered_dependencies {
                 if let Some(dependencies) = &result.dependencies {
                     optimistic_prior_writes.extend(dependencies.writes().iter().copied());
                 } else {
@@ -4262,12 +4574,26 @@ impl Controller {
             self.parallel_transactions_fallback = self
                 .parallel_transactions_fallback
                 .saturating_add(optimistic_fallbacks as u64);
+            let estimate = estimate_parallel_waves(&parallel_reports);
             info!(
-                "parallel ordered commit block={} committed={} fallbacks={} prefix_complete={}",
+                "parallel execution block={} workers={} window={} snapshot_bytes={} snapshot_us={} explicit={} successful={} failed={} committable={} action_traces={} waves={} max_width={} committed={} fallbacks={} speculation_cancelled={} prefix_complete={} elapsed_us={}",
                 block.block_num(),
+                parallel_worker_count,
+                parallel_dispatch_window,
+                parallel_snapshot_bytes,
+                parallel_snapshot_us,
+                parallel_task_count,
+                parallel_successful,
+                parallel_failed,
+                parallel_committable,
+                parallel_action_traces,
+                estimate.waves,
+                estimate.max_width,
                 optimistic_committed,
                 optimistic_fallbacks,
+                speculation_cancelled,
                 optimistic_prefix_complete,
+                parallel_started.elapsed().as_micros(),
             );
         }
 
@@ -4549,67 +4875,73 @@ impl Controller {
         let block_height = BlockHeader::num_from_id(&self.pending_tip_id()) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let configured_workers = self.parallel_execution_workers;
+        let configured_tasks_per_worker = self.parallel_execution_tasks_per_worker;
         self.parallel_execution_workers = workers.clamp(1, 64);
+        self.parallel_execution_tasks_per_worker = 1;
         let db = self.db.clone();
         db.arena_start_undo_session();
         let attempt = (|| {
+            let mut scheduled_authorizers = BTreeSet::new();
             let tasks = transactions
                 .iter()
-                .cloned()
                 .enumerate()
-                .map(|(index, transaction)| {
-                    (
+                .filter_map(|(index, transaction)| {
+                    if !first_speculation_for_authorizer(transaction, &mut scheduled_authorizers) {
+                        return None;
+                    }
+                    Some((
                         index,
-                        transaction,
+                        transaction.clone(),
                         TransactionResourceMode::Measure,
                         SubjectiveBill::default(),
-                    )
+                    ))
                 })
                 .collect();
-            let outcomes = self.execute_parallel_transactions(
+            let mut outcomes = self.start_parallel_transactions(
                 tasks,
                 pending_block_timestamp,
                 &BlockStatus::Benchmarking,
                 protocol_context,
                 AuthorizationCheck::Required,
-                1,
+                workers.clamp(1, 2),
             );
-            let mut outcomes = outcomes.into_iter().peekable();
-            let mut prior_writes = BTreeSet::<DependencyKey>::new();
+            let mut prior_writes = CommittedWriteIndex::default();
             let mut report = ParallelExecutionBenchmark::default();
+            if let Some(outcomes) = &outcomes {
+                report.effective_workers = outcomes.worker_count;
+                report.snapshot_bytes = outcomes.snapshot_bytes;
+            }
+            let effective_workers = report.effective_workers;
 
             for (index, transaction) in transactions.iter().enumerate() {
-                let outcome = if outcomes
-                    .peek()
-                    .is_some_and(|outcome| outcome.receipt_index == index)
-                {
-                    outcomes.next().map(|outcome| outcome.outcome)
-                } else {
-                    None
-                };
+                let outcome = outcomes
+                    .as_mut()
+                    .and_then(|outcomes| outcomes.outcome_for(index));
                 let optimistic = match outcome {
                     Some(Ok(candidate))
                         if candidate
                             .dependencies
-                            .can_optimistically_commit_after(&prior_writes) =>
+                            .can_optimistically_commit_after_index(&prior_writes) =>
                     {
                         self.commit_parallel_candidate(candidate).ok()
                     }
                     _ => None,
                 };
+                let track_ordered_dependencies = outcomes.is_some();
                 let result = if let Some(result) = optimistic {
                     report.optimistic_commits = report.optimistic_commits.saturating_add(1);
                     result
                 } else {
                     report.serial_fallbacks = report.serial_fallbacks.saturating_add(1);
                     db.arena_start_undo_session();
-                    match self.execute_transaction_with_protocol(
+                    match self.execute_transaction_with_protocol_tracking(
                         transaction,
                         protocol_context,
                         pending_block_timestamp,
                         &BlockStatus::Benchmarking,
                         TransactionResourceMode::Measure,
                         AuthorizationCheck::Required,
+                        track_ordered_dependencies,
                     ) {
                         Ok(result) => {
                             db.arena_squash();
@@ -4621,16 +4953,78 @@ impl Controller {
                         }
                     }
                 };
-                let dependencies = result.dependencies.as_ref().ok_or_else(|| {
-                    ChainError::InternalError(
+                if let Some(dependencies) = &result.dependencies {
+                    prior_writes.extend(dependencies.writes().iter().copied());
+                } else if track_ordered_dependencies {
+                    return Err(ChainError::InternalError(
                         "ordered benchmark transaction has no dependency report".into(),
-                    )
-                })?;
-                prior_writes.extend(dependencies.writes().iter().copied());
+                    ));
+                }
                 report.transactions = report.transactions.saturating_add(1);
                 report.actions = report
                     .actions
                     .saturating_add(result.trace.action_traces.len());
+                if outcomes.is_some()
+                    && speculation_is_counterproductive(
+                        report.optimistic_commits,
+                        report.serial_fallbacks,
+                        effective_workers,
+                    )
+                {
+                    outcomes.take();
+                    report.speculation_cancelled = true;
+                }
+            }
+            Ok(report)
+        })();
+        db.arena_undo();
+        self.parallel_execution_workers = configured_workers;
+        self.parallel_execution_tasks_per_worker = configured_tasks_per_worker;
+        attempt
+    }
+
+    /// Benchmark the authoritative serial path without dependency recording or
+    /// speculative setup. The complete batch is rolled back before returning.
+    pub fn benchmark_serial_transactions(
+        &mut self,
+        transactions: &[PackedTransaction],
+        pending_block_timestamp: &BlockTimestamp,
+    ) -> Result<ParallelExecutionBenchmark, ChainError> {
+        if transactions.is_empty() {
+            return Ok(ParallelExecutionBenchmark::default());
+        }
+        let block_height = BlockHeader::num_from_id(&self.pending_tip_id()) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        let configured_workers = self.parallel_execution_workers;
+        self.parallel_execution_workers = 0;
+        let db = self.db.clone();
+        db.arena_start_undo_session();
+        let attempt = (|| {
+            let mut report = ParallelExecutionBenchmark::default();
+            for transaction in transactions {
+                db.arena_start_undo_session();
+                let result = match self.execute_transaction_with_protocol(
+                    transaction,
+                    protocol_context,
+                    pending_block_timestamp,
+                    &BlockStatus::Benchmarking,
+                    TransactionResourceMode::Measure,
+                    AuthorizationCheck::Required,
+                ) {
+                    Ok(result) => {
+                        db.arena_squash();
+                        result
+                    }
+                    Err(error) => {
+                        db.arena_undo();
+                        return Err(error);
+                    }
+                };
+                report.transactions = report.transactions.saturating_add(1);
+                report.actions = report
+                    .actions
+                    .saturating_add(result.trace.action_traces.len());
+                report.serial_fallbacks = report.serial_fallbacks.saturating_add(1);
             }
             Ok(report)
         })();
@@ -4815,6 +5209,7 @@ impl Controller {
             resource_mode,
             authorization_check,
             is_deferred,
+            false,
         )
     }
 
@@ -4827,6 +5222,27 @@ impl Controller {
         resource_mode: TransactionResourceMode,
         authorization_check: AuthorizationCheck,
     ) -> Result<TransactionResult, ChainError> {
+        self.execute_transaction_with_protocol_tracking(
+            packed_transaction,
+            protocol_context,
+            pending_block_timestamp,
+            block_status,
+            resource_mode,
+            authorization_check,
+            false,
+        )
+    }
+
+    fn execute_transaction_with_protocol_tracking(
+        &mut self,
+        packed_transaction: &PackedTransaction,
+        protocol_context: ProtocolExecutionContext,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+        resource_mode: TransactionResourceMode,
+        authorization_check: AuthorizationCheck,
+        track_dependencies: bool,
+    ) -> Result<TransactionResult, ChainError> {
         self.execute_transaction_with_protocol_authorization(
             packed_transaction,
             protocol_context,
@@ -4835,6 +5251,7 @@ impl Controller {
             resource_mode,
             authorization_check,
             false,
+            track_dependencies,
         )
     }
 
@@ -4847,6 +5264,7 @@ impl Controller {
         resource_mode: TransactionResourceMode,
         authorization_check: AuthorizationCheck,
         is_deferred: bool,
+        track_dependencies: bool,
     ) -> Result<TransactionResult, ChainError> {
         let trx = packed_transaction.get_transaction();
         let track_subjective_failure = resource_mode == TransactionResourceMode::Measure
@@ -4872,7 +5290,7 @@ impl Controller {
 
         let (mut execution_db, dependency_tracker) = if *DEPENDENCY_TELEMETRY_ENABLED
             || *PARALLEL_WAVE_TELEMETRY_ENABLED
-            || self.parallel_execution_workers > 0
+            || track_dependencies
         {
             let (database, tracker) = self.db.clone_with_dependency_tracking();
             (database, Some(tracker))
@@ -8026,10 +8444,12 @@ mod tests {
     fn full_transaction_workers_execute_in_parallel_without_canonical_writes()
     -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        let transactions = ["alice", "bob", "carol", "dan"]
-            .into_iter()
-            .map(|name| create_account(&private_key, Name::from_str(name)?, chain_id))
-            .collect::<Result<Vec<_>, ChainError>>()?;
+        let transactions = [
+            "alice", "bob", "carol", "dan", "erin", "frank", "grace", "hank",
+        ]
+        .into_iter()
+        .map(|name| create_account(&private_key, Name::from_str(name)?, chain_id))
+        .collect::<Result<Vec<_>, ChainError>>()?;
         let before = controller.db.arena_state_root();
         let timestamp = controller.last_accepted_block().timestamp().clone();
 
@@ -8045,6 +8465,7 @@ mod tests {
         assert_eq!(ordered.transactions, transactions.len());
         assert_eq!(ordered.optimistic_commits, 0);
         assert_eq!(ordered.serial_fallbacks, transactions.len());
+        assert_eq!(ordered.effective_workers, 0);
         assert_eq!(controller.db.arena_state_root(), before);
         for transaction in transactions {
             assert!(
@@ -8226,6 +8647,23 @@ mod tests {
                 &timestamp,
                 &status,
             )?;
+            controller.execute_transaction(
+                &call_contract_as(
+                    private_key,
+                    token,
+                    Name::from_str("transfer")?,
+                    &Transfer {
+                        from: token,
+                        to: recipient,
+                        quantity: Asset::new(10, Symbol(1_162_826_500)),
+                        memo: "fund ordered recipient".into(),
+                    },
+                    token,
+                    chain_id,
+                )?,
+                &timestamp,
+                &status,
+            )?;
             Ok((token, recipient))
         }
 
@@ -8234,23 +8672,27 @@ mod tests {
         let (token, recipient) = install_token_state(&mut producer, &private_key, chain_id)?;
         install_token_state(&mut validator, &private_key, chain_id)?;
 
-        let transfers = ["parallel-block-a", "parallel-block-b"]
-            .into_iter()
-            .map(|memo| {
-                call_contract(
-                    &private_key,
-                    token,
-                    Name::from_str("transfer")?,
-                    &Transfer {
-                        from: token,
-                        to: recipient,
-                        quantity: Asset::new(1, Symbol(1_162_826_500)),
-                        memo: memo.into(),
-                    },
-                    chain_id,
-                )
-            })
-            .collect::<Result<Vec<_>, ChainError>>()?;
+        let transfers = [
+            (token, recipient, "parallel-block-a"),
+            (recipient, token, "parallel-block-b"),
+        ]
+        .into_iter()
+        .map(|(from, to, memo)| {
+            call_contract_as(
+                &private_key,
+                token,
+                Name::from_str("transfer")?,
+                &Transfer {
+                    from,
+                    to,
+                    quantity: Asset::new(1, Symbol(1_162_826_500)),
+                    memo: memo.into(),
+                },
+                from,
+                chain_id,
+            )
+        })
+        .collect::<Result<Vec<_>, ChainError>>()?;
         let mut producer_mempool = Mempool::new();
         for transaction in &transfers {
             producer_mempool.add_transaction(transaction.clone());

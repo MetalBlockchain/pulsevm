@@ -900,7 +900,8 @@ pub use speculation::{
 /// executing WASM.
 #[derive(Clone)]
 pub struct ExecutionSnapshot {
-    arena: Arc<[u8]>,
+    arena: crate::backend::ChainDatabase,
+    estimated_heap_bytes: usize,
     system_accounts: SystemAccountNames,
     native_system_contract: bool,
     protocol_records: Vec<ProtocolActivationRecord>,
@@ -908,7 +909,7 @@ pub struct ExecutionSnapshot {
 
 impl ExecutionSnapshot {
     pub fn byte_len(&self) -> usize {
-        self.arena.len()
+        self.estimated_heap_bytes
     }
 }
 
@@ -979,7 +980,11 @@ pub enum ExecutionOperation {
 }
 
 impl ExecutionOperation {
-    fn explain_writes(&self, writes: &mut BTreeSet<DependencyKey>) {
+    fn explain_writes(&self, writes: &mut BTreeMap<DependencyKey, usize>) {
+        let mut write = |key| {
+            let count = writes.entry(key).or_default();
+            *count = count.saturating_add(1);
+        };
         let contract = |key: &ContractPrimaryKey, index| {
             DependencyKey::Contract(ContractRowKey::new(
                 key.code,
@@ -991,58 +996,56 @@ impl ExecutionOperation {
         };
         match self {
             Self::PrimaryCreate { key, .. } | Self::PrimaryRemove { key } => {
-                writes.insert(DependencyKey::Contract(ContractRowKey::table(
+                write(DependencyKey::Contract(ContractRowKey::table(
                     key.code, key.scope, key.table,
                 )));
-                writes.insert(contract(key, ContractIndex::Primary));
+                write(contract(key, ContractIndex::Primary));
             }
             Self::PrimaryUpdate { key, .. } => {
-                writes.insert(contract(key, ContractIndex::Primary));
+                write(contract(key, ContractIndex::Primary));
             }
             Self::SecondaryCreate { key, value, .. } | Self::SecondaryUpdate { key, value, .. } => {
                 if matches!(self, Self::SecondaryCreate { .. }) {
-                    writes.insert(DependencyKey::Contract(ContractRowKey::table(
+                    write(DependencyKey::Contract(ContractRowKey::table(
                         key.code, key.scope, key.table,
                     )));
                 }
-                writes.insert(contract(key, secondary_value_index(*value)));
+                write(contract(key, secondary_value_index(*value)));
             }
             Self::SecondaryRemove { key, index } => {
-                writes.insert(DependencyKey::Contract(ContractRowKey::table(
+                write(DependencyKey::Contract(ContractRowKey::table(
                     key.code, key.scope, key.table,
                 )));
-                writes.insert(contract(key, *index));
+                write(contract(key, *index));
             }
             Self::AccountUsage { account, .. } => {
-                writes.insert(DependencyKey::System(SystemKey::ResourceUsage(*account)));
-                writes.insert(DependencyKey::System(SystemKey::ResourceState));
+                write(DependencyKey::System(SystemKey::ResourceUsage(*account)));
+                write(DependencyKey::System(SystemKey::ResourceState));
             }
             Self::RamUsage { account, .. } => {
-                writes.insert(DependencyKey::System(SystemKey::ResourceUsage(*account)));
+                write(DependencyKey::System(SystemKey::ResourceUsage(*account)));
             }
             Self::VerifyRam { .. } => {}
             Self::PermissionUsage {
                 actor, permission, ..
             } => {
-                writes.insert(DependencyKey::System(SystemKey::PermissionUsage {
+                write(DependencyKey::System(SystemKey::PermissionUsage {
                     owner: *actor,
                     name: *permission,
                 }));
             }
             Self::RecordTransaction { id, .. } => {
-                writes.insert(DependencyKey::System(SystemKey::Transaction(*id)));
+                write(DependencyKey::System(SystemKey::Transaction(*id)));
             }
             Self::ActionSequences {
                 receiver,
                 auth_actors,
             } => {
-                writes.insert(DependencyKey::System(SystemKey::GlobalActionSequence));
-                writes.insert(DependencyKey::System(SystemKey::AccountSequence(*receiver)));
-                writes.extend(
-                    auth_actors
-                        .iter()
-                        .map(|actor| DependencyKey::System(SystemKey::AccountSequence(*actor))),
-                );
+                write(DependencyKey::System(SystemKey::GlobalActionSequence));
+                write(DependencyKey::System(SystemKey::AccountSequence(*receiver)));
+                for actor in auth_actors {
+                    write(DependencyKey::System(SystemKey::AccountSequence(*actor)));
+                }
             }
         }
     }
@@ -1063,6 +1066,12 @@ const fn secondary_value_index(value: ContractSecondaryValue) -> ContractIndex {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionJournal {
     operations: Vec<ExecutionOperation>,
+}
+
+#[derive(Default)]
+struct ExecutionJournalState {
+    operations: Vec<ExecutionOperation>,
+    observed_writes: BTreeMap<DependencyKey, usize>,
 }
 
 impl ExecutionJournal {
@@ -1112,7 +1121,7 @@ pub struct Database {
     dependency_recorder: Option<DependencyRecorder>,
     /// Present only on a full execution fork. Every supported mutation appends
     /// a logical operation here; clones made by action contexts share it.
-    execution_journal: Option<Arc<Mutex<Vec<ExecutionOperation>>>>,
+    execution_journal: Option<Arc<Mutex<ExecutionJournalState>>>,
     /// Installed lazily by the default-off speculative-wave API. Normal nodes
     /// pay only an unset `OnceLock` branch; once installed, logical writes bump
     /// the shared epoch so stale read snapshots can never commit.
@@ -1323,7 +1332,8 @@ impl Database {
             .map_err(|_| ChainError::InternalError("protocol record lock poisoned".into()))?
             .clone();
         Ok(ExecutionSnapshot {
-            arena: Arc::from(self.backend.execution_snapshot()),
+            arena: self.backend.execution_fork(),
+            estimated_heap_bytes: self.backend.estimated_heap_bytes(),
             system_accounts: self.system_accounts(),
             native_system_contract: self.native_system_contract,
             protocol_records,
@@ -1336,10 +1346,7 @@ impl Database {
     pub fn fork_execution_snapshot(
         snapshot: &ExecutionSnapshot,
     ) -> Result<(Self, DependencyTracker), ChainError> {
-        let backend = crate::backend::ChainDatabase::from_execution_snapshot(&snapshot.arena)
-            .map_err(|error| {
-                ChainError::InternalError(format!("load execution snapshot: {error:?}"))
-            })?;
+        let backend = snapshot.arena.execution_fork();
         let system_accounts = Arc::new(OnceLock::new());
         system_accounts.set(snapshot.system_accounts).map_err(|_| {
             ChainError::InternalError("execution snapshot system account initialized twice".into())
@@ -1354,7 +1361,7 @@ impl Database {
                 native_system_contract_locked: true,
                 protocol_records: Arc::new(Mutex::new(snapshot.protocol_records.clone())),
                 dependency_recorder: Some(tracker.recorder()),
-                execution_journal: Some(Arc::new(Mutex::new(Vec::new()))),
+                execution_journal: Some(Arc::new(Mutex::new(ExecutionJournalState::default()))),
                 speculation_epoch: Arc::new(OnceLock::new()),
                 speculation_freeze: Arc::new(AtomicBool::new(false)),
                 speculation_coordinator: Arc::new(AtomicBool::new(false)),
@@ -1372,7 +1379,7 @@ impl Database {
     pub fn reset_execution_tracking(&mut self) -> DependencyTracker {
         let tracker = DependencyTracker::new();
         self.dependency_recorder = Some(tracker.recorder());
-        self.execution_journal = Some(Arc::new(Mutex::new(Vec::new())));
+        self.execution_journal = Some(Arc::new(Mutex::new(ExecutionJournalState::default())));
         tracker
     }
 
@@ -1392,7 +1399,16 @@ impl Database {
         if let Some(journal) = &self.execution_journal
             && let Ok(mut journal) = journal.lock()
         {
-            journal.push(operation);
+            journal.operations.push(operation);
+        }
+    }
+
+    fn record_execution_write(&self, key: DependencyKey) {
+        if let Some(journal) = &self.execution_journal
+            && let Ok(mut journal) = journal.lock()
+        {
+            let count = journal.observed_writes.entry(key).or_default();
+            *count = count.saturating_add(1);
         }
     }
 
@@ -1403,13 +1419,17 @@ impl Database {
         &self,
         tracker: &DependencyTracker,
     ) -> Option<ExecutionJournal> {
-        let operations = self.execution_journal.as_ref()?.lock().ok()?.clone();
-        let mut explained = BTreeSet::new();
+        let journal = self.execution_journal.as_ref()?.lock().ok()?;
+        let operations = journal.operations.clone();
+        let observed_writes = journal.observed_writes.clone();
+        drop(journal);
+        let mut explained = BTreeMap::new();
         for operation in &operations {
             operation.explain_writes(&mut explained);
         }
         let dependencies = tracker.snapshot();
-        if dependencies.writes() != &explained {
+        let explained_keys = explained.keys().copied().collect::<BTreeSet<_>>();
+        if observed_writes != explained || dependencies.writes() != &explained_keys {
             return None;
         }
         tracker.mark_complete();
@@ -1701,6 +1721,8 @@ impl Database {
         primary: u64,
     ) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::Contract(ContractRowKey::new(code, scope, table, index, primary));
+        self.record_execution_write(key);
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             let capturing = cache.read_only_capture.is_some();
@@ -1715,18 +1737,16 @@ impl Database {
             }
         }
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::Contract(ContractRowKey::new(
-                code, scope, table, index, primary,
-            )));
+            recorder.write(key);
         }
     }
 
     fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::Contract(ContractRowKey::table(code, scope, table));
+        self.record_execution_write(key);
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::Contract(ContractRowKey::table(
-                code, scope, table,
-            )));
+            recorder.write(key);
         }
     }
 
@@ -1744,8 +1764,10 @@ impl Database {
 
     fn dependency_system_write(&self, key: SystemKey) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::System(key);
+        self.record_execution_write(key);
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::System(key));
+            recorder.write(key);
         }
     }
 
@@ -8469,6 +8491,25 @@ mod tests {
         assert_eq!(report.exact_read_count(), 0);
         assert_eq!(report.range_read_count(), 0);
         assert_eq!(report.write_count(), 7);
+    }
+
+    #[test]
+    fn journal_rejects_an_unexplained_duplicate_write_event() {
+        let base = Database::default();
+        let snapshot = base.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        worker
+            .create_key_value_object_standalone(1, 2, 3, 4, 5, b"value")
+            .unwrap();
+
+        // Simulate a future mutation path that records the correct dependency
+        // key but forgets to append its own logical journal operation. A set-only
+        // audit would miss this because the supported create already touched the
+        // same row; event-count parity must reject it.
+        worker.dependency_write(1, 2, 3, ContractIndex::Primary, 5);
+
+        assert!(worker.finish_execution_journal(&tracker).is_none());
+        assert!(!tracker.snapshot().is_complete());
     }
 }
 

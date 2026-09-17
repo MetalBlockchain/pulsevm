@@ -1695,6 +1695,18 @@ impl ChainDatabase {
         self.read().snapshot_bytes()
     }
 
+    /// Create an isolated copy-on-write Arena fork without serializing or
+    /// rebuilding indexes. Shared pages detach lazily on worker mutation.
+    pub fn execution_fork(&self) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(self.read().execution_fork())),
+        }
+    }
+
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.read().estimated_heap_bytes()
+    }
+
     /// Build an independent Arena from an in-memory execution snapshot.
     pub fn from_execution_snapshot(snapshot: &[u8]) -> Result<Self, DbError> {
         let mut db = build_registered_db()?;
@@ -6556,6 +6568,57 @@ mod tests {
         assert_eq!(canonical.idx64_find_primary(1, 2, 3, 20), Some(201));
         canonical.undo();
         assert_eq!(canonical.state_root(), before);
+    }
+
+    #[test]
+    fn copy_on_write_execution_forks_are_isolated() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"base")
+            .unwrap();
+        canonical
+            .create_index64_object(1, 2, 4, 9, 10, 100)
+            .unwrap();
+        let root = canonical.state_root();
+        let first = canonical.execution_fork();
+        let second = canonical.execution_fork();
+
+        first
+            .update_key_value_object(1, 2, 3, 10, 9, b"first")
+            .unwrap();
+        first.update_index64_object(1, 2, 4, 10, 9, 101).unwrap();
+
+        assert_eq!(canonical.state_root(), root);
+        assert_eq!(canonical.kv_get(1, 2, 3, 10).as_deref(), Some(&b"base"[..]));
+        assert_eq!(second.kv_get(1, 2, 3, 10).as_deref(), Some(&b"base"[..]));
+        assert_eq!(canonical.idx64_find_primary(1, 2, 4, 10), Some(100));
+        assert_eq!(second.idx64_find_primary(1, 2, 4, 10), Some(100));
+        assert_eq!(first.kv_get(1, 2, 3, 10).as_deref(), Some(&b"first"[..]));
+        assert_eq!(first.idx64_find_primary(1, 2, 4, 10), Some(101));
+        assert!(canonical.estimated_heap_bytes() > 0);
+    }
+
+    #[test]
+    fn copy_on_write_fork_freezes_live_uncommitted_prefix() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"committed")
+            .unwrap();
+        let committed_root = canonical.state_root();
+
+        canonical.start_undo_session();
+        canonical
+            .update_key_value_object(1, 2, 3, 10, 9, b"pending")
+            .unwrap();
+        let fork = canonical.execution_fork();
+        canonical.undo();
+
+        assert_eq!(canonical.state_root(), committed_root);
+        assert_eq!(
+            canonical.kv_get(1, 2, 3, 10).as_deref(),
+            Some(&b"committed"[..])
+        );
+        assert_eq!(fork.kv_get(1, 2, 3, 10).as_deref(), Some(&b"pending"[..]));
     }
 
     #[test]

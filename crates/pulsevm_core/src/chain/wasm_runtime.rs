@@ -3,6 +3,7 @@ use std::{
     cell::RefCell,
     collections::{
         BTreeSet,
+        HashMap,
         HashSet,
     },
     fs,
@@ -1174,6 +1175,9 @@ const MAX_INSTANCES_PER_STORE: u32 = 64;
 /// instance setup cost — compiled modules and consensus-visible execution stay
 /// unchanged.
 const MAX_WARM_STORES: usize = 64;
+/// Per-thread handles are cheap clones of the shared compiled module, but they
+/// avoid taking the shared LRU's write lock on every hot contract action.
+const MAX_THREAD_MODULES: usize = 16;
 
 /// Bound LLVM modules independently from their much smaller WASM inputs. A
 /// long historical replay sees thousands of obsolete deployments, and keeping
@@ -1195,6 +1199,8 @@ const WASM_ARTIFACT_CACHE_NAMESPACE: &str = "wasmer-7.2.0-llvm-pulsevm-v1";
 thread_local! {
     static STORE_POOL: RefCell<LruCache<Id, WarmStore>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(MAX_WARM_STORES).unwrap()));
+    static THREAD_MODULE_CACHE: RefCell<LruCache<Id, CachedModule>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(MAX_THREAD_MODULES).unwrap()));
 }
 
 struct InnerWasmRuntime {
@@ -1202,9 +1208,15 @@ struct InnerWasmRuntime {
     precompiling: HashSet<Id>,
 }
 
+struct ModuleCompileFlight {
+    result: Mutex<Option<Result<CachedModule, String>>>,
+    ready: std::sync::Condvar,
+}
+
 #[derive(Clone)]
 pub struct WasmRuntime {
     inner: Arc<RwLock<InnerWasmRuntime>>,
+    compile_flights: Arc<Mutex<HashMap<Id, Arc<ModuleCompileFlight>>>>,
     precompile_tx: Option<SyncSender<PrecompileJob>>,
     artifact_cache_dir: Option<PathBuf>,
 }
@@ -1301,6 +1313,7 @@ impl WasmRuntime {
 
         Ok(Self {
             inner,
+            compile_flights: Arc::new(Mutex::new(HashMap::new())),
             precompile_tx,
             artifact_cache_dir,
         })
@@ -1472,6 +1485,81 @@ impl WasmRuntime {
         Ok(())
     }
 
+    fn compile_module_singleflight(
+        &self,
+        db: &Database,
+        code_hash: &[u8; 32],
+        id: Id,
+    ) -> Result<CachedModule, ChainError> {
+        let (flight, leader) = {
+            let mut flights = self.compile_flights.lock().map_err(|_| {
+                ChainError::WasmRuntimeError("module compile-flight lock poisoned".into())
+            })?;
+            match flights.entry(id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    (Arc::clone(entry.get()), false)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let flight = Arc::new(ModuleCompileFlight {
+                        result: Mutex::new(None),
+                        ready: std::sync::Condvar::new(),
+                    });
+                    entry.insert(Arc::clone(&flight));
+                    (flight, true)
+                }
+            }
+        };
+
+        if !leader {
+            let mut result = flight.result.lock().map_err(|_| {
+                ChainError::WasmRuntimeError("module compile result lock poisoned".into())
+            })?;
+            while result.is_none() {
+                result = flight.ready.wait(result).map_err(|_| {
+                    ChainError::WasmRuntimeError("module compile result lock poisoned".into())
+                })?;
+            }
+            let Some(result) = result.as_ref() else {
+                return Err(ChainError::WasmRuntimeError(
+                    "module compile flight completed without a result".into(),
+                ));
+            };
+            return result.clone().map_err(ChainError::WasmRuntimeError);
+        }
+
+        let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // A caller can observe a shared miss, lose the race to a completed
+            // flight, and only then install a new flight after the first was
+            // removed. Recheck here so that window never recompiles the module.
+            if let Some(module) = self.inner.write()?.code_cache.get(&id) {
+                return Ok(module.clone());
+            }
+            let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
+            let (candidate, _) =
+                Self::compile_module(&code_bytes, id, self.artifact_cache_dir.as_deref())?;
+            let mut inner = self.inner.write()?;
+            Ok::<_, ChainError>(if let Some(module) = inner.code_cache.get(&id) {
+                module.clone()
+            } else {
+                inner.code_cache.put(id, candidate.clone());
+                candidate
+            })
+        }))
+        .unwrap_or_else(|_| {
+            Err(ChainError::WasmRuntimeError(
+                "module compilation panicked".into(),
+            ))
+        });
+        if let Ok(mut result) = flight.result.lock() {
+            *result = Some(compiled.as_ref().cloned().map_err(ToString::to_string));
+            flight.ready.notify_all();
+        }
+        if let Ok(mut flights) = self.compile_flights.lock() {
+            flights.remove(&id);
+        }
+        compiled
+    }
+
     /// Queue validated contract bytecode for best-effort compilation before its
     /// first execution. The queue is bounded and never blocks block execution;
     /// a cache miss still compiles synchronously with identical settings.
@@ -1553,23 +1641,19 @@ impl WasmRuntime {
         let id = Id::new(*code_hash);
         let module_started = profiling.then(Instant::now);
         let mut compiled = false;
-        let cached = self.inner.write()?.code_cache.get(&id).cloned();
+        let cached = THREAD_MODULE_CACHE.with(|cache| cache.borrow_mut().get(&id).cloned());
         let module = if let Some(module) = cached {
             module
         } else {
-            compiled = true;
-            let code_bytes = db.get_code_bytes_by_hash(code_hash, 0, 0)?;
-            // LLVM compilation is deliberately outside the shared cache lock so
-            // replay-only precompile workers cannot stall contract execution.
-            let (candidate, _) =
-                Self::compile_module(&code_bytes, id, self.artifact_cache_dir.as_deref())?;
-            let mut inner = self.inner.write()?;
-            if let Some(module) = inner.code_cache.get(&id) {
-                module.clone()
+            let shared = self.inner.write()?.code_cache.get(&id).cloned();
+            let module = if let Some(module) = shared {
+                module
             } else {
-                inner.code_cache.put(id, candidate.clone());
-                candidate
-            }
+                compiled = true;
+                self.compile_module_singleflight(&db, code_hash, id)?
+            };
+            THREAD_MODULE_CACHE.with(|cache| cache.borrow_mut().put(id, module.clone()));
+            module
         };
         let module_elapsed = module_started.map_or(Duration::ZERO, |started| started.elapsed());
         let store_started = profiling.then(Instant::now);
