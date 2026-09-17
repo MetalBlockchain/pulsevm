@@ -787,12 +787,9 @@ mod tests {
     use pulsevm_serialization::Write;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::{
-        sync::oneshot,
-        time::{
-            sleep,
-            timeout,
-        },
+    use tokio::time::{
+        sleep,
+        timeout,
     };
 
     const GENESIS_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
@@ -1063,33 +1060,20 @@ mod tests {
         let transaction = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
         let controller_guard = service.controller.write().await;
 
-        let (complete_tx, mut complete_rx) = oneshot::channel();
         let admission_service = service.clone();
-        tokio::spawn(async move {
-            let _ = complete_tx.send(admission_service.admit_transaction(transaction).await);
-        });
+        let admission =
+            tokio::spawn(async move { admission_service.admit_transaction(transaction).await });
 
-        let mut result = None;
-        for _ in 0..100 {
-            match complete_rx.try_recv() {
-                Ok(admission) => {
-                    result = Some(admission);
-                    break;
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(1))
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    panic!("admission task exited before returning a result")
-                }
-            }
-        }
-
-        assert!(
-            result
-                .expect("admission remained blocked on the controller execution lock")
-                .expect("admission failed")
-        );
+        // Awaiting yields the runtime worker instead of blocking it with
+        // thread::sleep. A generous wall-time limit still proves that admission
+        // does not wait for the controller guard while tolerating loaded CI
+        // runners and concurrent workspace tests.
+        let admitted = timeout(Duration::from_secs(5), admission)
+            .await
+            .expect("admission remained blocked on the controller execution lock")
+            .expect("admission task panicked")
+            .expect("admission failed");
+        assert!(admitted);
         assert!(mempool.read().await.has_transactions());
         let metrics = service.admission_metrics();
         assert_eq!(metrics.state_preflights, 1);
