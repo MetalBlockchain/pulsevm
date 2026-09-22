@@ -5,7 +5,7 @@ use crate::name::Name;
 use pulsevm_constants::PERCENT_100;
 use pulsevm_name_macro::name;
 
-pub const PLUGIN_VERSION: u32 = 43;
+pub const PLUGIN_VERSION: u32 = 45;
 pub const VERSION: &str = "v0.0.1";
 
 /// Metering points per microsecond of reference CPU time. This is the physical
