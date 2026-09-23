@@ -352,13 +352,21 @@ impl SignedBlock {
         transaction_mroot: Digest,
         action_mroot: Digest,
     ) -> Result<(), ChainError> {
+        self.validate_transaction_mroot(transaction_mroot)?;
+        self.validate_action_mroot(action_mroot)
+    }
+
+    pub fn validate_transaction_mroot(&self, transaction_mroot: Digest) -> Result<(), ChainError> {
         pulse_assert(
             self.signed_block_header.header.transaction_mroot == transaction_mroot,
             ChainError::BlockError(format!(
                 "transaction merkle root mismatch: expected {}, got {}",
                 transaction_mroot, self.signed_block_header.header.transaction_mroot
             )),
-        )?;
+        )
+    }
+
+    pub fn validate_action_mroot(&self, action_mroot: Digest) -> Result<(), ChainError> {
         pulse_assert(
             self.signed_block_header.header.action_mroot == action_mroot,
             ChainError::BlockError(format!(

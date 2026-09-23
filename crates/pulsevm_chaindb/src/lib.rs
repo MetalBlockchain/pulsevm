@@ -766,7 +766,9 @@ impl ChainConfigParams {
         out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
-        out.extend_from_slice(&self.deferred_trx_expiration_window.to_le_bytes());
+        // The frozen Leap state-root fixture uses the historical 16-field
+        // chain_config state shape. Keep deferred-trx expiration available to
+        // runtime configuration, but do not add it to this legacy root.
         out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());

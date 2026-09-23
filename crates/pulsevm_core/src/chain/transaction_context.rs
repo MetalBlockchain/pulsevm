@@ -842,6 +842,7 @@ impl TransactionContext {
     pub fn init_for_input_trx_from_block(
         &mut self,
         transaction: &Transaction,
+        bill_first_authorizer: bool,
     ) -> Result<(), ChainError> {
         self.validate_expiration(transaction)?;
         self.validate_referenced_accounts(transaction)?;
@@ -849,9 +850,10 @@ impl TransactionContext {
         let first_authorizer = transaction.first_authorizer().ok_or_else(|| {
             ChainError::TransactionError("transaction has no authorizations".into())
         })?;
-        let only_bill_first = self
-            .db
-            .protocol_feature_activated(ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST);
+        let only_bill_first = bill_first_authorizer
+            || self
+                .db
+                .protocol_feature_activated(ONLY_BILL_FIRST_AUTHORIZER_FEATURE_DIGEST);
         let billed_accounts = billed_accounts_for_transaction(
             transaction,
             Name::new(first_authorizer),
