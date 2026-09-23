@@ -563,10 +563,16 @@ impl Vm for VirtualMachine {
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::CreateHandlersResponse>, Status> {
         Ok(Response::new(vm::CreateHandlersResponse {
-            handlers: vec![Handler {
-                prefix: "/rpc".to_string(),
-                server_addr: self.server_addr.to_string(),
-            }],
+            handlers: vec![
+                Handler {
+                    prefix: "/rpc".to_string(),
+                    server_addr: self.server_addr.to_string(),
+                },
+                Handler {
+                    prefix: "/v1/chain".to_string(),
+                    server_addr: self.server_addr.to_string(),
+                },
+            ],
         }))
     }
 
@@ -1342,8 +1348,18 @@ impl Http for VirtualMachine {
         &self,
         request: Request<http::HandleSimpleHttpRequest>,
     ) -> Result<tonic::Response<http::HandleSimpleHttpResponse>, Status> {
-        let body = std::str::from_utf8(request.get_ref().body.as_slice())
+        let http_req = request.get_ref();
+        let url = &http_req.url;
+        let body = std::str::from_utf8(http_req.body.as_slice())
             .map_err(|_| Status::invalid_argument("invalid utf-8"))?;
+
+        // Dispatch based on URL path
+        if url.contains("/v1/chain/") {
+            // Handle nodeos compatibility API
+            return api::nodeos_compat::handle_nodeos_request(&self.rpc_service, url, body).await;
+        }
+
+        // Default to JSON-RPC handler
         let resp = self
             .rpc_service
             .handle_api_request(&body)

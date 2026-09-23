@@ -767,6 +767,147 @@ impl RpcServer for RpcService {
     }
 }
 
+// Public wrapper methods for nodeos compatibility layer
+impl RpcService {
+    pub async fn get_info_compat(&self) -> Result<crate::api::GetInfoResponse, ErrorObjectOwned> {
+        <Self as RpcServer>::get_info(self).await
+    }
+
+    pub async fn get_account_compat(
+        &self,
+        account_name: Name,
+        expected_core_symbol: Option<String>,
+    ) -> Result<Value, ErrorObjectOwned> {
+        <Self as RpcServer>::get_account(self, account_name, expected_core_symbol).await
+    }
+
+    pub async fn get_block_compat(
+        &self,
+        block_num_or_id: String,
+    ) -> Result<SignedBlock, ErrorObjectOwned> {
+        <Self as RpcServer>::get_block(self, block_num_or_id).await
+    }
+
+    pub async fn get_abi_compat(
+        &self,
+        account_name: Name,
+    ) -> Result<AbiDefinition, ErrorObjectOwned> {
+        <Self as RpcServer>::get_abi(self, account_name).await
+    }
+
+    pub async fn get_raw_abi_compat(
+        &self,
+        account_name: Name,
+    ) -> Result<crate::api::GetRawABIResponse, ErrorObjectOwned> {
+        <Self as RpcServer>::get_raw_abi(self, account_name).await
+    }
+
+    pub async fn get_table_rows_compat(
+        &self,
+        json: Option<bool>,
+        code: Name,
+        scope: String,
+        table: Name,
+        table_key: Option<String>,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
+        limit: Option<I32Flex>,
+        key_type: String,
+        index_position: Option<I32Flex>,
+        encode_type: Option<String>,
+        reverse: Option<bool>,
+        show_payer: Option<bool>,
+    ) -> Result<Value, ErrorObjectOwned> {
+        <Self as RpcServer>::get_table_rows(
+            self,
+            json,
+            code,
+            scope,
+            table,
+            table_key,
+            lower_bound,
+            upper_bound,
+            limit,
+            key_type,
+            index_position,
+            encode_type,
+            reverse,
+            show_payer,
+        )
+        .await
+    }
+
+    pub async fn get_table_by_scope_compat(
+        &self,
+        code: Name,
+        table: Name,
+        lower_bound: Option<StringFlex>,
+        upper_bound: Option<StringFlex>,
+        limit: Option<I32Flex>,
+        reverse: Option<bool>,
+    ) -> Result<Value, ErrorObjectOwned> {
+        <Self as RpcServer>::get_table_by_scope(
+            self,
+            code,
+            table,
+            lower_bound,
+            upper_bound,
+            limit,
+            reverse,
+        )
+        .await
+    }
+
+    pub async fn get_currency_balance_compat(
+        &self,
+        code: Name,
+        account: Name,
+        symbol: Option<String>,
+    ) -> Result<Value, ErrorObjectOwned> {
+        <Self as RpcServer>::get_currency_balance(self, code, account, symbol).await
+    }
+
+    pub async fn get_currency_stats_compat(
+        &self,
+        code: Name,
+        symbol: String,
+    ) -> Result<Value, ErrorObjectOwned> {
+        <Self as RpcServer>::get_currency_stats(self, code, symbol).await
+    }
+
+    pub async fn get_code_hash_compat(
+        &self,
+        account_name: Name,
+    ) -> Result<crate::api::GetCodeHashResponse, ErrorObjectOwned> {
+        <Self as RpcServer>::get_code_hash(self, account_name).await
+    }
+
+    pub async fn get_required_keys_compat(
+        &self,
+        trx: Transaction,
+        candidate_keys: BTreeSet<AuthorityPublicKey>,
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ErrorObjectOwned> {
+        <Self as RpcServer>::get_required_keys(self, trx, candidate_keys).await
+    }
+
+    pub async fn issue_tx_compat(
+        &self,
+        signatures: Vec<Signature>,
+        compression: TransactionCompression,
+        packed_context_free_data: Bytes,
+        packed_trx: Bytes,
+    ) -> Result<crate::api::IssueTxResponse, ErrorObjectOwned> {
+        <Self as RpcServer>::issue_tx(
+            self,
+            signatures,
+            compression,
+            packed_context_free_data,
+            packed_trx,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
