@@ -1434,4 +1434,67 @@ mod ram_usage_metric_tests {
                 .any(|label| label.name == "overflow" && label.value == "true")
         );
     }
+
+    #[tokio::test]
+    async fn create_handlers_advertises_rpc_and_nodeos_endpoints() {
+        let vm = VirtualMachine::new("127.0.0.1:1234".parse().unwrap()).unwrap();
+        let response = vm.create_handlers(Request::new(())).await.unwrap();
+        let handlers = response.into_inner().handlers;
+
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(handlers[0].prefix, "/rpc");
+        assert_eq!(handlers[1].prefix, "/v1/chain");
+        assert!(
+            handlers
+                .iter()
+                .all(|handler| handler.server_addr == "127.0.0.1:1234")
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_http_dispatches_nodeos_and_json_rpc_requests() {
+        let vm = VirtualMachine::new("127.0.0.1:1234".parse().unwrap()).unwrap();
+
+        let nodeos = vm
+            .handle_simple(Request::new(http::HandleSimpleHttpRequest {
+                method: "POST".to_string(),
+                url: "/v1/chain/unknown".to_string(),
+                request_headers: vec![],
+                body: b"{}".to_vec(),
+                response_headers: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(nodeos.code, 404);
+        assert!(
+            String::from_utf8(nodeos.body)
+                .unwrap()
+                .contains("unknown_method")
+        );
+
+        let utf8_status = vm
+            .handle_simple(Request::new(http::HandleSimpleHttpRequest {
+                method: "POST".to_string(),
+                url: "/rpc".to_string(),
+                request_headers: vec![],
+                body: vec![0xff],
+                response_headers: vec![],
+            }))
+            .await
+            .expect_err("invalid UTF-8 should be rejected");
+        assert_eq!(utf8_status.code(), tonic::Code::InvalidArgument);
+
+        let rpc_status = vm
+            .handle_simple(Request::new(http::HandleSimpleHttpRequest {
+                method: "POST".to_string(),
+                url: "/rpc".to_string(),
+                request_headers: vec![],
+                body: b"not-json".to_vec(),
+                response_headers: vec![],
+            }))
+            .await
+            .expect_err("malformed JSON-RPC should be rejected");
+        assert_eq!(rpc_status.code(), tonic::Code::Internal);
+    }
 }

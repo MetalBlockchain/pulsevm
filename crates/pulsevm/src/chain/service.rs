@@ -1402,4 +1402,205 @@ mod tests {
         build.await.unwrap().unwrap();
         assert!(mempool.read().await.contains(duplicate.id()));
     }
+
+    async fn nodeos_response(
+        service: &RpcService,
+        url: &str,
+        body: &str,
+    ) -> (i32, serde_json::Value) {
+        let response = crate::api::nodeos_compat::handle_nodeos_request(service, url, body)
+            .await
+            .unwrap()
+            .into_inner();
+        (
+            response.code,
+            serde_json::from_slice(&response.body).expect("nodeos response must be JSON"),
+        )
+    }
+
+    #[tokio::test]
+    async fn nodeos_compat_covers_successful_read_and_transaction_paths() {
+        let (service, _mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+
+        let (code, info) = nodeos_response(&service, "/v1/chain/get_info", "{}").await;
+        assert_eq!(code, 200);
+        assert_eq!(info["head_block_num"], 1);
+
+        let (code, account) = nodeos_response(
+            &service,
+            "/v1/chain/get_account",
+            r#"{"account_name":"pulse","expected_core_symbol":"XPR"}"#,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(account["account_name"], "pulse");
+
+        let (code, block) = nodeos_response(
+            &service,
+            "/v1/chain/get_block?irrelevant=true",
+            r#"{"block_num_or_id":"1"}"#,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(block.is_object());
+
+        let (code, block_info) =
+            nodeos_response(&service, "/v1/chain/get_block_info", r#"{"block_num":1}"#).await;
+        assert_eq!(code, 200);
+        assert_eq!(block_info["block_num"], 1);
+        assert_eq!(block_info["ref_block_num"], 1);
+
+        let (code, rows) = nodeos_response(
+            &service,
+            "/v1/chain/get_table_rows",
+            r#"{
+                "json":true,
+                "code":"pulse",
+                "scope":"pulse",
+                "table":"accounts",
+                "lower_bound":"",
+                "upper_bound":"",
+                "limit":0,
+                "index_position":0,
+                "reverse":false,
+                "show_payer":false
+            }"#,
+        )
+        .await;
+        assert_eq!(code, 500);
+        assert!(rows.is_object());
+
+        let (code, scoped) = nodeos_response(
+            &service,
+            "/v1/chain/get_table_by_scope",
+            r#"{
+                "code":"pulse",
+                "table":"accounts",
+                "lower_bound":"",
+                "upper_bound":"",
+                "limit":0,
+                "reverse":false
+            }"#,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(scoped.is_object());
+
+        let (code, required_keys) = nodeos_response(
+            &service,
+            "/v1/chain/get_required_keys",
+            r#"{
+                "transaction": {
+                    "expiration":"2023-01-01T00:00:00",
+                    "max_net_usage_words":0,
+                    "max_cpu_usage_ms":0,
+                    "actions":[]
+                },
+                "available_keys":[]
+            }"#,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(required_keys["required_keys"], serde_json::json!([]));
+
+        let packed = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        service
+            .admit_transaction(packed.clone())
+            .await
+            .expect("test transaction should be admitted before the HTTP request");
+        let packed_json = serde_json::to_value(&packed).unwrap();
+        let push_body = serde_json::json!({
+            "signatures": packed_json["signatures"],
+            "packed_context_free_data": packed_json["packed_context_free_data"],
+            "packed_trx": packed_json["packed_trx"]
+        })
+        .to_string();
+        let (code, pushed) =
+            nodeos_response(&service, "/v1/chain/push_transaction", &push_body).await;
+        assert_eq!(code, 200, "push response: {pushed}");
+        assert!(pushed["transaction_id"].is_string());
+
+        let (code, duplicate) =
+            nodeos_response(&service, "/v1/chain/send_transaction", &push_body).await;
+        assert_eq!(code, 200);
+        assert_eq!(duplicate["transaction_id"], pushed["transaction_id"]);
+    }
+
+    #[tokio::test]
+    async fn nodeos_compat_covers_parse_and_backend_errors() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+        for method in [
+            "get_account",
+            "get_block",
+            "get_block_info",
+            "get_abi",
+            "get_raw_abi",
+            "get_table_rows",
+            "get_table_by_scope",
+            "get_currency_balance",
+            "get_currency_stats",
+            "get_code_hash",
+            "get_required_keys",
+            "push_transaction",
+        ] {
+            let (code, body) = nodeos_response(&service, &format!("/v1/chain/{method}"), "{").await;
+            assert_eq!(code, 400, "{method} should reject malformed JSON");
+            assert_eq!(body["error"]["name"], "parse_error");
+        }
+
+        let (code, body) = nodeos_response(
+            &service,
+            "/v1/chain/get_account",
+            r#"{"account_name":"missing"}"#,
+        )
+        .await;
+        assert_eq!(code, 500);
+        assert_eq!(body["error"]["name"], "internal_error");
+
+        for (method, request) in [
+            ("get_abi", r#"{"account_name":"missing"}"#),
+            ("get_raw_abi", r#"{"account_name":"missing"}"#),
+            ("get_code_hash", r#"{"account_name":"missing"}"#),
+            ("get_block_info", r#"{"block_num":999999}"#),
+            ("get_block", r#"{"block_num_or_id":"not-a-block"}"#),
+            ("push_transaction", r#"{"signatures":[],"packed_trx":""}"#),
+        ] {
+            let (code, body) =
+                nodeos_response(&service, &format!("/v1/chain/{method}"), request).await;
+            assert_eq!(code, 500, "{method} should expose backend failure");
+            assert!(body["error"]["what"].is_string());
+        }
+
+        let (code, stats) = nodeos_response(
+            &service,
+            "/v1/chain/get_currency_stats",
+            r#"{"code":"pulse","symbol":"XPR"}"#,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(stats.is_array() || stats.is_object());
+
+        let (code, body) = nodeos_response(&service, "/v1/chain/unknown", "{}").await;
+        assert_eq!(code, 404);
+        assert_eq!(body["error"]["name"], "unknown_method");
+
+        let status = crate::api::nodeos_compat::handle_nodeos_request(&service, "/rpc", "{}")
+            .await
+            .expect_err("non-nodeos URL should be rejected");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn json_rpc_handler_round_trips_get_info() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+        let response = service
+            .handle_api_request(
+                r#"{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}"#,
+            )
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["head_block_num"], 1);
+    }
 }
