@@ -3771,6 +3771,7 @@ impl ChainDatabase {
         code: &[u8],
         code_hash: [u8; 32],
         head_block_num: u32,
+        first_block_used_override: Option<u32>,
         last_code_update: i64,
         vm_type: u8,
         vm_version: u8,
@@ -3806,7 +3807,8 @@ impl ChainDatabase {
                     c.code_hash = code_hash;
                     c.code = code_blob;
                     c.code_ref_count = 1;
-                    c.first_block_used = head_block_num.wrapping_add(1);
+                    c.first_block_used =
+                        first_block_used_override.unwrap_or_else(|| head_block_num.wrapping_add(1));
                     c.vm_type = vm_type;
                     c.vm_version = vm_version;
                 })?;

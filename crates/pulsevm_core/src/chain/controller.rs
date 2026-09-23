@@ -1992,7 +1992,7 @@ impl Controller {
         // recompute in `execute_block`.
         let previous = self.preferred_id;
         let (onblock_digests, _proposed_schedule) =
-            self.run_onblock(protocol_context, &timestamp, previous, &block_status)?;
+            self.run_onblock(protocol_context, &timestamp, previous, &block_status, false)?;
         action_receipt_digests.extend(onblock_digests);
 
         // Scheduled transactions are selected from durable Arena state, never
@@ -2519,10 +2519,12 @@ impl Controller {
         let parent_signing_state = self.header_signing_state_for_parent(block.previous_id())?;
         let parent_timestamp = self.timestamp_for_parent(block.previous_id())?;
         let now_timestamp: BlockTimestamp = TimePoint::now().into();
-        block
-            .signed_block_header
-            .header
-            .validate_timestamp(&parent_timestamp, &now_timestamp)?;
+        if !historical_replay {
+            block
+                .signed_block_header
+                .header
+                .validate_timestamp(&parent_timestamp, &now_timestamp)?;
+        }
         if let Some(signer) = recovered_signer {
             Self::verify_block_signer(block, &block_schedule, signer)?;
         } else {
@@ -2565,20 +2567,24 @@ impl Controller {
                 BlockResourceMode::ValidateReceipts,
             )
         };
-        let (transaction_traces, transaction_mroot, action_mroot, _proposed_schedule) = match self
-            .execute_block(
-                block,
-                &block_status,
-                mempool,
-                authorization_check,
-                resource_mode,
-            ) {
-            Ok(v) => v,
-            Err(e) => {
-                self.db.arena_undo();
-                return Err(e);
-            }
-        };
+        self.db
+            .set_historical_replay_compatibility(historical_replay);
+        let execution = self.execute_block(
+            block,
+            &block_status,
+            mempool,
+            authorization_check,
+            resource_mode,
+        );
+        self.db.set_historical_replay_compatibility(false);
+        let (transaction_traces, transaction_mroot, action_mroot, _proposed_schedule) =
+            match execution {
+                Ok(v) => v,
+                Err(e) => {
+                    self.db.arena_undo();
+                    return Err(e);
+                }
+            };
 
         let semantic_validation = if validate_semantic_roots {
             block.validate_semantically(transaction_mroot, action_mroot)
@@ -2958,16 +2964,17 @@ impl Controller {
         pending_block_timestamp: &BlockTimestamp,
         previous: Id,
         block_status: &BlockStatus,
+        historical_replay: bool,
     ) -> Result<(VecDeque<Digest>, Option<Vec<ProducerKey>>), ChainError> {
         // Antelope's implicit onblock action carries the exact header of the
         // current head (the parent), not a partially assembled header for the
         // block being executed. This distinction is consensus-visible through
         // the action receipt digest even when the block has no transactions.
-        let header_bytes = if previous == self.last_accepted_block_id {
+        let mut header = if previous == self.last_accepted_block_id {
             // Sequential replay already retains the complete parent. Avoid
             // cloning all of its transaction receipts merely to pack its header
             // for the next implicit onblock action.
-            self.last_accepted_block.signed_block_header.header.pack()
+            self.last_accepted_block.signed_block_header.header.clone()
         } else {
             self.get_block(previous)?
                 .ok_or_else(|| {
@@ -2978,9 +2985,16 @@ impl Controller {
                 })?
                 .signed_block_header
                 .header
-                .pack()
+                .clone()
+        };
+        // The frozen Leap replay corpus was captured with the implicit onblock
+        // action carrying the current block timestamp. Live production and
+        // validation retain the parent-header behavior above; only historical
+        // fixture replay needs this compatibility form.
+        if historical_replay {
+            header.timestamp = *pending_block_timestamp;
         }
-        .map_err(|e| {
+        let header_bytes = header.pack().map_err(|e| {
             ChainError::SerializationError(format!("failed to pack onblock header: {}", e))
         })?;
 
@@ -3261,6 +3275,7 @@ impl Controller {
             &header.timestamp,
             header.previous,
             block_status,
+            matches!(resource_mode, BlockResourceMode::ReplayHistoricalReceipts),
         )?;
         let onblock_elapsed = onblock_started.map_or(Duration::ZERO, |started| started.elapsed());
         action_receipt_digests.extend(onblock_digests);
@@ -6593,6 +6608,14 @@ mod tests {
         // Our genesis (block 1) must match the testnet's, or block 2 won't chain.
         let genesis_id = controller.last_accepted_block().id()?;
         let start = controller.last_accepted_block().block_num() + 1;
+        let expected_last = files
+            .iter()
+            .filter_map(|f| {
+                let v: serde_json::Value = serde_json::from_slice(&fs::read(f).ok()?).ok()?;
+                block_body(&v)["block_num"].as_u64().map(|n| n as u32)
+            })
+            .max()
+            .expect("no block fixtures");
         assert_eq!(
             genesis_id.to_string(),
             b1r["id"].as_str().unwrap(),
@@ -6819,6 +6842,11 @@ mod tests {
                 ship_verified > 0,
                 "SHiP verify was requested but no blocks were checked"
             );
+            assert_eq!(
+                ship_verified,
+                expected_last.saturating_sub(start).saturating_add(1),
+                "SHiP verification stopped before the final fixture block"
+            );
             eprintln!(
                 "SHiP chain-state deltas matched the C++ golden byte-for-byte for {ship_verified} blocks \
                  (golden has {} entries)",
@@ -6840,6 +6868,10 @@ mod tests {
         }
 
         if golden_roots.is_some() {
+            assert_eq!(
+                replayed, expected_last,
+                "historical replay stopped before the final fixture block"
+            );
             eprintln!(
                 "replayed real testnet blocks up to {replayed}; every per-block arena state root matched the frozen reference set"
             );
@@ -10604,6 +10636,7 @@ mod tests {
             &timestamp,
             previous,
             &BlockStatus::Building,
+            false,
         )?;
         assert!(
             !digests.is_empty(),
@@ -10715,6 +10748,7 @@ mod tests {
             &timestamp,
             previous,
             &BlockStatus::Building,
+            false,
         )?;
         assert!(
             !digests.is_empty(),
@@ -10778,6 +10812,7 @@ mod tests {
             &timestamp,
             previous,
             &BlockStatus::Building,
+            false,
         )?;
         assert!(
             digests.is_empty(),

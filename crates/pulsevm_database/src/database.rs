@@ -919,6 +919,9 @@ pub struct Database {
     /// Non-persisted capability used only by the offline XPR replay tool.
     /// Production VM construction leaves it false.
     xpr_native_replay: Arc<AtomicBool>,
+    /// Historical Leap fixture compatibility for non-SHiP code bookkeeping.
+    /// Production VM construction leaves it false.
+    historical_replay_compatibility: Arc<AtomicBool>,
     /// Contract rows rewritten repeatedly by audited native handlers are held
     /// in block-scoped overlays and applied once at commit. This is process-local
     /// replay machinery; ordinary VM execution never enables it.
@@ -1084,6 +1087,7 @@ impl Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            historical_replay_compatibility: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
             ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
@@ -3240,11 +3244,23 @@ impl Database {
                 new_code,
                 *code_hash,
                 head_block_num,
+                self.historical_replay_compatibility
+                    .load(Ordering::Relaxed)
+                    .then_some(2),
                 pending_block_time.time_since_epoch().count(),
                 vm_type,
                 vm_version,
             )
             .map_err(|e| ChainError::InternalError(format!("arena update_account_code: {e:?}")))
+    }
+
+    /// Enable the legacy code-object bookkeeping used by the frozen Leap
+    /// historical replay corpus. This is not consensus state and is disabled
+    /// for normal nodes.
+    #[doc(hidden)]
+    pub fn set_historical_replay_compatibility(&self, enabled: bool) {
+        self.historical_replay_compatibility
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Replace an account's ABI. Takes the account *name*; both the account and
@@ -8045,6 +8061,7 @@ impl Default for Database {
             speculation_freeze: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
+            historical_replay_compatibility: Arc::new(AtomicBool::new(false)),
             xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
             ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
