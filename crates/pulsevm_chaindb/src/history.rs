@@ -69,9 +69,9 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 19 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
 /// A table appears in the stream only when it has entries for the block.
-const TABLE_ORDER: [&str; 19] = [
+const TABLE_ORDER: [&str; 16] = [
     "account",
     "account_metadata",
     "code",
@@ -80,10 +80,7 @@ const TABLE_ORDER: [&str; 19] = [
     "contract_index64",
     "contract_index128",
     "contract_index256",
-    "contract_index_double",
-    "contract_index_long_double",
     "global_property",
-    "generated_transaction",
     "protocol_state",
     "permission",
     "permission_link",
