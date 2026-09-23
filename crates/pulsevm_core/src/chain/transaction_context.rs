@@ -184,13 +184,15 @@ pub(super) fn try_execute_xpr_mechanics_from_block(
         )?,
     ]);
     cache.record_permission_usage(authorization.actor(), authorization.permission());
+    // The caller gates this shortcut on ReplayValidatedReceipts. Preserve the
+    // committed bill in both accumulators without applying affordability again.
     ResourceLimitsManager::add_transaction_usage(
         db,
         &billed_account,
         u64::from(cpu_usage_us),
         u64::from(net_usage_words) * 8,
         pending.slot(),
-        true,
+        false,
     )?;
 
     Ok(Some(action_digests))
@@ -418,13 +420,15 @@ pub(super) fn try_execute_xpr_bot_from_block(
     // audited bot action observes resource usage between init and finalize, so
     // one call produces byte-identical usage rows without the redundant Arena
     // write/undo entry.
+    // The caller gates this shortcut on ReplayValidatedReceipts, so the receipt
+    // has already passed the objective quota checks on this node.
     ResourceLimitsManager::add_transaction_usage(
         db,
         &billed_account,
         u64::from(cpu_usage_us),
         u64::from(net_usage_words) * 8,
         pending.slot(),
-        true,
+        false,
     )?;
     result.profile.resources =
         resources_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -1423,6 +1427,14 @@ impl TransactionContext {
         // During benchmarks this would throw an error because the accounts won't have enough CPU to
         // cover the billed time, so we skip this step if we're benchmarking.
         if self.block_status != BlockStatus::Benchmarking {
+            // Explicit billing is used only for implicit transactions and for
+            // receipts this node has already validated. Both must advance the
+            // account and block accumulators, but neither is subject to the
+            // input-transaction affordability check at this point: implicit
+            // transactions have no account CPU ceiling, while replay must apply
+            // the producer-recorded receipt even if the payer's remaining quota
+            // at the end of the block is lower than that receipt.
+            let validate_resource_limits = !inner.explicit_billed_cpu_time;
             for account in &inner.bill_to_accounts {
                 ResourceLimitsManager::add_transaction_usage(
                     &mut self.db,
@@ -1430,7 +1442,7 @@ impl TransactionContext {
                     inner.trace.receipt.cpu_usage_us as u64,
                     inner.trace.net_usage as u64,
                     inner.pending_block_timestamp.slot(),
-                    true,
+                    validate_resource_limits,
                 )?;
             }
         }
