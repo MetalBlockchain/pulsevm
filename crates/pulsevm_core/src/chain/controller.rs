@@ -3003,13 +3003,16 @@ impl Controller {
                     receipt_started.map_or(Duration::ZERO, |started| started.elapsed());
                 let resources_started = profiling.then(Instant::now);
                 let min_cpu = self.db.chain_config()?.min_transaction_cpu_usage;
+                // onblock is an implicit system transaction with no account CPU
+                // ceiling. It still contributes its fixed bill to account and
+                // block usage, but cannot fail an input-transaction quota check.
                 ResourceLimitsManager::add_transaction_usage(
                     &mut self.db,
                     &system,
                     u64::from(min_cpu),
                     0,
                     pending_block_timestamp.slot(),
-                    true,
+                    false,
                 )?;
                 direct_profile.resources =
                     resources_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -9300,6 +9303,102 @@ mod tests {
             validator.pending_chain.is_empty(),
             "a rejected block must leave nothing on the pending chain"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_receipt_replay_bills_usage_without_rechecking_payer_quota()
+    -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _producer_temp) = init_test_controller()?;
+        let mut producer_mempool = Mempool::new();
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("testapi")?,
+            chain_id,
+        )?);
+        let block = producer.build_block(&mut producer_mempool).await?;
+        let receipt_cpu = u64::from(block.transactions[0].cpu_usage_us());
+
+        let exhaust_pulse_cpu = |controller: &mut Controller| -> Result<(), ChainError> {
+            // A zero weight has no effect while total stake is zero, so add a
+            // second weighted account to make pulse's zero CPU allowance
+            // objective. The account is otherwise unrelated to block execution.
+            let weighted = Name::from_str("resourcefund")?;
+            controller.db.create_account(weighted.as_u64(), 0)?;
+            controller
+                .db
+                .initialize_account_resource_limits(weighted.as_u64())?;
+            controller
+                .db
+                .set_account_limits(weighted.as_u64(), -1, 1_000_000, 1_000_000)?;
+            controller
+                .db
+                .set_account_limits(PULSE_NAME.as_u64(), -1, 1_000_000, 0)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut controller.db)
+        };
+
+        // First-time validation is still objective: an untrusted block cannot
+        // spend CPU for a payer whose current allowance is zero.
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        exhaust_pulse_cpu(&mut validator)?;
+        let mut validator_mempool = Mempool::new();
+        validator.db.arena_start_undo_session();
+        let validation = validator
+            .execute_block(
+                &block,
+                &BlockStatus::Verifying,
+                &mut validator_mempool,
+                AuthorizationCheck::Required,
+                BlockResourceMode::ValidateReceipts,
+            )
+            .map(|_| ());
+        validator.db.arena_undo();
+        let validation_error =
+            validation.expect_err("first-time validation must retain objective resource limits");
+        assert!(
+            validation_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("cpu"),
+            "expected an objective CPU failure, got: {validation_error}"
+        );
+
+        // The same receipt may be replayed only after this node has validated
+        // it. Replay applies the committed bill even though the payer has no
+        // quota left, and must still advance the payer's CPU accumulator.
+        let (mut replayer, _replayer_key, _replayer_chain_id, _replayer_temp) =
+            init_test_controller()?;
+        exhaust_pulse_cpu(&mut replayer)?;
+        let usage_before = replayer
+            .db
+            .arena_account_cpu_usage_value_ex(PULSE_NAME.as_u64())
+            .expect("pulse must have a resource-usage row");
+        let min_cpu = u64::from(replayer.db.chain_config()?.min_transaction_cpu_usage);
+        let cpu_window = u128::from(replayer.db.get_account_cpu_usage_average_window()?);
+        let value_ex_contribution = |units: u64| {
+            u64::try_from((u128::from(units) * 1_000_000).div_ceil(cpu_window)).unwrap()
+        };
+        let mut replay_mempool = Mempool::new();
+        replayer.db.arena_start_undo_session();
+        replayer.execute_block(
+            &block,
+            &BlockStatus::Verifying,
+            &mut replay_mempool,
+            AuthorizationCheck::AlreadyValidated,
+            BlockResourceMode::ReplayValidatedReceipts,
+        )?;
+        let usage_after = replayer
+            .db
+            .arena_account_cpu_usage_value_ex(PULSE_NAME.as_u64())
+            .expect("pulse must retain its resource-usage row");
+        assert_eq!(
+            usage_after,
+            usage_before + value_ex_contribution(min_cpu) + value_ex_contribution(receipt_cpu),
+            "trusted replay must record both onblock and receipt CPU exactly"
+        );
+        replayer.db.arena_undo();
 
         Ok(())
     }
