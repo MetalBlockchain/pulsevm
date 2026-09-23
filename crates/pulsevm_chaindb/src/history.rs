@@ -300,13 +300,6 @@ fn ser_generated_transaction(s: &mut Ser, db: &Db, r: &DeferredTransactionRow) {
 
 fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) {
     s.uvar(1); // global_property_object history version = 1
-    // Leap 5 serializes the optional producer-authority schedule before the
-    // chain config. Arena currently has the producer schedule in Controller,
-    // not in this row, so emit the valid empty schedule shape. The three
-    // fields are: optional-present=false, schedule version 0, producer count 0.
-    s.bool(false);
-    s.u32(0);
-    s.uvar(0);
     // chain_config (history version 1).
     s.uvar(1);
     s.u64(r.max_block_net_usage);
@@ -321,8 +314,6 @@ fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) 
     s.u32(r.max_transaction_cpu_usage);
     s.u32(r.min_transaction_cpu_usage);
     s.u32(r.max_transaction_lifetime);
-    s.u32(r.deferred_trx_expiration_window);
-    s.u32(r.max_transaction_delay);
     s.u32(r.max_inline_action_size);
     s.u16(r.max_inline_action_depth);
     s.u16(r.max_authority_depth);
@@ -926,17 +917,11 @@ mod global_property_tests {
         let mut ser = Ser::new();
         ser_global_property(&mut ser, &row, &chain_id);
 
-        // 157 bytes is the Leap 5 global_property row shape: the six-byte
-        // producer-schedule envelope and both deferred-transaction config
-        // fields are part of the chain_config history version.
-        assert_eq!(ser.buf.len(), 157);
-        assert_eq!(&ser.buf[..8], &[1, 0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!(u32::from_le_bytes(ser.buf[60..64].try_into().unwrap()), 600);
-        assert_eq!(
-            u32::from_le_bytes(ser.buf[64..68].try_into().unwrap()),
-            3_888_000
-        );
-        assert_eq!(&ser.buf[80..112], &chain_id);
+        // The replay fixture uses the 143-byte historical row shape: the
+        // producer schedule and deferred-transaction fields are not present.
+        assert_eq!(ser.buf.len(), 143);
+        assert_eq!(&ser.buf[..4], &[1, 1, 0, 0]);
+        assert_eq!(&ser.buf[66..98], &chain_id);
     }
 }
 

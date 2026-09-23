@@ -11,3 +11,4 @@ install/
 plugins/build/
 
 .claude/*
+.vscode/settings.json
