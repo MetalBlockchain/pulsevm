@@ -26,6 +26,7 @@ use std::{
 
 mod history;
 
+pub use pulsevm_arena::DbDelta;
 use pulsevm_arena::{
     ArenaObject,
     BlobRef,
@@ -1688,6 +1689,51 @@ impl ChainDatabase {
         Ok(ChainDatabase {
             inner: Arc::new(RwLock::new(db)),
         })
+    }
+
+    /// Capture the current live Arena state for transaction-local worker forks.
+    /// The source's dirty markers and undo stack are not changed.
+    pub fn execution_snapshot(&self) -> Vec<u8> {
+        self.read().snapshot_bytes()
+    }
+
+    /// Create an isolated copy-on-write Arena fork without serializing or
+    /// rebuilding indexes. Shared pages detach lazily on worker mutation.
+    pub fn execution_fork(&self) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(self.read().execution_fork())),
+        }
+    }
+
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.read().estimated_heap_bytes()
+    }
+
+    pub fn execution_private_bytes(&self) -> usize {
+        self.read().execution_private_bytes()
+    }
+
+    /// Build an independent Arena from an in-memory execution snapshot.
+    pub fn from_execution_snapshot(snapshot: &[u8]) -> Result<Self, DbError> {
+        let mut db = build_registered_db()?;
+        db.load_snapshot_bytes(snapshot)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(db)),
+        })
+    }
+
+    /// Export the writes made by an independent transaction worker.
+    pub fn execution_delta(&self) -> DbDelta {
+        self.read().delta_bytes()
+    }
+
+    pub fn reset_execution_delta_baseline(&self) {
+        self.lock().reset_delta_baseline();
+    }
+
+    /// Apply a validated worker delta inside the caller's active undo session.
+    pub fn apply_execution_delta(&self, delta: &DbDelta) -> Result<(), DbError> {
+        self.lock().apply_delta_bytes(delta)
     }
 
     fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Db> {
@@ -5136,6 +5182,115 @@ impl ChainDatabase {
             .collect()
     }
 
+    /// Every idx128 row in `(secondary_key, primary_key)` order, including the
+    /// secondary row's RAM payer.
+    pub fn idx128_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u128, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex128Row>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdx128BySecondary>()
+            .range((
+                Bound::Included((t_id, u128::MIN, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u64::MAX)),
+            ))
+            .map(|(&(_, secondary, primary), row)| (secondary, primary, row.payer))
+            .collect()
+    }
+
+    /// Every idx256 row in chainbase `(word0, word1, primary_key)` order.
+    pub fn idx256_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<([u8; 32], u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex256Row>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdx256BySecondary>()
+            .range((
+                Bound::Included((t_id, u128::MIN, u128::MIN, u64::MIN)),
+                Bound::Included((t_id, u128::MAX, u128::MAX, u64::MAX)),
+            ))
+            .map(|(&(_, word0, word1, primary), row)| {
+                (join_key256(word0, word1), primary, row.payer)
+            })
+            .collect()
+    }
+
+    /// Every idx_double row in the same software-float order as iterator
+    /// traversal. Secondary values are returned as their exact stored bits.
+    pub fn idx_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndexDoubleRow>() else {
+            return Vec::new();
+        };
+        tbl.get_index::<ContractIdxDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, DoubleKey(f64::NEG_INFINITY), u64::MIN)),
+                Bound::Included((t_id, DoubleKey(f64::INFINITY), u64::MAX)),
+            ))
+            .map(|(&(_, _, primary), row)| (row.secondary_key.to_bits(), primary, row.payer))
+            .collect()
+    }
+
+    /// Every idx_long_double row in the same software-float order as iterator
+    /// traversal, returned as exact `(lo, hi)` words.
+    pub fn idx_long_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<((u64, u64), u64, u64)> {
+        use std::ops::Bound;
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndexLongDoubleRow>() else {
+            return Vec::new();
+        };
+        let min_key = LongDoubleKey {
+            lo: 0,
+            hi: 0xFFFF_0000_0000_0000,
+        };
+        let max_key = LongDoubleKey {
+            lo: 0,
+            hi: 0x7FFF_0000_0000_0000,
+        };
+        tbl.get_index::<ContractIdxLongDoubleBySecondary>()
+            .range((
+                Bound::Included((t_id, min_key, u64::MIN)),
+                Bound::Included((t_id, max_key, u64::MAX)),
+            ))
+            .map(|(&(_, _, primary), row)| ((row.sec_lo, row.sec_hi), primary, row.payer))
+            .collect()
+    }
+
     /// idx128 secondary-index positioning, same semantics as the idx64 family but
     /// over a `u128` secondary key: `(primary, secondary)` of the landing row,
     /// in `(secondary, primary)` order.
@@ -6392,6 +6547,107 @@ mod tests {
         });
     }
 
+    #[test]
+    fn execution_forks_rebase_independent_fixed_rows_and_undo() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_index64_object(1, 2, 3, 9, 10, 100)
+            .unwrap();
+        canonical
+            .create_index64_object(1, 2, 3, 9, 20, 200)
+            .unwrap();
+        let before = canonical.state_root();
+        let snapshot = canonical.execution_snapshot();
+
+        let first = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        first.update_index64_object(1, 2, 3, 10, 9, 101).unwrap();
+        let first_delta = first.execution_delta();
+        assert!(first_delta.allocation_domains().is_empty());
+
+        let second = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        second.update_index64_object(1, 2, 3, 20, 9, 201).unwrap();
+        let second_delta = second.execution_delta();
+        assert!(second_delta.allocation_domains().is_empty());
+
+        canonical.start_undo_session();
+        canonical.apply_execution_delta(&first_delta).unwrap();
+        canonical.apply_execution_delta(&second_delta).unwrap();
+        assert_eq!(canonical.idx64_find_primary(1, 2, 3, 10), Some(101));
+        assert_eq!(canonical.idx64_find_primary(1, 2, 3, 20), Some(201));
+        canonical.undo();
+        assert_eq!(canonical.state_root(), before);
+    }
+
+    #[test]
+    fn copy_on_write_execution_forks_are_isolated() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"base")
+            .unwrap();
+        canonical
+            .create_index64_object(1, 2, 4, 9, 10, 100)
+            .unwrap();
+        let root = canonical.state_root();
+        let first = canonical.execution_fork();
+        let second = canonical.execution_fork();
+
+        first
+            .update_key_value_object(1, 2, 3, 10, 9, b"first")
+            .unwrap();
+        first.update_index64_object(1, 2, 4, 10, 9, 101).unwrap();
+
+        assert_eq!(canonical.state_root(), root);
+        assert_eq!(canonical.kv_get(1, 2, 3, 10).as_deref(), Some(&b"base"[..]));
+        assert_eq!(second.kv_get(1, 2, 3, 10).as_deref(), Some(&b"base"[..]));
+        assert_eq!(canonical.idx64_find_primary(1, 2, 4, 10), Some(100));
+        assert_eq!(second.idx64_find_primary(1, 2, 4, 10), Some(100));
+        assert_eq!(first.kv_get(1, 2, 3, 10).as_deref(), Some(&b"first"[..]));
+        assert_eq!(first.idx64_find_primary(1, 2, 4, 10), Some(101));
+        assert!(canonical.estimated_heap_bytes() > 0);
+    }
+
+    #[test]
+    fn copy_on_write_fork_freezes_live_uncommitted_prefix() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"committed")
+            .unwrap();
+        let committed_root = canonical.state_root();
+
+        canonical.start_undo_session();
+        canonical
+            .update_key_value_object(1, 2, 3, 10, 9, b"pending")
+            .unwrap();
+        let fork = canonical.execution_fork();
+        canonical.undo();
+
+        assert_eq!(canonical.state_root(), committed_root);
+        assert_eq!(
+            canonical.kv_get(1, 2, 3, 10).as_deref(),
+            Some(&b"committed"[..])
+        );
+        assert_eq!(fork.kv_get(1, 2, 3, 10).as_deref(), Some(&b"pending"[..]));
+    }
+
+    #[test]
+    fn execution_delta_reports_row_and_blob_allocator_domains() {
+        let canonical = ChainDatabase::new().unwrap();
+        canonical
+            .create_key_value_object(1, 2, 3, 9, 10, b"old")
+            .unwrap();
+        let snapshot = canonical.execution_snapshot();
+
+        let update = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        update
+            .update_key_value_object(1, 2, 3, 10, 9, b"new value")
+            .unwrap();
+        assert!(!update.execution_delta().allocation_domains().is_empty());
+
+        let create = ChainDatabase::from_execution_snapshot(&snapshot).unwrap();
+        create.create_index64_object(1, 2, 3, 9, 20, 200).unwrap();
+        assert!(!create.execution_delta().allocation_domains().is_empty());
+    }
+
     /// The read primitives the arena serves to a contract — point read, forward
     /// scan, and the four iterator-positioning queries — must follow the index's
     /// primary-key order regardless of insertion order.
@@ -6949,6 +7205,10 @@ mod tests {
         s.update_index128_object(code, scope, table, 5, p1, 101)
             .unwrap();
         assert_eq!(s.idx128_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx128_range_with_payer(code, scope, table),
+            vec![(101, 5, p1)]
+        );
         s.remove_index128_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx128_payer(code, scope, table, 5), None);
 
@@ -6960,6 +7220,10 @@ mod tests {
         s.update_index256_object(code, scope, table, 5, p1, key)
             .unwrap();
         assert_eq!(s.idx256_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx256_range_with_payer(code, scope, table),
+            vec![(key, 5, p1)]
+        );
         s.remove_index256_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx256_payer(code, scope, table, 5), None);
 
@@ -6970,6 +7234,10 @@ mod tests {
         s.update_idx_double_object(code, scope, table, 5, p1, 2.0f64.to_bits())
             .unwrap();
         assert_eq!(s.idx_double_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx_double_range_with_payer(code, scope, table),
+            vec![(2.0f64.to_bits(), 5, p1)]
+        );
         s.remove_idx_double_object(code, scope, table, 5).unwrap();
         assert_eq!(s.idx_double_payer(code, scope, table, 5), None);
 
@@ -6980,6 +7248,10 @@ mod tests {
         s.update_idx_long_double_object(code, scope, table, 5, p1, (0, 2))
             .unwrap();
         assert_eq!(s.idx_long_double_payer(code, scope, table, 5), Some(p1));
+        assert_eq!(
+            s.idx_long_double_range_with_payer(code, scope, table),
+            vec![((0, 2), 5, p1)]
+        );
         s.remove_idx_long_double_object(code, scope, table, 5)
             .unwrap();
         assert_eq!(s.idx_long_double_payer(code, scope, table, 5), None);

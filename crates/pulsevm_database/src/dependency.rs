@@ -1,10 +1,10 @@
 //! Transaction-local database dependency recording.
 //!
-//! This is the observation-only first stage of optimistic execution. A
-//! recorder is attached to a cloned [`crate::Database`] handle, so all clones
+//! A recorder is attached to a cloned [`crate::Database`] handle, so all clones
 //! made for inline actions and WASM host functions share one transaction-local
-//! report while unrelated transactions do not. Recording never participates in
-//! a database result and is absent from the default execution path.
+//! report while unrelated transactions do not. Full execution workers use the
+//! completed report to validate ordered logical-journal commit; ordinary serial
+//! execution can also enable the same recorder for telemetry and fallback.
 
 use std::{
     collections::BTreeSet,
@@ -75,6 +75,39 @@ pub struct ContractRangeKey {
     pub index: ContractIndex,
 }
 
+/// Inclusive primary-key interval whose contents or absence affected an
+/// iterator-positioning result. Writes outside the interval cannot change that
+/// observation and therefore need not force serial fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContractPrimaryRangeKey {
+    pub code: u64,
+    pub scope: u64,
+    pub table: u64,
+    pub lower: u64,
+    pub upper: u64,
+}
+
+impl ContractPrimaryRangeKey {
+    pub(crate) const fn new(code: u64, scope: u64, table: u64, lower: u64, upper: u64) -> Self {
+        Self {
+            code,
+            scope,
+            table,
+            lower,
+            upper,
+        }
+    }
+
+    fn contains(&self, row: ContractRowKey) -> bool {
+        row.index == ContractIndex::Primary
+            && self.code == row.code
+            && self.scope == row.scope
+            && self.table == row.table
+            && self.lower <= row.primary
+            && row.primary <= self.upper
+    }
+}
+
 impl ContractRangeKey {
     pub(crate) const fn new(code: u64, scope: u64, table: u64, index: ContractIndex) -> Self {
         Self {
@@ -91,6 +124,10 @@ impl ContractRangeKey {
 pub enum SystemKey {
     Account(u64),
     AccountMetadata(u64),
+    /// Receipt-only receiver/auth sequence counters stored in account metadata.
+    /// These are rebased in canonical action order and must not hide semantic
+    /// metadata writes such as code, ABI, or privilege changes.
+    AccountSequence(u64),
     Permission {
         owner: u64,
         name: u64,
@@ -144,21 +181,99 @@ pub enum DependencyKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RangeDependency {
     Contract(ContractRangeKey),
+    ContractPrimary(ContractPrimaryRangeKey),
     System(SystemRangeKey),
 }
 
 /// Dependencies observed while executing one serial transaction.
 ///
-/// Serial telemetry leaves `complete` false. The closed, typed speculative
-/// overlay marks it true only when execution used exclusively supported logical
-/// operations; any unsupported path keeps the report incomplete. An optimistic
-/// commit implementation must reject incomplete reports.
+/// Serial telemetry leaves `complete` false. A speculative overlay or full
+/// transaction worker marks it true only when execution used exclusively
+/// supported logical operations; any unsupported path keeps the report
+/// incomplete. Ordered commit always rejects incomplete reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionDependencies {
     exact_reads: BTreeSet<DependencyKey>,
     range_reads: BTreeSet<RangeDependency>,
     writes: BTreeSet<DependencyKey>,
     complete: bool,
+}
+
+/// Incremental index of canonical writes committed after a worker snapshot.
+///
+/// Ordered validation walks the candidate's bounded dependency set instead of
+/// rescanning every write accumulated by the block. Range summaries preserve
+/// the same conservative phantom rules as [`dependencies_observe_write`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommittedWriteIndex {
+    exact: BTreeSet<DependencyKey>,
+    contract_ranges: BTreeSet<ContractRangeKey>,
+    contract_primary_writes: BTreeSet<(u64, u64, u64, u64)>,
+    permission_owners: BTreeSet<u64>,
+    deferred_queue_dirty: bool,
+}
+
+impl CommittedWriteIndex {
+    pub fn insert(&mut self, write: DependencyKey) {
+        if is_ordered_commit_bookkeeping(write) {
+            return;
+        }
+        match write {
+            DependencyKey::Contract(row) => {
+                self.contract_ranges.insert(ContractRangeKey::new(
+                    row.code, row.scope, row.table, row.index,
+                ));
+                if row.index == ContractIndex::Primary {
+                    self.contract_primary_writes.insert((
+                        row.code,
+                        row.scope,
+                        row.table,
+                        row.primary,
+                    ));
+                }
+            }
+            DependencyKey::System(SystemKey::Permission { owner, .. }) => {
+                self.permission_owners.insert(owner);
+            }
+            DependencyKey::System(SystemKey::DeferredTransaction(_))
+            | DependencyKey::System(SystemKey::DeferredSender { .. }) => {
+                self.deferred_queue_dirty = true;
+            }
+            DependencyKey::System(_) => {}
+        }
+        self.exact.insert(write);
+    }
+
+    pub fn extend(&mut self, writes: impl IntoIterator<Item = DependencyKey>) {
+        for write in writes {
+            self.insert(write);
+        }
+    }
+
+    pub fn conflicts(&self, dependencies: &TransactionDependencies) -> bool {
+        dependencies
+            .exact_reads
+            .iter()
+            .chain(&dependencies.writes)
+            .any(|key| self.exact.contains(key))
+            || dependencies.range_reads.iter().any(|range| match range {
+                RangeDependency::Contract(range) => self.contract_ranges.contains(range),
+                RangeDependency::ContractPrimary(range) => self
+                    .contract_primary_writes
+                    .range(
+                        (range.code, range.scope, range.table, range.lower)
+                            ..=(range.code, range.scope, range.table, range.upper),
+                    )
+                    .next()
+                    .is_some(),
+                RangeDependency::System(SystemRangeKey::PermissionsByOwner(owner)) => {
+                    self.permission_owners.contains(owner)
+                }
+                RangeDependency::System(SystemRangeKey::DeferredDueQueue) => {
+                    self.deferred_queue_dirty
+                }
+            })
+    }
 }
 
 impl TransactionDependencies {
@@ -208,7 +323,9 @@ impl TransactionDependencies {
                             write.table,
                             write.index,
                         )),
-                    ),
+                    ) || self.range_reads.iter().any(|range| {
+                        matches!(range, RangeDependency::ContractPrimary(range) if range.contains(*write))
+                    }),
                     DependencyKey::System(SystemKey::Permission { owner, .. }) => {
                         self.range_reads.contains(&RangeDependency::System(
                             SystemRangeKey::PermissionsByOwner(*owner),
@@ -223,12 +340,26 @@ impl TransactionDependencies {
         })
     }
 
-    /// Safe ordered-commit gate for a future optimistic executor.
+    /// Safe ordered-commit gate for the optimistic executor.
     ///
     /// Keeping the completeness check next to conflict validation prevents a
     /// partially instrumented report from being accidentally treated as valid.
     pub fn can_optimistically_commit_after(&self, prior_writes: &BTreeSet<DependencyKey>) -> bool {
-        self.complete && !self.conflicts_with_prior_writes(prior_writes)
+        self.complete
+            && !prior_writes
+                .iter()
+                .copied()
+                .filter(|key| !is_ordered_commit_bookkeeping(*key))
+                .any(|write| dependencies_observe_write(self, write))
+    }
+
+    /// Indexed equivalent of [`Self::can_optimistically_commit_after`] for the
+    /// ordered block hot path.
+    pub fn can_optimistically_commit_after_index(
+        &self,
+        prior_writes: &CommittedWriteIndex,
+    ) -> bool {
+        self.complete && !prior_writes.conflicts(self)
     }
 
     /// Whether two transactions that execute from the same block-prefix
@@ -257,12 +388,9 @@ fn is_ordered_commit_bookkeeping(key: DependencyKey) -> bool {
     matches!(
         key,
         DependencyKey::System(
-            SystemKey::AccountMetadata(_)
+            SystemKey::AccountSequence(_)
                 | SystemKey::GlobalActionSequence
-                | SystemKey::PermissionUsage { .. }
-                | SystemKey::ResourceUsage(_)
                 | SystemKey::ResourceState
-                | SystemKey::Transaction(_)
         )
     )
 }
@@ -284,6 +412,9 @@ fn dependencies_observe_write(
                     write.table,
                     write.index,
                 )))
+                || dependencies.range_reads.iter().any(|range| {
+                    matches!(range, RangeDependency::ContractPrimary(range) if range.contains(write))
+                })
         }
         DependencyKey::System(SystemKey::Permission { owner, .. }) => {
             dependencies.range_reads.contains(&RangeDependency::System(
@@ -399,6 +530,10 @@ impl DependencyTracker {
         self.recorder.snapshot()
     }
 
+    pub(crate) fn mark_complete(&self) {
+        self.recorder.mark_complete();
+    }
+
     pub(crate) fn recorder(&self) -> DependencyRecorder {
         self.recorder.clone()
     }
@@ -427,6 +562,63 @@ mod tests {
         assert_eq!(report.range_reads, BTreeSet::from([range]));
         assert_eq!(report.writes, BTreeSet::from([row]));
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn primary_interval_ignores_writes_that_cannot_change_positioning() {
+        let dependencies = TransactionDependencies {
+            exact_reads: BTreeSet::new(),
+            range_reads: BTreeSet::from([RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(1, 2, 3, 10, 20),
+            )]),
+            writes: BTreeSet::new(),
+            complete: true,
+        };
+        let outside =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 21));
+        let inside =
+            DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 15));
+
+        assert!(dependencies.can_optimistically_commit_after(&BTreeSet::from([outside])));
+        assert!(!dependencies.can_optimistically_commit_after(&BTreeSet::from([inside])));
+        let mut index = CommittedWriteIndex::default();
+        index.insert(outside);
+        assert!(dependencies.can_optimistically_commit_after_index(&index));
+        index.insert(inside);
+        assert!(!dependencies.can_optimistically_commit_after_index(&index));
+    }
+
+    #[test]
+    fn ordered_commit_only_excludes_field_safe_bookkeeping() {
+        let account = 7;
+        let transaction = [9; 32];
+        let dependencies = TransactionDependencies {
+            exact_reads: BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountMetadata(account)),
+                DependencyKey::System(SystemKey::Transaction(transaction)),
+            ]),
+            range_reads: BTreeSet::new(),
+            writes: BTreeSet::new(),
+            complete: true,
+        };
+
+        assert!(
+            dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountSequence(account)),
+                DependencyKey::System(SystemKey::GlobalActionSequence),
+                DependencyKey::System(SystemKey::ResourceState),
+            ]))
+        );
+        assert!(
+            !dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::AccountMetadata(account)),
+            ]))
+        );
+        assert!(
+            !dependencies.can_optimistically_commit_after(&BTreeSet::from([
+                DependencyKey::System(SystemKey::Transaction(transaction)),
+            ]))
+        );
     }
 
     #[test]
@@ -523,6 +715,59 @@ mod tests {
     }
 
     #[test]
+    fn indexed_ordered_conflicts_match_write_set_validation() {
+        let row = DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Idx64, 4));
+        let permission = DependencyKey::System(SystemKey::Permission { owner: 7, name: 8 });
+        let deferred = DependencyKey::System(SystemKey::DeferredTransaction([9; 32]));
+        let bookkeeping = DependencyKey::System(SystemKey::GlobalActionSequence);
+        let writes = BTreeSet::from([row, permission, deferred, bookkeeping]);
+        let mut index = CommittedWriteIndex::default();
+        index.extend(writes.iter().copied());
+
+        let cases =
+            [
+                TransactionDependencies {
+                    exact_reads: BTreeSet::from([row]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::Contract(
+                        ContractRangeKey::new(1, 2, 3, ContractIndex::Idx64),
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::System(
+                        SystemRangeKey::PermissionsByOwner(7),
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    range_reads: BTreeSet::from([RangeDependency::System(
+                        SystemRangeKey::DeferredDueQueue,
+                    )]),
+                    complete: true,
+                    ..Default::default()
+                },
+                TransactionDependencies {
+                    exact_reads: BTreeSet::from([bookkeeping]),
+                    complete: true,
+                    ..Default::default()
+                },
+            ];
+
+        for dependencies in cases {
+            assert_eq!(
+                dependencies.can_optimistically_commit_after(&writes),
+                dependencies.can_optimistically_commit_after_index(&index),
+            );
+        }
+    }
+
+    #[test]
     fn wave_estimate_serializes_data_conflicts_but_not_commit_counters() {
         let row_a =
             DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 10));
@@ -530,8 +775,8 @@ mod tests {
             DependencyKey::Contract(ContractRowKey::new(1, 2, 3, ContractIndex::Primary, 11));
         let bookkeeping = BTreeSet::from([
             DependencyKey::System(SystemKey::GlobalActionSequence),
-            DependencyKey::System(SystemKey::AccountMetadata(1)),
-            DependencyKey::System(SystemKey::ResourceUsage(7)),
+            DependencyKey::System(SystemKey::AccountSequence(1)),
+            DependencyKey::System(SystemKey::ResourceState),
         ]);
         let first = TransactionDependencies {
             writes: BTreeSet::from([row_a])

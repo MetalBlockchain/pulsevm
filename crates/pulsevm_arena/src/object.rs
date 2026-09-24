@@ -13,6 +13,7 @@ use std::{
         Hasher,
     },
     marker::PhantomData,
+    sync::Arc,
 };
 
 use zerocopy::{
@@ -142,6 +143,7 @@ pub trait IndexedBy<T: ArenaObject>: Send + Sync + 'static {
 /// Object-safe interface used by [`Table`] to maintain a secondary index
 /// without knowing its key type.
 pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>>;
     fn tag(&self) -> TypeId;
     fn index_name(&self) -> &'static str;
     /// Inserts the object's key -> id in a single tree operation; returns
@@ -156,7 +158,11 @@ pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
     /// than one `try_insert` per row, and index reconstruction dominates open.
     /// Returns `false` if two live rows share a key (a corrupt snapshot).
     fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool;
+    /// Fold sparse changes back into the base when it is no longer shared.
+    fn compact(&mut self);
     fn len(&self) -> usize;
+    /// Heap bytes privately owned after a copy-on-write execution fork.
+    fn detached_bytes(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -165,19 +171,81 @@ pub trait SecondaryIndex<T: ArenaObject>: Send + Sync {
 
 /// Concrete secondary index: an ordered map from `Tag::Key` to object id.
 pub struct KeyIndex<T: ArenaObject, Tag: IndexedBy<T>> {
-    pub(crate) map: BTreeMap<Tag::Key, i64>,
+    pub(crate) map: Arc<BTreeMap<Tag::Key, i64>>,
+    pub(crate) changes: BTreeMap<Tag::Key, Option<i64>>,
+    overlay: bool,
+    len: usize,
     _marker: PhantomData<fn() -> (T, Tag)>,
 }
 
 /// Creates the boxed index registered from [`ArenaObject::secondary_indices`].
 pub fn key_index<T: ArenaObject, Tag: IndexedBy<T>>() -> Box<dyn SecondaryIndex<T>> {
     Box::new(KeyIndex::<T, Tag> {
-        map: BTreeMap::new(),
+        map: Arc::new(BTreeMap::new()),
+        changes: BTreeMap::new(),
+        overlay: false,
+        len: 0,
         _marker: PhantomData,
     })
 }
 
+impl<T: ArenaObject, Tag: IndexedBy<T>> KeyIndex<T, Tag> {
+    pub(crate) fn id_for(&self, key: &Tag::Key) -> Option<i64> {
+        self.changes
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| self.map.get(key).copied())
+    }
+
+    fn overlay_set(&mut self, key: Tag::Key, value: Option<i64>) {
+        let previous = self.id_for(&key);
+        match (previous, value) {
+            (None, Some(_)) => self.len = self.len.saturating_add(1),
+            (Some(_), None) => self.len = self.len.saturating_sub(1),
+            _ => {}
+        }
+        if self.map.get(&key).copied() == value {
+            self.changes.remove(&key);
+        } else {
+            self.changes.insert(key, value);
+        }
+    }
+
+    fn materialized(&self) -> BTreeMap<Tag::Key, i64> {
+        let mut map = self.map.as_ref().clone();
+        for (key, value) in &self.changes {
+            if let Some(id) = value {
+                map.insert(key.clone(), *id);
+            } else {
+                map.remove(key);
+            }
+        }
+        map
+    }
+
+    fn prepare_mutation(&mut self) {
+        if !self.overlay && Arc::strong_count(&self.map) > 1 {
+            self.overlay = true;
+        }
+    }
+}
+
 impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>> {
+        let map = if self.changes.is_empty() {
+            Arc::clone(&self.map)
+        } else {
+            Arc::new(self.materialized())
+        };
+        Box::new(Self {
+            map,
+            changes: BTreeMap::new(),
+            overlay: true,
+            len: self.len,
+            _marker: PhantomData,
+        })
+    }
+
     fn tag(&self) -> TypeId {
         TypeId::of::<Tag>()
     }
@@ -187,9 +255,19 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
     }
 
     fn try_insert(&mut self, obj: &T) -> bool {
-        match self.map.entry(Tag::key(obj)) {
+        self.prepare_mutation();
+        let key = Tag::key(obj);
+        if self.overlay {
+            if self.id_for(&key).is_some() {
+                return false;
+            }
+            self.overlay_set(key, Some(obj.id().raw()));
+            return true;
+        }
+        match Arc::make_mut(&mut self.map).entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(obj.id().raw());
+                self.len = self.len.saturating_add(1);
                 true
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
@@ -197,18 +275,28 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
     }
 
     fn replace(&mut self, old: &T, new: &T) -> bool {
+        self.prepare_mutation();
         let old_key = Tag::key(old);
         let new_key = Tag::key(new);
         if old_key == new_key {
             return true;
         }
-        match self.map.entry(new_key) {
+        if self.overlay {
+            if self.id_for(&new_key).is_some() {
+                return false;
+            }
+            self.overlay_set(new_key, Some(old.id().raw()));
+            self.overlay_set(old_key, None);
+            return true;
+        }
+        let map = Arc::make_mut(&mut self.map);
+        match map.entry(new_key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(old.id().raw());
             }
             std::collections::btree_map::Entry::Occupied(_) => return false,
         }
-        let removed = self.map.remove(&old_key);
+        let removed = map.remove(&old_key);
         debug_assert_eq!(
             removed,
             Some(old.id().raw()),
@@ -219,7 +307,19 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
     }
 
     fn erase(&mut self, obj: &T) {
-        let removed = self.map.remove(&Tag::key(obj));
+        self.prepare_mutation();
+        let key = Tag::key(obj);
+        let removed = if self.overlay {
+            let removed = self.id_for(&key);
+            self.overlay_set(key, None);
+            removed
+        } else {
+            let removed = Arc::make_mut(&mut self.map).remove(&key);
+            if removed.is_some() {
+                self.len = self.len.saturating_sub(1);
+            }
+            removed
+        };
         debug_assert_eq!(
             removed,
             Some(obj.id().raw()),
@@ -233,19 +333,40 @@ impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for KeyIndex<T, Tag> {
         // far cheaper than inserting each row into an empty map. Row position is
         // the object id.
         let mut live = 0usize;
-        self.map = rows
-            .iter()
-            .map(|(id, obj)| {
-                live += 1;
-                (Tag::key(obj), *id)
-            })
-            .collect();
+        self.map = Arc::new(
+            rows.iter()
+                .map(|(id, obj)| {
+                    live += 1;
+                    (Tag::key(obj), *id)
+                })
+                .collect(),
+        );
+        self.changes.clear();
+        self.overlay = false;
+        self.len = self.map.len();
         // Unique index: a dropped entry means two rows collided on a key.
         self.map.len() == live
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.len
+    }
+
+    fn compact(&mut self) {
+        if Arc::strong_count(&self.map) != 1 {
+            return;
+        }
+        if !self.changes.is_empty() {
+            self.map = Arc::new(self.materialized());
+            self.changes.clear();
+        }
+        self.overlay = false;
+    }
+
+    fn detached_bytes(&self) -> usize {
+        self.changes
+            .len()
+            .saturating_mul(std::mem::size_of::<(Tag::Key, Option<i64>)>().max(48))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -261,7 +382,10 @@ pub struct HashKeyIndex<T: ArenaObject, Tag: IndexedBy<T>>
 where
     Tag::Key: Hash + Eq,
 {
-    pub(crate) map: HashMap<Tag::Key, i64>,
+    pub(crate) map: Arc<HashMap<Tag::Key, i64>>,
+    pub(crate) changes: HashMap<Tag::Key, Option<i64>>,
+    overlay: bool,
+    len: usize,
     _marker: PhantomData<fn() -> (T, Tag)>,
 }
 
@@ -272,15 +396,77 @@ where
     Tag::Key: Hash + Eq,
 {
     Box::new(HashKeyIndex::<T, Tag> {
-        map: HashMap::new(),
+        map: Arc::new(HashMap::new()),
+        changes: HashMap::new(),
+        overlay: false,
+        len: 0,
         _marker: PhantomData,
     })
+}
+
+impl<T: ArenaObject, Tag: IndexedBy<T>> HashKeyIndex<T, Tag>
+where
+    Tag::Key: Hash + Eq,
+{
+    pub(crate) fn id_for(&self, key: &Tag::Key) -> Option<i64> {
+        self.changes
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| self.map.get(key).copied())
+    }
+
+    fn overlay_set(&mut self, key: Tag::Key, value: Option<i64>) {
+        let previous = self.id_for(&key);
+        match (previous, value) {
+            (None, Some(_)) => self.len = self.len.saturating_add(1),
+            (Some(_), None) => self.len = self.len.saturating_sub(1),
+            _ => {}
+        }
+        if self.map.get(&key).copied() == value {
+            self.changes.remove(&key);
+        } else {
+            self.changes.insert(key, value);
+        }
+    }
+
+    fn materialized(&self) -> HashMap<Tag::Key, i64> {
+        let mut map = self.map.as_ref().clone();
+        for (key, value) in &self.changes {
+            if let Some(id) = value {
+                map.insert(key.clone(), *id);
+            } else {
+                map.remove(key);
+            }
+        }
+        map
+    }
+
+    fn prepare_mutation(&mut self) {
+        if !self.overlay && Arc::strong_count(&self.map) > 1 {
+            self.overlay = true;
+        }
+    }
 }
 
 impl<T: ArenaObject, Tag: IndexedBy<T>> SecondaryIndex<T> for HashKeyIndex<T, Tag>
 where
     Tag::Key: Hash + Eq,
 {
+    fn fork_box(&self) -> Box<dyn SecondaryIndex<T>> {
+        let map = if self.changes.is_empty() {
+            Arc::clone(&self.map)
+        } else {
+            Arc::new(self.materialized())
+        };
+        Box::new(Self {
+            map,
+            changes: HashMap::new(),
+            overlay: true,
+            len: self.len,
+            _marker: PhantomData,
+        })
+    }
+
     fn tag(&self) -> TypeId {
         TypeId::of::<Tag>()
     }
@@ -290,9 +476,19 @@ where
     }
 
     fn try_insert(&mut self, obj: &T) -> bool {
-        match self.map.entry(Tag::key(obj)) {
+        self.prepare_mutation();
+        let key = Tag::key(obj);
+        if self.overlay {
+            if self.id_for(&key).is_some() {
+                return false;
+            }
+            self.overlay_set(key, Some(obj.id().raw()));
+            return true;
+        }
+        match Arc::make_mut(&mut self.map).entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(obj.id().raw());
+                self.len = self.len.saturating_add(1);
                 true
             }
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -300,18 +496,28 @@ where
     }
 
     fn replace(&mut self, old: &T, new: &T) -> bool {
+        self.prepare_mutation();
         let old_key = Tag::key(old);
         let new_key = Tag::key(new);
         if old_key == new_key {
             return true;
         }
-        match self.map.entry(new_key) {
+        if self.overlay {
+            if self.id_for(&new_key).is_some() {
+                return false;
+            }
+            self.overlay_set(new_key, Some(old.id().raw()));
+            self.overlay_set(old_key, None);
+            return true;
+        }
+        let map = Arc::make_mut(&mut self.map);
+        match map.entry(new_key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(old.id().raw());
             }
             std::collections::hash_map::Entry::Occupied(_) => return false,
         }
-        let removed = self.map.remove(&old_key);
+        let removed = map.remove(&old_key);
         debug_assert_eq!(
             removed,
             Some(old.id().raw()),
@@ -322,7 +528,19 @@ where
     }
 
     fn erase(&mut self, obj: &T) {
-        let removed = self.map.remove(&Tag::key(obj));
+        self.prepare_mutation();
+        let key = Tag::key(obj);
+        let removed = if self.overlay {
+            let removed = self.id_for(&key);
+            self.overlay_set(key, None);
+            removed
+        } else {
+            let removed = Arc::make_mut(&mut self.map).remove(&key);
+            if removed.is_some() {
+                self.len = self.len.saturating_sub(1);
+            }
+            removed
+        };
         debug_assert_eq!(
             removed,
             Some(obj.id().raw()),
@@ -333,18 +551,39 @@ where
 
     fn bulk_build(&mut self, rows: &[(i64, T)]) -> bool {
         let mut live = 0usize;
-        self.map = rows
-            .iter()
-            .map(|(id, obj)| {
-                live += 1;
-                (Tag::key(obj), *id)
-            })
-            .collect();
+        self.map = Arc::new(
+            rows.iter()
+                .map(|(id, obj)| {
+                    live += 1;
+                    (Tag::key(obj), *id)
+                })
+                .collect(),
+        );
+        self.changes.clear();
+        self.overlay = false;
+        self.len = self.map.len();
         self.map.len() == live
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.len
+    }
+
+    fn compact(&mut self) {
+        if Arc::strong_count(&self.map) != 1 {
+            return;
+        }
+        if !self.changes.is_empty() {
+            self.map = Arc::new(self.materialized());
+            self.changes.clear();
+        }
+        self.overlay = false;
+    }
+
+    fn detached_bytes(&self) -> usize {
+        self.changes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Tag::Key, Option<i64>)>().max(32))
     }
 
     fn as_any(&self) -> &dyn Any {

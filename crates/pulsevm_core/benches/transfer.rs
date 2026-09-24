@@ -1,6 +1,7 @@
 use chrono::Utc;
 use criterion::{
     Criterion,
+    Throughput,
     black_box,
     criterion_group,
     criterion_main,
@@ -260,7 +261,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     from: Name::from_str("pulse.token").unwrap(),
                     to: Name::from_str("alice").unwrap(),
                     quantity: Asset {
-                        amount: 100000000,
+                        amount: 50000000,
                         symbol: Symbol::from_str("4,EOS").unwrap(),
                     },
                     memo: "Initial transfer".to_string(),
@@ -276,6 +277,55 @@ fn criterion_benchmark(c: &mut Criterion) {
             &block_status,
         )
         .unwrap();
+
+    // Seed disjoint sender/recipient balance rows for the scalable workload.
+    // Every account uses the benchmark key; setup is outside timed sections.
+    let suffixes = [
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+    ];
+    let mut independent_pairs = Vec::new();
+    for suffix in suffixes {
+        let sender = Name::from_str(&format!("send{suffix}")).unwrap();
+        let recipient = Name::from_str(&format!("recv{suffix}")).unwrap();
+        for account in [sender, recipient] {
+            controller
+                .execute_transaction(
+                    &create_account(&private_key, account, controller.chain_id().clone()).unwrap(),
+                    &pending_block_timestamp,
+                    &block_status,
+                )
+                .unwrap();
+        }
+        for (account, amount) in [(sender, 100), (recipient, 1)] {
+            controller
+                .execute_transaction(
+                    &call_contract(
+                        &private_key,
+                        Name::from_str("pulse.token").unwrap(),
+                        Name::from_str("transfer").unwrap(),
+                        &Transfer {
+                            from: Name::from_str("pulse.token").unwrap(),
+                            to: account,
+                            quantity: Asset {
+                                amount,
+                                symbol: Symbol::from_str("4,EOS").unwrap(),
+                            },
+                            memo: format!("fund-{account}"),
+                        },
+                        controller.chain_id().clone(),
+                        vec![PermissionLevel::new(
+                            Name::from_str("pulse.token").unwrap().as_u64(),
+                            ACTIVE_NAME.as_u64(),
+                        )],
+                    )
+                    .unwrap(),
+                    &pending_block_timestamp,
+                    &block_status,
+                )
+                .unwrap();
+        }
+        independent_pairs.push((sender, recipient));
+    }
 
     // Keep the exact same signed WASM transfer for both admission paths. This
     // isolates the work that the new preflight avoids: opening an undo session
@@ -327,6 +377,127 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
     admission_group.finish();
+
+    // The hot-key batch measures conflict-heavy speculation. The independent
+    // batch updates distinct pre-existing balance/resource/permission rows and
+    // measures useful ordered commits. Both include full authorization, WASM,
+    // dependency capture, journal replay/fallback, and rollback of the timed
+    // batch so every Criterion iteration starts from the same state.
+    let hot_batch = (0..16)
+        .map(|index| {
+            call_contract(
+                &private_key,
+                Name::from_str("pulse.token").unwrap(),
+                Name::from_str("transfer").unwrap(),
+                &Transfer {
+                    from: Name::from_str("alice").unwrap(),
+                    to: Name::from_str("bob").unwrap(),
+                    quantity: Asset {
+                        amount: 1,
+                        symbol: Symbol::from_str("4,EOS").unwrap(),
+                    },
+                    memo: format!("parallel-{index}"),
+                },
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(
+                    Name::from_str("alice").unwrap().as_u64(),
+                    ACTIVE_NAME.as_u64(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let independent_batch = independent_pairs
+        .iter()
+        .enumerate()
+        .map(|(index, (sender, recipient))| {
+            call_contract(
+                &private_key,
+                Name::from_str("pulse.token").unwrap(),
+                Name::from_str("transfer").unwrap(),
+                &Transfer {
+                    from: *sender,
+                    to: *recipient,
+                    quantity: Asset {
+                        amount: 1,
+                        symbol: Symbol::from_str("4,EOS").unwrap(),
+                    },
+                    memo: format!("independent-{index}"),
+                },
+                controller.chain_id().clone(),
+                vec![PermissionLevel::new(sender.as_u64(), ACTIVE_NAME.as_u64())],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut parallel_group = c.benchmark_group("wasm_parallel_execution");
+    parallel_group.throughput(Throughput::Elements(hot_batch.len() as u64));
+    parallel_group.bench_function("serial_hot", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .benchmark_serial_transactions(
+                        black_box(&hot_batch),
+                        black_box(&pending_block_timestamp),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    parallel_group.bench_function("serial_independent", |b| {
+        b.iter(|| {
+            black_box(
+                controller
+                    .benchmark_serial_transactions(
+                        black_box(&independent_batch),
+                        black_box(&pending_block_timestamp),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    for workers in [1usize, 2, 4, 8] {
+        parallel_group.bench_function(format!("speculation_hot/workers_{workers}"), |b| {
+            b.iter(|| {
+                black_box(
+                    controller
+                        .benchmark_parallel_transactions(
+                            black_box(&hot_batch),
+                            black_box(&pending_block_timestamp),
+                            workers,
+                        )
+                        .unwrap(),
+                )
+            })
+        });
+        parallel_group.bench_function(format!("ordered_hot/workers_{workers}"), |b| {
+            b.iter(|| {
+                black_box(
+                    controller
+                        .benchmark_ordered_parallel_transactions(
+                            black_box(&hot_batch),
+                            black_box(&pending_block_timestamp),
+                            workers,
+                        )
+                        .unwrap(),
+                )
+            })
+        });
+        parallel_group.bench_function(format!("ordered_independent/workers_{workers}"), |b| {
+            b.iter(|| {
+                black_box(
+                    controller
+                        .benchmark_ordered_parallel_transactions(
+                            black_box(&independent_batch),
+                            black_box(&pending_block_timestamp),
+                            workers,
+                        )
+                        .unwrap(),
+                )
+            })
+        });
+    }
+    parallel_group.finish();
 
     let mut nonce = 0u64;
     c.bench_function("transfer", |b| {

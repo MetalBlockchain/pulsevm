@@ -3,6 +3,7 @@
 use std::{
     collections::{
         BTreeMap,
+        BTreeSet,
         HashMap,
     },
     fs,
@@ -45,6 +46,7 @@ use crate::{
     IndexDoubleObject,
     IndexLongDoubleObject,
     KeyValueObject,
+    Microseconds,
     NetLimitResult,
     PermissionObject,
     Ratio,
@@ -52,6 +54,7 @@ use crate::{
     U256,
     dependency::{
         ContractIndex,
+        ContractPrimaryRangeKey,
         ContractRangeKey,
         ContractRowKey,
         DependencyKey,
@@ -877,12 +880,270 @@ pub use speculation::{
     BlockReadSnapshot,
     ContractPrimaryKey,
     ContractPrimaryOverlay,
+    ContractSecondaryRow,
+    ContractSecondaryValue,
+    ContractTableOverlay,
     SnapshotVersion,
+    SpeculativeBatchResult,
+    SpeculativeCandidate,
     SpeculativeCommitOutcome,
     SpeculativeFallbackReason,
+    SpeculativeShadowResult,
+    SpeculativeTask,
+    SpeculativeTaskOutcome,
     SpeculativeTransaction,
     SpeculativeWave,
 };
+
+/// Frozen live state used to construct independent full-database transaction
+/// workers. The bytes are shared by all workers in a batch; each worker builds
+/// its own Arena and therefore never takes the canonical database lock while
+/// executing WASM.
+#[derive(Clone)]
+pub struct ExecutionSnapshot {
+    arena: crate::backend::ChainDatabase,
+    estimated_heap_bytes: usize,
+    system_accounts: SystemAccountNames,
+    native_system_contract: bool,
+    protocol_records: Vec<ProtocolActivationRecord>,
+}
+
+impl ExecutionSnapshot {
+    pub fn byte_len(&self) -> usize {
+        self.estimated_heap_bytes
+    }
+}
+
+/// Physical transaction patch produced by a full-database execution fork.
+pub struct ExecutionDelta {
+    arena: crate::backend::DbDelta,
+}
+
+/// Stable logical operations produced by a full transaction worker. Unlike an
+/// Arena delta these contain no row ids or blob offsets, so replay assigns all
+/// physical storage in canonical transaction order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionOperation {
+    PrimaryCreate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: Vec<u8>,
+    },
+    PrimaryUpdate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: Vec<u8>,
+    },
+    PrimaryRemove {
+        key: ContractPrimaryKey,
+    },
+    SecondaryCreate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    },
+    SecondaryUpdate {
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    },
+    SecondaryRemove {
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    },
+    AccountUsage {
+        account: u64,
+        cpu_usage: u64,
+        net_usage: u64,
+        time_slot: u32,
+        validate: bool,
+    },
+    RamUsage {
+        account: u64,
+        delta: i64,
+    },
+    VerifyRam {
+        account: u64,
+    },
+    PermissionUsage {
+        actor: u64,
+        permission: u64,
+        time_us: i64,
+    },
+    RecordTransaction {
+        id: [u8; 32],
+        expiration: u32,
+    },
+    DeferredCreate {
+        transaction: crate::backend::DeferredTransaction,
+    },
+    DeferredRemoveById {
+        trx_id: [u8; 32],
+        sender: Option<(u64, u128)>,
+    },
+    DeferredRemoveBySender {
+        sender: u64,
+        sender_id: u128,
+        trx_id: Option<[u8; 32]>,
+    },
+    ActionSequences {
+        receiver: u64,
+        auth_actors: Vec<u64>,
+    },
+}
+
+impl ExecutionOperation {
+    fn explain_writes(&self, writes: &mut BTreeMap<DependencyKey, usize>) {
+        let mut write = |key| {
+            let count = writes.entry(key).or_default();
+            *count = count.saturating_add(1);
+        };
+        let contract = |key: &ContractPrimaryKey, index| {
+            DependencyKey::Contract(ContractRowKey::new(
+                key.code,
+                key.scope,
+                key.table,
+                index,
+                key.primary,
+            ))
+        };
+        match self {
+            Self::PrimaryCreate { key, .. } | Self::PrimaryRemove { key } => {
+                write(DependencyKey::Contract(ContractRowKey::table(
+                    key.code, key.scope, key.table,
+                )));
+                write(contract(key, ContractIndex::Primary));
+            }
+            Self::PrimaryUpdate { key, .. } => {
+                write(contract(key, ContractIndex::Primary));
+            }
+            Self::SecondaryCreate { key, value, .. } | Self::SecondaryUpdate { key, value, .. } => {
+                if matches!(self, Self::SecondaryCreate { .. }) {
+                    write(DependencyKey::Contract(ContractRowKey::table(
+                        key.code, key.scope, key.table,
+                    )));
+                }
+                write(contract(key, secondary_value_index(*value)));
+            }
+            Self::SecondaryRemove { key, index } => {
+                write(DependencyKey::Contract(ContractRowKey::table(
+                    key.code, key.scope, key.table,
+                )));
+                write(contract(key, *index));
+            }
+            Self::AccountUsage { account, .. } => {
+                write(DependencyKey::System(SystemKey::ResourceUsage(*account)));
+                write(DependencyKey::System(SystemKey::ResourceState));
+            }
+            Self::RamUsage { account, .. } => {
+                write(DependencyKey::System(SystemKey::ResourceUsage(*account)));
+            }
+            Self::VerifyRam { .. } => {}
+            Self::PermissionUsage {
+                actor, permission, ..
+            } => {
+                write(DependencyKey::System(SystemKey::PermissionUsage {
+                    owner: *actor,
+                    name: *permission,
+                }));
+            }
+            Self::RecordTransaction { id, .. } => {
+                write(DependencyKey::System(SystemKey::Transaction(*id)));
+            }
+            Self::DeferredCreate { transaction } => {
+                write(DependencyKey::System(SystemKey::DeferredTransaction(
+                    transaction.trx_id,
+                )));
+                write(DependencyKey::System(SystemKey::DeferredSender {
+                    sender: transaction.sender,
+                    sender_id: transaction.sender_id,
+                }));
+            }
+            Self::DeferredRemoveById { trx_id, sender } => {
+                write(DependencyKey::System(SystemKey::DeferredTransaction(
+                    *trx_id,
+                )));
+                if let Some((sender, sender_id)) = sender {
+                    write(DependencyKey::System(SystemKey::DeferredSender {
+                        sender: *sender,
+                        sender_id: *sender_id,
+                    }));
+                }
+            }
+            Self::DeferredRemoveBySender {
+                sender,
+                sender_id,
+                trx_id,
+            } => {
+                write(DependencyKey::System(SystemKey::DeferredSender {
+                    sender: *sender,
+                    sender_id: *sender_id,
+                }));
+                if let Some(trx_id) = trx_id {
+                    write(DependencyKey::System(SystemKey::DeferredTransaction(
+                        *trx_id,
+                    )));
+                }
+            }
+            Self::ActionSequences {
+                receiver,
+                auth_actors,
+            } => {
+                write(DependencyKey::System(SystemKey::GlobalActionSequence));
+                write(DependencyKey::System(SystemKey::AccountSequence(*receiver)));
+                for actor in auth_actors {
+                    write(DependencyKey::System(SystemKey::AccountSequence(*actor)));
+                }
+            }
+        }
+    }
+}
+
+const fn secondary_value_index(value: ContractSecondaryValue) -> ContractIndex {
+    match value {
+        ContractSecondaryValue::Idx64(_) => ContractIndex::Idx64,
+        ContractSecondaryValue::Idx128(_) => ContractIndex::Idx128,
+        ContractSecondaryValue::Idx256(_) => ContractIndex::Idx256,
+        ContractSecondaryValue::IdxDouble(_) => ContractIndex::IdxDouble,
+        ContractSecondaryValue::IdxLongDouble(_) => ContractIndex::IdxLongDouble,
+    }
+}
+
+/// Replayable transaction journal whose dependency set has passed the closed
+/// supported-write audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionJournal {
+    operations: Vec<ExecutionOperation>,
+}
+
+#[derive(Default)]
+struct ExecutionJournalState {
+    operations: Vec<ExecutionOperation>,
+    observed_writes: BTreeMap<DependencyKey, usize>,
+}
+
+impl ExecutionJournal {
+    pub fn operations(&self) -> &[ExecutionOperation] {
+        &self.operations
+    }
+}
+
+/// Canonical sequence values allocated while replaying an action journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebasedActionSequences {
+    pub receiver: u64,
+    pub auth_actors: Vec<u64>,
+    pub global_sequence: u64,
+    pub recv_sequence: u64,
+    pub auth_sequences: Vec<u64>,
+}
+
+impl ExecutionDelta {
+    /// Arena table ids whose row-id or blob-offset allocators advanced.
+    pub fn allocation_domains(&self) -> &[u16] {
+        self.arena.allocation_domains()
+    }
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -906,6 +1167,9 @@ pub struct Database {
     /// Present only on an opt-in transaction-local clone. The recorder is not
     /// part of Arena state and failures to record are intentionally ignored.
     dependency_recorder: Option<DependencyRecorder>,
+    /// Present only on a full execution fork. Every supported mutation appends
+    /// a logical operation here; clones made by action contexts share it.
+    execution_journal: Option<Arc<Mutex<ExecutionJournalState>>>,
     /// Installed lazily by the default-off speculative-wave API. Normal nodes
     /// pay only an unset `OnceLock` branch; once installed, logical writes bump
     /// the shared epoch so stale read snapshots can never commit.
@@ -913,6 +1177,10 @@ pub struct Database {
     /// Guards the currently supported live contract-primary write surface while
     /// a speculative wave owns the canonical controller handle.
     speculation_freeze: Arc<AtomicBool>,
+    /// Serializes wave creation and high-level batch ownership across cloned
+    /// handles. Unlike the write freeze, a batch keeps this set while it opens
+    /// fresh waves around serial fallbacks.
+    speculation_coordinator: Arc<AtomicBool>,
     /// Cache decoded authorities by their complete canonical blob so permission
     /// updates cannot return stale authority data.
     authority_cache: Arc<Mutex<HashMap<Vec<u8>, Authority>>>,
@@ -1083,8 +1351,10 @@ impl Database {
             native_system_contract_locked: metadata.is_some(),
             protocol_records: Arc::new(Mutex::new(protocol_records)),
             dependency_recorder: None,
+            execution_journal: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            speculation_coordinator: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             historical_replay_compatibility: Arc::new(AtomicBool::new(false)),
@@ -1104,6 +1374,393 @@ impl Database {
         let mut database = self.clone();
         database.dependency_recorder = Some(tracker.recorder());
         (database, tracker)
+    }
+
+    /// Freeze the current live block prefix for independent transaction workers.
+    pub fn execution_snapshot(&self) -> Result<ExecutionSnapshot, ChainError> {
+        let protocol_records = self
+            .protocol_records
+            .lock()
+            .map_err(|_| ChainError::InternalError("protocol record lock poisoned".into()))?
+            .clone();
+        Ok(ExecutionSnapshot {
+            arena: self.backend.execution_fork(),
+            estimated_heap_bytes: self.backend.estimated_heap_bytes(),
+            system_accounts: self.system_accounts(),
+            native_system_contract: self.native_system_contract,
+            protocol_records,
+        })
+    }
+
+    /// Current Arena heap privately detached by this execution worker.
+    pub fn execution_private_bytes(&self) -> usize {
+        self.backend.execution_private_bytes()
+    }
+
+    /// Construct an isolated full database from a frozen execution snapshot.
+    /// The returned tracker observes the worker's complete Database facade path;
+    /// callers must still reject reports not explicitly marked complete.
+    pub fn fork_execution_snapshot(
+        snapshot: &ExecutionSnapshot,
+    ) -> Result<(Self, DependencyTracker), ChainError> {
+        let backend = snapshot.arena.execution_fork();
+        let system_accounts = Arc::new(OnceLock::new());
+        system_accounts.set(snapshot.system_accounts).map_err(|_| {
+            ChainError::InternalError("execution snapshot system account initialized twice".into())
+        })?;
+        let tracker = DependencyTracker::new();
+        Ok((
+            Database {
+                path: String::new(),
+                backend,
+                system_accounts,
+                native_system_contract: snapshot.native_system_contract,
+                native_system_contract_locked: true,
+                protocol_records: Arc::new(Mutex::new(snapshot.protocol_records.clone())),
+                dependency_recorder: Some(tracker.recorder()),
+                execution_journal: Some(Arc::new(Mutex::new(ExecutionJournalState::default()))),
+                speculation_epoch: Arc::new(OnceLock::new()),
+                speculation_freeze: Arc::new(AtomicBool::new(false)),
+                speculation_coordinator: Arc::new(AtomicBool::new(false)),
+                authority_cache: Arc::new(Mutex::new(HashMap::new())),
+                xpr_native_replay: Arc::new(AtomicBool::new(false)),
+                xpr_native_rows: Arc::new(Mutex::new(XprNativeRowCache::default())),
+                xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
+                ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
+            },
+            tracker,
+        ))
+    }
+
+    /// Install fresh transaction-local recorders on a reusable worker fork.
+    pub fn reset_execution_tracking(&mut self) -> DependencyTracker {
+        let tracker = DependencyTracker::new();
+        self.dependency_recorder = Some(tracker.recorder());
+        self.execution_journal = Some(Arc::new(Mutex::new(ExecutionJournalState::default())));
+        tracker
+    }
+
+    /// Clear delta dirtiness after the current worker transaction was undone.
+    pub fn reset_execution_delta_baseline(&self) {
+        self.backend.reset_execution_delta_baseline();
+    }
+
+    /// Export all Arena writes made since a worker fork was created.
+    pub fn execution_delta(&self) -> ExecutionDelta {
+        ExecutionDelta {
+            arena: self.backend.execution_delta(),
+        }
+    }
+
+    fn record_execution_operation(&self, operation: ExecutionOperation) {
+        if let Some(journal) = &self.execution_journal
+            && let Ok(mut journal) = journal.lock()
+        {
+            journal.operations.push(operation);
+        }
+    }
+
+    fn record_execution_write(&self, key: DependencyKey) {
+        if let Some(journal) = &self.execution_journal
+            && let Ok(mut journal) = journal.lock()
+        {
+            let count = journal.observed_writes.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// Close a worker journal only when every observed write belongs to the
+    /// replayable subset. This is the completeness boundary for authoritative
+    /// optimistic commit; unknown system mutations always fall back to serial.
+    pub fn finish_execution_journal(
+        &self,
+        tracker: &DependencyTracker,
+    ) -> Option<ExecutionJournal> {
+        let journal = self.execution_journal.as_ref()?.lock().ok()?;
+        let operations = journal.operations.clone();
+        let observed_writes = journal.observed_writes.clone();
+        drop(journal);
+        let mut explained = BTreeMap::new();
+        for operation in &operations {
+            operation.explain_writes(&mut explained);
+        }
+        let dependencies = tracker.snapshot();
+        let explained_keys = explained.keys().copied().collect::<BTreeSet<_>>();
+        if observed_writes != explained || dependencies.writes() != &explained_keys {
+            return None;
+        }
+        tracker.mark_complete();
+        Some(ExecutionJournal { operations })
+    }
+
+    /// Replay a validated logical journal into the current canonical undo
+    /// session. Callers retain responsibility for dependency validation and
+    /// must undo the surrounding child session on any error.
+    pub fn apply_execution_journal(
+        &mut self,
+        journal: &ExecutionJournal,
+    ) -> Result<Vec<RebasedActionSequences>, ChainError> {
+        let mut sequences = Vec::new();
+        for operation in &journal.operations {
+            match operation {
+                ExecutionOperation::PrimaryCreate { key, payer, value } => {
+                    self.create_key_value_object_standalone(
+                        key.code,
+                        key.scope,
+                        key.table,
+                        *payer,
+                        key.primary,
+                        value,
+                    )?;
+                }
+                ExecutionOperation::PrimaryUpdate { key, payer, value } => {
+                    self.update_key_value_object_standalone(
+                        key.code,
+                        key.scope,
+                        key.table,
+                        key.primary,
+                        *payer,
+                        value,
+                    )?;
+                }
+                ExecutionOperation::PrimaryRemove { key } => {
+                    self.remove_key_value_object_standalone(
+                        key.code,
+                        key.scope,
+                        key.table,
+                        key.primary,
+                    )?;
+                }
+                ExecutionOperation::SecondaryCreate { key, payer, value } => {
+                    self.apply_execution_secondary_create(*key, *payer, *value)?;
+                }
+                ExecutionOperation::SecondaryUpdate { key, payer, value } => {
+                    self.apply_execution_secondary_update(*key, *payer, *value)?;
+                }
+                ExecutionOperation::SecondaryRemove { key, index } => {
+                    self.apply_execution_secondary_remove(*key, *index)?;
+                }
+                ExecutionOperation::AccountUsage {
+                    account,
+                    cpu_usage,
+                    net_usage,
+                    time_slot,
+                    validate,
+                } => self.account_usage(*account, *cpu_usage, *net_usage, *time_slot, *validate)?,
+                ExecutionOperation::RamUsage { account, delta } => {
+                    self.add_pending_ram_usage(*account, *delta)?;
+                }
+                ExecutionOperation::VerifyRam { account } => {
+                    self.verify_account_ram_usage(*account)?;
+                }
+                ExecutionOperation::PermissionUsage {
+                    actor,
+                    permission,
+                    time_us,
+                } => self.update_permission_usage(
+                    *actor,
+                    *permission,
+                    &TimePoint::new(Microseconds::new(*time_us)),
+                )?,
+                ExecutionOperation::RecordTransaction { id, expiration } => {
+                    self.record_transaction(id, *expiration)?;
+                }
+                ExecutionOperation::DeferredCreate { transaction } => {
+                    self.xpr_import_deferred_transaction(
+                        transaction.sender,
+                        transaction.sender_id,
+                        transaction.payer,
+                        transaction.trx_id,
+                        transaction.delay_until,
+                        transaction.expiration,
+                        transaction.published,
+                        &transaction.packed_trx,
+                    )?;
+                }
+                ExecutionOperation::DeferredRemoveById { trx_id, sender } => {
+                    let removed = self.arena_remove_deferred_transaction(*trx_id)?;
+                    if removed != sender.is_some() {
+                        return Err(ChainError::DatabaseError(
+                            "deferred transaction changed before journal replay".into(),
+                        ));
+                    }
+                }
+                ExecutionOperation::DeferredRemoveBySender {
+                    sender,
+                    sender_id,
+                    trx_id,
+                } => {
+                    let removed =
+                        self.arena_remove_deferred_transaction_by_sender_id(*sender, *sender_id)?;
+                    if removed.as_ref().map(|row| row.trx_id) != *trx_id {
+                        return Err(ChainError::DatabaseError(
+                            "deferred sender id changed before journal replay".into(),
+                        ));
+                    }
+                }
+                ExecutionOperation::ActionSequences {
+                    receiver,
+                    auth_actors,
+                } => {
+                    let (global_sequence, recv_sequence, auth_sequences) =
+                        self.next_action_sequences(*receiver, auth_actors)?;
+                    sequences.push(RebasedActionSequences {
+                        receiver: *receiver,
+                        auth_actors: auth_actors.clone(),
+                        global_sequence,
+                        recv_sequence,
+                        auth_sequences,
+                    });
+                }
+            }
+        }
+        Ok(sequences)
+    }
+
+    fn apply_execution_secondary_create(
+        &self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        match value {
+            ContractSecondaryValue::Idx64(value) => self.create_index64_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                payer,
+                key.primary,
+                value,
+            ),
+            ContractSecondaryValue::Idx128(value) => self.create_index128_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                payer,
+                key.primary,
+                value,
+            ),
+            ContractSecondaryValue::Idx256(value) => self.create_index256_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                payer,
+                key.primary,
+                U256 { value },
+            ),
+            ContractSecondaryValue::IdxDouble(value) => self.create_idx_double_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                payer,
+                key.primary,
+                value,
+            ),
+            ContractSecondaryValue::IdxLongDouble((lo, hi)) => self
+                .create_idx_long_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    payer,
+                    key.primary,
+                    Float128 { lo, hi },
+                ),
+        }
+    }
+
+    fn apply_execution_secondary_update(
+        &self,
+        key: ContractPrimaryKey,
+        payer: u64,
+        value: ContractSecondaryValue,
+    ) -> Result<(), ChainError> {
+        match value {
+            ContractSecondaryValue::Idx64(value) => self.update_index64_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+                payer,
+                value,
+            ),
+            ContractSecondaryValue::Idx128(value) => self.update_index128_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+                payer,
+                value,
+            ),
+            ContractSecondaryValue::Idx256(value) => self.update_index256_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+                payer,
+                U256 { value },
+            ),
+            ContractSecondaryValue::IdxDouble(value) => self.update_idx_double_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+                payer,
+                value,
+            ),
+            ContractSecondaryValue::IdxLongDouble((lo, hi)) => self
+                .update_idx_long_double_object_standalone(
+                    key.code,
+                    key.scope,
+                    key.table,
+                    key.primary,
+                    payer,
+                    Float128 { lo, hi },
+                ),
+        }
+    }
+
+    fn apply_execution_secondary_remove(
+        &self,
+        key: ContractPrimaryKey,
+        index: ContractIndex,
+    ) -> Result<(), ChainError> {
+        match index {
+            ContractIndex::Idx64 => {
+                self.remove_index64_object_standalone(key.code, key.scope, key.table, key.primary)
+            }
+            ContractIndex::Idx128 => {
+                self.remove_index128_object_standalone(key.code, key.scope, key.table, key.primary)
+            }
+            ContractIndex::Idx256 => {
+                self.remove_index256_object_standalone(key.code, key.scope, key.table, key.primary)
+            }
+            ContractIndex::IdxDouble => self.remove_idx_double_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::IdxLongDouble => self.remove_idx_long_double_object_standalone(
+                key.code,
+                key.scope,
+                key.table,
+                key.primary,
+            ),
+            ContractIndex::Table | ContractIndex::Primary => Err(ChainError::DatabaseError(
+                format!("{index:?} is not a secondary index"),
+            )),
+        }
+    }
+
+    /// Apply a validated worker patch inside the canonical transaction session.
+    pub fn apply_execution_delta(&self, delta: &ExecutionDelta) -> Result<(), ChainError> {
+        self.backend
+            .apply_execution_delta(&delta.arena)
+            .map_err(|error| {
+                ChainError::InternalError(format!("apply execution delta: {error:?}"))
+            })?;
+        self.bump_speculation_epoch();
+        Ok(())
     }
 
     fn dependency_exact_read(
@@ -1140,6 +1797,29 @@ impl Database {
         }
     }
 
+    fn dependency_primary_range_read(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        lower: u64,
+        upper: u64,
+    ) {
+        self.capture_xpr_read_only_contract(code);
+        if lower <= upper
+            && let Some(recorder) = &self.dependency_recorder
+        {
+            recorder.range_read(RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(code, scope, table, lower, upper),
+            ));
+        }
+    }
+
+    // Consensus invariant: every database mutation reachable from transaction
+    // execution must record its logical write here (or through
+    // `dependency_system_write`). The execution journal's closed-write audit
+    // can reject an unsupported mutation only when the dependency recorder has
+    // observed it.
     fn dependency_write(
         &self,
         code: u64,
@@ -1149,6 +1829,8 @@ impl Database {
         primary: u64,
     ) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::Contract(ContractRowKey::new(code, scope, table, index, primary));
+        self.record_execution_write(key);
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_rows.lock().unwrap();
             let capturing = cache.read_only_capture.is_some();
@@ -1163,18 +1845,16 @@ impl Database {
             }
         }
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::Contract(ContractRowKey::new(
-                code, scope, table, index, primary,
-            )));
+            recorder.write(key);
         }
     }
 
     fn dependency_table_write(&self, code: u64, scope: u64, table: u64) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::Contract(ContractRowKey::table(code, scope, table));
+        self.record_execution_write(key);
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::Contract(ContractRowKey::table(
-                code, scope, table,
-            )));
+            recorder.write(key);
         }
     }
 
@@ -1192,8 +1872,10 @@ impl Database {
 
     fn dependency_system_write(&self, key: SystemKey) {
         self.bump_speculation_epoch();
+        let key = DependencyKey::System(key);
+        self.record_execution_write(key);
         if let Some(recorder) = &self.dependency_recorder {
-            recorder.write(DependencyKey::System(key));
+            recorder.write(key);
         }
     }
 
@@ -1532,6 +2214,43 @@ impl Database {
         }
     }
 
+    pub fn arena_idx128_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u128, u64, u64)> {
+        self.backend.idx128_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx256_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<([u8; 32], u64, u64)> {
+        self.backend.idx256_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        self.backend.idx_double_range_with_payer(code, scope, table)
+    }
+
+    pub fn arena_idx_long_double_range_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+    ) -> Vec<((u64, u64), u64, u64)> {
+        self.backend
+            .idx_long_double_range_with_payer(code, scope, table)
+    }
+
     /// The account's creation-date block-timestamp slot, for the RPC account
     /// formatter's `created` field. `None` when absent.
     pub fn arena_account_creation_date(&self, account_name: u64) -> Option<u32> {
@@ -1680,8 +2399,9 @@ impl Database {
     /// db_next successor), `prev` = last primary < key. `None` = off the end.
     /// All return `None`
     pub fn arena_kv_lower_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_lower_bound(code, scope, table, key)
+        let result = self.backend.kv_lower_bound(code, scope, table, key);
+        self.dependency_primary_range_read(code, scope, table, key, result.unwrap_or(u64::MAX));
+        result
     }
 
     pub fn arena_kv_table_exists(&self, code: u64, scope: u64, table: u64) -> bool {
@@ -1694,20 +2414,45 @@ impl Database {
     }
 
     pub fn arena_kv_upper_bound(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_upper_bound(code, scope, table, key)
+        let result = self.backend.kv_upper_bound(code, scope, table, key);
+        if let Some(lower) = key.checked_add(1) {
+            self.dependency_primary_range_read(
+                code,
+                scope,
+                table,
+                lower,
+                result.unwrap_or(u64::MAX),
+            );
+        }
+        result
     }
 
     pub fn arena_kv_prev(&self, code: u64, scope: u64, table: u64, key: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_prev(code, scope, table, key)
+        let result = self.backend.kv_prev(code, scope, table, key);
+        if let Some(upper) = key.checked_sub(1) {
+            self.dependency_primary_range_read(
+                code,
+                scope,
+                table,
+                result.unwrap_or(u64::MIN),
+                upper,
+            );
+        }
+        result
     }
 
     /// Largest primary in the table — db_previous_i64's landing when stepping
     /// back from the end iterator. `None` if empty.
     pub fn arena_kv_last(&self, code: u64, scope: u64, table: u64) -> Option<u64> {
-        self.dependency_range_read(code, scope, table, ContractIndex::Primary);
-        self.backend.kv_last(code, scope, table)
+        let result = self.backend.kv_last(code, scope, table);
+        self.dependency_primary_range_read(
+            code,
+            scope,
+            table,
+            result.unwrap_or(u64::MIN),
+            u64::MAX,
+        );
+        result
     }
 
     /// Arena idx64 secondary-index positioning, updating db_idx64_find_secondary
@@ -3445,7 +4190,20 @@ impl Database {
             )
             .map_err(|e| {
                 ChainError::InternalError(format!("XPR import deferred transaction: {e:?}"))
-            })
+            })?;
+        self.record_execution_operation(ExecutionOperation::DeferredCreate {
+            transaction: crate::backend::DeferredTransaction {
+                sender,
+                sender_id,
+                payer,
+                trx_id,
+                delay_until,
+                expiration,
+                published,
+                packed_trx: packed_trx.to_vec(),
+            },
+        });
+        Ok(())
     }
 
     /// Pending migrated deferred transaction count. Controllers must only
@@ -3487,17 +4245,21 @@ impl Database {
 
     pub fn arena_remove_deferred_transaction(&self, trx_id: [u8; 32]) -> Result<bool, ChainError> {
         self.dependency_system_write(SystemKey::DeferredTransaction(trx_id));
-        if let Some(row) = self.backend.deferred_transaction(trx_id) {
-            self.dependency_system_write(SystemKey::DeferredSender {
-                sender: row.sender,
-                sender_id: row.sender_id,
-            });
+        let sender = self
+            .backend
+            .deferred_transaction(trx_id)
+            .map(|row| (row.sender, row.sender_id));
+        if let Some((sender, sender_id)) = sender {
+            self.dependency_system_write(SystemKey::DeferredSender { sender, sender_id });
         }
-        self.backend
+        let removed = self
+            .backend
             .remove_deferred_transaction(trx_id)
             .map_err(|e| {
                 ChainError::InternalError(format!("arena remove deferred transaction: {e:?}"))
-            })
+            })?;
+        self.record_execution_operation(ExecutionOperation::DeferredRemoveById { trx_id, sender });
+        Ok(removed)
     }
 
     pub fn arena_remove_deferred_transaction_by_sender_id(
@@ -3517,6 +4279,11 @@ impl Database {
         if let Some(row) = &removed {
             self.dependency_system_write(SystemKey::DeferredTransaction(row.trx_id));
         }
+        self.record_execution_operation(ExecutionOperation::DeferredRemoveBySender {
+            sender,
+            sender_id,
+            trx_id: removed.as_ref().map(|row| row.trx_id),
+        });
         Ok(removed)
     }
 
@@ -3797,6 +4564,14 @@ impl Database {
             }
         }
 
+        self.record_execution_operation(ExecutionOperation::AccountUsage {
+            account,
+            cpu_usage,
+            net_usage,
+            time_slot,
+            validate,
+        });
+
         s.add_transaction_and_block_usage(
             account, cpu_usage, net_usage, time_slot, net_window, cpu_window,
         )
@@ -3810,6 +4585,10 @@ impl Database {
         ram_bytes: i64,
     ) -> Result<(), ChainError> {
         self.dependency_system_write(SystemKey::ResourceUsage(account_name));
+        self.record_execution_operation(ExecutionOperation::RamUsage {
+            account: account_name,
+            delta: ram_bytes,
+        });
         let s = &self.backend;
         return s
             .add_pending_ram_usage(account_name, ram_bytes)
@@ -3819,6 +4598,9 @@ impl Database {
     pub fn verify_account_ram_usage(&mut self, account_name: u64) -> Result<(), ChainError> {
         self.dependency_system_read(SystemKey::ResourceLimits(account_name));
         self.dependency_system_read(SystemKey::ResourceUsage(account_name));
+        self.record_execution_operation(ExecutionOperation::VerifyRam {
+            account: account_name,
+        });
         // Reproduce chainbase's resource_limits check: an account whose RAM quota
         // is set (>= 0) may not use more than it. A negative quota is unlimited.
         let ram_bytes = self
@@ -4614,6 +5396,11 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        self.record_execution_operation(ExecutionOperation::PrimaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: buffer.to_vec(),
+        });
         let table_created =
             self.ram_usage_monitor_enabled() && !self.backend.table_exists(code, scope, table);
         let s = &self.backend;
@@ -4664,6 +5451,11 @@ impl Database {
         buffer: &[u8],
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        self.record_execution_operation(ExecutionOperation::PrimaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: buffer.to_vec(),
+        });
         let old = self
             .ram_usage_monitor_enabled()
             .then(|| self.backend.kv_row(code, scope, table, primary_key))
@@ -4749,6 +5541,9 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Primary, primary_key);
+        self.record_execution_operation(ExecutionOperation::PrimaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend.kv_row(code, scope, table, primary_key),
@@ -4802,6 +5597,11 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx64(secondary_key),
+        });
         let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index64_object(code, scope, table, payer, primary_key, secondary_key)
@@ -4827,6 +5627,11 @@ impl Database {
         secondary_key: u64,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx64(secondary_key),
+        });
         let old_payer = self
             .ram_usage_monitor_enabled()
             .then(|| self.backend.idx64_payer(code, scope, table, primary_key))
@@ -4854,6 +5659,10 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx64, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            index: ContractIndex::Idx64,
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend.idx64_payer(code, scope, table, primary_key),
@@ -4898,6 +5707,11 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx128(secondary_key),
+        });
         let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index128_object(code, scope, table, payer, primary_key, secondary_key)
@@ -4923,6 +5737,11 @@ impl Database {
         secondary_key: u128,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx128(secondary_key),
+        });
         let old_payer = self
             .ram_usage_monitor_enabled()
             .then(|| self.backend.idx128_payer(code, scope, table, primary_key))
@@ -4950,6 +5769,10 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx128, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            index: ContractIndex::Idx128,
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend.idx128_payer(code, scope, table, primary_key),
@@ -4994,6 +5817,11 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx256(secondary_key.value),
+        });
         let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_index256_object(code, scope, table, payer, primary_key, secondary_key.value)
@@ -5019,6 +5847,11 @@ impl Database {
         secondary_key: U256,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::Idx256(secondary_key.value),
+        });
         let old_payer = self
             .ram_usage_monitor_enabled()
             .then(|| self.backend.idx256_payer(code, scope, table, primary_key))
@@ -5046,6 +5879,10 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::Idx256, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            index: ContractIndex::Idx256,
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend.idx256_payer(code, scope, table, primary_key),
@@ -5090,6 +5927,11 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::IdxDouble(secondary_key),
+        });
         let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_idx_double_object(code, scope, table, payer, primary_key, secondary_key)
@@ -5115,6 +5957,11 @@ impl Database {
         secondary_key: u64,
     ) -> Result<(), ChainError> {
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::IdxDouble(secondary_key),
+        });
         let old_payer = self
             .ram_usage_monitor_enabled()
             .then(|| {
@@ -5145,6 +5992,10 @@ impl Database {
     ) -> Result<(), ChainError> {
         self.dependency_table_write(code, scope, table);
         self.dependency_write(code, scope, table, ContractIndex::IdxDouble, primary_key);
+        self.record_execution_operation(ExecutionOperation::SecondaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            index: ContractIndex::IdxDouble,
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend
@@ -5196,6 +6047,11 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        self.record_execution_operation(ExecutionOperation::SecondaryCreate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::IdxLongDouble((secondary_key.lo, secondary_key.hi)),
+        });
         let table_created = self.monitored_table_created(code, scope, table);
         self.backend_ref()?
             .create_idx_long_double_object(
@@ -5236,6 +6092,11 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        self.record_execution_operation(ExecutionOperation::SecondaryUpdate {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            payer,
+            value: ContractSecondaryValue::IdxLongDouble((secondary_key.lo, secondary_key.hi)),
+        });
         let old_payer = self
             .ram_usage_monitor_enabled()
             .then(|| {
@@ -5281,6 +6142,10 @@ impl Database {
             ContractIndex::IdxLongDouble,
             primary_key,
         );
+        self.record_execution_operation(ExecutionOperation::SecondaryRemove {
+            key: ContractPrimaryKey::new(code, scope, table, primary_key),
+            index: ContractIndex::IdxLongDouble,
+        });
         let monitored = self.ram_usage_monitor_enabled().then(|| {
             (
                 self.backend
@@ -5684,7 +6549,7 @@ impl Database {
     /// inside this method, so no database-bound reference escapes into execution.
     /// The returned sequence lands in the `ActionReceipt` digest.
     pub fn next_recv_sequence(&mut self, receiver: u64) -> Result<u64, ChainError> {
-        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
+        self.dependency_system_write(SystemKey::AccountSequence(receiver));
         let s = &self.backend;
         return s
             .next_recv_sequence(receiver)
@@ -5698,7 +6563,7 @@ impl Database {
     }
 
     pub fn next_auth_sequence(&mut self, actor: u64) -> Result<u64, ChainError> {
-        self.dependency_system_write(SystemKey::AccountMetadata(actor));
+        self.dependency_system_write(SystemKey::AccountSequence(actor));
         let s = &self.backend;
         s.next_auth_sequence(actor)
             .map_err(|e| ChainError::InternalError(format!("arena next_auth_sequence: {e:?}")))?;
@@ -5735,10 +6600,14 @@ impl Database {
         auth_actors: &[u64],
     ) -> Result<(u64, u64, Vec<u64>), ChainError> {
         self.dependency_system_write(SystemKey::GlobalActionSequence);
-        self.dependency_system_write(SystemKey::AccountMetadata(receiver));
+        self.dependency_system_write(SystemKey::AccountSequence(receiver));
         for actor in auth_actors {
-            self.dependency_system_write(SystemKey::AccountMetadata(*actor));
+            self.dependency_system_write(SystemKey::AccountSequence(*actor));
         }
+        self.record_execution_operation(ExecutionOperation::ActionSequences {
+            receiver,
+            auth_actors: auth_actors.to_vec(),
+        });
         if self.xpr_native_replay_enabled() {
             let mut cache = self.xpr_native_sequences.lock().unwrap();
             let current_global = cache
@@ -5942,6 +6811,11 @@ impl Database {
             owner: actor,
             name: permission,
         });
+        self.record_execution_operation(ExecutionOperation::PermissionUsage {
+            actor,
+            permission,
+            time_us: pending_block_time.elapsed.count,
+        });
         let s = &self.backend;
         return s
             .update_permission_usage(actor, permission, pending_block_time.elapsed.count)
@@ -6062,6 +6936,10 @@ impl Database {
         expiration: u32,
     ) -> Result<(), ChainError> {
         self.dependency_system_write(SystemKey::Transaction(*trx_id));
+        self.record_execution_operation(ExecutionOperation::RecordTransaction {
+            id: *trx_id,
+            expiration,
+        });
         self.backend
             .record_transaction(*trx_id, expiration)
             .map_err(|e| ChainError::InternalError(format!("arena record_transaction: {e:?}")))
@@ -7496,12 +8374,9 @@ mod tests {
         );
         assert_eq!(
             report.range_reads(),
-            &BTreeSet::from([RangeDependency::Contract(ContractRangeKey::new(
-                code,
-                scope,
-                table,
-                ContractIndex::Primary,
-            ))])
+            &BTreeSet::from([RangeDependency::ContractPrimary(
+                ContractPrimaryRangeKey::new(code, scope, table, 0, primary,),
+            )])
         );
         assert_eq!(
             report.writes(),
@@ -7747,7 +8622,7 @@ mod tests {
             SystemKey::ChainConfig,
             SystemKey::ProposedSchedule,
             SystemKey::ResourceUsage(system),
-            SystemKey::AccountMetadata(system),
+            SystemKey::AccountSequence(system),
             SystemKey::GlobalActionSequence,
         ] {
             assert!(report.writes().contains(&DependencyKey::System(write)));
@@ -7781,6 +8656,51 @@ mod tests {
         assert_eq!(report.exact_read_count(), 0);
         assert_eq!(report.range_read_count(), 0);
         assert_eq!(report.write_count(), 7);
+    }
+
+    #[test]
+    fn journal_rejects_an_unexplained_duplicate_write_event() {
+        let base = Database::default();
+        let snapshot = base.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        worker
+            .create_key_value_object_standalone(1, 2, 3, 4, 5, b"value")
+            .unwrap();
+
+        // Simulate a future mutation path that records the correct dependency
+        // key but forgets to append its own logical journal operation. A set-only
+        // audit would miss this because the supported create already touched the
+        // same row; event-count parity must reject it.
+        worker.dependency_write(1, 2, 3, ContractIndex::Primary, 5);
+
+        assert!(worker.finish_execution_journal(&tracker).is_none());
+        assert!(!tracker.snapshot().is_complete());
+    }
+
+    #[test]
+    fn deferred_create_and_remove_are_replayable_journal_operations() {
+        let mut canonical = Database::default();
+        let snapshot = canonical.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        worker
+            .xpr_import_deferred_transaction(1, 2, 3, [4; 32], 5, 6, 7, &[8, 9])
+            .unwrap();
+        let journal = worker.finish_execution_journal(&tracker).unwrap();
+        canonical.apply_execution_journal(&journal).unwrap();
+        assert_eq!(
+            canonical
+                .arena_deferred_transaction([4; 32])
+                .unwrap()
+                .packed_trx,
+            vec![8, 9]
+        );
+
+        let snapshot = canonical.execution_snapshot().unwrap();
+        let (worker, tracker) = Database::fork_execution_snapshot(&snapshot).unwrap();
+        assert!(worker.arena_remove_deferred_transaction([4; 32]).unwrap());
+        let journal = worker.finish_execution_journal(&tracker).unwrap();
+        canonical.apply_execution_journal(&journal).unwrap();
+        assert!(canonical.arena_deferred_transaction([4; 32]).is_none());
     }
 }
 
@@ -8057,8 +8977,10 @@ impl Default for Database {
             native_system_contract_locked: false,
             protocol_records: Arc::new(Mutex::new(Vec::new())),
             dependency_recorder: None,
+            execution_journal: None,
             speculation_epoch: Arc::new(OnceLock::new()),
             speculation_freeze: Arc::new(AtomicBool::new(false)),
+            speculation_coordinator: Arc::new(AtomicBool::new(false)),
             authority_cache: Arc::new(Mutex::new(HashMap::new())),
             xpr_native_replay: Arc::new(AtomicBool::new(false)),
             historical_replay_compatibility: Arc::new(AtomicBool::new(false)),

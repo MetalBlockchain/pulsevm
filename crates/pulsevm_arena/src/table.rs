@@ -6,6 +6,7 @@ use std::{
         VecDeque,
     },
     ops::Bound,
+    sync::Arc,
 };
 
 use crate::object::{
@@ -124,12 +125,13 @@ impl DirtyPages {
     }
 }
 
+#[derive(Clone)]
 struct PrimaryPage<T> {
     slots: Box<[Option<T>]>,
     live: usize,
 }
 
-impl<T> PrimaryPage<T> {
+impl<T: Clone> PrimaryPage<T> {
     fn new() -> Self {
         Self {
             slots: std::iter::repeat_with(|| None)
@@ -146,12 +148,13 @@ impl<T> PrimaryPage<T> {
 /// `Option<T>` for every historical id made a small checkpoint expand to tens
 /// of gigabytes. Fixed-size pages retain O(1) lookup and deterministic id-order
 /// iteration while allocating row slots only near live ids.
+#[derive(Clone)]
 struct PagedPrimary<T> {
-    pages: Vec<Option<PrimaryPage<T>>>,
+    pages: Vec<Option<Arc<PrimaryPage<T>>>>,
     len: usize,
 }
 
-impl<T> PagedPrimary<T> {
+impl<T: Clone> PagedPrimary<T> {
     fn new() -> Self {
         Self {
             pages: Vec::new(),
@@ -171,6 +174,7 @@ impl<T> PagedPrimary<T> {
             if first_slot != 0
                 && let Some(Some(page)) = self.pages.get_mut(first_page)
             {
+                let page = Arc::make_mut(page);
                 for slot in &mut page.slots[first_slot..] {
                     if slot.take().is_some() {
                         page.live -= 1;
@@ -203,6 +207,7 @@ impl<T> PagedPrimary<T> {
         self.pages
             .get_mut(id / PRIMARY_PAGE_SIZE)
             .and_then(Option::as_mut)
+            .map(Arc::make_mut)
             .and_then(|page| page.slots[id % PRIMARY_PAGE_SIZE].as_mut())
     }
 
@@ -212,7 +217,8 @@ impl<T> PagedPrimary<T> {
         if self.pages.len() <= page_id {
             self.pages.resize_with(page_id + 1, || None);
         }
-        let page = self.pages[page_id].get_or_insert_with(PrimaryPage::new);
+        let page = self.pages[page_id].get_or_insert_with(|| Arc::new(PrimaryPage::new()));
+        let page = Arc::make_mut(page);
         let slot = &mut page.slots[id % PRIMARY_PAGE_SIZE];
         let was_absent = slot.is_none();
         *slot = Some(obj);
@@ -234,7 +240,7 @@ impl<T> PagedPrimary<T> {
             return None;
         }
         let page_id = id / PRIMARY_PAGE_SIZE;
-        let page = self.pages.get_mut(page_id)?.as_mut()?;
+        let page = Arc::make_mut(self.pages.get_mut(page_id)?.as_mut()?);
         let obj = page.slots[id % PRIMARY_PAGE_SIZE].take()?;
         page.live -= 1;
         if page.live == 0 {
@@ -264,7 +270,7 @@ pub struct Table<T: ArenaObject> {
     primary: PagedPrimary<T>,
     /// Append-only byte arena for variable-length fields, addressed by
     /// [`BlobRef`]. Grows within a session and is truncated back on undo.
-    blobs: Vec<u8>,
+    blobs: BlobArena,
     secondaries: Vec<Box<dyn SecondaryIndex<T>>>,
     tag_positions: HashMap<TypeId, usize>,
     undo_stack: VecDeque<UndoState<T>>,
@@ -290,6 +296,158 @@ pub struct Table<T: ArenaObject> {
     blob_patches: Vec<BlobRef>,
     /// Blob bytes already written to the log; the tail beyond this is new.
     flushed_blob_len: usize,
+    /// Primary slab length at the same snapshot/flush boundary.
+    flushed_next_id: usize,
+    execution_fork: bool,
+}
+
+/// Blob storage optimized for execution forks. Canonical tables retain the
+/// compact contiguous representation used by persistence. A speculative fork
+/// borrows that immutable prefix and writes only an append-only private tail;
+/// transaction workers clear the free-span list, so their normal mutation path
+/// never needs to copy the shared prefix.
+enum BlobArena {
+    Shared(Arc<Vec<u8>>),
+    Fork { base: Arc<Vec<u8>>, tail: Vec<u8> },
+}
+
+impl BlobArena {
+    fn new() -> Self {
+        Self::Shared(Arc::new(Vec::new()))
+    }
+
+    fn execution_fork(&self) -> Self {
+        let base = match self {
+            Self::Shared(bytes) => Arc::clone(bytes),
+            Self::Fork { base, tail } if tail.is_empty() => Arc::clone(base),
+            Self::Fork { base, tail } => {
+                let mut bytes = Vec::with_capacity(base.len().saturating_add(tail.len()));
+                bytes.extend_from_slice(base);
+                bytes.extend_from_slice(tail);
+                Arc::new(bytes)
+            }
+        };
+        Self::Fork {
+            base,
+            tail: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Shared(bytes) => bytes.len(),
+            Self::Fork { base, tail } => base.len().saturating_add(tail.len()),
+        }
+    }
+
+    fn get(&self, start: usize, len: usize) -> &[u8] {
+        let end = start.saturating_add(len);
+        match self {
+            Self::Shared(bytes) => &bytes[start..end],
+            Self::Fork { base, tail } if end <= base.len() => &base[start..end],
+            Self::Fork { base, tail } if start >= base.len() => {
+                &tail[start - base.len()..end - base.len()]
+            }
+            Self::Fork { .. } => {
+                unreachable!("one blob allocation cannot straddle the shared prefix and tail")
+            }
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if let Self::Shared(current) = self
+            && Arc::strong_count(current) > 1
+        {
+            *self = Self::Fork {
+                base: Arc::clone(current),
+                tail: Vec::new(),
+            };
+        }
+        match self {
+            Self::Shared(current) => Arc::make_mut(current).extend_from_slice(bytes),
+            Self::Fork { tail, .. } => tail.extend_from_slice(bytes),
+        }
+    }
+
+    fn can_write_without_materializing(&self, start: usize) -> bool {
+        match self {
+            Self::Shared(bytes) => Arc::strong_count(bytes) == 1,
+            Self::Fork { base, .. } => start >= base.len(),
+        }
+    }
+
+    fn compact(&mut self) {
+        let can_compact = matches!(self, Self::Fork { base, .. } if Arc::strong_count(base) == 1);
+        if can_compact {
+            let _ = self.materialize_mut();
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Shared(bytes) => Arc::make_mut(bytes).truncate(len),
+            Self::Fork { base, tail } if len >= base.len() => tail.truncate(len - base.len()),
+            Self::Fork { .. } => {
+                self.materialize_mut().truncate(len);
+            }
+        }
+    }
+
+    fn write(&mut self, start: usize, bytes: &[u8]) {
+        let end = start.saturating_add(bytes.len());
+        match self {
+            Self::Shared(current) => {
+                Arc::make_mut(current)[start..end].copy_from_slice(bytes);
+            }
+            Self::Fork { base, tail } if start >= base.len() => {
+                tail[start - base.len()..end - base.len()].copy_from_slice(bytes);
+            }
+            Self::Fork { .. } => {
+                self.materialize_mut()[start..end].copy_from_slice(bytes);
+            }
+        }
+    }
+
+    fn materialize_mut(&mut self) -> &mut Vec<u8> {
+        if let Self::Fork { base, tail } = self {
+            let mut bytes = Vec::with_capacity(base.len().saturating_add(tail.len()));
+            bytes.extend_from_slice(base);
+            bytes.extend_from_slice(tail);
+            *self = Self::Shared(Arc::new(bytes));
+        }
+        let Self::Shared(bytes) = self else {
+            unreachable!();
+        };
+        Arc::make_mut(bytes)
+    }
+
+    fn extend_output(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Shared(bytes) => out.extend_from_slice(bytes),
+            Self::Fork { base, tail } => {
+                out.extend_from_slice(base);
+                out.extend_from_slice(tail);
+            }
+        }
+    }
+
+    fn update_hash(&self, hasher: &mut sha2::Sha256) {
+        use sha2::Digest;
+        match self {
+            Self::Shared(bytes) => hasher.update(bytes.as_slice()),
+            Self::Fork { base, tail } => {
+                hasher.update(base.as_slice());
+                hasher.update(tail);
+            }
+        }
+    }
+
+    fn execution_private_bytes(&self) -> usize {
+        match self {
+            Self::Shared(_) => 0,
+            Self::Fork { tail, .. } => tail.capacity(),
+        }
+    }
 }
 
 impl<T: ArenaObject> Default for Table<T> {
@@ -313,7 +471,7 @@ impl<T: ArenaObject> Table<T> {
         }
         Table {
             primary: PagedPrimary::new(),
-            blobs: Vec::new(),
+            blobs: BlobArena::new(),
             secondaries,
             tag_positions,
             undo_stack: VecDeque::new(),
@@ -324,7 +482,78 @@ impl<T: ArenaObject> Table<T> {
             free: HashMap::new(),
             blob_patches: Vec::new(),
             flushed_blob_len: 0,
+            flushed_next_id: 0,
+            execution_fork: false,
         }
+    }
+
+    /// Shallow copy-on-write view used by parallel transaction workers. Live
+    /// primary pages, blob bytes, and secondary maps remain shared until this
+    /// fork mutates them; undo and persistence bookkeeping start empty.
+    pub(crate) fn execution_fork(&self) -> Self {
+        Self {
+            primary: self.primary.clone(),
+            blobs: self.blobs.execution_fork(),
+            secondaries: self
+                .secondaries
+                .iter()
+                .map(|index| index.fork_box())
+                .collect(),
+            tag_positions: self.tag_positions.clone(),
+            undo_stack: VecDeque::new(),
+            row_count: self.row_count,
+            revision: self.revision,
+            dirty: Vec::new(),
+            in_dirty: DirtyPages::new(),
+            free: HashMap::new(),
+            blob_patches: Vec::new(),
+            flushed_blob_len: self.blobs.len(),
+            flushed_next_id: self.primary.len(),
+            execution_fork: true,
+        }
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let primary = self
+            .primary
+            .pages
+            .iter()
+            .flatten()
+            .count()
+            .saturating_mul(PRIMARY_PAGE_SIZE)
+            .saturating_mul(std::mem::size_of::<Option<T>>());
+        let secondary = self
+            .secondaries
+            .iter()
+            .map(|index| index.len().saturating_mul(48))
+            .sum::<usize>();
+        primary
+            .saturating_add(self.blobs.len())
+            .saturating_add(secondary)
+    }
+
+    pub(crate) fn execution_private_bytes(&self) -> usize {
+        if !self.execution_fork {
+            return 0;
+        }
+        let primary = self
+            .primary
+            .pages
+            .iter()
+            .flatten()
+            .filter(|page| Arc::strong_count(page) == 1)
+            .count()
+            .saturating_mul(std::mem::size_of::<PrimaryPage<T>>().saturating_add(
+                PRIMARY_PAGE_SIZE.saturating_mul(std::mem::size_of::<Option<T>>()),
+            ));
+        let secondary = self
+            .secondaries
+            .iter()
+            .map(|index| index.detached_bytes())
+            .sum::<usize>();
+        primary
+            .saturating_add(self.blobs.execution_private_bytes())
+            .saturating_add(secondary)
     }
 
     /// Appends `bytes` to the blob arena and returns a [`BlobRef`] to them, for
@@ -337,23 +566,26 @@ impl<T: ArenaObject> Table<T> {
         let len = bytes.len() as u32;
         // Reuse an abandoned span of the exact size before growing the arena.
         if let Some(off) = self.free.get_mut(&len).and_then(|offs| offs.pop()) {
-            let start = off as usize;
-            self.blobs[start..start + bytes.len()].copy_from_slice(bytes);
-            let r = BlobRef { off, len };
-            // This overwrote bytes inside the already-flushed region; log it so a
-            // WAL replay reproduces them (the tail-only delta would not).
-            if (off as usize) < self.flushed_blob_len {
-                self.blob_patches.push(r);
+            if self.blobs.can_write_without_materializing(off as usize) {
+                let start = off as usize;
+                self.blobs.write(start, bytes);
+                let r = BlobRef { off, len };
+                // This overwrote bytes inside the already-flushed region; log it so a
+                // WAL replay reproduces them (the tail-only delta would not).
+                if (off as usize) < self.flushed_blob_len {
+                    self.blob_patches.push(r);
+                }
+                // If a session is open the allocation can be undone, so remember to
+                // hand the span back to the free list then.
+                if let Some(state) = self.undo_stack.back_mut() {
+                    state.reused.push(r);
+                }
+                return r;
             }
-            // If a session is open the allocation can be undone, so remember to
-            // hand the span back to the free list then.
-            if let Some(state) = self.undo_stack.back_mut() {
-                state.reused.push(r);
-            }
-            return r;
+            self.free.entry(len).or_default().push(off);
         }
         let off = self.blobs.len() as u32;
-        self.blobs.extend_from_slice(bytes);
+        self.blobs.append(bytes);
         BlobRef { off, len }
     }
 
@@ -382,7 +614,7 @@ impl<T: ArenaObject> Table<T> {
     /// Resolves a [`BlobRef`] to its bytes.
     pub fn blob(&self, r: BlobRef) -> &[u8] {
         let start = r.off as usize;
-        &self.blobs[start..start + r.len as usize]
+        self.blobs.get(start, r.len as usize)
     }
 
     /// Total bytes in the blob arena (live + not-yet-reused free spans). Used to
@@ -521,7 +753,7 @@ impl<T: ArenaObject> Table<T> {
             .downcast_ref::<KeyIndex<T, Tag>>()
             .expect("tag registered with mismatching key index type");
         IndexView {
-            map: &index.map,
+            index,
             primary: &self.primary,
         }
     }
@@ -548,7 +780,7 @@ impl<T: ArenaObject> Table<T> {
             .downcast_ref::<crate::object::HashKeyIndex<T, Tag>>()
             .expect("tag registered as ordered; use get_index, not get_hash_index");
         HashIndexView {
-            map: &index.map,
+            index,
             primary: &self.primary,
         }
     }
@@ -814,7 +1046,7 @@ impl<T: ArenaObject> Table<T> {
             out.extend_from_slice(obj.as_bytes());
         }
         out.extend_from_slice(&(self.blobs.len() as u64).to_le_bytes());
-        out.extend_from_slice(&self.blobs);
+        self.blobs.extend_output(out);
     }
 
     /// Restores rows written by [`Table::pack_into`] into this freshly
@@ -857,12 +1089,13 @@ impl<T: ArenaObject> Table<T> {
             .checked_add(blob_len)
             .filter(|end| *end <= bytes.len())
             .ok_or(TableError::Corrupted("blob arena extends past snapshot"))?;
-        self.blobs.extend_from_slice(&bytes[pos..end]);
+        self.blobs.append(&bytes[pos..end]);
         pos = end;
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in table snapshot"));
         }
         self.flushed_blob_len = self.blobs.len();
+        self.flushed_next_id = self.primary.len();
         Ok(())
     }
 
@@ -897,11 +1130,21 @@ impl<T: ArenaObject> Table<T> {
             out.extend_from_slice(&(r.off as u64).to_le_bytes());
             out.extend_from_slice(&(r.len as u64).to_le_bytes());
             let start = r.off as usize;
-            out.extend_from_slice(&self.blobs[start..start + r.len as usize]);
+            out.extend_from_slice(self.blobs.get(start, r.len as usize));
         }
-        let tail = &self.blobs[self.flushed_blob_len..];
-        out.extend_from_slice(&(tail.len() as u64).to_le_bytes());
-        out.extend_from_slice(tail);
+        let tail_len = self.blobs.len().saturating_sub(self.flushed_blob_len);
+        out.extend_from_slice(&(tail_len as u64).to_le_bytes());
+        if tail_len > 0 {
+            out.extend_from_slice(self.blobs.get(self.flushed_blob_len, tail_len));
+        }
+    }
+
+    pub(crate) fn has_unflushed_allocation(&self) -> bool {
+        self.primary.len() > self.flushed_next_id || self.blobs.len() > self.flushed_blob_len
+    }
+
+    pub(crate) fn has_unflushed_blob_patch(&self) -> bool {
+        !self.blob_patches.is_empty()
     }
 
     /// Replays a delta produced by [`Table::pack_delta`] onto the current state.
@@ -919,11 +1162,22 @@ impl<T: ArenaObject> Table<T> {
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.take(id) {
+            let old = self.primary.take(id);
+            if let Some(old) = old {
                 for index in &mut self.secondaries {
                     index.erase(&old);
                 }
                 self.row_count -= 1;
+                if tag == 1 {
+                    self.on_modify(id as i64, old);
+                } else if let Some(state) = self.undo_stack.back_mut()
+                    && (id as i64) < state.old_next_id
+                {
+                    if !state.removed_values.contains_key(&(id as i64)) {
+                        state.removed_order.push(id as i64);
+                    }
+                    state.removed_values.insert(id as i64, old);
+                }
             }
             if tag == 1 {
                 let end = pos
@@ -944,6 +1198,7 @@ impl<T: ArenaObject> Table<T> {
                 self.primary.insert(id, obj);
                 self.row_count += 1;
             }
+            self.mark_dirty(id as i64);
         }
         // In-place patches (into bytes appended by earlier frames), then the tail.
         let patch_count = read_u64(bytes, &mut pos)?;
@@ -957,7 +1212,7 @@ impl<T: ArenaObject> Table<T> {
             if off + len > self.blobs.len() {
                 return Err(TableError::Corrupted("delta patch out of range"));
             }
-            self.blobs[off..off + len].copy_from_slice(&bytes[pos..end]);
+            self.blobs.write(off, &bytes[pos..end]);
             pos = end;
         }
         let blob_len = read_u64(bytes, &mut pos)? as usize;
@@ -965,12 +1220,11 @@ impl<T: ArenaObject> Table<T> {
             .checked_add(blob_len)
             .filter(|end| *end <= bytes.len())
             .ok_or(TableError::Corrupted("delta blob extends past record"))?;
-        self.blobs.extend_from_slice(&bytes[pos..end]);
+        self.blobs.append(&bytes[pos..end]);
         pos = end;
         if pos != bytes.len() {
             return Err(TableError::Corrupted("trailing bytes in delta"));
         }
-        self.flushed_blob_len = self.blobs.len();
         Ok(())
     }
 
@@ -980,7 +1234,12 @@ impl<T: ArenaObject> Table<T> {
         }
         self.dirty.clear();
         self.blob_patches.clear();
+        self.blobs.compact();
+        for index in &mut self.secondaries {
+            index.compact();
+        }
         self.flushed_blob_len = self.blobs.len();
+        self.flushed_next_id = self.primary.len();
     }
 
     /// Feeds this table's committed content into the state hasher: the live rows
@@ -994,7 +1253,7 @@ impl<T: ArenaObject> Table<T> {
             hasher.update(obj.as_bytes());
         }
         hasher.update((self.blobs.len() as u64).to_le_bytes());
-        hasher.update(&self.blobs);
+        self.blobs.update_hash(hasher);
     }
 }
 
@@ -1031,8 +1290,121 @@ fn try_insert_all<T: ArenaObject>(
 
 /// Read view over one secondary index, resolving ids through the primary arena.
 pub struct IndexView<'a, T: ArenaObject, Tag: IndexedBy<T>> {
-    map: &'a BTreeMap<Tag::Key, i64>,
+    index: &'a KeyIndex<T, Tag>,
     primary: &'a PagedPrimary<T>,
+}
+
+enum OverlayRange<'a, K: Ord + Clone> {
+    /// Preserve the standard library's streaming O(n) traversal on the common
+    /// canonical path, where there are no sparse COW changes to merge.
+    Base(std::collections::btree_map::Range<'a, K, i64>),
+    Sparse {
+        base: &'a BTreeMap<K, i64>,
+        changes: &'a BTreeMap<K, Option<i64>>,
+        front: Bound<K>,
+        back: Bound<K>,
+    },
+}
+
+impl<'a, K: Ord + Clone> Iterator for OverlayRange<'a, K> {
+    type Item = (&'a K, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Self::Sparse {
+            base,
+            changes,
+            front,
+            back,
+        } = self
+        else {
+            let Self::Base(entries) = self else {
+                unreachable!();
+            };
+            return entries.next().map(|(key, id)| (key, *id));
+        };
+        let base_candidate = base
+            .range((front.clone(), back.clone()))
+            .find(|(key, _)| !changes.contains_key(*key))
+            .map(|(key, id)| (key, *id));
+        let changed = changes
+            .range((front.clone(), back.clone()))
+            .find_map(|(key, id)| id.map(|id| (key, id)));
+        let candidate = match (base_candidate, changed) {
+            (Some(base), Some(changed)) if base.0 <= changed.0 => base,
+            (Some(_), Some(changed)) => changed,
+            (Some(base), None) => base,
+            (None, Some(changed)) => changed,
+            (None, None) => return None,
+        };
+        *front = Bound::Excluded(candidate.0.clone());
+        Some(candidate)
+    }
+}
+
+impl<'a, K: Ord + Clone> DoubleEndedIterator for OverlayRange<'a, K> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let Self::Sparse {
+            base,
+            changes,
+            front,
+            back,
+        } = self
+        else {
+            let Self::Base(entries) = self else {
+                unreachable!();
+            };
+            return entries.next_back().map(|(key, id)| (key, *id));
+        };
+        let base_candidate = base
+            .range((front.clone(), back.clone()))
+            .rev()
+            .find(|(key, _)| !changes.contains_key(*key))
+            .map(|(key, id)| (key, *id));
+        let changed = changes
+            .range((front.clone(), back.clone()))
+            .rev()
+            .find_map(|(key, id)| id.map(|id| (key, id)));
+        let candidate = match (base_candidate, changed) {
+            (Some(base), Some(changed)) if base.0 >= changed.0 => base,
+            (Some(_), Some(changed)) => changed,
+            (Some(base), None) => base,
+            (None, Some(changed)) => changed,
+            (None, None) => return None,
+        };
+        *back = Bound::Excluded(candidate.0.clone());
+        Some(candidate)
+    }
+}
+
+pub struct IndexRange<'a, T: ArenaObject, Tag: IndexedBy<T>> {
+    entries: OverlayRange<'a, Tag::Key>,
+    primary: &'a PagedPrimary<T>,
+}
+
+impl<'a, T: ArenaObject, Tag: IndexedBy<T>> Iterator for IndexRange<'a, T, Tag> {
+    type Item = (&'a Tag::Key, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next().map(|(key, id)| {
+            let row = self
+                .primary
+                .get(id as usize)
+                .expect("secondary index points at a live row");
+            (key, row)
+        })
+    }
+}
+
+impl<'a, T: ArenaObject, Tag: IndexedBy<T>> DoubleEndedIterator for IndexRange<'a, T, Tag> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.entries.next_back().map(|(key, id)| {
+            let row = self
+                .primary
+                .get(id as usize)
+                .expect("secondary index points at a live row");
+            (key, row)
+        })
+    }
 }
 
 impl<'a, T: ArenaObject, Tag: IndexedBy<T>> IndexView<'a, T, Tag> {
@@ -1043,7 +1415,7 @@ impl<'a, T: ArenaObject, Tag: IndexedBy<T>> IndexView<'a, T, Tag> {
     }
 
     pub fn find(&self, key: &Tag::Key) -> Option<&'a T> {
-        self.map.get(key).map(|&id| self.row(id))
+        self.index.id_for(key).map(|id| self.row(id))
     }
 
     pub fn get(&self, key: &Tag::Key) -> Result<&'a T, TableError> {
@@ -1053,44 +1425,48 @@ impl<'a, T: ArenaObject, Tag: IndexedBy<T>> IndexView<'a, T, Tag> {
     }
 
     pub fn contains(&self, key: &Tag::Key) -> bool {
-        self.map.contains_key(key)
+        self.index.id_for(key).is_some()
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&'a Tag::Key, &'a T)> + '_ {
-        self.map.iter().map(|(key, &id)| (key, self.row(id)))
+    pub fn iter(&self) -> IndexRange<'a, T, Tag> {
+        self.range((Bound::<Tag::Key>::Unbounded, Bound::<Tag::Key>::Unbounded))
     }
 
     /// Objects with key `>= key`, in key order (chainbase `lower_bound`).
-    pub fn lower_bound(
-        &self,
-        key: &Tag::Key,
-    ) -> impl DoubleEndedIterator<Item = (&'a Tag::Key, &'a T)> + '_ {
+    pub fn lower_bound(&self, key: &Tag::Key) -> IndexRange<'a, T, Tag> {
         self.range((Bound::Included(key.clone()), Bound::Unbounded))
     }
 
     /// Objects with key `> key`, in key order (chainbase `upper_bound`).
-    pub fn upper_bound(
-        &self,
-        key: &Tag::Key,
-    ) -> impl DoubleEndedIterator<Item = (&'a Tag::Key, &'a T)> + '_ {
+    pub fn upper_bound(&self, key: &Tag::Key) -> IndexRange<'a, T, Tag> {
         self.range((Bound::Excluded(key.clone()), Bound::Unbounded))
     }
 
-    pub fn range<R: std::ops::RangeBounds<Tag::Key>>(
-        &self,
-        range: R,
-    ) -> impl DoubleEndedIterator<Item = (&'a Tag::Key, &'a T)> + '_ {
-        self.map
-            .range((range.start_bound().cloned(), range.end_bound().cloned()))
-            .map(|(key, &id)| (key, self.row(id)))
+    pub fn range<R: std::ops::RangeBounds<Tag::Key>>(&self, range: R) -> IndexRange<'a, T, Tag> {
+        let front = range.start_bound().cloned();
+        let back = range.end_bound().cloned();
+        let entries = if self.index.changes.is_empty() {
+            OverlayRange::Base(self.index.map.range((front, back)))
+        } else {
+            OverlayRange::Sparse {
+                base: &self.index.map,
+                changes: &self.index.changes,
+                front,
+                back,
+            }
+        };
+        IndexRange {
+            entries,
+            primary: self.primary,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.index.is_empty()
     }
 }
 
@@ -1099,7 +1475,7 @@ pub struct HashIndexView<'a, T: ArenaObject, Tag: IndexedBy<T>>
 where
     Tag::Key: std::hash::Hash + Eq,
 {
-    map: &'a std::collections::HashMap<Tag::Key, i64>,
+    index: &'a crate::object::HashKeyIndex<T, Tag>,
     primary: &'a PagedPrimary<T>,
 }
 
@@ -1114,19 +1490,19 @@ where
     }
 
     pub fn find(&self, key: &Tag::Key) -> Option<&'a T> {
-        self.map.get(key).map(|&id| self.row(id))
+        self.index.id_for(key).map(|id| self.row(id))
     }
 
     pub fn contains(&self, key: &Tag::Key) -> bool {
-        self.map.contains_key(key)
+        self.index.id_for(key).is_some()
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.index.is_empty()
     }
 }
 
@@ -1158,6 +1534,20 @@ mod tests {
         fn set_id(&mut self, id: ObjectId<Self>) {
             self.id = id;
         }
+
+        fn secondary_indices() -> Vec<Box<dyn SecondaryIndex<Self>>> {
+            vec![crate::key_index::<Self, ByValue>()]
+        }
+    }
+
+    struct ByValue;
+
+    impl IndexedBy<TestRow> for ByValue {
+        type Key = u64;
+
+        fn key(obj: &TestRow) -> Self::Key {
+            obj.value
+        }
     }
 
     #[test]
@@ -1177,5 +1567,98 @@ mod tests {
             table.iter().next().unwrap().value,
             (PRIMARY_PAGE_SIZE * 3) as u64
         );
+    }
+
+    #[test]
+    fn execution_fork_appends_blobs_without_detaching_shared_prefix() {
+        let mut table = Table::<TestRow>::new();
+        let original = table.alloc_blob(b"shared-prefix");
+        let mut fork = table.execution_fork();
+        let appended = fork.alloc_blob(b"private-tail");
+
+        let BlobArena::Shared(canonical) = &table.blobs else {
+            panic!("canonical table must keep contiguous blob storage");
+        };
+        let BlobArena::Fork { base, tail } = &fork.blobs else {
+            panic!("execution fork must keep an append-only tail");
+        };
+        assert!(Arc::ptr_eq(canonical, base));
+        assert_eq!(tail, b"private-tail");
+        assert_eq!(fork.blob(original), b"shared-prefix");
+        assert_eq!(fork.blob(appended), b"private-tail");
+        assert_eq!(table.blob_arena_len(), b"shared-prefix".len());
+        assert!(fork.execution_private_bytes() >= b"private-tail".len());
+    }
+
+    #[test]
+    fn execution_fork_overlays_secondary_changes_in_both_directions() {
+        let mut table = Table::<TestRow>::new();
+        for value in [1, 3, 5] {
+            table.emplace(|row| row.value = value).unwrap();
+        }
+        let mut fork = table.execution_fork();
+        fork.remove(ObjectId::new(0)).unwrap();
+        fork.modify(ObjectId::new(1), |row| row.value = 4).unwrap();
+        fork.emplace(|row| row.value = 2).unwrap();
+
+        let forward = fork
+            .get_index::<ByValue>()
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        let reverse = fork
+            .get_index::<ByValue>()
+            .iter()
+            .rev()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        assert_eq!(forward, vec![2, 4, 5]);
+        assert_eq!(reverse, vec![5, 4, 2]);
+        assert_eq!(
+            table
+                .get_index::<ByValue>()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+
+        let index = fork.secondaries[0]
+            .as_any()
+            .downcast_ref::<KeyIndex<TestRow, ByValue>>()
+            .unwrap();
+        assert_eq!(index.map.len(), 3);
+        assert_eq!(index.changes.len(), 4);
+    }
+
+    #[test]
+    fn canonical_writes_stay_sparse_while_execution_snapshot_is_live() {
+        let mut table = Table::<TestRow>::new();
+        table.alloc_blob(b"base");
+        table.emplace(|row| row.value = 1).unwrap();
+        let snapshot = table.execution_fork();
+
+        table.alloc_blob(b"tail");
+        table.emplace(|row| row.value = 2).unwrap();
+        assert!(matches!(table.blobs, BlobArena::Fork { .. }));
+        let canonical_index = table.secondaries[0]
+            .as_any()
+            .downcast_ref::<KeyIndex<TestRow, ByValue>>()
+            .unwrap();
+        let snapshot_index = snapshot.secondaries[0]
+            .as_any()
+            .downcast_ref::<KeyIndex<TestRow, ByValue>>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&canonical_index.map, &snapshot_index.map));
+        assert_eq!(canonical_index.changes.len(), 1);
+
+        drop(snapshot);
+        table.mark_flushed();
+        assert!(matches!(table.blobs, BlobArena::Shared(_)));
+        let canonical_index = table.secondaries[0]
+            .as_any()
+            .downcast_ref::<KeyIndex<TestRow, ByValue>>()
+            .unwrap();
+        assert!(canonical_index.changes.is_empty());
     }
 }

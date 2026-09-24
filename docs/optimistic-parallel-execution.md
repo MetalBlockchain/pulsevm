@@ -1,178 +1,291 @@
 # Consensus-safe optimistic parallel execution
 
-## Goal
+## Goal and status
 
-Use otherwise idle validator cores to execute independent explicit transactions
-in parallel while preserving the exact result of the current serial executor.
-Transaction order, receipts, billed resources, traces, Merkle roots, database
-state, and failure behavior remain serial-order authoritative. Parallelism is a
-node-local optimization and does not introduce a protocol feature.
+PulseVM executes independent explicit transactions concurrently while preserving
+the exact result of canonical serial execution. Transaction order, authority
+checks, deterministic CPU/NET/RAM billing, receipts, action digests, Merkle
+roots, Arena state, and failure behavior remain serial-order authoritative.
 
-The serial executor remains the reference implementation and the mandatory
-fallback. A speculative result is committed only when a deterministic conflict
-check proves that it observed the state it would have observed in serial order.
+The production path is enabled by default on hosts with at least two usable
+workers. It is used both while producing a block from the mempool and while
+validating or replaying a block. Parallelism is node-local: nodes may choose
+different worker counts without changing block validity or state.
 
-## Execution boundary
+## Serial boundary
 
-Keep these operations serial:
+These operations remain serial:
 
-- block header, timestamp, producer schedule, and protocol-feature validation;
-- `eosio::onblock` and other implicit actions;
-- due deferred transactions, `onerror`, and deferred retirement;
-- transaction receipt ordering and transaction/action Merkle construction;
-- final Arena commit, accepted logs, state-history output, and mempool removal.
+- block headers, timestamps, schedules, and protocol-feature activation;
+- `pulse::onblock` and other implicit actions;
+- due deferred transactions, retirement, and `onerror`;
+- ordered speculative commit or serial fallback;
+- transaction/action Merkle construction and end-of-block accounting;
+- accepted logs, state-history output, and mempool removal.
 
-Initially speculate only explicit packed transactions in their canonical block
-order. Inline and context-free actions remain inside their parent transaction
-and execute serially on that transaction's worker. A transaction that changes
-code, ABI, permissions, resource limits, producer state, or protocol state is
-valid input; its recorded writes simply force dependent later transactions to
-fall back to serial execution.
+Only explicit packed transactions are sent to workers. Inline and notification
+actions execute normally inside their parent transaction. Offline XPR batched
+replay remains on its specialized serial/native path because its private native
+row cache is not part of the worker snapshot.
 
-## Deterministic algorithm
+## Execution algorithm
 
-1. Execute the block's serial prelude and freeze a versioned read view.
-2. Assign explicit transactions to workers by transaction index. Completion
-   order never affects validation or commit order.
-3. Each worker executes against an isolated overlay and produces:
-   - the transaction result and action traces;
-   - deterministic CPU/NET/RAM billing inputs;
-   - an exact key read set and write set;
-   - range/index dependencies for lower-bound, upper-bound, and iteration reads;
-   - a database changeset that has not touched canonical Arena state.
-4. Visit results strictly in receipt order. A result is valid only if none of
-   its reads, range dependencies, or writes conflict with earlier committed
-   writes. Treat a write as an implicit read unless the database operation is
-   proven to be an unconditional blind write.
-5. Apply a valid changeset and its trace in order. Re-execute a conflicting,
-   incomplete, or failed speculative result with the existing serial executor
-   on the current canonical prefix, then commit that serial result.
-6. Run the existing semantic root checks and block accept path unchanged.
+1. Execute the serial block prelude and create one shallow copy-on-write Arena
+   snapshot of that exact prefix. Primary pages, blob arenas, and secondary
+   indexes are shared immutably until a worker writes to them.
+2. Bound the worker pool by the configured limit, available CPUs, transaction
+   count, and the snapshot memory budget. Since every successful ordinary
+   transaction writes its first authorizer's resource-usage row, only the first
+   transaction for each authorizer is dispatched from a common snapshot;
+   guaranteed-conflict duplicates stay on the serial path.
+3. A persistent, named worker pool takes tasks from a bounded dispatch window.
+   Each worker creates one isolated COW fork per batch and reuses it for multiple
+   transactions. Every transaction runs in a child undo session and is undone
+   before the worker accepts another task. Persistent threads also retain their
+   thread-local warm WASM stores and module handles between blocks.
+4. A worker runs the normal signature/authority checks, `TransactionContext`,
+   native/WASM dispatch, deterministic metering, resource checks, trace
+   construction, and database dependency recording.
+5. Successful supported mutations produce a logical execution journal. The
+   journal contains stable keys and values, never Arena row IDs, blob offsets,
+   or allocator state.
+6. The controller consumes results while workers are still running, but visits
+   them strictly in canonical transaction order. A compact incremental index of
+   prior writes validates each candidate by walking its own exact reads,
+   conservative range reads, and non-rebaseable writes; validation does not
+   rescan the block's entire accumulated write set.
+7. The controller replays an accepted journal through the ordinary database
+   APIs inside a child undo session. Arena therefore allocates physical rows and
+   blobs in canonical order. Receipt sequence counters are allocated during
+   replay and their action digests are recomputed.
+8. A conflict, incomplete journal, worker error or panic, stale resource check,
+   or replay error discards that candidate and executes the transaction with
+   the existing serial path on the current prefix.
 
-Conflict decisions use only transaction order, recorded dependencies, and
-versioned state. They never depend on wall-clock timing, worker identity, or
-which task finishes first.
+Worker completion order is never observed. Only twice the effective worker
+count may be dispatched or buffered at once. If at least 75% of the first
+`max(workers, 4)` ordered attempts fall back, the remaining speculation is
+cancelled and the suffix runs serially. A panic recreates the affected worker
+fork; a terminated pool thread is reaped and replaced before the next submit.
+Neither failure can modify canonical state or invalidate a block.
 
-## Database work
+## Dependencies and phantom protection
 
-Add the concurrency boundary in `pulsevm_database`, below contract execution:
+Dependency keys cover contract primary rows and all five secondary-index
+families (`idx64`, `idx128`, `idx256`, `idx_double`, and `idx_long_double`).
+Point lookups use stable logical row keys. Primary lower/upper/previous/last
+positioning records the exact inclusive key interval that could change its
+result. Full primary scans and secondary bounds/iteration retain conservative
+whole-index ranges, so an earlier insert, remove, or secondary re-key cannot
+create an unobserved phantom.
 
-- `VersionedReadView`: immutable block-prefix snapshot plus per-record versions;
-- `TransactionOverlay`: read-through snapshot with private ordered writes;
-- `ReadDependency`: exact primary/secondary keys and conservative index ranges;
-- `TransactionChangeset`: ordered inserts, updates, removals, and metadata;
-- `validate_and_apply`: serial-order conflict validation and atomic Arena apply.
+System keys cover accounts, code, ABI, permissions and links, permission usage,
+chain configuration, producer schedules, protocol features, resource limits
+and usage, input-transaction deduplication, deferred transactions, and action
+sequence counters. Most system mutations conflict conservatively.
 
-Every consensus database intrinsic must route through the overlay abstraction.
-Iterator and range reads require phantom protection: until interval tracking is
-proven, any write to a table/index read through iteration conflicts. Resource
-limits, permissions, generated transactions, code/ABI, protocol features, and
-producer schedules are versioned records, not untracked side channels.
+Only fields that have an explicit ordered replay rule are exempt from ordinary
+write/write conflicts:
 
-Arena itself remains single-writer. Worker overlays must not open concurrent
-Arena undo sessions or mutate shared iterator caches. The first implementation
-should favor conservative conflicts over unsafe parallel commits.
+- global action sequence;
+- per-account receiver/authorization sequence;
+- block resource accumulator state.
 
-## Failure and resource semantics
+Account metadata changes, permission usage, account resource usage, and
+transaction dedupe rows are not broadly exempt. This distinction prevents a
+contract upgrade or authority/resource mutation from being mistaken for a
+harmless counter rebase.
 
-- Metered WASM points are deterministic and stay local to each overlay.
-- Subjective wall-clock deadlines are not committed state. Queue delay must not
-  turn an otherwise valid block into a consensus rejection.
-- A speculative exception is authoritative only when its dependency set still
-  validates; otherwise the transaction is re-executed serially.
-- RAM quota checks and deferred scheduling are evaluated against the ordered
-  prefix. Stale speculative decisions conflict and re-execute.
-- A worker panic, incomplete dependency record, unsupported intrinsic, or
-  overlay limit always degrades to serial execution for that transaction.
+## Logical journal completeness
 
-## Rollout gates
+The authoritative journal currently supports:
 
-1. **Dependency telemetry:** instrument the serial executor, measure read/write
-   set sizes and expected conflict rates, and do not change execution.
-2. **Shadow mode:** execute selected transactions in overlays but commit only the
-   serial result; compare status, billing, traces, changesets, and roots.
-3. **Validator mode:** enable ordered optimistic commit with sampled serial
-   replay comparison and an automatic process-level serial escape hatch.
-4. **Producer mode:** enable only after validator parity over the full XPR replay
-   and sustained multi-node tests.
+- primary and secondary contract-row create, update, and remove;
+- account CPU/NET usage and RAM deltas/checks;
+- permission last-used updates;
+- input-transaction dedupe records;
+- deferred-transaction create and removal by transaction or sender id;
+- action receiver/global/authorization sequence allocation.
 
-### Current dependency-telemetry slice
+At worker completion, PulseVM independently derives the write-event multiset
+explained by those operations and requires exact key and occurrence-count
+equality with the database recorder's observed writes. Counting events prevents
+an unsupported mutation from hiding behind a supported operation that happens
+to touch the same key. A native action such as `newaccount`, `setcode`, `setabi`,
+authority mutation, producer proposal, protocol activation, or any future
+unjournaled write therefore cannot be committed
+optimistically; it falls back to serial execution.
 
-The first rollout gate is available behind the node-local
-`PULSEVM_DEPENDENCY_TELEMETRY` environment variable. It is unset by default and
-does not change transaction execution or Arena state. When enabled, each
-explicit/deferred serial transaction receives an isolated recorder through its
-cloned `Database` handle; inline actions and WASM host functions inherit that
-same recorder. Debug logs include the transaction id, outcome, counts, exact
-contract/system keys, conservative range keys, and writes.
+This closed-write check is deliberately conservative. Adding a new mutating
+database API requires dependency-write instrumentation. Without a journal
+representation its observed write makes the candidate fall back to serial;
+omitting dependency instrumentation is a consensus-correctness bug and is
+called out as an invariant beside the database recorder.
 
-The recorder covers the contract primary table plus idx64, idx128,
-idx256, idx_double, and idx_long_double. Point reads use stable logical row keys
-and iterator/secondary searches conservatively depend on the whole relevant
-index, including absent reads. Table existence and payer reads track the table
-metadata row. Child creation/removal also writes that metadata because it
-changes the table row count and can create or delete the table.
+## Ordered resource and receipt semantics
 
-Consensus-visible system state reached by explicit/deferred transaction
-execution is also recorded: accounts and metadata, code objects, permissions,
-permission usage and links, chain configuration, proposed producer schedules,
-protocol features and their preactivation queue, resource limits/usage/config,
-input-transaction dedupe rows, deferred transactions, and receipt sequence
-counters. Permission-tree walks and due-deferred scans use conservative range
-keys. Exact logical keys deliberately coarsen pending/committed resource limits
-and singleton state where field-level merging has not been proven safe.
+Workers perform deterministic metering and initial quota checks against the
+shared prefix. Journal replay then applies CPU/NET usage, RAM deltas, permission
+usage, and dedupe writes against the real ordered prefix. If an earlier
+transaction exhausted a limit or otherwise invalidated the speculative result,
+replay fails atomically and the transaction is re-executed serially.
 
-Serial telemetry reports still intentionally set `complete = false`, so they
-cannot authorize an optimistic commit. They measure working sets but do not run
-through the typed overlay described below, and an independent call-path audit
-must still prove future execution cannot bypass either dependency recording or
-private writes. Global action receipt sequencing and per-block resource usage
-are conservative singleton writes, so they currently conflict across
-transactions; safe ordered rebasing or aggregation is required before telemetry
-can translate into useful parallel commits.
+Global, receiver, and authorization sequences necessarily differ between
+workers that started from one prefix. Replay allocates the canonical values,
+patches every action receipt, and recomputes the action receipt digests before
+Merkle construction. Real token-WASM parity tests compare those digests,
+transaction receipts, traces (excluding wall-clock trace telemetry), and the
+complete Arena state root against serial execution.
 
-### Contract-primary overlay foundation
+Producer workers also receive the current node-local subjective failure bill.
+If a serial fallback fails and changes that non-consensus ledger, only later
+candidates with the same first authorizer are invalidated. A failure without an
+authorizer conservatively sends the remaining suffix through the serial path.
 
-The database now also exposes a default-off, typed speculation wave for the
-first bounded overlay slice. Starting a wave mutably borrows the controller's
-canonical `Database`, freezing that handle while workers receive cloneable
-read-only snapshots. Because Arena does not yet provide MVCC or copy-on-write
-snapshots, the snapshot shares the frozen store and carries both the Arena
-revision and a lazily installed logical-mutation epoch. Reads check the epoch
-before and after touching Arena; any write through an instrumented alias makes
-the snapshot stale and prevents commit. Nodes that never start a wave do not
-install the atomic epoch and retain the normal write path.
+## Resource bounds and configuration
 
-Worker overlays currently expose only exact contract-primary get/create/update/
-remove operations. Writes remain private ordered logical operations keyed by
-`(code, scope, table, primary)`; they never contain Arena object ids or blob
-references. Ordered apply validates snapshot version, completeness, and prior
-writes, then invokes the live logical database API inside a nested undo session,
-so Arena assigns ids in canonical transaction/operation order. Secondary
-indices, range iteration, and every system-state operation are unsupported in
-this slice and must mark the worker result incomplete for serial re-execution.
-After any serial fallback, the conservative implementation invalidates the
-remaining wave rather than letting results from the old prefix commit.
+`PULSEVM_PARALLEL_EXECUTION_WORKERS` controls the maximum worker count:
 
-This API is not wired into block execution. Before that integration, every
-transaction database mutation must be routed through the typed overlay, the
-mutation-epoch bypass audit must cover lifecycle/state-replacement methods, and
-global receipt/resource singletons need an ordered rebase strategy. An Arena
-MVCC/COW read view would eventually replace the controller freeze invariant,
-but a full state clone per block is explicitly not an acceptable substitute.
+- unset: use `available_parallelism()`, capped at 64;
+- `0`: disable full-transaction parallel execution;
+- positive integer: use at most that many workers, capped at 64.
 
-Required gates include unit tests for exact keys and range phantoms, inline
-actions, authorization changes, contract upgrades, RAM exhaustion, deferred
-creation/cancellation, soft/hard failures, and traps; randomized serial-vs-
-parallel differential tests; the 512-position parity gate; the complete XPR
-history replay; state/trace/Merkle comparison; crash recovery; and a live
-five-node network with mixed serial and parallel validators.
+`PULSEVM_PARALLEL_EXECUTION_MEMORY_MB` bounds worker memory. The default is 1024
+MiB and the accepted maximum is 65536 MiB. The controller subtracts the shared
+snapshot estimate and reserves 8 MiB of runtime overhead per worker. During
+execution each worker reports its actual detached primary pages, secondary
+overlay entries, and blob-tail capacity. Crossing the configured limit cancels
+new speculative work and sends the suffix through the serial path. Worker count
+is also capped by available CPUs and task count. Production block execution
+requires at least two effective workers; otherwise it uses the serial path
+without changing behavior.
 
-## Expected performance
+`PULSEVM_PARALLEL_EXECUTION_TASKS_PER_WORKER` controls the minimum useful work
+per worker. It defaults to four and accepts values from 1 through 1024. For
+example, a 16-transaction batch normally uses at most four workers even on a
+larger host. This avoids paying fork and scheduling overhead for idle capacity;
+the explicit benchmark API overrides it to measure requested worker counts.
 
-Empty blocks remain dominated by serial `onblock`, so audited WASM instance
-reuse is the relevant optimization there. Optimistic execution targets later
-busy blocks. Its ceiling is the number of independent explicit transactions per
-block, not the machine's raw core count. Measure speedup, conflict rate, serial
-fallback rate, overlay bytes, and ordered-commit wait time independently; do not
-promote the path unless end-to-end replay improves without any parity delta.
+Snapshot creation is pointer-level COW cloning rather than serialization and
+index rebuilding. Primary storage detaches by fixed-size page. Blob arenas keep
+an immutable shared prefix and a private append tail. Ordered and hash secondary
+indexes retain their immutable base and record only sparse key changes in each
+worker; ordered iteration merges both views without materializing the tree.
+When pruning leaves fewer than two useful production tasks, PulseVM avoids the
+snapshot and dependency recorder entirely and runs the batch serially.
+
+After three sustained high-contention batches, the node skips most speculative
+batches and probes periodically. Successful probes decay the score and restore
+normal parallel execution. This policy is node-local and cannot affect block
+validity.
+
+## Failure and consensus properties
+
+- The canonical Arena remains single-writer.
+- Every journal replay is enclosed by a child undo session and is squashed or
+  undone exactly once.
+- Worker Arenas never share iterator caches or mutable storage with canonical
+  execution; shared storage is immutable and worker changes are private.
+- Subjective wall-clock deadlines are disabled for first-time block validation;
+  queueing and host speed cannot decide validity.
+- Authorization and deterministic receipt measurement are still required for a
+  peer block. Only an exact block already validated by this node may use trusted
+  replay mode.
+- Parallel settings, task scheduling, completion timing, and log counters are
+  node-local and do not enter hashes or state.
+- Physical Arena deltas remain a diagnostic/test API only. Authoritative
+  full-transaction commit uses logical journals because physical allocator
+  offsets from a common prefix cannot be safely merged in general.
+
+## Telemetry
+
+The controller logs effective workers, dispatch window, estimated snapshot
+bytes, snapshot time, worker success/failure counts, complete journals,
+estimated dependency waves, total elapsed time, optimistic commits, and serial
+fallbacks. It keeps node-local cumulative commit/fallback counters for tests and
+future metrics export.
+
+Compiled WASM modules use a small thread-local handle cache ahead of the shared
+LRU, avoiding its write lock on hot actions. A per-code-hash single-flight gate
+ensures concurrent first use compiles one LLVM module while waiters reuse the
+result. Compilation itself remains outside the shared cache lock.
+
+Recovered transaction keys use a bounded LRU keyed by chain id and packed
+digest, allowing mempool admission, block production, and validation to reuse
+the same cryptographic result. Recovery on cache misses remains outside the
+cache lock so unrelated signatures execute concurrently.
+
+`PULSEVM_DEPENDENCY_TELEMETRY` emits full serial dependency reports.
+`PULSEVM_PARALLEL_WAVE_TELEMETRY` emits conflict-wave estimates. Both are
+observational and do not change consensus behavior.
+
+The lower-level `Database::execute_speculative_batch` API remains available for
+typed contract-row workloads. It uses the same conservative dependency model,
+bounded restarts, ordered apply, serial escape hatch, and whole-batch rollback.
+
+## Verification
+
+The regression suite includes:
+
+- exact point/range keys and secondary-index phantom conflicts;
+- concurrent typed tasks, hot-key restarts, worker errors/panics, and rollback;
+- reusable full transaction workers that cannot mutate canonical state;
+- copy-on-write fork isolation across primary rows and secondary indexes;
+- indexed conflict decisions equivalent to the reference write-set scan;
+- duplicate unexplained write events rejected by journal auditing;
+- unsupported native/system writes that deterministically fall back;
+- real deployed token-WASM journal replay versus serial receipts, action
+  digests, traces, and Arena roots;
+- two independent real-WASM transactions that both commit optimistically;
+- producer and validator execution of the same conflict-heavy block, with one
+  optimistic commit, one serial fallback, and identical final state.
+- a five-validator MetalGo E2E block containing eight independent token
+  transfers, with all eight committed optimistically, zero fallbacks, identical
+  sender/receiver balances, and converged heads on every node.
+
+Before release, run the workspace/all-target gates and the frozen replay corpus.
+Multi-node E2E remains required when the pinned MetalGo binary and replay
+fixtures are available. The focused optimistic-path E2E can be run with:
+
+```sh
+cd tests/e2e
+METALGO_PATH=/path/to/metalgo \
+PULSEVM_PLUGIN_DIR=/path/to/plugin-directory \
+go test -v -count=1 -run '^TestParallelBlockExecution$' ./...
+```
+
+## Benchmarks
+
+The database coordinator microbenchmark runs independent, 25%-hot, and fully
+contended workloads with one, two, four, and eight workers:
+
+```sh
+cargo bench -p pulsevm_database --bench optimistic_execution --locked
+```
+
+The core benchmark runs complete deployed-token WASM transactions. It includes
+true authoritative serial baselines, an isolated hot-key speculation
+measurement, and the production ordered path for both hot-key and
+independent-row batches. The ordered measurement includes COW snapshot/fork
+construction, pool dispatch, authorization, WASM, dependency capture, indexed
+conflict validation, journal replay or serial fallback, and rollback so every
+sample starts from the same state:
+
+```sh
+cargo bench -p pulsevm_core --bench transfer --locked -- wasm_parallel_execution
+```
+
+Use `-- --quick` for a smoke sample. The returned benchmark result exposes
+transaction/action counts, effective workers, snapshot bytes, detached bytes,
+and optimistic-commit/fallback counts, ensuring the timed path is consumed.
+Independent rows show useful scaling; the hot-key case guards adaptive fallback
+cost and prevents optimistic throughput claims from hiding contention.
+
+## Performance model
+
+Parallel execution targets busy blocks. Empty or tiny blocks remain dominated
+by serial prelude and snapshot overhead and automatically stay serial when
+fewer than two workers are useful. The speedup ceiling is the number of
+independent explicit transactions, not the host's raw core count. Production
+monitoring should track end-to-end block time, snapshot bytes, effective worker
+count, optimistic commit rate, fallback rate, and ordered replay time together.
