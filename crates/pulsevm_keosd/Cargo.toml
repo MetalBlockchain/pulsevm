@@ -12,7 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 actix-web = "4"
-aes = "0.8"
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
 bs58 = "0.5"
 cbc = { version = "0.1", features = ["alloc"] }
 clap = { version = "4", features = ["derive"] }
@@ -24,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 spdlog-rs = "0.5.3"
+subtle = "2.6"
 thiserror = "2"
 zeroize = { version = "1.8.2", features = ["derive"] }
 

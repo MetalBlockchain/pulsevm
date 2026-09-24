@@ -766,7 +766,9 @@ impl ChainConfigParams {
         out.extend_from_slice(&self.max_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.min_transaction_cpu_usage.to_le_bytes());
         out.extend_from_slice(&self.max_transaction_lifetime.to_le_bytes());
-        out.extend_from_slice(&self.deferred_trx_expiration_window.to_le_bytes());
+        // The frozen Leap state-root fixture uses the historical 16-field
+        // chain_config state shape. Keep deferred-trx expiration available to
+        // runtime configuration, but do not add it to this legacy root.
         out.extend_from_slice(&self.max_transaction_delay.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_size.to_le_bytes());
         out.extend_from_slice(&self.max_inline_action_depth.to_le_bytes());
@@ -3769,6 +3771,7 @@ impl ChainDatabase {
         code: &[u8],
         code_hash: [u8; 32],
         head_block_num: u32,
+        first_block_used_override: Option<u32>,
         last_code_update: i64,
         vm_type: u8,
         vm_version: u8,
@@ -3804,7 +3807,8 @@ impl ChainDatabase {
                     c.code_hash = code_hash;
                     c.code = code_blob;
                     c.code_ref_count = 1;
-                    c.first_block_used = head_block_num.wrapping_add(1);
+                    c.first_block_used =
+                        first_block_used_override.unwrap_or_else(|| head_block_num.wrapping_add(1));
                     c.vm_type = vm_type;
                     c.vm_version = vm_version;
                 })?;
