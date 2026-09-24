@@ -347,4 +347,4 @@ The code is authoritative when it differs from the design notes.
 
 ## License
 
-PulseVM is licensed under the [MIT License](LICENSE), with attribution to Metallicus and the Antelope/EOSIO projects on which it is based.
+PulseVM is licensed under the [PulseVM Business License](LICENSE). Non-commercial use, modification, and distribution are permitted; **commercial use requires the prior written permission of Metallicus, Inc.**

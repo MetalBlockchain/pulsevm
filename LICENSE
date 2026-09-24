@@ -1,31 +1,92 @@
 MetalBlockchain/pulsevm
 Copyright (c) 2025-2026 Metallicus, Inc. and its contributors.  All rights reserved.
-This software is based upon:
 
-AntelopeIO/spring
-Copyright (c) 2025-2025 Vaulta Foundation (VF) and its contributors.  All rights reserved. 
-Copyright (c) 2021-2025 EOS Network Foundation (ENF) and its contributors.  All rights reserved. 
-This Vaulta software is based upon:
+                        PULSEVM BUSINESS LICENSE
+                              Version 1.0
 
-EOSIO/eos
-Copyright (c) 2017-2021 block.one and its contributors.  All rights reserved.
+1. Definitions
 
-The MIT License
+   "Licensor" means Metallicus, Inc.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+   "Software" means the PulseVM source code, object code, documentation, and
+   associated files distributed under this License.
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
+   "You" (or "Your") means any individual or legal entity exercising rights
+   under this License.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+   "Commercial Use" means any use of the Software, in whole or in part, that
+   is intended for or directed toward commercial advantage or monetary
+   compensation, including without limitation: (a) operating the Software, or
+   any product or service that incorporates or depends on the Software, for a
+   fee or in exchange for other consideration; (b) using the Software to
+   provide hosted, managed, or network-accessible services to third parties;
+   (c) using the Software in the internal operations of a business or other
+   organization in a manner that produces revenue or reduces costs; and
+   (d) selling, licensing, or otherwise distributing the Software or
+   derivative works of the Software for consideration.
+
+   "Non-Commercial Use" means any use of the Software that is not Commercial
+   Use, including personal use, academic research, teaching, evaluation, and
+   testing.
+
+2. Grant of Rights for Non-Commercial Use
+
+   Subject to the terms and conditions of this License, Licensor hereby
+   grants You a worldwide, royalty-free, non-exclusive, non-transferable,
+   non-sublicensable license to use, copy, modify, and create derivative
+   works of the Software, and to distribute the Software and such derivative
+   works in source or object form, solely for Non-Commercial Use.
+
+3. Commercial Use Requires Permission
+
+   Commercial Use of the Software is not permitted under this License.
+   Any Commercial Use of the Software requires the prior express written
+   permission of Licensor, which may be granted or withheld in Licensor's sole
+   discretion and may be conditioned upon a separate commercial license
+   agreement. To request permission, contact Metallicus, Inc.
+
+4. Conditions
+
+   Any copy or distribution of the Software or a derivative work, in any
+   form, must:
+
+   (a) retain this License in its entirety, including the copyright notice
+       above;
+   (b) include prominent notice of any modifications You have made; and
+   (c) not remove, obscure, or alter any copyright, trademark, or attribution
+       notices contained in the Software.
+
+   You may not use the names, trademarks, service marks, or logos of Licensor
+   or the Metal Blockchain, other than as required for the attribution
+   notices above, without Licensor's prior written permission.
+
+5. Contributions
+
+   Unless You explicitly state otherwise, any contribution intentionally
+   submitted by You for inclusion in the Software shall be licensed to
+   Licensor under a perpetual, worldwide, non-exclusive, royalty-free,
+   irrevocable license to use, reproduce, modify, distribute, sublicense, and
+   relicense such contribution, without any additional terms or conditions.
+
+6. Termination
+
+   This License terminates automatically if You breach any of its terms.
+   Upon termination, You must cease all use and distribution of the Software
+   and destroy all copies in Your possession or control. Sections 7 and 8
+   survive termination.
+
+7. Disclaimer of Warranty and Limitation of Liability
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS, COPYRIGHT HOLDERS, OR LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+8. Governing Law
+
+   This License shall be governed by and construed in accordance with the
+   laws of the jurisdiction in which Licensor is organized, without regard to
+   its conflict of law provisions.
