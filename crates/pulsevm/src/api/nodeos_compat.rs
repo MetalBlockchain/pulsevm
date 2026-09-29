@@ -43,6 +43,7 @@ pub async fn handle_nodeos_request(
         "get_code_hash" => handle_get_code_hash(rpc_service, body).await,
         "get_required_keys" => handle_get_required_keys(rpc_service, body).await,
         "push_transaction" | "send_transaction" => handle_push_transaction(rpc_service, body).await,
+        "send_transaction2" => handle_send_transaction2(rpc_service, body).await,
         _ => (404, error_body("Not found", "unknown_method")),
     };
 
@@ -375,7 +376,26 @@ async fn handle_push_transaction(rpc_service: &RpcService, body: &str) -> (i32, 
         Ok(r) => r,
         Err(_) => return (400, error_body("Invalid JSON", "parse_error")),
     };
+    issue_packed_transaction(rpc_service, req).await
+}
 
+/// `/v1/chain/send_transaction2` is what cleos 5 (and Leap 5 clients generally) call by default.
+/// It wraps the same packed transaction as `push_transaction` in an envelope:
+/// `{"return_failure_trace": bool, "retry_trx": bool, "retry_trx_num_blocks": u32, "transaction":
+/// {...}}`. The retry options are nodeos-side re-broadcast knobs with no PulseVM equivalent, so
+/// they are accepted and ignored; the transaction is admitted exactly like `push_transaction`.
+async fn handle_send_transaction2(rpc_service: &RpcService, body: &str) -> (i32, String) {
+    let req: SendTransaction2Request = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return (400, error_body("Invalid JSON", "parse_error")),
+    };
+    issue_packed_transaction(rpc_service, req.transaction).await
+}
+
+async fn issue_packed_transaction(
+    rpc_service: &RpcService,
+    req: PushTransactionRequest,
+) -> (i32, String) {
     let result = match rpc_service
         .issue_tx_compat(
             req.signatures,
@@ -487,6 +507,72 @@ struct PushTransactionRequest {
     packed_trx: Bytes,
 }
 
+#[derive(serde::Deserialize)]
+struct SendTransaction2Request {
+    transaction: PushTransactionRequest,
+    #[serde(default)]
+    #[allow(dead_code)]
+    return_failure_trace: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    retry_trx: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    retry_trx_num_blocks: Option<u32>,
+}
+
 fn default_compression() -> TransactionCompression {
     TransactionCompression::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The body cleos 5 sends to /v1/chain/send_transaction2 (captured from `cleos transfer`),
+    // signatures elided (the list may be empty at the parsing layer).
+    const CLEOS5_SEND_TRANSACTION2: &str = r#"{
+      "return_failure_trace": true,
+      "retry_trx": false,
+      "transaction": {
+        "signatures": [],
+        "compression": "none",
+        "packed_context_free_data": "",
+        "packed_trx": "71e2ba6ac008ec23202b000000000100a6823403ea3055000000572d3ccdcd01"
+      }
+    }"#;
+
+    #[test]
+    fn send_transaction2_envelope_parses_to_the_push_request() {
+        let req: SendTransaction2Request =
+            serde_json::from_str(CLEOS5_SEND_TRANSACTION2).expect("cleos 5 body parses");
+        assert_eq!(req.transaction.compression, TransactionCompression::None);
+        assert!(req.transaction.signatures.is_empty());
+        assert_eq!(req.return_failure_trace, Some(true));
+        assert_eq!(req.retry_trx, Some(false));
+    }
+
+    #[test]
+    fn send_transaction2_without_optional_flags_parses() {
+        let body = r#"{"transaction":{"signatures":[],"packed_trx":"00"}}"#;
+        let req: SendTransaction2Request =
+            serde_json::from_str(body).expect("minimal envelope parses");
+        assert_eq!(req.transaction.compression, TransactionCompression::None);
+        assert!(req.retry_trx.is_none());
+    }
+
+    #[test]
+    fn a_bare_push_body_is_not_a_send_transaction2_envelope() {
+        let bare = r#"{"signatures":[],"compression":"none","packed_trx":"00"}"#;
+        assert!(serde_json::from_str::<SendTransaction2Request>(bare).is_err());
+        assert!(serde_json::from_str::<PushTransactionRequest>(bare).is_ok());
+    }
+
+    #[test]
+    fn send_transaction2_route_is_extracted() {
+        assert_eq!(
+            extract_method("/ext/bc/abc/v1/chain/send_transaction2").as_deref(),
+            Some("send_transaction2")
+        );
+    }
 }
