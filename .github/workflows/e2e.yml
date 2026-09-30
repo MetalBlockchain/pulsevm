@@ -9,9 +9,10 @@ on:
 # The e2e suite boots a real multi-node metalgo network with the PulseVM plugin
 # loaded, so it needs both a compiled plugin and a metalgo binary. The metalgo
 # version is pinned: the plugin and the node must agree on the rpcchainvm
-# protocol version, and TestPluginProtocolVersion asserts exactly that.
+# protocol version, and TestPluginProtocolVersion asserts exactly that. The
+# plugin speaks rpcchainvm protocol 45, which needs metalgo 1.14.x.
 env:
-  METALGO_VERSION: v1.13.5
+  METALGO_VERSION: v1.14.2-tahoe
   # The VM ID metalgo resolves the plugin by. Derived from the name "pulsevm"
   # zero-padded to 32 bytes; see scripts/install.sh.
   VM_ID: rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs
@@ -62,7 +63,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
 
       - name: Check out metalgo
         uses: actions/checkout@v4
