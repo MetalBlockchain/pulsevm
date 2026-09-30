@@ -158,7 +158,7 @@ pub trait Rpc {
         upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         key_type: String,
-        index_position: Option<I32Flex>,
+        index_position: Option<StringFlex>,
         encode_type: Option<String>, //dec, hex , default=dec
         reverse: Option<bool>,
         show_payer: Option<bool>,
@@ -736,7 +736,7 @@ impl RpcServer for RpcService {
         upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         key_type: String,
-        index_position: Option<I32Flex>,
+        index_position: Option<StringFlex>,
         encode_type: Option<String>, //dec, hex , default=dec
         reverse: Option<bool>,
         show_payer: Option<bool>,
@@ -753,7 +753,7 @@ impl RpcServer for RpcService {
             &upper_bound.unwrap_or_default().0,
             limit.unwrap_or(I32Flex(10)).0 as u32,
             &key_type,
-            &index_position.unwrap_or(I32Flex(1)).0.to_string(),
+            &index_position.map_or_else(|| "1".to_string(), |position| position.0),
             &encode_type.unwrap_or_else(|| "dec".to_string()),
             reverse.unwrap_or(false),
             show_payer.unwrap_or(false),
@@ -813,7 +813,7 @@ impl RpcService {
         upper_bound: Option<StringFlex>,
         limit: Option<I32Flex>,
         key_type: String,
-        index_position: Option<I32Flex>,
+        index_position: Option<StringFlex>,
         encode_type: Option<String>,
         reverse: Option<bool>,
         show_payer: Option<bool>,
@@ -1547,6 +1547,49 @@ mod tests {
         )
         .await;
         assert_eq!(block_info["timestamp"], block["timestamp"]);
+    }
+
+    #[tokio::test]
+    async fn nodeos_compat_accepts_nodeos_request_forms() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+
+        // eosjs sends block_num_or_id as a JSON number.
+        let (code, by_number) =
+            nodeos_response(&service, "/v1/chain/get_block", r#"{"block_num_or_id":1}"#).await;
+        assert_eq!(code, 200, "get_block by number: {by_number}");
+        assert_eq!(by_number["block_num"], 1);
+
+        let by_id_body = json!({ "block_num_or_id": by_number["id"] }).to_string();
+        let (code, by_id) = nodeos_response(&service, "/v1/chain/get_block", &by_id_body).await;
+        assert_eq!(code, 200, "get_block by id: {by_id}");
+        assert_eq!(by_id["id"], by_number["id"]);
+
+        let (code, block_info) =
+            nodeos_response(&service, "/v1/chain/get_block_info", r#"{"block_num":"1"}"#).await;
+        assert_eq!(code, 200, "get_block_info by numeric string: {block_info}");
+        assert_eq!(block_info["block_num"], 1);
+
+        // Named index positions and stringly-typed scalars reach the table
+        // reader instead of failing request parsing.
+        let (code, rows) = nodeos_response(
+            &service,
+            "/v1/chain/get_table_rows",
+            r#"{
+                "json":"true",
+                "code":"pulse",
+                "scope":"pulse",
+                "table":"accounts",
+                "lower_bound":0,
+                "limit":"10",
+                "key_type":"name",
+                "index_position":"secondary",
+                "reverse":"false",
+                "show_payer":0
+            }"#,
+        )
+        .await;
+        assert_ne!(rows["error"]["name"], "parse_error", "{rows}");
+        assert_ne!(code, 400);
     }
 
     #[tokio::test]
