@@ -1527,6 +1527,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nodeos_compat_get_block_info_formats_timestamp_like_nodeos() {
+        let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
+
+        let (code, block_info) =
+            nodeos_response(&service, "/v1/chain/get_block_info", r#"{"block_num":1}"#).await;
+        assert_eq!(code, 200);
+        // nodeos serializes block_timestamp_type as ISO-8601 with millisecond
+        // precision and no zone suffix.
+        assert_eq!(block_info["timestamp"], "2023-01-01T00:00:00.000");
+
+        let (_, info) = nodeos_response(&service, "/v1/chain/get_info", "{}").await;
+        assert_eq!(block_info["timestamp"], info["head_block_time"]);
+
+        let (_, block) = nodeos_response(
+            &service,
+            "/v1/chain/get_block",
+            r#"{"block_num_or_id":"1"}"#,
+        )
+        .await;
+        assert_eq!(block_info["timestamp"], block["timestamp"]);
+    }
+
+    #[tokio::test]
     async fn nodeos_compat_covers_parse_and_backend_errors() {
         let (service, _mempool, _genesis_key, _chain_id, _temp) = service_with_genesis();
         for method in [

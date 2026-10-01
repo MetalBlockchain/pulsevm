@@ -148,13 +148,12 @@ async fn handle_get_block_info(rpc_service: &RpcService, body: &str) -> (i32, St
     let producer = &block.signed_block_header.header.producer;
     let transaction_mroot = &block.signed_block_header.header.transaction_mroot;
     let action_mroot = &block.signed_block_header.header.action_mroot;
-    let timestamp_str = format!("{:?}", block.timestamp().to_time_point());
 
     let block_info = json!({
         "block_num": req.block_num,
         "ref_block_num": (req.block_num & 0xffff) as u16,
         "id": block_id.to_string(),
-        "timestamp": timestamp_str,
+        "timestamp": block.timestamp(),
         "producer": producer.to_string(),
         "confirmed": 0,
         "previous": block.previous_id().to_string(),
