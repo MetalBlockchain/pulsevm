@@ -164,6 +164,13 @@ impl AuthorityPublicKey {
                 .map_err(|e| AuthorityKeyError(format!("invalid K1 authority key: {e}")))?;
             return Ok(Self::K1(point.try_into().unwrap()));
         }
+        if let Some(data) = s.strip_prefix("EOS") {
+            // Legacy K1 spelling, still accepted by nodeos: the same point with
+            // a RIPEMD160 checksum that omits the key-type suffix.
+            let point = decode_b58_checked(data, 33, b"")
+                .map_err(|e| AuthorityKeyError(format!("invalid legacy K1 authority key: {e}")))?;
+            return Ok(Self::K1(point.try_into().unwrap()));
+        }
         if let Some(data) = s.strip_prefix("PUB_R1_") {
             let point = decode_b58_checked(data, 33, b"R1")
                 .map_err(|e| AuthorityKeyError(format!("invalid R1 authority key: {e}")))?;
@@ -399,6 +406,29 @@ mod tests {
         assert_eq!(
             AuthorityPublicKey::from_string(&key.to_string()).unwrap(),
             key
+        );
+    }
+
+    #[test]
+    fn legacy_eos_spelling_parses_to_the_same_k1_key() {
+        let legacy = "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq";
+        let key = AuthorityPublicKey::from_string(legacy).unwrap();
+        let modern = crate::k1::K1PublicKey::from_string(legacy).unwrap();
+
+        assert_eq!(key, AuthorityPublicKey::from(modern));
+        assert_eq!(
+            AuthorityPublicKey::from_string(&key.to_string()).unwrap(),
+            key
+        );
+        assert_eq!(
+            serde_json::from_value::<AuthorityPublicKey>(serde_json::json!(legacy)).unwrap(),
+            key
+        );
+        assert!(
+            AuthorityPublicKey::from_string(
+                "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdr"
+            )
+            .is_err()
         );
     }
 
