@@ -130,6 +130,79 @@ fn mod_exp_uses_activated_crypto_primitives_and_checks_output_capacity() {
 }
 
 #[test]
+fn alt_bn128_mul_uses_activated_crypto_primitives_and_matches_antelope_vector() {
+    let mut h = Host::new(false);
+    let point = hex::decode(concat!(
+        "007c43fcd125b2b13e2521e395a81727710a46b34fe279adbf1b94c72f7f9136",
+        "0db2f980370fb8962751c6ff064f4516a6a93d563388518bb77ab9a6b30755be"
+    ))
+    .unwrap();
+    let scalar =
+        hex::decode("0312ed43559cf8ecbab5221256a56e567aac5035308e3f1d54954d8b97cd1c9b").unwrap();
+    let expected = hex::decode(concat!(
+        "2d66cdeca5e1715896a5a924c50a149be87ddd2347b862150fbb0fd7d0b1833c",
+        "11c76319ebefc5379f7aa6d85d40169a612597637242a4bbb39e5cd3b844becd"
+    ))
+    .unwrap();
+    h.write(10, &point);
+    h.write(80, &scalar);
+    h.write(OUT, &[0xa5; 65]);
+
+    h.budget(cost::ALT_BN128_MUL);
+    assert!(alt_bn128_mul(h.env(), ptr(10), 64, ptr(80), 32, ptr(OUT), 64).is_err());
+
+    h.db.preactivate_protocol_feature(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+        .unwrap();
+    h.db.activate_protocol_features(&[CRYPTO_PRIMITIVES_FEATURE_DIGEST], 2)
+        .unwrap();
+    h.budget(cost::ALT_BN128_MUL);
+    assert_eq!(
+        alt_bn128_mul(h.env(), ptr(10), 64, ptr(80), 32, ptr(OUT), 65).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 64), expected);
+    assert_eq!(h.read(OUT + 64, 1), [0xa5]);
+    assert_eq!(h.remaining(), 0);
+
+    // Invalid lengths and off-curve points return Antelope's failure value
+    // without changing guest memory.
+    h.write(OUT, &[0xa5; 64]);
+    h.write(10, &[0; 64]);
+    h.budget(cost::ALT_BN128_MUL);
+    assert_eq!(
+        alt_bn128_mul(h.env(), ptr(10), 63, ptr(80), 32, ptr(OUT), 64).unwrap(),
+        1
+    );
+    assert_eq!(h.read(OUT, 64), [0xa5; 64]);
+    h.write(10, &[0; 64]);
+    // (0, 0) is Antelope's identity encoding and scalar multiplication keeps it.
+    h.budget(cost::ALT_BN128_MUL);
+    assert_eq!(
+        alt_bn128_mul(h.env(), ptr(10), 64, ptr(80), 32, ptr(OUT), 64).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 64), [0; 64]);
+
+    h.write(10, &[0; 64]);
+    h.write(10, &[1; 64]);
+    h.write(OUT, &[0xa5; 64]);
+    h.budget(cost::ALT_BN128_MUL);
+    assert_eq!(
+        alt_bn128_mul(h.env(), ptr(10), 64, ptr(80), 32, ptr(OUT), 64).unwrap(),
+        1
+    );
+    assert_eq!(h.read(OUT, 64), [0xa5; 64]);
+
+    h.write(10, &point);
+    h.budget(u64::MAX);
+    assert_eq!(
+        alt_bn128_mul(h.env(), ptr(10), 64, ptr(80), 32, ptr(OUT), 63).unwrap(),
+        1
+    );
+    assert!(alt_bn128_mul(h.env(), ptr(END - 63), 64, ptr(80), 32, ptr(OUT), 64).is_err());
+}
+
+#[test]
 fn key_recovery_checks_packing_truncation_mismatch_and_malformed_input() {
     let mut h = Host::new(false);
     let digest = Digest::hash(b"host-recovery-test");

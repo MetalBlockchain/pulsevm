@@ -69,6 +69,9 @@ pub fn memory(len: u64) -> u64 {
 /// A full secp256k1 recovery (~14.5 µs) -- by far the heaviest intrinsic.
 pub const RECOVER_KEY: u64 = 1_650_000;
 
+/// BN254 G1 scalar multiplication (provisional fixed-width pricing).
+pub const ALT_BN128_MUL: u64 = 1_000_000;
+
 /// Modular exponentiation. The grade-school upper bound is proportional to the
 /// exponent bytes times the square of the larger operand. Saturation makes
 /// oversized inputs exhaust any practical transaction budget before bigint

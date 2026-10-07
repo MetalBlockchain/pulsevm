@@ -1,3 +1,10 @@
+use bn::{
+    AffineG1,
+    Fq,
+    Fr,
+    G1,
+    Group,
+};
 use num_bigint::BigUint;
 use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
@@ -77,6 +84,83 @@ pub fn mod_exp(
     let result = base.modpow(&exponent, &modulus).to_bytes_be();
     if result.len() > result_len as usize {
         return Ok(1);
+    }
+    view.write(result_ptr.offset() as u64, &result)?;
+    Ok(0)
+}
+
+/// Antelope `alt_bn128_mul` host intrinsic using 32-byte big-endian field
+/// elements and scalars, and the 64-byte uncompressed (x || y) G1 encoding.
+pub fn alt_bn128_mul(
+    mut env: FunctionEnvMut<WasmContext>,
+    point_ptr: WasmPtr<u8>,
+    point_len: u32,
+    scalar_ptr: WasmPtr<u8>,
+    scalar_len: u32,
+    result_ptr: WasmPtr<u8>,
+    result_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    if !env_data
+        .db()
+        .protocol_feature_activated(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "alt_bn128_mul requires the CRYPTO_PRIMITIVES protocol feature",
+        ));
+    }
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    env_data.charge(&mut store, cost::ALT_BN128_MUL)?;
+
+    let view = memory.view(&store);
+    if point_len != 64 || scalar_len != 32 || result_len < 64 {
+        return Ok(1);
+    }
+    let point_slice = point_ptr.slice(&view, 64)?;
+    let scalar_slice = scalar_ptr.slice(&view, 32)?;
+    let _ = result_ptr.slice(&view, 64)?;
+
+    let mut point_bytes = [0u8; 64];
+    let mut scalar_bytes = [0u8; 32];
+    point_slice.read_slice(&mut point_bytes)?;
+    scalar_slice.read_slice(&mut scalar_bytes)?;
+
+    // Antelope represents the point at infinity as (0, 0).
+    let point = if point_bytes.iter().all(|byte| *byte == 0) {
+        G1::zero()
+    } else {
+        let x = match Fq::from_slice(&point_bytes[..32]) {
+            Ok(value) => value,
+            Err(_) => return Ok(1),
+        };
+        let y = match Fq::from_slice(&point_bytes[32..]) {
+            Ok(value) => value,
+            Err(_) => return Ok(1),
+        };
+        let affine = match AffineG1::new(x, y) {
+            Ok(value) => value,
+            Err(_) => return Ok(1),
+        };
+        G1::from(affine)
+    };
+    let scalar = Fr::from_slice(&scalar_bytes)
+        .map_err(|_| RuntimeError::new("invalid alt_bn128_mul scalar encoding"))?;
+    let product = point * scalar;
+
+    let mut result = [0u8; 64];
+    if let Some(affine) = AffineG1::from_jacobian(product) {
+        affine
+            .x()
+            .to_big_endian(&mut result[..32])
+            .map_err(|_| RuntimeError::new("failed to encode alt_bn128_mul x coordinate"))?;
+        affine
+            .y()
+            .to_big_endian(&mut result[32..])
+            .map_err(|_| RuntimeError::new("failed to encode alt_bn128_mul y coordinate"))?;
     }
     view.write(result_ptr.offset() as u64, &result)?;
     Ok(0)
