@@ -16,6 +16,18 @@ first measurement found, and the calibration decision that measurement forces.
 
 ## Method (a stripped-down NEAR runtime-params-estimator)
 
+`alt_bn128_mul` charges a fixed provisional 1,000,000 points for its fixed-width
+BN254 scalar multiplication. The constant is consensus-visible CPU billing and
+must be recalibrated only through a coordinated protocol upgrade.
+
+`mod_exp` uses a deterministic provisional estimate of
+`1,000 + 11 × input_bytes + 32 × max(base_bytes, modulus_bytes)² × exponent_bytes`
+points. This formula charges input copying and reflects modular exponentiation's
+repeated multiplication work. It is charged before allocating bigint operands.
+It has not yet been calibrated with the estimator below. It is consensus-visible
+CPU billing and must be changed only with a coordinated upgrade after
+measurement.
+
 The estimator is an ignored test:
 
 ```

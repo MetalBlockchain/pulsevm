@@ -69,6 +69,31 @@ pub fn memory(len: u64) -> u64 {
 /// A full secp256k1 recovery (~14.5 µs) -- by far the heaviest intrinsic.
 pub const RECOVER_KEY: u64 = 1_650_000;
 
+/// BN254 G1 scalar multiplication (provisional fixed-width pricing).
+pub const ALT_BN128_MUL: u64 = 1_000_000;
+
+/// Modular exponentiation. The grade-school upper bound is proportional to the
+/// exponent bytes times the square of the larger operand. Saturation makes
+/// oversized inputs exhaust any practical transaction budget before bigint
+/// allocation or arithmetic begins.
+#[inline]
+pub fn mod_exp(base_len: u64, exp_len: u64, mod_len: u64) -> u64 {
+    let width = u128::from(base_len.max(mod_len));
+    let exponent = u128::from(exp_len);
+    let input_bytes = u128::from(base_len)
+        .saturating_add(u128::from(exp_len))
+        .saturating_add(u128::from(mod_len));
+    let points = 1_000u128
+        .saturating_add(11u128.saturating_mul(input_bytes))
+        .saturating_add(
+            32u128
+                .saturating_mul(width)
+                .saturating_mul(width)
+                .saturating_mul(exponent),
+        );
+    points.min(u128::from(u64::MAX)) as u64
+}
+
 // ---------------------------------------------------------------------------
 // PROVISIONAL (hand-scaled, pending measurement)
 // ---------------------------------------------------------------------------
@@ -173,6 +198,11 @@ mod tests {
         assert_eq!((ripemd160(0), ripemd160(1)), (16_600, 16_876));
         assert_eq!((memory(0), memory(1)), (300, 310));
         assert_eq!(RECOVER_KEY, 1_650_000);
+        assert_eq!(mod_exp(1, 1, 1), 1_065);
+        assert_eq!(
+            mod_exp(u32::MAX.into(), u32::MAX.into(), u32::MAX.into()),
+            u64::MAX
+        );
 
         // MEASURED database tiers + value byte.
         assert_eq!((DB_STORE, DB_FIND, DB_ITERATE), (16_000, 6_500, 2_500));
