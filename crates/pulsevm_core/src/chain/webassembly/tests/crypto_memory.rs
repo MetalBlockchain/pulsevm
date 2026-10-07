@@ -75,6 +75,61 @@ hash_test!(
 );
 
 #[test]
+fn mod_exp_uses_activated_crypto_primitives_and_checks_output_capacity() {
+    let mut h = Host::new(false);
+    h.write(10, &[5]);
+    h.write(20, &[3]);
+    h.write(30, &[13]);
+    h.write(OUT, &[0xa5; 2]);
+
+    h.budget(cost::mod_exp(1, 1, 1));
+    assert!(mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 1, ptr(OUT), 2,).is_err());
+
+    h.db.preactivate_protocol_feature(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+        .unwrap();
+    h.db.activate_protocol_features(&[CRYPTO_PRIMITIVES_FEATURE_DIGEST], 2)
+        .unwrap();
+    h.budget(cost::mod_exp(1, 1, 1));
+    assert_eq!(
+        mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 1, ptr(OUT), 2,).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 2), [8, 0xa5]);
+    assert_eq!(h.remaining(), 0);
+
+    h.write(OUT, &[0xa5]);
+    h.budget(cost::mod_exp(1, 1, 1));
+    assert_eq!(
+        mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 1, ptr(OUT), 0,).unwrap(),
+        1
+    );
+    assert_eq!(h.read(OUT, 1), [0xa5]);
+
+    h.write(30, &[0]);
+    h.budget(cost::mod_exp(1, 1, 1));
+    assert_eq!(
+        mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 1, ptr(OUT), 1,).unwrap(),
+        1
+    );
+
+    h.budget(u64::MAX);
+    assert!(
+        mod_exp(
+            h.env(),
+            ptr(END - 1),
+            2,
+            ptr(20),
+            1,
+            ptr(30),
+            1,
+            ptr(OUT),
+            1,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn key_recovery_checks_packing_truncation_mismatch_and_malformed_input() {
     let mut h = Host::new(false);
     let digest = Digest::hash(b"host-recovery-test");

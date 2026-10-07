@@ -1,3 +1,4 @@
+use num_bigint::BigUint;
 use pulsevm_crypto::AuthorityPublicKey;
 use pulsevm_serialization::{
     Read,
@@ -15,6 +16,71 @@ use crate::{
     chain::wasm_runtime::WasmContext,
     crypto::Signature,
 };
+
+/// Antelope's activated CRYPTO_PRIMITIVES feature (canonical feature digest).
+pub(crate) const CRYPTO_PRIMITIVES_FEATURE_DIGEST: [u8; 32] = [
+    0x6b, 0xcb, 0x40, 0xa2, 0x4e, 0x49, 0xc2, 0x6d, 0x0a, 0x60, 0x51, 0x3b, 0x6a, 0xeb, 0x85, 0x51,
+    0xd2, 0x64, 0xe4, 0x71, 0x7f, 0x30, 0x6b, 0x81, 0xa3, 0x7a, 0x5a, 0xfb, 0x3b, 0x47, 0xce, 0xdc,
+];
+
+/// Antelope CDT `mod_exp(base, exp, modulus, result)` host intrinsic.
+/// Operands and the minimal result are unsigned, big-endian byte strings.
+pub fn mod_exp(
+    mut env: FunctionEnvMut<WasmContext>,
+    base_ptr: WasmPtr<u8>,
+    base_len: u32,
+    exp_ptr: WasmPtr<u8>,
+    exp_len: u32,
+    mod_ptr: WasmPtr<u8>,
+    mod_len: u32,
+    result_ptr: WasmPtr<u8>,
+    result_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    if !env_data
+        .db()
+        .protocol_feature_activated(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "mod_exp requires the CRYPTO_PRIMITIVES protocol feature",
+        ));
+    }
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    env_data.charge(
+        &mut store,
+        cost::mod_exp(base_len.into(), exp_len.into(), mod_len.into()),
+    )?;
+
+    let view = memory.view(&store);
+    let base_slice = base_ptr.slice(&view, base_len)?;
+    let exp_slice = exp_ptr.slice(&view, exp_len)?;
+    let mod_slice = mod_ptr.slice(&view, mod_len)?;
+    let _ = result_ptr.slice(&view, result_len)?;
+
+    let mut base_bytes = vec![0u8; base_len as usize];
+    let mut exp_bytes = vec![0u8; exp_len as usize];
+    let mut mod_bytes = vec![0u8; mod_len as usize];
+    base_slice.read_slice(&mut base_bytes)?;
+    exp_slice.read_slice(&mut exp_bytes)?;
+    mod_slice.read_slice(&mut mod_bytes)?;
+
+    let base = BigUint::from_bytes_be(&base_bytes);
+    let exponent = BigUint::from_bytes_be(&exp_bytes);
+    let modulus = BigUint::from_bytes_be(&mod_bytes);
+    if modulus == BigUint::default() {
+        return Ok(1);
+    }
+    let result = base.modpow(&exponent, &modulus).to_bytes_be();
+    if result.len() > result_len as usize {
+        return Ok(1);
+    }
+    view.write(result_ptr.offset() as u64, &result)?;
+    Ok(0)
+}
 
 pub fn assert_recover_key(
     mut env: FunctionEnvMut<WasmContext>,

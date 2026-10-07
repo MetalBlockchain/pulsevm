@@ -214,6 +214,7 @@ use crate::chain::{
         memcpy,
         memmove,
         memset,
+        mod_exp,
         preactivate_feature,
         printdf,
         printhex,
@@ -1750,6 +1751,7 @@ impl WasmRuntime {
                 // Crypto functions
                 "assert_recover_key" => Function::new_typed_with_env(&mut store, &env, assert_recover_key),
                 "recover_key" => Function::new_typed_with_env(&mut store, &env, recover_key),
+                "mod_exp" => Function::new_typed_with_env(&mut store, &env, mod_exp),
                 "sha1" => Function::new_typed_with_env(&mut store, &env, sha1),
                 "sha224" => Function::new_typed_with_env(&mut store, &env, sha224),
                 "sha256" => Function::new_typed_with_env(&mut store, &env, sha256),

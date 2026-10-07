@@ -40,6 +40,7 @@ pulsevm_serialization = { path = "../pulsevm_serialization" }
 pulsevm_softfloat = { path = "../pulsevm_softfloat" }
 pulsevm_database = { path = "../pulsevm_database" }
 pulsevm_wasm_validation = { path = "../pulsevm_wasm_validation" }
+num-bigint = "=0.4.8"
 
 [features]
 default = []

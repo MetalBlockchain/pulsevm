@@ -16,6 +16,14 @@ first measurement found, and the calibration decision that measurement forces.
 
 ## Method (a stripped-down NEAR runtime-params-estimator)
 
+`mod_exp` uses a deterministic provisional estimate of
+`1,000 + 11 × input_bytes + 32 × max(base_bytes, modulus_bytes)² × exponent_bytes`
+points. This formula charges input copying and reflects modular exponentiation's
+repeated multiplication work. It is charged before allocating bigint operands.
+It has not yet been calibrated with the estimator below. It is consensus-visible
+CPU billing and must be changed only with a coordinated upgrade after
+measurement.
+
 The estimator is an ignored test:
 
 ```
