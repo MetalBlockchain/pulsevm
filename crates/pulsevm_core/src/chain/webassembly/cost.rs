@@ -72,6 +72,17 @@ pub const RECOVER_KEY: u64 = 1_650_000;
 /// BN254 G1 scalar multiplication (provisional fixed-width pricing).
 pub const ALT_BN128_MUL: u64 = 1_000_000;
 
+/// BN254 G1 point addition (provisional fixed-width pricing).
+pub const ALT_BN128_ADD: u64 = 100_000;
+
+/// BN254 pairing check: charge 100,000,000 points per 192-byte pair before
+/// parsing or allocating pair data. This is a conservative provisional price.
+#[inline]
+pub fn alt_bn128_pair(input_len: u64) -> u64 {
+    let pairs = u128::from(input_len).saturating_add(191) / 192;
+    (1_000_000u128 + 100_000_000u128.saturating_mul(pairs)).min(u128::from(u64::MAX)) as u64
+}
+
 /// Modular exponentiation. The grade-school upper bound is proportional to the
 /// exponent bytes times the square of the larger operand. Saturation makes
 /// oversized inputs exhaust any practical transaction budget before bigint
@@ -209,6 +220,12 @@ mod tests {
         assert_eq!(db_value_per_byte(256), 11 * 256);
 
         // PROVISIONAL fixed costs.
+        assert_eq!((ALT_BN128_ADD, ALT_BN128_MUL), (100_000, 1_000_000));
+        assert_eq!(
+            (alt_bn128_pair(0), alt_bn128_pair(192)),
+            (1_000_000, 101_000_000)
+        );
+        assert_eq!(alt_bn128_pair(u64::MAX), u64::MAX);
         assert_eq!((BASE, AUTH), (5, 40));
         assert_eq!(per_byte(100), 100);
     }

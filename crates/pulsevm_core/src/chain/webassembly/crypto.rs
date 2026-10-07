@@ -1,9 +1,14 @@
 use bn::{
     AffineG1,
+    AffineG2,
     Fq,
+    Fq2,
     Fr,
     G1,
+    G2,
     Group,
+    Gt,
+    pairing_batch,
 };
 use num_bigint::BigUint;
 use pulsevm_crypto::AuthorityPublicKey;
@@ -78,12 +83,18 @@ pub fn mod_exp(
     let base = BigUint::from_bytes_be(&base_bytes);
     let exponent = BigUint::from_bytes_be(&exp_bytes);
     let modulus = BigUint::from_bytes_be(&mod_bytes);
-    if modulus == BigUint::default() {
+    if mod_len == 0 {
         return Ok(1);
     }
-    let result = base.modpow(&exponent, &modulus).to_bytes_be();
-    if result.len() > result_len as usize {
+    if result_len < mod_len {
         return Ok(1);
+    }
+    // Antelope returns exactly the modulus width, including leading zeroes.
+    // A zero modulus also returns a zero-filled buffer of that width.
+    let mut result = vec![0u8; mod_len as usize];
+    if modulus != BigUint::default() {
+        let value = base.modpow(&exponent, &modulus).to_bytes_be();
+        result[mod_len as usize - value.len()..].copy_from_slice(&value);
     }
     view.write(result_ptr.offset() as u64, &result)?;
     Ok(0)
@@ -129,23 +140,9 @@ pub fn alt_bn128_mul(
     point_slice.read_slice(&mut point_bytes)?;
     scalar_slice.read_slice(&mut scalar_bytes)?;
 
-    // Antelope represents the point at infinity as (0, 0).
-    let point = if point_bytes.iter().all(|byte| *byte == 0) {
-        G1::zero()
-    } else {
-        let x = match Fq::from_slice(&point_bytes[..32]) {
-            Ok(value) => value,
-            Err(_) => return Ok(1),
-        };
-        let y = match Fq::from_slice(&point_bytes[32..]) {
-            Ok(value) => value,
-            Err(_) => return Ok(1),
-        };
-        let affine = match AffineG1::new(x, y) {
-            Ok(value) => value,
-            Err(_) => return Ok(1),
-        };
-        G1::from(affine)
+    let point = match decode_g1(&point_bytes) {
+        Ok(point) => point,
+        Err(()) => return Ok(1),
     };
     let scalar = Fr::from_slice(&scalar_bytes)
         .map_err(|_| RuntimeError::new("invalid alt_bn128_mul scalar encoding"))?;
@@ -164,6 +161,155 @@ pub fn alt_bn128_mul(
     }
     view.write(result_ptr.offset() as u64, &result)?;
     Ok(0)
+}
+
+/// Antelope `alt_bn128_add` host intrinsic using two 64-byte uncompressed
+/// (x || y) G1 points and a 64-byte output.
+pub fn alt_bn128_add(
+    mut env: FunctionEnvMut<WasmContext>,
+    lhs_ptr: WasmPtr<u8>,
+    lhs_len: u32,
+    rhs_ptr: WasmPtr<u8>,
+    rhs_len: u32,
+    result_ptr: WasmPtr<u8>,
+    result_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    if !env_data
+        .db()
+        .protocol_feature_activated(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "alt_bn128_add requires the CRYPTO_PRIMITIVES protocol feature",
+        ));
+    }
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    env_data.charge(&mut store, cost::ALT_BN128_ADD)?;
+
+    let view = memory.view(&store);
+    if lhs_len != 64 || rhs_len != 64 || result_len < 64 {
+        return Ok(1);
+    }
+    let lhs_slice = lhs_ptr.slice(&view, 64)?;
+    let rhs_slice = rhs_ptr.slice(&view, 64)?;
+    let _ = result_ptr.slice(&view, 64)?;
+
+    let mut lhs_bytes = [0u8; 64];
+    let mut rhs_bytes = [0u8; 64];
+    lhs_slice.read_slice(&mut lhs_bytes)?;
+    rhs_slice.read_slice(&mut rhs_bytes)?;
+
+    let lhs = match decode_g1(&lhs_bytes) {
+        Ok(point) => point,
+        Err(()) => return Ok(1),
+    };
+    let rhs = match decode_g1(&rhs_bytes) {
+        Ok(point) => point,
+        Err(()) => return Ok(1),
+    };
+    let sum = lhs + rhs;
+
+    let mut result = [0u8; 64];
+    if let Some(affine) = AffineG1::from_jacobian(sum) {
+        affine
+            .x()
+            .to_big_endian(&mut result[..32])
+            .map_err(|_| RuntimeError::new("failed to encode alt_bn128_add x coordinate"))?;
+        affine
+            .y()
+            .to_big_endian(&mut result[32..])
+            .map_err(|_| RuntimeError::new("failed to encode alt_bn128_add y coordinate"))?;
+    }
+    view.write(result_ptr.offset() as u64, &result)?;
+    Ok(0)
+}
+
+fn decode_g1(bytes: &[u8; 64]) -> Result<G1, ()> {
+    // Antelope represents the point at infinity as (0, 0).
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(G1::zero());
+    }
+    let x = Fq::from_slice(&bytes[..32]).map_err(|_| ())?;
+    let y = Fq::from_slice(&bytes[32..]).map_err(|_| ())?;
+    let affine = AffineG1::new(x, y).map_err(|_| ())?;
+    Ok(G1::from(affine))
+}
+
+/// Antelope `alt_bn128_pair` host intrinsic. Inputs are concatenated 192-byte
+/// (G1, G2) pairs; a zero result means their product pairing is one.
+pub fn alt_bn128_pair(
+    mut env: FunctionEnvMut<WasmContext>,
+    pairs_ptr: WasmPtr<u8>,
+    pairs_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (env_data, mut store) = env.data_and_store_mut();
+    if !env_data
+        .db()
+        .protocol_feature_activated(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+    {
+        return Err(RuntimeError::new(
+            "alt_bn128_pair requires the CRYPTO_PRIMITIVES protocol feature",
+        ));
+    }
+
+    let memory = env_data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    env_data.charge(&mut store, cost::alt_bn128_pair(pairs_len.into()))?;
+    if pairs_len % 192 != 0 {
+        return Ok(1);
+    }
+
+    let view = memory.view(&store);
+    let pair_slice = pairs_ptr.slice(&view, pairs_len)?;
+    let mut bytes = vec![0u8; pairs_len as usize];
+    pair_slice.read_slice(&mut bytes)?;
+    let mut pairs = Vec::with_capacity((pairs_len / 192) as usize);
+    for encoded in bytes.chunks_exact(192) {
+        let g1_bytes: &[u8; 64] = encoded[..64]
+            .try_into()
+            .map_err(|_| RuntimeError::new("invalid alt_bn128_pair G1 length"))?;
+        let g2_bytes: &[u8; 128] = encoded[64..]
+            .try_into()
+            .map_err(|_| RuntimeError::new("invalid alt_bn128_pair G2 length"))?;
+        let g1 = match decode_g1(g1_bytes) {
+            Ok(point) => point,
+            Err(()) => return Ok(1),
+        };
+        let g2 = match decode_g2(g2_bytes) {
+            Ok(point) => point,
+            Err(()) => return Ok(1),
+        };
+        pairs.push((g1, g2));
+    }
+
+    Ok(if pairing_batch(&pairs) == Gt::one() {
+        0
+    } else {
+        1
+    })
+}
+
+fn decode_g2(bytes: &[u8; 128]) -> Result<G2, ()> {
+    // Antelope represents the point at infinity as (0, 0).
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(G2::zero());
+    }
+    // Antelope stores each Fq2 coefficient imaginary first, while this crate's
+    // constructor takes real then imaginary.
+    let x_imaginary = Fq::from_slice(&bytes[..32]).map_err(|_| ())?;
+    let x_real = Fq::from_slice(&bytes[32..64]).map_err(|_| ())?;
+    let y_imaginary = Fq::from_slice(&bytes[64..96]).map_err(|_| ())?;
+    let y_real = Fq::from_slice(&bytes[96..]).map_err(|_| ())?;
+    let x = Fq2::new(x_real, x_imaginary);
+    let y = Fq2::new(y_real, y_imaginary);
+    let affine = AffineG2::new(x, y).map_err(|_| ())?;
+    Ok(G2::from(affine))
 }
 
 pub fn assert_recover_key(

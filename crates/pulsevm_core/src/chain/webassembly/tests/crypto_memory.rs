@@ -109,8 +109,21 @@ fn mod_exp_uses_activated_crypto_primitives_and_checks_output_capacity() {
     h.budget(cost::mod_exp(1, 1, 1));
     assert_eq!(
         mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 1, ptr(OUT), 1,).unwrap(),
-        1
+        0
     );
+    assert_eq!(h.read(OUT, 1), [0]);
+
+    // Results retain the modulus width, including leading zero bytes.
+    h.write(10, &[2]);
+    h.write(20, &[5]);
+    h.write(30, &[3, 232]);
+    h.write(OUT, &[0xa5; 2]);
+    h.budget(cost::mod_exp(1, 1, 2));
+    assert_eq!(
+        mod_exp(h.env(), ptr(10), 1, ptr(20), 1, ptr(30), 2, ptr(OUT), 2,).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 2), [0, 32]);
 
     h.budget(u64::MAX);
     assert!(
@@ -200,6 +213,131 @@ fn alt_bn128_mul_uses_activated_crypto_primitives_and_matches_antelope_vector() 
         1
     );
     assert!(alt_bn128_mul(h.env(), ptr(END - 63), 64, ptr(80), 32, ptr(OUT), 64).is_err());
+}
+
+#[test]
+fn alt_bn128_add_uses_activated_crypto_primitives_and_matches_antelope_vector() {
+    let mut h = Host::new(false);
+    let lhs = hex::decode(concat!(
+        "222480c9f95409bfa4ac6ae890b9c150bc88542b87b352e92950c340458b0c09",
+        "2976efd698cf23b414ea622b3f720dd9080d679042482ff3668cb2e32cad8ae2"
+    ))
+    .unwrap();
+    let rhs = hex::decode(concat!(
+        "1bd20beca3d8d28e536d2b5bd3bf36d76af68af5e6c96ca6e5519ba9ff8f5332",
+        "2a53edf6b48bcf5cb1c0b4ad1d36dfce06a79dcd6526f1c386a14d8ce4649844"
+    ))
+    .unwrap();
+    let expected = hex::decode(concat!(
+        "16c7c4042e3a725ddbacf197c519c3dcad2bc87dfd9ac7e1e1631154ee0b7d9c",
+        "19cd640dd28c9811ebaaa095a16b16190d08d6906c4f926fce581985fe35be0e"
+    ))
+    .unwrap();
+    h.write(10, &lhs);
+    h.write(80, &rhs);
+    h.write(OUT, &[0xa5; 65]);
+
+    h.budget(cost::ALT_BN128_ADD);
+    assert!(alt_bn128_add(h.env(), ptr(10), 64, ptr(80), 64, ptr(OUT), 64).is_err());
+
+    h.db.preactivate_protocol_feature(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+        .unwrap();
+    h.db.activate_protocol_features(&[CRYPTO_PRIMITIVES_FEATURE_DIGEST], 2)
+        .unwrap();
+    h.budget(cost::ALT_BN128_ADD);
+    assert_eq!(
+        alt_bn128_add(h.env(), ptr(10), 64, ptr(80), 64, ptr(OUT), 65).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 64), expected);
+    assert_eq!(h.read(OUT + 64, 1), [0xa5]);
+    assert_eq!(h.remaining(), 0);
+
+    // The identity point is encoded as (0, 0); adding it preserves the point.
+    h.write(10, &[0; 64]);
+    h.budget(cost::ALT_BN128_ADD);
+    assert_eq!(
+        alt_bn128_add(h.env(), ptr(10), 64, ptr(80), 64, ptr(OUT), 64).unwrap(),
+        0
+    );
+    assert_eq!(h.read(OUT, 64), rhs);
+
+    h.write(10, &[1; 64]);
+    h.write(OUT, &[0xa5; 64]);
+    h.budget(cost::ALT_BN128_ADD);
+    assert_eq!(
+        alt_bn128_add(h.env(), ptr(10), 64, ptr(80), 64, ptr(OUT), 64).unwrap(),
+        1
+    );
+    assert_eq!(h.read(OUT, 64), [0xa5; 64]);
+    h.budget(u64::MAX);
+    assert_eq!(
+        alt_bn128_add(h.env(), ptr(10), 64, ptr(80), 64, ptr(OUT), 63).unwrap(),
+        1
+    );
+    assert!(alt_bn128_add(h.env(), ptr(END - 63), 64, ptr(80), 64, ptr(OUT), 64).is_err());
+}
+
+#[test]
+fn alt_bn128_pair_uses_activated_crypto_primitives_and_matches_antelope_vectors() {
+    let mut h = Host::new(false);
+    // Standard generator pair: a single pairing is not one.
+    let single = hex::decode(concat!(
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000000000000000000000000000002",
+        "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+        "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+        "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+        "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"
+    ))
+    .unwrap();
+    // Leap's two-pair vector whose product pairing is one.
+    let paired = hex::decode(concat!(
+        "0f25929bcb43d5a57391564615c9e70a992b10eafa4db109709649cf48c50dd2",
+        "16da2f5cb6be7a0aa72c440c53c9bbdfec6c36c7d515536431b3a865468acbba",
+        "2e89718ad33c8bed92e210e81d1853435399a271913a6520736a4729cf0d51eb",
+        "01a9e2ffa2e92599b68e44de5bcf354fa2642bd4f26b259daa6f7ce3ed57aeb3",
+        "14a9a87b789a58af499b314e13c3d65bede56c07ea2d418d6874857b70763713",
+        "178fb49a2d6cd347dc58973ff49613a20757d0fcc22079f9abd10c3baee24590",
+        "1b9e027bd5cfc2cb5db82d4dc9677ac795ec500ecd47deee3b5da006d6d049b8",
+        "11d7511c78158de484232fc68daf8a45cf217d1c2fae693ff5871e8752d73b21",
+        "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+        "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+        "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+        "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"
+    ))
+    .unwrap();
+    h.write(10, &single);
+    h.write(10 + single.len() as u32, &paired);
+
+    h.budget(cost::alt_bn128_pair(192));
+    assert!(alt_bn128_pair(h.env(), ptr(10), 192).is_err());
+
+    h.db.preactivate_protocol_feature(CRYPTO_PRIMITIVES_FEATURE_DIGEST)
+        .unwrap();
+    h.db.activate_protocol_features(&[CRYPTO_PRIMITIVES_FEATURE_DIGEST], 2)
+        .unwrap();
+    h.budget(cost::alt_bn128_pair(192));
+    assert_eq!(alt_bn128_pair(h.env(), ptr(10), 192).unwrap(), 1);
+    assert_eq!(h.remaining(), 0);
+
+    h.budget(cost::alt_bn128_pair(paired.len() as u64));
+    assert_eq!(
+        alt_bn128_pair(h.env(), ptr(10 + single.len() as u32), paired.len() as u32).unwrap(),
+        0
+    );
+    assert_eq!(h.remaining(), 0);
+
+    h.budget(cost::alt_bn128_pair(0));
+    assert_eq!(alt_bn128_pair(h.env(), ptr(10), 0).unwrap(), 0);
+    h.budget(cost::alt_bn128_pair(191));
+    assert_eq!(alt_bn128_pair(h.env(), ptr(10), 191).unwrap(), 1);
+
+    h.write(10, &[1; 192]);
+    h.budget(cost::alt_bn128_pair(192));
+    assert_eq!(alt_bn128_pair(h.env(), ptr(10), 192).unwrap(), 1);
+    h.budget(u64::MAX);
+    assert!(alt_bn128_pair(h.env(), ptr(END - 191), 192).is_err());
 }
 
 #[test]
