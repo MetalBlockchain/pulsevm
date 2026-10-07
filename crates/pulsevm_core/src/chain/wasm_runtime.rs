@@ -127,7 +127,9 @@ use crate::chain::{
         __umodti3,
         __unordtf2,
         abort,
+        alt_bn128_add,
         alt_bn128_mul,
+        alt_bn128_pair,
         assert_recover_key,
         assert_ripemd160,
         assert_sha1,
@@ -1750,6 +1752,8 @@ impl WasmRuntime {
                 "get_code_hash" => Function::new_typed_with_env(&mut store, &env, get_code_hash),
                 "get_sender" => Function::new_typed_with_env(&mut store, &env, get_sender),
                 // Crypto functions
+                "alt_bn128_add" => Function::new_typed_with_env(&mut store, &env, alt_bn128_add),
+                "alt_bn128_pair" => Function::new_typed_with_env(&mut store, &env, alt_bn128_pair),
                 "assert_recover_key" => Function::new_typed_with_env(&mut store, &env, assert_recover_key),
                 "recover_key" => Function::new_typed_with_env(&mut store, &env, recover_key),
                 "mod_exp" => Function::new_typed_with_env(&mut store, &env, mod_exp),
