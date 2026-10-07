@@ -16,9 +16,11 @@ first measurement found, and the calibration decision that measurement forces.
 
 ## Method (a stripped-down NEAR runtime-params-estimator)
 
-`alt_bn128_mul` charges a fixed provisional 1,000,000 points for its fixed-width
-BN254 scalar multiplication. The constant is consensus-visible CPU billing and
-must be recalibrated only through a coordinated protocol upgrade.
+`alt_bn128_add` and `alt_bn128_mul` charge provisional fixed costs of 100,000
+and 1,000,000 points for their fixed-width BN254 operations. `alt_bn128_pair`
+charges 100,000,000 points per 192-byte pair, plus a 1,000,000 point base.
+These constants are consensus-visible CPU billing and must be recalibrated only
+through a coordinated protocol upgrade.
 
 `mod_exp` uses a deterministic provisional estimate of
 `1,000 + 11 × input_bytes + 32 × max(base_bytes, modulus_bytes)² × exponent_bytes`
