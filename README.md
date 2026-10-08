@@ -59,7 +59,7 @@ The build produces:
 
 ## Run a local network
 
-In addition to the build dependencies, you need a compiled MetalGo binary and `metal-network-runner` on your `PATH`. CI tests against MetalGo **v1.13.5**; the node and VM must agree on rpcchainvm plugin protocol **43**.
+In addition to the build dependencies, you need a compiled MetalGo binary and `metal-network-runner` on your `PATH`. CI tests against MetalGo **v1.14.2-tahoe**; the node and VM must agree on rpcchainvm plugin protocol **45**.
 
 From the repository root, stage the compiled VM under the ID MetalGo uses to discover it:
 
