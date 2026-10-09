@@ -1485,16 +1485,15 @@ async fn main() -> Result<()> {
     });
     let initial_ram_residual = audit_ram_account
         .map(|account| -> Result<i64> {
-            let stored = controller.database().get_account_ram_usage(account.as_u64())?;
+            let stored = controller
+                .database()
+                .get_account_ram_usage(account.as_u64())?;
             let represented = controller
                 .database()
                 .account_ram_billing_breakdown(account.as_u64())?
                 .total()?;
             let residual = stored - represented;
-            eprintln!(
-                "RAM inventory baseline at block {}: account={account} stored={stored} represented={represented} residual={residual}",
-                start - 1
-            );
+            eprintln!("RAM inventory baseline recorded at block {}", start - 1);
             Ok(residual)
         })
         .transpose()?;
@@ -1640,12 +1639,7 @@ async fn main() -> Result<()> {
                     .database()
                     .arena_account_ram_usage(account.as_u64());
                 if current != traced_ram_usage {
-                    eprintln!(
-                        "RAM trace block {block_num} {block_id}: account={account} before={traced_ram_usage:?} after={current:?} delta={:?}",
-                        current
-                            .zip(traced_ram_usage)
-                            .map(|(after, before)| i128::from(after) - i128::from(before))
-                    );
+                    eprintln!("RAM trace observed a change at block {block_num} {block_id}");
                     traced_ram_usage = current;
                 }
             }
@@ -1660,14 +1654,9 @@ async fn main() -> Result<()> {
                         .account_ram_billing_breakdown(account.as_u64())?
                         .total()?;
                     let residual = stored - represented;
-                    eprintln!(
-                        "RAM inventory audit at block {block_num}: account={account} stored={stored} represented={represented} residual={residual}"
-                    );
+                    eprintln!("RAM inventory audit completed at block {block_num}");
                     if Some(residual) != initial_ram_residual {
-                        bail!(
-                            "RAM inventory residual changed for {account} at or before block {block_num}: {:?} -> {residual}",
-                            initial_ram_residual
-                        );
+                        bail!("RAM inventory residual changed at or before block {block_num}");
                     }
                 }
                 // Bulk replay defers the per-block block-log durability barrier.
