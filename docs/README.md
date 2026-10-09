@@ -20,6 +20,7 @@ authoritative and the document is a bug.
 | [wasm-determinism.md](./wasm-determinism.md) | WASM feature pinning, floating-point behavior, database key ordering, and replay validation | Working reference |
 | [optimistic-parallel-execution.md](./optimistic-parallel-execution.md) | Consensus-safe ordered speculation, dependency tracking, fallbacks, and rollout gates | Telemetry plus default-off contract-primary overlay foundation |
 | [code-coverage.md](./code-coverage.md) | Coverage CI, Codecov checks and setup, report scope, and local reports | Current workflow |
+| [xpr-mainnet-follow.md](./xpr-mainnet-follow.md) | EC2 XPR mainnet P2P-to-PulseVM-to-Hyperion follow deployment and recovery checks | Operational runbook |
 
 ---
 

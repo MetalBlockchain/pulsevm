@@ -10,7 +10,9 @@ readonly LOG_FILE="${XPR_REPLAY_LOG_FILE:-/data/xpr-mainnet-replay.log}"
 readonly TARGET_DIR="${XPR_REPLAY_TARGET_DIR:-$REPO_ROOT/target/xpr-replay-native}"
 readonly BINARY="$TARGET_DIR/release/examples/xpr_blocklog_replay"
 readonly SERVICE="${XPR_REPLAY_SERVICE:-pulsevm-xpr-mainnet-replay}.service"
-readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-1000000}"
+readonly FOLLOW="${XPR_REPLAY_FOLLOW:-0}"
+readonly CHECKPOINT_DEFAULT="$(if [[ "$FOLLOW" == 1 ]]; then printf 10000; else printf 1000000; fi)"
+readonly CHECKPOINT_INTERVAL="${XPR_REPLAY_CHECKPOINT_INTERVAL:-$CHECKPOINT_DEFAULT}"
 readonly SIGNATURE_THREADS="${XPR_REPLAY_SIGNATURE_THREADS:-8}"
 readonly NATIVE_REPLAY="${XPR_REPLAY_NATIVE_REPLAY:-1}"
 readonly BATCHED_REPLAY="${XPR_REPLAY_BATCHED_REPLAY:-0}"
@@ -19,7 +21,15 @@ readonly TRACE_RAM_ACCOUNT="${XPR_REPLAY_TRACE_RAM_ACCOUNT:-}"
 readonly TRUST_LEGACY_CHECKPOINT="${XPR_REPLAY_TRUST_LEGACY_CHECKPOINT:-0}"
 readonly REPLAY_PROFILE="${XPR_REPLAY_PROFILE:-0}"
 readonly REPLAY_PROFILE_INTERVAL="${XPR_REPLAY_PROFILE_INTERVAL:-1000}"
+readonly RPC_BIND="${XPR_REPLAY_RPC_BIND:-127.0.0.1:9660}"
+readonly SHIP_ENABLED_DEFAULT="$(if [[ "$FOLLOW" == 1 ]]; then printf 1; else printf 0; fi)"
+readonly SHIP_ENABLED="${XPR_REPLAY_SHIP_ENABLED:-$SHIP_ENABLED_DEFAULT}"
+readonly SHIP_BIND="${XPR_REPLAY_SHIP_BIND:-127.0.0.1:9091}"
+readonly INDEXED_HEIGHT_FILE="${XPR_REPLAY_INDEXED_HEIGHT_FILE:-/data/xpr-hyperion/indexed-height}"
+readonly SHIP_MAX_LAG="${XPR_REPLAY_SHIP_MAX_LAG:-300000}"
+readonly SHIP_RETAIN_BLOCKS="${XPR_REPLAY_SHIP_RETAIN_BLOCKS:-200000}"
 readonly WASM_PRECOMPILE_THREADS="${XPR_REPLAY_WASM_PRECOMPILE_THREADS:-4}"
+readonly PRODUCER_KEY="${XPR_REPLAY_PRODUCER_KEY:-}"
 
 fail() {
   echo "error: $*" >&2
@@ -64,6 +74,10 @@ start_replay() {
     fail "XPR_REPLAY_NATIVE_REPLAY must be 0 or 1"
   [[ "$BATCHED_REPLAY" == 0 || "$BATCHED_REPLAY" == 1 ]] || \
     fail "XPR_REPLAY_BATCHED_REPLAY must be 0 or 1"
+  [[ "$FOLLOW" == 0 || "$FOLLOW" == 1 ]] || \
+    fail "XPR_REPLAY_FOLLOW must be 0 or 1"
+  [[ "$FOLLOW" == 0 || -z "$LAST_BLOCK" ]] || \
+    fail "XPR_REPLAY_FOLLOW cannot be combined with XPR_REPLAY_LAST_BLOCK"
   if [[ "$NATIVE_REPLAY" == 0 && "$BATCHED_REPLAY" == 1 ]]; then
     fail "batched replay requires XPR_REPLAY_NATIVE_REPLAY=1"
   fi
@@ -71,8 +85,17 @@ start_replay() {
     fail "XPR_REPLAY_TRUST_LEGACY_CHECKPOINT must be 0 or 1"
   [[ "$REPLAY_PROFILE" == 0 || "$REPLAY_PROFILE" == 1 ]] || \
     fail "XPR_REPLAY_PROFILE must be 0 or 1"
+  [[ "$SHIP_ENABLED" == 0 || "$SHIP_ENABLED" == 1 ]] || \
+    fail "XPR_REPLAY_SHIP_ENABLED must be 0 or 1"
   validate_uint "$REPLAY_PROFILE_INTERVAL" XPR_REPLAY_PROFILE_INTERVAL
   validate_uint "$WASM_PRECOMPILE_THREADS" XPR_REPLAY_WASM_PRECOMPILE_THREADS
+  if [[ "$SHIP_ENABLED" == 1 ]]; then
+    validate_uint "$SHIP_MAX_LAG" XPR_REPLAY_SHIP_MAX_LAG
+    validate_uint "$SHIP_RETAIN_BLOCKS" XPR_REPLAY_SHIP_RETAIN_BLOCKS
+    (( SHIP_RETAIN_BLOCKS < SHIP_MAX_LAG )) || \
+      fail "XPR_REPLAY_SHIP_RETAIN_BLOCKS must be smaller than XPR_REPLAY_SHIP_MAX_LAG"
+  fi
+  [[ -n "$PRODUCER_KEY" ]] || fail "XPR_REPLAY_PRODUCER_KEY is required by NodeConfig"
   [[ -z "$LAST_BLOCK" ]] || validate_uint "$LAST_BLOCK" XPR_REPLAY_LAST_BLOCK
   [[ -x "$BINARY" ]] || fail "replay binary is missing; run '$0 build' first"
   [[ -s "$SOURCE_DIR/blocks.log" ]] || fail "missing $SOURCE_DIR/blocks.log"
@@ -95,7 +118,23 @@ start_replay() {
     env "XPR_REPLAY_CHECKPOINT_INTERVAL=$CHECKPOINT_INTERVAL"
     "XPR_REPLAY_SIGNATURE_THREADS=$SIGNATURE_THREADS"
     "PULSEVM_WASM_PRECOMPILE_THREADS=$WASM_PRECOMPILE_THREADS"
+    "XPR_REPLAY_PRODUCER_KEY=$PRODUCER_KEY"
   )
+  if [[ "$FOLLOW" == 1 ]]; then
+    command+=("XPR_REPLAY_FOLLOW=1")
+  fi
+  if [[ -n "$RPC_BIND" ]]; then
+    command+=("XPR_REPLAY_RPC_BIND=$RPC_BIND")
+  fi
+  if [[ "$SHIP_ENABLED" == 1 ]]; then
+    command+=(
+      "XPR_REPLAY_SHIP_ENABLED=1"
+      "XPR_REPLAY_SHIP_BIND=$SHIP_BIND"
+      "XPR_REPLAY_INDEXED_HEIGHT_FILE=$INDEXED_HEIGHT_FILE"
+      "XPR_REPLAY_SHIP_MAX_LAG=$SHIP_MAX_LAG"
+      "XPR_REPLAY_SHIP_RETAIN_BLOCKS=$SHIP_RETAIN_BLOCKS"
+    )
+  fi
   if [[ "$NATIVE_REPLAY" == 1 ]]; then
     command+=("PULSEVM_XPR_NATIVE_REPLAY=1")
   fi
@@ -110,8 +149,8 @@ start_replay() {
   fi
   if [[ "$REPLAY_PROFILE" == 1 ]]; then
     command+=(
-      "PULSEVM_REPLAY_PROFILE=1"
-      "PULSEVM_REPLAY_PROFILE_INTERVAL=$REPLAY_PROFILE_INTERVAL"
+      "XPR_REPLAY_PROFILE=1"
+      "XPR_REPLAY_PROFILE_INTERVAL=$REPLAY_PROFILE_INTERVAL"
     )
   fi
   command+=("$BINARY" "$SOURCE_DIR" "$ARENA_DIR")
@@ -166,7 +205,15 @@ Environment:
   XPR_REPLAY_TARGET_DIR          Native Cargo target directory
   XPR_REPLAY_SERVICE             systemd user service name without .service
   XPR_REPLAY_LAST_BLOCK          Optional pinned terminal block
-  XPR_REPLAY_CHECKPOINT_INTERVAL Durable checkpoint interval (default: 1000000)
+  XPR_REPLAY_FOLLOW              Follow an append-only Leap blocks.index indefinitely
+  XPR_REPLAY_PRODUCER_KEY        Local config key required by NodeConfig; never signs replay blocks
+  XPR_REPLAY_RPC_BIND            JSON-RPC bind address (default: 127.0.0.1:9660; empty disables)
+  XPR_REPLAY_SHIP_ENABLED        Enable SHiP WebSocket (default: 1 in follow mode)
+  XPR_REPLAY_SHIP_BIND           SHiP bind address (default: 127.0.0.1:9091)
+  XPR_REPLAY_INDEXED_HEIGHT_FILE Hyperion indexed-height watermark for SHiP backpressure
+  XPR_REPLAY_SHIP_MAX_LAG        Maximum SHiP backlog before pausing (default: 300000)
+  XPR_REPLAY_SHIP_RETAIN_BLOCKS  SHiP history retained behind Hyperion (default: 200000)
+  XPR_REPLAY_CHECKPOINT_INTERVAL Durable checkpoint interval (default: 1000000; 10000 in follow mode)
   XPR_REPLAY_SIGNATURE_THREADS   Header signature workers (default: 8)
   XPR_REPLAY_NATIVE_REPLAY       Enable audited native XPR handlers: 0 or 1 (default: 1)
   XPR_REPLAY_BATCHED_REPLAY      Bypass general transaction graphs for pinned bot/oracle actions

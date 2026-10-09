@@ -11,8 +11,11 @@ anyhow = "1.0.98"
 base64 = "0.22.1"
 chrono = "0.4.40"
 flate2 = "1.1.2"
+futures-util = "0.3"
 hex = "0.4"
 lru = "0.18.4"
+jsonrpsee = { version = "0.26", features = ["server"] }
+reqwest = { version = "0.13", features = ["json"] }
 ripemd = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,7 +25,10 @@ spdlog-rs = "0.5.3"
 tempfile = "3.23.0"
 thiserror = "2"
 time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.16" }
+tokio-tungstenite = "0.21"
+tungstenite = { version = "0.21" }
 wasmer = { version = "7.4.0", features = ["llvm"] }
 wasmer-compiler-llvm = "7.4.0"
 wasmer-middlewares = "7.4.0"

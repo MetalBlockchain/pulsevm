@@ -1,6 +1,5 @@
 mod api;
 mod chain;
-mod state_history;
 
 use pulsevm_core::{
     ChainError,
@@ -15,6 +14,7 @@ use pulsevm_core::{
         NodeId,
     },
     mempool::Mempool,
+    state_history::StateHistoryServer,
     transaction::PackedTransaction,
 };
 use pulsevm_grpc::{
@@ -91,13 +91,10 @@ use tonic::{
     },
 };
 
-use crate::{
-    chain::{
-        BlockTimer,
-        GossipType,
-        Gossipable,
-    },
-    state_history::StateHistoryServer,
+use crate::chain::{
+    BlockTimer,
+    GossipType,
+    Gossipable,
 };
 
 /// Default bind address for the state history WebSocket API. Used when WS_BIND
@@ -162,7 +159,7 @@ async fn main() {
         .await
         .expect("failed to initialize runtime engine");
 
-    let state_history_service = StateHistoryServer::new(vm.clone());
+    let state_history_service = StateHistoryServer::new(vm.controller.clone());
     // An explicit WS_BIND is honoured exactly; the default is allowed to move to
     // an ephemeral port so that co-located nodes do not contend for one port.
     let ws_bind_override = std::env::var("WS_BIND").ok();

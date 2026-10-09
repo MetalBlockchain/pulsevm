@@ -10,6 +10,14 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    controller::Controller,
+    state_history::{
+        SHIP_ABI,
+        StateHistoryLog,
+    },
+    transaction::TransactionTrace,
+};
 use anyhow::{
     Result,
     anyhow,
@@ -17,14 +25,6 @@ use anyhow::{
 use futures_util::{
     SinkExt,
     StreamExt,
-};
-use pulsevm_core::{
-    controller::Controller,
-    state_history::{
-        SHIP_ABI,
-        StateHistoryLog,
-    },
-    transaction::TransactionTrace,
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{
@@ -51,7 +51,7 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
-use crate::state_history::{
+use super::{
     request::RequestType,
     types::{
         BlockPosition,
@@ -476,7 +476,7 @@ async fn make_block_response_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsevm_core::id::Id;
+    use crate::id::Id;
     use std::str::FromStr;
 
     fn block_id(block_num: u32) -> Id {
@@ -493,7 +493,7 @@ mod tests {
             "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"
         }"#
         .to_vec();
-        let genesis = include_bytes!("../../../../genesis.json").to_vec();
+        let genesis = include_bytes!("../../../../../../genesis.json").to_vec();
         let chain_id =
             Id::from_str("0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306")
                 .unwrap();

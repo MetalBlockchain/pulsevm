@@ -4,6 +4,7 @@
 //! responses: signatures, transaction variants, schedules, and extensions must
 //! all reach the production `verify_block` -> `accept_block` path unchanged.
 
+use base64::Engine;
 use std::{
     env,
     fs::{
@@ -21,7 +22,10 @@ use std::{
         PathBuf,
     },
     str::FromStr,
-    sync::mpsc::sync_channel,
+    sync::{
+        Arc,
+        mpsc::sync_channel,
+    },
     thread,
     time::{
         Duration,
@@ -34,7 +38,16 @@ use anyhow::{
     Result,
     bail,
 };
+use jsonrpsee::{
+    RpcModule,
+    server::ServerBuilder,
+    types::{
+        ErrorObjectOwned,
+        Params,
+    },
+};
 use pulsevm_core::{
+    abi::AbiDefinition,
     block::SignedBlock,
     controller::{
         AuthenticatedMigrationBlock,
@@ -45,21 +58,25 @@ use pulsevm_core::{
     id::Id,
     mempool::Mempool,
     name::Name,
+    protocol_features::PROTOCOL_VERSION,
+    state_history::StateHistoryServer,
     transaction::{
         Action,
         TransactionStatus,
     },
 };
+use pulsevm_crypto::Digest as PulseDigest;
 use pulsevm_serialization::Read as PulseRead;
 use serde_json::json;
 use sha2::{
     Digest,
     Sha256,
 };
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 const XPR_CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
 const XPR_BLOCK_ONE_ID: &str = "000000018421bd47ce23d4c47706e0bb98604157afedc67d56d05c82d5aa10c5";
-const UNUSED_PRODUCER_KEY: &str = "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez";
 const XPR_V3_FIRST_BLOCK_OFFSET: u64 = 126;
 const PARTIAL_SCAN_WINDOW: usize = 4 * 1024 * 1024;
 const SIGNATURE_BATCH_SIZE: usize = 256;
@@ -75,6 +92,459 @@ const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
     0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
 ];
+
+type ReplayController = Arc<RwLock<Controller>>;
+
+fn replay_rpc_error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(code, "replay_rpc_error", Some(message.into()))
+}
+
+fn params_object(
+    params: Params<'_>,
+) -> Result<serde_json::Map<String, serde_json::Value>, ErrorObjectOwned> {
+    let value: serde_json::Value = params
+        .parse()
+        .map_err(|error| replay_rpc_error(400, format!("invalid parameters: {error}")))?;
+    match value {
+        serde_json::Value::Null => Ok(serde_json::Map::new()),
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(replay_rpc_error(400, "parameters must be a JSON object")),
+    }
+}
+
+fn parameter_string(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, ErrorObjectOwned> {
+    let value = params
+        .get(key)
+        .ok_or_else(|| replay_rpc_error(400, format!("missing parameter {key}")))?;
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => Err(replay_rpc_error(
+            400,
+            format!("parameter {key} must be a string or number"),
+        )),
+    }
+}
+
+fn parameter_name(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Name, ErrorObjectOwned> {
+    let value = parameter_string(params, key)?;
+    Name::from_str(&value)
+        .map_err(|error| replay_rpc_error(400, format!("invalid {key} {value}: {error}")))
+}
+
+fn optional_string(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>, ErrorObjectOwned> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(replay_rpc_error(
+            400,
+            format!("parameter {key} must be a string"),
+        )),
+    }
+}
+
+fn optional_bool(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: bool,
+) -> Result<bool, ErrorObjectOwned> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| replay_rpc_error(400, format!("parameter {key} must be a boolean"))),
+    }
+}
+
+fn optional_u32(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: u32,
+) -> Result<u32, ErrorObjectOwned> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| replay_rpc_error(400, format!("parameter {key} must be a uint32"))),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<u32>()
+            .map_err(|error| replay_rpc_error(400, format!("invalid {key}: {error}"))),
+        Some(_) => Err(replay_rpc_error(
+            400,
+            format!("parameter {key} must be a uint32"),
+        )),
+    }
+}
+
+async fn replay_get_info(
+    controller: &ReplayController,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let controller = controller.read().await;
+    let head = controller.last_accepted_block();
+    let database = controller.database();
+    let head_id = head
+        .id()
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let next_protocol_upgrade = controller
+        .next_protocol_upgrade(head.block_num())
+        .map(|upgrade| {
+            json!({
+                "protocol_version": upgrade.protocol_version,
+                "activation_height": upgrade.activation_height,
+            })
+        });
+
+    Ok(json!({
+        "server_version": "pulsevm-replay",
+        "protocol_version": controller.protocol_version(head.block_num()),
+        "supported_protocol_version": PROTOCOL_VERSION,
+        "protocol_upgrade_schedule_hash": hex::encode(controller.protocol_upgrade_schedule_hash()),
+        "next_protocol_upgrade": next_protocol_upgrade,
+        "server_time": head.timestamp(),
+        "chain_id": controller.chain_id(),
+        "head_block_num": head.block_num(),
+        "last_irreversible_block_num": head.block_num(),
+        "last_irreversible_block_id": head_id,
+        "head_block_id": head_id,
+        "head_block_time": head.timestamp(),
+        "head_block_producer": head.signed_block_header.header.producer,
+        "virtual_block_cpu_limit": database.get_virtual_block_cpu_limit().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "virtual_block_net_limit": database.get_virtual_block_net_limit().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "block_cpu_limit": database.get_block_cpu_limit().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "block_net_limit": database.get_block_net_limit().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "server_version_string": "v5.0.3",
+        "fork_db_head_block_num": head.block_num(),
+        "fork_db_head_block_id": head_id,
+        "server_full_version_string": "v5.0.3-pulsevm-replay",
+        "total_cpu_weight": database.get_total_cpu_weight().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "total_net_weight": database.get_total_net_weight().map_err(|error| replay_rpc_error(500, error.to_string()))?,
+        "earliest_available_block_num": 1,
+        "last_irreversible_block_time": head.timestamp(),
+    }))
+}
+
+async fn replay_get_block(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let identifier = parameter_string(&params, "block_num_or_id")?;
+    let controller = controller.read().await;
+    let block = if let Ok(block_num) = identifier.parse::<u32>() {
+        controller
+            .get_block_by_height(block_num)
+            .map_err(|error| replay_rpc_error(500, error.to_string()))?
+            .ok_or_else(|| replay_rpc_error(404, format!("block {block_num} not found")))?
+    } else {
+        let id = Id::from_str(&identifier)
+            .map_err(|error| replay_rpc_error(400, format!("invalid block identifier: {error}")))?;
+        controller
+            .get_block(id)
+            .map_err(|error| replay_rpc_error(500, error.to_string()))?
+            .ok_or_else(|| replay_rpc_error(404, format!("block {identifier} not found")))?
+    };
+    serde_json::to_value(block).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_account(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let account = parameter_name(&params, "account_name")?;
+    let expected_core_symbol = optional_string(&params, "expected_core_symbol")?;
+    let controller = controller.read().await;
+    let database = controller.database();
+    let head_num = controller.last_accepted_block().block_num();
+    let head_time = controller.last_accepted_block().timestamp().to_time_point();
+    let response = match expected_core_symbol {
+        Some(symbol) => database.get_account_info_with_core_symbol(
+            account.as_u64(),
+            &symbol,
+            head_num,
+            &head_time,
+        ),
+        None => {
+            database.get_account_info_without_core_symbol(account.as_u64(), head_num, &head_time)
+        }
+    }
+    .map_err(|error| replay_rpc_error(404, error.to_string()))?;
+    serde_json::from_str(&response).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_table_rows(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let json_mode = optional_bool(&params, "json", true)?;
+    let code = parameter_name(&params, "code")?;
+    let scope = parameter_string(&params, "scope")?;
+    let table = parameter_name(&params, "table")?;
+    let table_key = optional_string(&params, "table_key")?.unwrap_or_default();
+    let lower_bound = optional_string(&params, "lower_bound")?.unwrap_or_default();
+    let upper_bound = optional_string(&params, "upper_bound")?.unwrap_or_default();
+    let limit = optional_u32(&params, "limit", 10)?;
+    let key_type = optional_string(&params, "key_type")?.unwrap_or_default();
+    let index_position = optional_u32(&params, "index_position", 1)?;
+    let encode_type = optional_string(&params, "encode_type")?.unwrap_or_else(|| "dec".to_string());
+    let reverse = optional_bool(&params, "reverse", false)?;
+    let show_payer = optional_bool(&params, "show_payer", false)?;
+    let controller = controller.read().await;
+    let response = controller
+        .database()
+        .get_table_rows(
+            json_mode,
+            code.as_u64(),
+            &scope,
+            table.as_u64(),
+            &table_key,
+            &lower_bound,
+            &upper_bound,
+            limit,
+            &key_type,
+            &index_position.to_string(),
+            &encode_type,
+            reverse,
+            show_payer,
+        )
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    serde_json::from_str(&response).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_table_by_scope(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let code = parameter_name(&params, "code")?;
+    let table = parameter_name(&params, "table")?;
+    let lower_bound = optional_string(&params, "lower_bound")?.unwrap_or_default();
+    let upper_bound = optional_string(&params, "upper_bound")?.unwrap_or_default();
+    let limit = optional_u32(&params, "limit", 10)?;
+    let reverse = optional_bool(&params, "reverse", false)?;
+    let controller = controller.read().await;
+    let response = controller
+        .database()
+        .get_table_by_scope(
+            code.as_u64(),
+            table.as_u64(),
+            &lower_bound,
+            &upper_bound,
+            limit,
+            reverse,
+        )
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    serde_json::from_str(&response).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_currency_balance(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let code = parameter_name(&params, "code")?;
+    let account = parameter_name(&params, "account")?;
+    let symbol = optional_string(&params, "symbol")?;
+    let controller = controller.read().await;
+    let response = match symbol {
+        Some(symbol) => controller.database().get_currency_balance_with_symbol(
+            code.as_u64(),
+            account.as_u64(),
+            &symbol,
+        ),
+        None => controller
+            .database()
+            .get_currency_balance_without_symbol(code.as_u64(), account.as_u64()),
+    }
+    .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    serde_json::from_str(&response).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_currency_stats(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let code = parameter_name(&params, "code")?;
+    let symbol = parameter_string(&params, "symbol")?;
+    let controller = controller.read().await;
+    let response = controller
+        .database()
+        .get_currency_stats(code.as_u64(), &symbol)
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    serde_json::from_str(&response).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_raw_abi(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let account = parameter_name(&params, "account_name")?;
+    let controller = controller.read().await;
+    let database = controller.database();
+    let abi = database
+        .arena_account_abi_bytes(account.as_u64())
+        .unwrap_or_default();
+    let (code_hash, _, _) = database
+        .account_code_hash_vm(account.as_u64())
+        .map_err(|error| replay_rpc_error(404, error.to_string()))?;
+    let abi_hash = if abi.is_empty() {
+        PulseDigest::default()
+    } else {
+        PulseDigest::hash(&abi)
+    };
+    Ok(json!({
+        "account_name": account,
+        "code_hash": Id::new(code_hash),
+        "abi_hash": abi_hash,
+        "abi": base64::engine::general_purpose::STANDARD.encode(abi),
+    }))
+}
+
+async fn replay_get_abi(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let account = parameter_name(&params, "account_name")?;
+    let controller = controller.read().await;
+    let abi = controller
+        .database()
+        .arena_account_abi_bytes(account.as_u64())
+        .ok_or_else(|| replay_rpc_error(404, format!("account {account} not found")))?;
+    let abi = AbiDefinition::read(abi.as_slice(), &mut 0)
+        .map_err(|error| replay_rpc_error(400, error.to_string()))?;
+    serde_json::to_value(abi).map_err(|error| replay_rpc_error(500, error.to_string()))
+}
+
+async fn replay_get_producers(
+    controller: &ReplayController,
+    params: Params<'_>,
+) -> Result<serde_json::Value, ErrorObjectOwned> {
+    let params = params_object(params)?;
+    let json_mode = optional_bool(&params, "json", true)?;
+    let controller = controller.read().await;
+    let schedule = controller.active_producer_schedule();
+    let eosio =
+        Name::from_str("eosio").map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let producers =
+        Name::from_str("producers").map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let response = controller
+        .database()
+        .get_table_rows(
+            json_mode,
+            eosio.as_u64(),
+            "eosio",
+            producers.as_u64(),
+            "",
+            "",
+            "",
+            125,
+            "",
+            "1",
+            "dec",
+            false,
+            false,
+        )
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let table = serde_json::from_str::<serde_json::Value>(&response)
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let table_rows = table
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rows = schedule
+        .producers
+        .iter()
+        .filter_map(|producer| {
+            let owner = producer.producer_name.to_string();
+            table_rows
+                .iter()
+                .find(|row| {
+                    row.get("owner").and_then(serde_json::Value::as_str) == Some(owner.as_str())
+                })
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        // The deployed Bloks frontend expects its PulseVM producer adapter
+        // to receive the same shape as its paginated producer API. Keep the
+        // SHiP/table-compatible fields as well for existing callers.
+        "producers": rows,
+        "count": schedule.producers.len(),
+        "rows": rows,
+        "total": schedule.producers.len(),
+        "more": "",
+        "schedule_version": schedule.version,
+    }))
+}
+
+async fn start_replay_rpc(
+    controller: ReplayController,
+    bind: &str,
+) -> Result<jsonrpsee::server::ServerHandle> {
+    let address = bind
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid XPR_REPLAY_RPC_BIND {bind}"))?;
+    let server = ServerBuilder::default().build(address).await?;
+    let mut module = RpcModule::new(controller);
+    module.register_async_method("pulsevm.getInfo", |_, controller, _| async move {
+        replay_get_info(controller.as_ref()).await
+    })?;
+    module.register_async_method("pulsevm.getBlock", |params, controller, _| async move {
+        replay_get_block(controller.as_ref(), params).await
+    })?;
+    module.register_async_method("pulsevm.getRawBlock", |params, controller, _| async move {
+        replay_get_block(controller.as_ref(), params).await
+    })?;
+    module.register_async_method("pulsevm.getAccount", |params, controller, _| async move {
+        replay_get_account(controller.as_ref(), params).await
+    })?;
+    module.register_async_method("pulsevm.getTableRows", |params, controller, _| async move {
+        replay_get_table_rows(controller.as_ref(), params).await
+    })?;
+    module.register_async_method(
+        "pulsevm.getTableByScope",
+        |params, controller, _| async move {
+            replay_get_table_by_scope(controller.as_ref(), params).await
+        },
+    )?;
+    module.register_async_method(
+        "pulsevm.getCurrencyBalance",
+        |params, controller, _| async move {
+            replay_get_currency_balance(controller.as_ref(), params).await
+        },
+    )?;
+    module.register_async_method(
+        "pulsevm.getCurrencyStats",
+        |params, controller, _| async move {
+            replay_get_currency_stats(controller.as_ref(), params).await
+        },
+    )?;
+    module.register_async_method("pulsevm.getRawABI", |params, controller, _| async move {
+        replay_get_raw_abi(controller.as_ref(), params).await
+    })?;
+    module.register_async_method("pulsevm.getABI", |params, controller, _| async move {
+        replay_get_abi(controller.as_ref(), params).await
+    })?;
+    module.register_async_method("pulsevm.getProducers", |params, controller, _| async move {
+        replay_get_producers(controller.as_ref(), params).await
+    })?;
+    Ok(server.start(module))
+}
 
 struct BlockLog {
     log: BufReader<File>,
@@ -344,9 +814,66 @@ impl BlockLog {
         Ok(self.offsets.len())
     }
 
+    /// Refresh a growing Leap block log. Leap publishes complete block-log
+    /// records before appending their offsets; ignore a partial trailing index
+    /// word while the producer is writing it, then expose only complete entries.
+    fn refresh(&mut self) -> Result<u32> {
+        self.effective_log_len = self.log.get_ref().metadata()?.len();
+        let BlockOffsets::Indexed {
+            reader,
+            blocks,
+            cached,
+        } = &mut self.offsets
+        else {
+            bail!("follow mode requires Leap's append-only blocks.index");
+        };
+        let index_len = reader.get_ref().metadata()?.len();
+        let complete_len = index_len / 8 * 8;
+        let new_blocks =
+            u32::try_from(complete_len / 8).context("source block index exceeds uint32 height")?;
+        if new_blocks < *blocks {
+            bail!("source block index shrank from {} to {new_blocks}", *blocks);
+        }
+        if new_blocks > *blocks {
+            *blocks = new_blocks;
+            *cached = None;
+        }
+        Ok(new_blocks)
+    }
+
     fn packed_block(&mut self, block_num: u32) -> Result<Vec<u8>> {
-        let (start, end) = self.offsets.pair(block_num, self.effective_log_len)?;
-        let length = usize::try_from(end - start).context("packed block is too large")?;
+        let (start, mut end) = self.offsets.pair(block_num, self.effective_log_len)?;
+        let mut length = usize::try_from(end - start).context("packed block is too large")?;
+        if block_num == self.offsets.len() {
+            // A live Leap writer can append bytes for the next block before its
+            // index entry appears. Decode the indexed block to find its exact
+            // record boundary instead of treating the current file tail as its
+            // end.
+            let available = usize::try_from(self.effective_log_len - start)
+                .context("live source tail is too large")?;
+            let mut tail = vec![0; available];
+            if self.next_offset != Some(start) {
+                self.log.seek(SeekFrom::Start(start))?;
+            }
+            self.log.read_exact(&mut tail)?;
+            // The tail read advances the buffered cursor to EOF. Force the
+            // record read below to seek back to this block's start.
+            self.next_offset = None;
+            let mut cursor = 0;
+            let block = SignedBlock::read(&tail, &mut cursor).map_err(|error| {
+                anyhow::anyhow!("decode live source block {block_num}: {error}")
+            })?;
+            if block.block_num() != block_num {
+                bail!(
+                    "live source offset {start} decoded as block {}, expected {block_num}",
+                    block.block_num()
+                );
+            }
+            length = cursor;
+            end = start
+                .checked_add(u64::try_from(length).context("packed block is too large")?)
+                .context("source block record offset overflow")?;
+        }
         let record_length = length
             .checked_add(8)
             .context("packed block record is too large")?;
@@ -525,6 +1052,37 @@ fn usage(program: &str) {
     );
 }
 
+fn read_indexed_height(path: &Path) -> Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value.trim().parse::<u32>().with_context(|| {
+            format!(
+                "invalid Hyperion indexed-height watermark {}",
+                path.display()
+            )
+        })?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("read Hyperion indexed-height watermark {}", path.display())),
+    }
+}
+
+async fn wait_for_hyperion_capacity(
+    next_block: u32,
+    watermark_path: &Path,
+    max_lag: u32,
+) -> Result<u32> {
+    loop {
+        let indexed = read_indexed_height(watermark_path)?.unwrap_or(0);
+        if next_block <= indexed.saturating_add(max_lag) {
+            return Ok(indexed);
+        }
+        eprintln!(
+            "replay waiting for Hyperion: next_block={next_block} indexed={indexed} max_lag={max_lag}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args();
@@ -541,6 +1099,10 @@ async fn main() -> Result<()> {
         .next()
         .map(|value| value.parse::<u32>().context("last-block must be a uint32"))
         .transpose()?;
+    let follow = env::var("XPR_REPLAY_FOLLOW").as_deref() == Ok("1");
+    if follow && requested_last.is_some() {
+        bail!("follow mode does not accept a fixed last-block argument");
+    }
     if args.next().is_some() {
         usage(&program);
         bail!("too many arguments");
@@ -563,6 +1125,42 @@ async fn main() -> Result<()> {
         .map(|value| Name::from_str(&value).context("invalid XPR_REPLAY_AUDIT_RAM_ACCOUNT"))
         .transpose()?;
     let profile_replay = env::var_os("XPR_REPLAY_PROFILE").is_some();
+    let ship_enabled = env::var("XPR_REPLAY_SHIP_ENABLED").as_deref() == Ok("1");
+    let ship_bind =
+        env::var("XPR_REPLAY_SHIP_BIND").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    let indexed_height_path = env::var_os("XPR_REPLAY_INDEXED_HEIGHT_FILE").map(PathBuf::from);
+    let ship_max_lag = env::var("XPR_REPLAY_SHIP_MAX_LAG")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("XPR_REPLAY_SHIP_MAX_LAG must be a uint32")
+        })
+        .transpose()?
+        .unwrap_or(100_000);
+    let ship_retained_blocks = env::var("XPR_REPLAY_SHIP_RETAIN_BLOCKS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .context("XPR_REPLAY_SHIP_RETAIN_BLOCKS must be a uint32")
+        })
+        .transpose()?
+        .unwrap_or(20_000);
+    let rpc_bind = env::var("XPR_REPLAY_RPC_BIND").ok();
+    if ship_enabled {
+        if ship_max_lag == 0 {
+            bail!("XPR_REPLAY_SHIP_MAX_LAG must be greater than zero");
+        }
+        if ship_retained_blocks == 0 || ship_retained_blocks >= ship_max_lag {
+            bail!(
+                "XPR_REPLAY_SHIP_RETAIN_BLOCKS must be greater than zero and smaller than XPR_REPLAY_SHIP_MAX_LAG"
+            );
+        }
+        if indexed_height_path.is_none() {
+            bail!("XPR_REPLAY_INDEXED_HEIGHT_FILE is required when SHiP replay is enabled");
+        }
+    }
     let checkpoint_interval = env::var("XPR_REPLAY_CHECKPOINT_INTERVAL")
         .ok()
         .map(|value| {
@@ -737,17 +1335,19 @@ async fn main() -> Result<()> {
     }
 
     let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
+    let producer_key = env::var("XPR_REPLAY_PRODUCER_KEY")
+        .context("XPR_REPLAY_PRODUCER_KEY must contain a local replay signing key")?;
     let config = serde_json::to_vec(&json!({
         "system_account": "eosio",
         "native_system_contract": false,
         "antelope_block_signatures": true,
-        // The importer needs canonical execution and final Arena state, not a
-        // second copy of source history-derived SHiP traces and table deltas.
-        "state_history_enabled": false,
+        // A full-history Hyperion audit emits SHiP data while replay runs. The
+        // ordinary state migration keeps it disabled to avoid derived history.
+        "state_history_enabled": ship_enabled,
+        "bulk_replay": true,
         "producer_name": "eosio",
-        // Replay validates source signatures against the on-chain schedule; this
-        // local key is required by NodeConfig but is never used to alter them.
-        "producer_key": UNUSED_PRODUCER_KEY,
+        // Required by NodeConfig, but replay never signs or produces blocks.
+        "producer_key": producer_key,
         "db_size": 48_u64 * 1024 * 1024 * 1024,
         "max_transaction_time_ms": 300_000
     }))?;
@@ -861,7 +1461,7 @@ async fn main() -> Result<()> {
         .last_accepted_block()
         .block_num()
         .saturating_add(1);
-    if start > last {
+    if start > last && !follow {
         println!(
             "XPR replay already complete at block {} (requested last {last}, source head {source_last})",
             start - 1
@@ -870,13 +1470,50 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "replaying canonical XPR blocks {start}..={last} from {} into {}",
+        "{} canonical XPR blocks beginning at {start} from {} into {}",
+        if follow { "following" } else { "replaying" },
         source_dir.display(),
         arena_dir.display()
     );
     let started = Instant::now();
     let mut mempool = Mempool::new();
     let mut authenticator = controller.migration_block_authenticator()?;
+    let mut traced_ram_usage = trace_ram_account.and_then(|account| {
+        controller
+            .database()
+            .arena_account_ram_usage(account.as_u64())
+    });
+    let initial_ram_residual = audit_ram_account
+        .map(|account| -> Result<i64> {
+            let stored = controller
+                .database()
+                .get_account_ram_usage(account.as_u64())?;
+            let represented = controller
+                .database()
+                .account_ram_billing_breakdown(account.as_u64())?
+                .total()?;
+            let residual = stored - represented;
+            eprintln!("RAM inventory baseline recorded at block {}", start - 1);
+            Ok(residual)
+        })
+        .transpose()?;
+    let controller = Arc::new(RwLock::new(controller));
+    let _rpc_handle = if let Some(bind) = rpc_bind.as_deref() {
+        Some(start_replay_rpc(controller.clone(), bind).await?)
+    } else {
+        None
+    };
+    let ship_cancel = CancellationToken::new();
+    let ship_handle = if ship_enabled {
+        let server = StateHistoryServer::new(controller.clone());
+        let bind = ship_bind.clone();
+        let cancel = ship_cancel.clone();
+        Some(tokio::spawn(async move {
+            server.run_ws_server(&bind, false, cancel).await
+        }))
+    } else {
+        None
+    };
     let (signature_sender, signature_receiver) =
         sync_channel::<Result<Vec<AuthenticatedMigrationBlock>>>(SIGNATURE_PIPELINE_BATCHES);
     let signature_worker = thread::Builder::new()
@@ -884,7 +1521,27 @@ async fn main() -> Result<()> {
         .spawn(move || {
             let result = (|| -> Result<()> {
                 let mut batch = Vec::with_capacity(SIGNATURE_BATCH_SIZE);
-                for block_num in start..=last {
+                let mut block_num = start;
+                loop {
+                    let available = source.refresh()?;
+                    if block_num > available {
+                        if !batch.is_empty() {
+                            let pending = std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(SIGNATURE_BATCH_SIZE),
+                            );
+                            let authenticated =
+                                authenticate_signature_batch(pending, signature_threads)?;
+                            if signature_sender.send(Ok(authenticated)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        if !follow {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
                     let packed = source.packed_block(block_num)?;
                     let prepared = authenticator
                         .prepare_packed(packed)
@@ -903,6 +1560,9 @@ async fn main() -> Result<()> {
                         }
                         batch = Vec::with_capacity(SIGNATURE_BATCH_SIZE);
                     }
+                    block_num = block_num
+                        .checked_add(1)
+                        .context("canonical block height overflow")?;
                 }
                 if !batch.is_empty() {
                     let authenticated = authenticate_signature_batch(batch, signature_threads)?;
@@ -921,27 +1581,8 @@ async fn main() -> Result<()> {
     let mut signature_wait_time = Duration::ZERO;
     let mut verify_time = Duration::ZERO;
     let mut accept_time = Duration::ZERO;
-    let mut traced_ram_usage = trace_ram_account.and_then(|account| {
-        controller
-            .database()
-            .arena_account_ram_usage(account.as_u64())
-    });
-    let initial_ram_residual = audit_ram_account
-        .map(|account| -> Result<i64> {
-            let stored = controller.database().get_account_ram_usage(account.as_u64())?;
-            let represented = controller
-                .database()
-                .account_ram_billing_breakdown(account.as_u64())?
-                .total()?;
-            let residual = stored - represented;
-            eprintln!(
-                "RAM inventory baseline at block {}: account={account} stored={stored} represented={represented} residual={residual}",
-                start - 1
-            );
-            Ok(residual)
-        })
-        .transpose()?;
-    while block_num <= last {
+
+    while follow || block_num <= last {
         let signature_wait_started = Instant::now();
         let batch = signature_receiver
             .recv()
@@ -949,8 +1590,14 @@ async fn main() -> Result<()> {
         if profile_replay {
             signature_wait_time += signature_wait_started.elapsed();
         }
-        controller.schedule_migration_wasm_precompiles(&batch);
+        controller
+            .read()
+            .await
+            .schedule_migration_wasm_precompiles(&batch);
         for authenticated in batch {
+            if let Some(path) = indexed_height_path.as_deref() {
+                wait_for_hyperion_capacity(block_num, path, ship_max_lag).await?;
+            }
             let block = authenticated.block();
             if block.transactions.is_empty() {
                 empty_blocks += 1;
@@ -967,6 +1614,7 @@ async fn main() -> Result<()> {
             }
             let block_id = block.id()?;
             let verify_started = Instant::now();
+            let mut controller = controller.write().await;
             controller
                 .verify_authenticated_migration_block(&authenticated, &mut mempool)
                 .await
@@ -991,17 +1639,12 @@ async fn main() -> Result<()> {
                     .database()
                     .arena_account_ram_usage(account.as_u64());
                 if current != traced_ram_usage {
-                    eprintln!(
-                        "RAM trace block {block_num} {block_id}: account={account} before={traced_ram_usage:?} after={current:?} delta={:?}",
-                        current
-                            .zip(traced_ram_usage)
-                            .map(|(after, before)| i128::from(after) - i128::from(before))
-                    );
+                    eprintln!("RAM trace observed a change at block {block_num} {block_id}");
                     traced_ram_usage = current;
                 }
             }
 
-            if block_num % checkpoint_interval == 0 || block_num == last {
+            if block_num % checkpoint_interval == 0 || (!follow && block_num == last) {
                 if let Some(account) = audit_ram_account {
                     let stored = controller
                         .database()
@@ -1011,14 +1654,9 @@ async fn main() -> Result<()> {
                         .account_ram_billing_breakdown(account.as_u64())?
                         .total()?;
                     let residual = stored - represented;
-                    eprintln!(
-                        "RAM inventory audit at block {block_num}: account={account} stored={stored} represented={represented} residual={residual}"
-                    );
+                    eprintln!("RAM inventory audit completed at block {block_num}");
                     if Some(residual) != initial_ram_residual {
-                        bail!(
-                            "RAM inventory residual changed for {account} at or before block {block_num}: {:?} -> {residual}",
-                            initial_ram_residual
-                        );
+                        bail!("RAM inventory residual changed at or before block {block_num}");
                     }
                 }
                 // Bulk replay defers the per-block block-log durability barrier.
@@ -1028,14 +1666,45 @@ async fn main() -> Result<()> {
                 controller.sync_accepted_logs()?;
                 controller.database().close()?;
                 controller.persist_migration_header_state()?;
+                if let Some(path) = indexed_height_path.as_deref()
+                    && let Some(indexed) = read_indexed_height(path)?
+                {
+                    let first_to_keep = indexed
+                        .saturating_sub(ship_retained_blocks)
+                        .max(1)
+                        .min(block_num);
+                    controller.block_log()?.prune_from(first_to_keep)?;
+                    if let Some(log) = controller.trace_log() {
+                        log.prune_from(first_to_keep)?;
+                    }
+                    if let Some(log) = controller.chain_state_log() {
+                        log.prune_from(first_to_keep)?;
+                    }
+                }
             }
-            if block_num % 10_000 == 0 || block_num == last {
+            if block_num % 10_000 == 0 || (!follow && block_num == last) {
                 let elapsed = started.elapsed().as_secs_f64();
                 let count = u64::from(block_num - start + 1);
                 println!(
-                    "accepted block {block_num}/{last} ({:.0} blocks/s, id {block_id})",
+                    "accepted block {block_num}/{} ({:.0} blocks/s, id {block_id})",
+                    if follow {
+                        "LIVE".to_string()
+                    } else {
+                        last.to_string()
+                    },
                     count as f64 / elapsed.max(0.001)
                 );
+                if profile_replay {
+                    println!(
+                        "XPR replay profile: signature_wait={:.3}s, verify={:.3}s, accept={:.3}s",
+                        signature_wait_time.as_secs_f64(),
+                        verify_time.as_secs_f64(),
+                        accept_time.as_secs_f64(),
+                    );
+                    signature_wait_time = Duration::ZERO;
+                    verify_time = Duration::ZERO;
+                    accept_time = Duration::ZERO;
+                }
             }
             block_num = block_num
                 .checked_add(1)
@@ -1045,6 +1714,20 @@ async fn main() -> Result<()> {
     signature_worker
         .join()
         .map_err(|_| anyhow::anyhow!("signature prefetch worker panicked"))?;
+
+    if !follow && let Some(path) = indexed_height_path.as_deref() {
+        while read_indexed_height(path)?.unwrap_or(0) < last {
+            let indexed = read_indexed_height(path)?.unwrap_or(0);
+            eprintln!("replay complete; waiting for Hyperion to index {indexed}/{last}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    ship_cancel.cancel();
+    if let Some(handle) = ship_handle {
+        handle
+            .await
+            .context("state-history server task panicked")??;
+    }
 
     println!(
         "XPR replay passed through block {last} in {:.1}s ({empty_blocks} empty blocks, {transaction_receipts} transaction receipts)",
