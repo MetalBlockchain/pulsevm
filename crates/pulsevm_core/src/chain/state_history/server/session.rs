@@ -476,7 +476,7 @@ async fn make_block_response_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsevm_core::id::Id;
+    use crate::id::Id;
     use std::str::FromStr;
 
     fn block_id(block_num: u32) -> Id {
@@ -493,7 +493,7 @@ mod tests {
             "producer_key": "PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT"
         }"#
         .to_vec();
-        let genesis = include_bytes!("../../../../genesis.json").to_vec();
+        let genesis = include_bytes!("../../../../../../genesis.json").to_vec();
         let chain_id =
             Id::from_str("0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306")
                 .unwrap();
