@@ -98,3 +98,22 @@ impl StateHistoryServer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use crate::controller::Controller;
+
+    use super::StateHistoryServer;
+
+    #[test]
+    fn server_retains_the_supplied_controller() {
+        let controller = Arc::new(RwLock::new(Controller::new()));
+        let server = StateHistoryServer::new(controller.clone());
+
+        assert!(Arc::ptr_eq(&server.controller, &controller));
+    }
+}

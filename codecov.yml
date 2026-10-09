@@ -1,3 +1,10 @@
+# Operational examples are excluded by cargo llvm-cov and are not part of the
+# unit-test coverage gate. The PulseVM binary entry point is bootstrapping code
+# that cannot be exercised by the library test suite.
+ignore:
+  - "crates/pulsevm_core/examples/**/*"
+  - "crates/pulsevm/src/main.rs"
+
 coverage:
   status:
     project:
