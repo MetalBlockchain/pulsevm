@@ -32,11 +32,13 @@ use chrono::NaiveDateTime;
 use pulsevm_core::{
     block::{
         BlockHeader,
+        PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID,
         SignedBlock,
         SignedBlockHeader,
     },
     crypto::Signature,
     id::Id,
+    name::Name,
     producer_schedule::ProducerSchedule,
     transaction::{
         PackedTransaction,
@@ -46,7 +48,10 @@ use pulsevm_core::{
         TransactionStatus,
     },
 };
-use pulsevm_crypto::Digest;
+use pulsevm_crypto::{
+    AuthorityPublicKey,
+    Digest,
+};
 use pulsevm_database::BlockTimestamp;
 use pulsevm_serialization::{
     Read as PulseRead,
@@ -58,7 +63,7 @@ use serde_json::Value;
 
 const CHAIN_ID: &str = "384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0";
 const MAX_BLOCK_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-const DEFAULT_CONCURRENCY: usize = 32;
+const DEFAULT_CONCURRENCY: usize = 64;
 const DEFAULT_APIS: &[&str] = &[
     "https://api.protonnz.com",
     "https://proton.eosusa.io",
@@ -90,11 +95,18 @@ impl BlockLogWriter {
             .open(&index_path)
             .with_context(|| format!("open {}", index_path.display()))?;
         let index_len = index.metadata()?.len();
-        if index_len == 0 || index_len % 8 != 0 {
-            bail!("{} is empty or has a partial offset", index_path.display());
+        let complete_index_len = index_len - index_len % 8;
+        if complete_index_len == 0 {
+            bail!("{} contains no complete offset", index_path.display());
         }
-        let blocks = u32::try_from(index_len / 8).context("block index exceeds uint32")?;
-        index.seek(SeekFrom::Start(index_len - 8))?;
+        if complete_index_len != index_len {
+            // A process can stop in the middle of writing a batched offset
+            // vector. The block log was synced first, so discard the partial
+            // offset and any corresponding unindexed log tail below.
+            index.set_len(complete_index_len)?;
+        }
+        let blocks = u32::try_from(complete_index_len / 8).context("block index exceeds uint32")?;
+        index.seek(SeekFrom::Start(complete_index_len - 8))?;
         let mut offset_bytes = [0; 8];
         index.read_exact(&mut offset_bytes)?;
         let last_offset = u64::from_le_bytes(offset_bytes);
@@ -137,25 +149,41 @@ impl BlockLogWriter {
         })
     }
 
-    fn append(&mut self, block: &SignedBlock, packed: &[u8]) -> Result<()> {
-        let expected = self
-            .blocks
-            .checked_add(1)
-            .context("block height overflow")?;
-        if block.block_num() != expected {
-            bail!("received block {}, expected {expected}", block.block_num());
+    fn append_batch(&mut self, blocks: &[(SignedBlock, Vec<u8>)]) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
         }
-        if block.previous_id() != &self.tip.id()? {
-            bail!("block {expected} does not extend the current block-log tip");
+
+        let mut expected = self.blocks;
+        let mut previous_id = self.tip.id()?;
+        let mut index_bytes = Vec::with_capacity(blocks.len() * 8);
+        for (block, _) in blocks {
+            expected = expected.checked_add(1).context("block height overflow")?;
+            if block.block_num() != expected {
+                bail!("received block {}, expected {expected}", block.block_num());
+            }
+            if block.previous_id() != &previous_id {
+                bail!("block {expected} does not extend the preceding block-log entry");
+            }
+            previous_id = block.id()?;
         }
-        let offset = self.log.stream_position()?;
-        self.log.write_all(packed)?;
-        self.log.write_all(&offset.to_le_bytes())?;
+
+        // Persist the log data before publishing offsets. An interrupted batch
+        // remains an unindexed tail and open() truncates it on restart.
+        for (_, packed) in blocks {
+            let offset = self.log.stream_position()?;
+            self.log.write_all(packed)?;
+            self.log.write_all(&offset.to_le_bytes())?;
+            index_bytes.extend_from_slice(&offset.to_le_bytes());
+        }
         self.log.sync_data()?;
-        self.index.write_all(&offset.to_le_bytes())?;
+        self.index.write_all(&index_bytes)?;
         self.index.sync_data()?;
+
         self.blocks = expected;
-        self.tip = block.clone();
+        if let Some((block, _)) = blocks.last() {
+            self.tip = block.clone();
+        }
         Ok(())
     }
 }
@@ -203,6 +231,69 @@ fn parse_extensions(value: Option<&Value>, field: &str) -> Result<Vec<(u16, Vec<
             Ok((id, hex::decode(bytes)?))
         })
         .collect()
+}
+
+fn parse_authority_schedule(value: &Value) -> Result<Vec<u8>> {
+    let version = u32::try_from(parse_u64(value, "version")?)?;
+    let producers = value
+        .get("producers")
+        .and_then(Value::as_array)
+        .context("new producer schedule producers are missing")?;
+    if producers.is_empty() || producers.len() > 125 {
+        bail!(
+            "new producer schedule has invalid producer count {}",
+            producers.len()
+        );
+    }
+
+    let mut packed = version.pack()?;
+    packed.extend(VarUint32(producers.len() as u32).pack()?);
+    for producer in producers {
+        let producer_name = producer
+            .get("producer_name")
+            .and_then(Value::as_str)
+            .context("new producer schedule name is missing")?;
+        packed.extend(Name::from_str(producer_name)?.pack()?);
+
+        let authority = producer
+            .get("authority")
+            .and_then(Value::as_array)
+            .filter(|authority| authority.len() == 2)
+            .context("producer authority is not a [variant, value] pair")?;
+        let authority_variant = authority[0]
+            .as_u64()
+            .context("producer authority variant is invalid")?;
+        if authority_variant != 0 {
+            bail!("unsupported producer authority variant {authority_variant}");
+        }
+        packed.extend(VarUint32(0).pack()?);
+
+        let authority_value = &authority[1];
+        let threshold = u32::try_from(parse_u64(authority_value, "threshold")?)?;
+        packed.extend(threshold.pack()?);
+        let keys = authority_value
+            .get("keys")
+            .and_then(Value::as_array)
+            .context("producer authority keys are missing")?;
+        if keys.is_empty() || keys.len() > 125 {
+            bail!("producer authority has invalid key count {}", keys.len());
+        }
+        packed.extend(VarUint32(keys.len() as u32).pack()?);
+        for key in keys {
+            let key_text = key
+                .get("key")
+                .and_then(Value::as_str)
+                .context("producer authority key is missing")?;
+            let public_key = pulsevm_core::crypto::PublicKey::from_str(key_text)?;
+            packed.extend(AuthorityPublicKey::from(public_key.into_k1()).pack()?);
+            let weight = u16::try_from(parse_u64(key, "weight")?)?;
+            packed.extend(weight.pack()?);
+        }
+    }
+
+    ProducerSchedule::read_authority_schedule_bounded(&packed)
+        .context("validate packed new producer authority schedule")?;
+    Ok(packed)
 }
 
 fn parse_slot(value: &str) -> Result<u32> {
@@ -255,6 +346,24 @@ fn parse_block(value: &Value, expected_num: u32) -> Result<SignedBlock> {
             schedule.clone(),
         )?),
     };
+    let mut header_extensions =
+        parse_extensions(value.get("header_extensions"), "header_extensions")?;
+    if let Some(schedule) = value
+        .get("new_producer_schedule")
+        .filter(|value| !value.is_null())
+    {
+        if new_producers.is_some()
+            || header_extensions
+                .iter()
+                .any(|(id, _)| *id == PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID)
+        {
+            bail!("block contains conflicting producer schedule representations");
+        }
+        header_extensions.push((
+            PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID,
+            parse_authority_schedule(schedule)?,
+        ));
+    }
     let header = BlockHeader {
         timestamp: BlockTimestamp::new(parse_slot(timestamp)?),
         producer: pulsevm_core::name::Name::from_str(producer)?,
@@ -264,7 +373,7 @@ fn parse_block(value: &Value, expected_num: u32) -> Result<SignedBlock> {
         action_mroot: parse_digest(value, "action_mroot")?,
         schedule_version,
         new_producers,
-        header_extensions: parse_extensions(value.get("header_extensions"), "header_extensions")?,
+        header_extensions,
     };
     let signature = Signature::from_str(producer_signature)?;
     let mut transactions = std::collections::VecDeque::new();
@@ -507,17 +616,102 @@ async fn main() -> Result<()> {
             let (block_num, block, packed) = result.context("block fetch task panicked")??;
             completed.insert(block_num, (block, packed));
         }
+        let mut batch = Vec::with_capacity((end - first + 1) as usize);
         for block_num in first..=end {
-            let (block, packed) = completed
-                .remove(&block_num)
-                .with_context(|| format!("fetch batch omitted block {block_num}"))?;
-            writer.append(&block, &packed)?;
+            batch.push(
+                completed
+                    .remove(&block_num)
+                    .with_context(|| format!("fetch batch omitted block {block_num}"))?,
+            );
         }
+        writer.append_batch(&batch)?;
         if writer.blocks % 1000 < concurrency as u32 || writer.blocks == lib {
             eprintln!(
                 "appended block {} through irreversible height {lib}",
                 writer.blocks
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_api_authority_schedule_as_header_extension() {
+        let previous = format!("00000001{}", "00".repeat(28));
+        let value = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00.000",
+            "producer": "alvosec",
+            "confirmed": 0,
+            "previous": previous,
+            "transaction_mroot": "00".repeat(32),
+            "action_mroot": "00".repeat(32),
+            "schedule_version": 1,
+            "new_producers": null,
+            "new_producer_schedule": {
+                "version": 2,
+                "producers": [{
+                    "producer_name": "alvosec",
+                    "authority": [0, {
+                        "threshold": 1,
+                        "keys": [{
+                            "key": "EOS6BidMyUTUHqFKcVMp3HgqTzR1qT1L3k645FkFFE2iN2VeAi7ea",
+                            "weight": 1
+                        }]
+                    }]
+                }]
+            },
+            "producer_signature": Signature::default().to_string(),
+            "transactions": []
+        });
+
+        let block = parse_block(&value, 2).unwrap();
+        let header = &block.signed_block_header.header;
+        assert_eq!(
+            header.header_extensions[0].0,
+            PRODUCER_SCHEDULE_CHANGE_EXTENSION_ID
+        );
+        let schedule = header.new_schedule().unwrap().unwrap();
+        assert_eq!(schedule.version, 2);
+        assert_eq!(schedule.producers.len(), 1);
+    }
+
+    #[test]
+    fn repairs_partial_offset_after_interrupted_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = SignedBlock::default();
+        let block_bytes = block.pack().unwrap();
+        let mut unindexed_block = SignedBlock::default();
+        unindexed_block.signed_block_header.header.previous = block.id().unwrap();
+        let unindexed_bytes = unindexed_block.pack().unwrap();
+        let mut log = File::create(directory.path().join("blocks.log")).unwrap();
+        log.write_all(&block_bytes).unwrap();
+        log.write_all(&0_u64.to_le_bytes()).unwrap();
+        log.write_all(&unindexed_bytes).unwrap();
+        log.write_all(&((block_bytes.len() + 8) as u64).to_le_bytes())
+            .unwrap();
+        let mut index = File::create(directory.path().join("blocks.index")).unwrap();
+        index.write_all(&0_u64.to_le_bytes()).unwrap();
+        index.write_all(&[1, 2, 3]).unwrap();
+        drop(log);
+        drop(index);
+
+        let writer = BlockLogWriter::open(directory.path()).unwrap();
+        assert_eq!(writer.blocks, 1);
+        drop(writer);
+        assert_eq!(
+            std::fs::metadata(directory.path().join("blocks.index"))
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path().join("blocks.log"))
+                .unwrap()
+                .len(),
+            block_bytes.len() as u64 + 8
+        );
     }
 }
