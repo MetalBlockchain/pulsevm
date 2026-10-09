@@ -16,13 +16,17 @@ use serde::{
     Serialize,
 };
 
-use crate::k1::{
-    K1PublicKey,
-    decode_b58_checked,
-    encode_b58_checked,
+use crate::{
+    MlDsaParameterSet,
+    MlDsaPublicKey,
+    k1::{
+        K1PublicKey,
+        decode_b58_checked,
+        encode_b58_checked,
+    },
 };
 
-/// A public-key variant accepted by Antelope authorities.
+/// An Antelope authority key or a protocol-v2 PulseVM ML-DSA extension.
 ///
 /// The packed form is exactly `fc::raw::pack(public_key_type)`: the variant
 /// index as a varuint, followed by the variant payload.  Keeping the tagged
@@ -40,6 +44,7 @@ pub enum AuthorityPublicKey {
         user_presence: u8,
         rpid: String,
     },
+    MlDsa(MlDsaPublicKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,17 +64,29 @@ impl From<K1PublicKey> for AuthorityPublicKey {
     }
 }
 
+impl From<MlDsaPublicKey> for AuthorityPublicKey {
+    fn from(value: MlDsaPublicKey) -> Self {
+        Self::MlDsa(value)
+    }
+}
+
 impl AuthorityPublicKey {
     pub fn as_k1(&self) -> Option<K1PublicKey> {
         match self {
             Self::K1(point) => K1PublicKey::from_compressed(point).ok(),
-            Self::R1(_) | Self::WebAuthn { .. } => None,
+            Self::R1(_) | Self::WebAuthn { .. } | Self::MlDsa(_) => None,
         }
     }
 
     /// Canonical Antelope binary representation, including the variant tag.
     pub fn to_packed(&self) -> Vec<u8> {
         match self {
+            Self::MlDsa(key) => {
+                let mut out = Vec::with_capacity(self.num_bytes());
+                out.push(key.parameters().tag());
+                out.extend_from_slice(key.as_bytes());
+                out
+            }
             Self::K1(point) => {
                 let mut out = Vec::with_capacity(34);
                 out.push(0);
@@ -123,6 +140,19 @@ impl AuthorityPublicKey {
                     rpid,
                 }
             }
+            3..=5 => {
+                if pos != 1 {
+                    return Err(AuthorityKeyError("noncanonical ML-DSA key tag".into()));
+                }
+                let parameters = MlDsaParameterSet::from_tag(tag as u8)
+                    .map_err(|e| AuthorityKeyError(e.to_string()))?;
+                let key = MlDsaPublicKey::from_bytes(
+                    parameters,
+                    take(bytes, &mut pos, parameters.public_key_len())?,
+                )
+                .map_err(|e| AuthorityKeyError(e.to_string()))?;
+                Self::MlDsa(key)
+            }
             _ => {
                 return Err(AuthorityKeyError(format!(
                     "unsupported authority public-key type {tag}"
@@ -137,10 +167,11 @@ impl AuthorityPublicKey {
         Ok(result)
     }
 
-    /// Antelope JSON spelling (`PUB_K1_`, `PUB_R1_`, or `PUB_WA_`).
+    /// Antelope JSON spelling, extended with `PUB_MLDSA{44,65,87}_`.
     #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         match self {
+            Self::MlDsa(key) => key.to_string(),
             Self::K1(point) => format!("PUB_K1_{}", encode_b58_checked(point, b"K1")),
             Self::R1(point) => format!("PUB_R1_{}", encode_b58_checked(point, b"R1")),
             Self::WebAuthn {
@@ -159,6 +190,11 @@ impl AuthorityPublicKey {
     }
 
     pub fn from_string(s: &str) -> Result<Self, AuthorityKeyError> {
+        if s.starts_with("PUB_MLDSA") {
+            return MlDsaPublicKey::from_string(s)
+                .map(Self::MlDsa)
+                .map_err(|e| AuthorityKeyError(e.to_string()));
+        }
         if let Some(data) = s.strip_prefix("PUB_K1_") {
             let point = decode_b58_checked(data, 33, b"K1")
                 .map_err(|e| AuthorityKeyError(format!("invalid K1 authority key: {e}")))?;
@@ -244,6 +280,7 @@ impl<'de> Deserialize<'de> for AuthorityPublicKey {
 impl NumBytes for AuthorityPublicKey {
     fn num_bytes(&self) -> usize {
         match self {
+            Self::MlDsa(key) => 1 + key.as_bytes().len(),
             Self::K1(_) | Self::R1(_) => 34,
             Self::WebAuthn { rpid, .. } => 35 + varuint_len(rpid.len()) + rpid.len(),
         }
@@ -268,6 +305,10 @@ impl Write for AuthorityPublicKey {
             .filter(|end| *end <= bytes.len())
             .ok_or(WriteError::NotEnoughSpace)?;
         match self {
+            Self::MlDsa(key) => {
+                bytes[*pos] = key.parameters().tag();
+                bytes[*pos + 1..end].copy_from_slice(key.as_bytes());
+            }
             Self::K1(point) => {
                 bytes[*pos] = 0;
                 bytes[*pos + 1..end].copy_from_slice(point);
@@ -330,6 +371,11 @@ fn packed_end(bytes: &[u8], start: usize) -> Result<usize, AuthorityKeyError> {
             take(bytes, &mut pos, 34)?;
             let len = read_varuint(bytes, &mut pos)? as usize;
             take(bytes, &mut pos, len)?;
+        }
+        tag @ 3..=5 => {
+            let parameters = MlDsaParameterSet::from_tag(tag as u8)
+                .map_err(|e| AuthorityKeyError(e.to_string()))?;
+            take(bytes, &mut pos, parameters.public_key_len())?;
         }
         tag => {
             return Err(AuthorityKeyError(format!(

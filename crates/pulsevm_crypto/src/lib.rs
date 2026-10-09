@@ -14,6 +14,15 @@ pub use merkle_tree::{
 };
 
 mod authority_key;
+mod ml_dsa;
+pub use ml_dsa::{
+    ML_DSA_TRANSACTION_CONTEXT,
+    MlDsaError,
+    MlDsaParameterSet,
+    MlDsaPrivateKey,
+    MlDsaPublicKey,
+    MlDsaSignature,
+};
 pub mod k1;
 pub use authority_key::{
     AuthorityKeyError,

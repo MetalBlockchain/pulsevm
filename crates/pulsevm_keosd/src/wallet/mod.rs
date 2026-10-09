@@ -250,8 +250,15 @@ impl Wallet {
             return Err(WalletError::Locked);
         }
 
-        let sk = keys::wif_to_private_key(wif)?;
-        let pub_key = keys::pub_k1_string(&sk);
+        let pub_key = if wif.starts_with("PVT_MLDSA") {
+            pulsevm_crypto::MlDsaPrivateKey::from_string(wif)
+                .map_err(|e| KeyError::CryptoError(e.to_string()))?
+                .public_key()
+                .to_string()
+        } else {
+            let sk = keys::wif_to_private_key(wif)?;
+            keys::pub_k1_string(&sk)
+        };
 
         if self.keys.contains_key(&pub_key) {
             return Err(WalletError::KeyAlreadyExists);
@@ -264,11 +271,23 @@ impl Wallet {
 
     /// Create a new key pair inside the wallet. Returns the EOS public key.
     pub fn create_key(&mut self) -> Result<String, WalletError> {
+        self.create_key_of_type("K1")
+    }
+
+    pub fn create_key_of_type(&mut self, key_type: &str) -> Result<String, WalletError> {
         if self.locked {
             return Err(WalletError::Locked);
         }
 
-        let (wif, pub_key) = keys::generate_keypair()?;
+        let (wif, pub_key) = if key_type == "K1" || key_type.is_empty() {
+            keys::generate_keypair()?
+        } else {
+            let parameters = key_type
+                .parse::<pulsevm_crypto::MlDsaParameterSet>()
+                .map_err(|e| KeyError::CryptoError(e.to_string()))?;
+            let key = pulsevm_crypto::MlDsaPrivateKey::random(parameters);
+            (key.to_string(), key.public_key().to_string())
+        };
         self.keys.insert(pub_key.clone(), wif);
         self.save_to_disk()?;
         Ok(pub_key)
@@ -318,6 +337,20 @@ impl Wallet {
         }
         match self.keys.get(public_key) {
             Some(wif) => {
+                if wif.starts_with("PVT_MLDSA") {
+                    if digest.len() != 32 {
+                        return Err(KeyError::CryptoError(
+                            "expected a 32-byte transaction digest".into(),
+                        )
+                        .into());
+                    }
+                    let key = pulsevm_crypto::MlDsaPrivateKey::from_string(wif)
+                        .map_err(|e| KeyError::CryptoError(e.to_string()))?;
+                    let signature = key
+                        .sign(digest, pulsevm_crypto::ML_DSA_TRANSACTION_CONTEXT)
+                        .map_err(|e| KeyError::CryptoError(e.to_string()))?;
+                    return Ok(Some(signature.to_string()));
+                }
                 let sk = keys::wif_to_private_key(wif)?;
                 let sig = keys::sign_digest(&sk, digest)?;
                 Ok(Some(sig))
@@ -612,6 +645,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ml_dsa_wallet_generates_imports_signs_and_reopens() {
+        use pulsevm_crypto::{
+            ML_DSA_TRANSACTION_CONTEXT,
+            MlDsaParameterSet,
+            MlDsaPrivateKey,
+            MlDsaSignature,
+        };
+        let directory = TempDir::new().unwrap();
+        let mut wallet = Wallet::create("mldsa", "correct horse", directory.path()).unwrap();
+        let digest = [11; 32];
+        for parameters in [
+            MlDsaParameterSet::MlDsa44,
+            MlDsaParameterSet::MlDsa65,
+            MlDsaParameterSet::MlDsa87,
+        ] {
+            let key = MlDsaPrivateKey::from_seed(parameters, [27; 32]);
+            let public = wallet.import_key(&key.to_string()).unwrap();
+            assert_eq!(public, key.public_key().to_string());
+            let signature = wallet.try_sign_digest(&digest, &public).unwrap().unwrap();
+            assert!(
+                MlDsaSignature::from_string(&signature)
+                    .unwrap()
+                    .verify(&digest, ML_DSA_TRANSACTION_CONTEXT)
+            );
+            assert!(wallet.try_sign_digest(&[0; 31], &public).is_err());
+            assert!(wallet.import_key(&key.to_string()).is_err());
+        }
+        for key_type in ["MLDSA44", "MLDSA65", "MLDSA87"] {
+            let public = wallet.create_key_of_type(key_type).unwrap();
+            assert!(public.starts_with(&format!("PUB_{key_type}_")));
+        }
+        assert!(wallet.create_key_of_type("MLDSA99").is_err());
+        let public_keys = wallet.list_public_keys().unwrap();
+        wallet.lock();
+        assert!(wallet.try_sign_digest(&digest, &public_keys[0]).is_err());
+        drop(wallet);
+        let mut reopened = Wallet::open("mldsa", directory.path()).unwrap();
+        reopened.unlock("correct horse").unwrap();
+        assert_eq!(reopened.list_public_keys().unwrap(), public_keys);
+        for public in public_keys {
+            let signature = reopened.try_sign_digest(&digest, &public).unwrap().unwrap();
+            let signature = MlDsaSignature::from_string(&signature).unwrap();
+            assert_eq!(signature.public_key().to_string(), public);
+            assert!(signature.verify(&digest, ML_DSA_TRANSACTION_CONTEXT));
+        }
+    }
+
+    #[test]
     fn new_wallet_uses_authenticated_versioned_format() {
         let directory = TempDir::new().unwrap();
         let wallet = Wallet::create("secure", "correct horse", directory.path()).unwrap();
@@ -679,7 +760,7 @@ mod tests {
         let mut wallet = Wallet::create("secure", "correct horse", directory.path()).unwrap();
         let first: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-        wallet.create_key().unwrap();
+        wallet.create_key_of_type("K1").unwrap();
         let second: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
 
         assert_ne!(first["nonce"], second["nonce"]);

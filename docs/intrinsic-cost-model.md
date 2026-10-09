@@ -16,6 +16,12 @@ first measurement found, and the calibration decision that measurement forces.
 
 ## Method (a stripped-down NEAR runtime-params-estimator)
 
+Protocol version 2 adds provisional ML-DSA verification prices: 20,000,000,
+35,000,000, and 55,000,000 base points for ML-DSA-44, -65, and -87, plus 100
+points per message or context byte. Transaction signatures use the same prices.
+These include public-matrix expansion and require estimator calibration before
+production rollout. See [ml-dsa.md](./ml-dsa.md) for the exact wire and host ABI.
+
 `alt_bn128_add` and `alt_bn128_mul` charge provisional fixed costs of 100,000
 and 1,000,000 points for their fixed-width BN254 operations. `alt_bn128_pair`
 charges 100,000,000 points per 192-byte pair, plus a 1,000,000 point base.

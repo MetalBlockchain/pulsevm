@@ -4,6 +4,8 @@ use pulsevm_constants::MAX_TRANSACTION_SIGNATURES;
 use pulsevm_crypto::{
     AuthorityPublicKey,
     Bytes,
+    ML_DSA_TRANSACTION_CONTEXT,
+    MlDsaPrivateKey,
 };
 use pulsevm_error::ChainError;
 use pulsevm_proc_macros::{
@@ -18,7 +20,13 @@ use sha2::Digest as Sha2Digest;
 use crate::{
     chain::{
         id::Id,
+        protocol_features::{
+            ProtocolExecutionContext,
+            ProtocolFeature,
+            ProtocolUpgradeSchedule,
+        },
         transaction::transaction::Transaction,
+        webassembly::cost,
     },
     crypto::{
         PrivateKey,
@@ -116,6 +124,18 @@ impl SignedTransaction {
         &self,
         chain_id: &Id,
     ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        let protocol = ProtocolUpgradeSchedule::default()
+            .execution_context(1)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        self.recovered_authority_keys_with_protocol(chain_id, protocol)
+    }
+
+    pub fn recovered_authority_keys_with_protocol(
+        &self,
+        chain_id: &Id,
+        protocol: ProtocolExecutionContext,
+    ) -> Result<BTreeSet<AuthorityPublicKey>, ChainError> {
+        self.check_signature_protocol(protocol)?;
         self.check_signature_count()?;
         let mut recovered_keys = BTreeSet::new();
         let digest = self
@@ -133,6 +153,54 @@ impl SignedTransaction {
         }
 
         Ok(recovered_keys)
+    }
+
+    /// Run even for trusted replay: new wire variants cannot appear in v1.
+    pub fn check_signature_protocol(
+        &self,
+        protocol: ProtocolExecutionContext,
+    ) -> Result<(), ChainError> {
+        if !protocol.feature_enabled(ProtocolFeature::MlDsa)
+            && self
+                .signatures
+                .iter()
+                .any(|signature| signature.ml_dsa_parameters().is_some())
+        {
+            return Err(ChainError::TransactionError(
+                "ML-DSA signatures require protocol version 2".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn ml_dsa_cpu_usage(&self) -> Result<u64, ChainError> {
+        let mut parameters = self
+            .signatures
+            .iter()
+            .filter_map(Signature::ml_dsa_parameters)
+            .peekable();
+        // Historical receipt replay does not reapply modern signature limits
+        // to legacy envelopes whose authorization was already trusted.
+        if parameters.peek().is_none() {
+            return Ok(0);
+        }
+        self.check_signature_count()?;
+        Ok(parameters
+            .map(|parameters| {
+                cost::ml_dsa_verify(parameters, 32, ML_DSA_TRANSACTION_CONTEXT.len() as u64)
+            })
+            .sum())
+    }
+
+    pub fn sign_ml_dsa(mut self, key: &MlDsaPrivateKey, chain_id: &Id) -> Result<Self, ChainError> {
+        let digest = self
+            .transaction
+            .signing_digest(chain_id, &self.context_free_data)?;
+        let signature = key
+            .sign(&digest, ML_DSA_TRANSACTION_CONTEXT)
+            .map_err(|e| ChainError::TransactionError(e.to_string()))?;
+        self.signatures.push(Signature::new_ml_dsa(signature));
+        Ok(self)
     }
 
     #[inline]
@@ -172,7 +240,10 @@ pub fn signing_digest(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        collections::BTreeSet,
+        str::FromStr,
+    };
 
     use base64::{
         Engine as _,
@@ -181,6 +252,7 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use pulsevm_crypto::{
         AuthorityPublicKey,
+        Bytes,
         R1Signature,
         WebAuthnSignature,
     };
@@ -229,6 +301,86 @@ mod tests {
             vec![],
         );
         (tx, chain_id)
+    }
+
+    #[test]
+    fn ml_dsa_transaction_signature_checks_activation_digest_and_duplicate_keys() {
+        use crate::protocol_features::ProtocolUpgradeSchedule;
+        use pulsevm_crypto::{
+            MlDsaParameterSet,
+            MlDsaPrivateKey,
+        };
+        let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":100}]}"#,
+        )
+        .unwrap();
+        for parameters in [
+            MlDsaParameterSet::MlDsa44,
+            MlDsaParameterSet::MlDsa65,
+            MlDsaParameterSet::MlDsa87,
+        ] {
+            let key = MlDsaPrivateKey::from_seed(parameters, [31; 32]);
+            let (transaction, chain_id) = transaction_signed_by(Vec::new());
+            let transaction = transaction.sign_ml_dsa(&key, &chain_id).unwrap();
+            assert!(
+                transaction
+                    .recovered_authority_keys_with_protocol(
+                        &chain_id,
+                        schedule.execution_context(99).unwrap()
+                    )
+                    .is_err()
+            );
+            for height in [100, 101] {
+                assert_eq!(
+                    transaction
+                        .recovered_authority_keys_with_protocol(
+                            &chain_id,
+                            schedule.execution_context(height).unwrap()
+                        )
+                        .unwrap(),
+                    BTreeSet::from([AuthorityPublicKey::from(key.public_key())])
+                );
+            }
+            let signature = transaction.signatures[0].clone();
+            let bytes = signature.pack().unwrap();
+            let mut position = 0;
+            assert_eq!(Signature::read(&bytes, &mut position).unwrap(), signature);
+            assert_eq!(position, bytes.len());
+            assert_eq!(
+                Signature::from_str(&signature.to_string()).unwrap(),
+                signature
+            );
+            let protocol = schedule.execution_context(100).unwrap();
+            assert!(
+                transaction
+                    .recovered_authority_keys_with_protocol(&Id::new([7; 32]), protocol)
+                    .is_err()
+            );
+            let mut tampered = transaction.clone();
+            tampered.context_free_data.push(Bytes::from(vec![1]));
+            assert!(
+                tampered
+                    .recovered_authority_keys_with_protocol(&chain_id, protocol)
+                    .is_err()
+            );
+            let mut duplicate = transaction;
+            duplicate.signatures.push(signature.clone());
+            assert!(
+                duplicate
+                    .recovered_authority_keys_with_protocol(&chain_id, protocol)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("more than one signature")
+            );
+            duplicate.signatures = vec![signature; MAX_TRANSACTION_SIGNATURES + 1];
+            assert!(
+                duplicate
+                    .ml_dsa_cpu_usage()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeding the limit")
+            );
+        }
     }
 
     /// Two *distinct* canonical signatures over the same digest from the same
@@ -357,6 +509,7 @@ mod tests {
         let signatures = garbage_signatures(MAX_TRANSACTION_SIGNATURES + 1);
         assert_eq!(signatures.len(), MAX_TRANSACTION_SIGNATURES + 1);
         let (transaction, chain_id) = transaction_signed_by(signatures);
+        assert_eq!(transaction.ml_dsa_cpu_usage().unwrap(), 0);
 
         for error in [
             transaction.recovered_authority_keys(&chain_id).unwrap_err(),

@@ -9,6 +9,7 @@ use crate::{
             PermissionLevel,
         },
         authorization_manager::AuthorizationManager,
+        protocol_features::ProtocolFeature,
         pulse_contract::pulse_contract_types::{
             DeleteAuth,
             LinkAuth,
@@ -63,6 +64,8 @@ pub fn newaccount(
         create.active.validate(),
         ChainError::TransactionError("invalid active authority".to_string()),
     )?;
+    validate_ml_dsa_authority(context, &create.owner)?;
+    validate_ml_dsa_authority(context, &create.active)?;
     let name_str = create.name.to_string();
     pulse_assert(
         !create.name.empty(),
@@ -330,6 +333,7 @@ pub fn updateauth(
         )?;
     }
 
+    validate_ml_dsa_authority(context, &update.auth)?;
     validate_authority_precondition(db, &update.auth)?;
 
     let requested = PermissionLevel::new(update.account.as_u64(), update.permission.as_u64());
@@ -519,6 +523,20 @@ pub fn unlinkauth(
         context.add_ram_usage(&unlink.account, delta)?;
     }
 
+    Ok(())
+}
+
+fn validate_ml_dsa_authority(context: &ApplyContext, auth: &Authority) -> Result<(), ChainError> {
+    if !context.protocol_feature_enabled(ProtocolFeature::MlDsa)
+        && auth
+            .keys
+            .iter()
+            .any(|weight| matches!(weight.key, pulsevm_crypto::AuthorityPublicKey::MlDsa(_)))
+    {
+        return Err(ChainError::ActionValidationError(
+            "ML-DSA account keys require protocol version 2".into(),
+        ));
+    }
     Ok(())
 }
 
