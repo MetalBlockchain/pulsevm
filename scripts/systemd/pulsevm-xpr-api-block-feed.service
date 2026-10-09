@@ -1,0 +1,18 @@
+[Unit]
+Description=Feed canonical XPR blocks to PulseVM's validating replay log
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pulsevm-hyperion-integration
+ExecStart=/home/ubuntu/pulsevm-hyperion-integration/target/release/examples/xpr_api_blocklog_feed /data/xpr-mainnet-follow-recovery/node/blocks 32
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:/data/xpr-hyperion/api-block-feed.log
+StandardError=append:/data/xpr-hyperion/api-block-feed.log
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,14 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    controller::Controller,
+    state_history::{
+        SHIP_ABI,
+        StateHistoryLog,
+    },
+    transaction::TransactionTrace,
+};
 use anyhow::{
     Result,
     anyhow,
@@ -17,14 +25,6 @@ use anyhow::{
 use futures_util::{
     SinkExt,
     StreamExt,
-};
-use pulsevm_core::{
-    controller::Controller,
-    state_history::{
-        SHIP_ABI,
-        StateHistoryLog,
-    },
-    transaction::TransactionTrace,
 };
 use pulsevm_crypto::Bytes;
 use pulsevm_serialization::{
@@ -51,7 +51,7 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 use tungstenite::Message;
 
-use crate::state_history::{
+use super::{
     request::RequestType,
     types::{
         BlockPosition,

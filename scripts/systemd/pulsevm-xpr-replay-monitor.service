@@ -1,0 +1,23 @@
+[Unit]
+Description=Verify PulseVM XPR replay and publish Hyperion watermark
+Wants=network-online.target
+After=network-online.target elasticsearch.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pulsevm-hyperion-integration
+EnvironmentFile=-/etc/default/pulsevm-xpr-replay-monitor
+ExecStart=/usr/bin/env python3 scripts/hyperion-full-replay-monitor.py
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:/data/xpr-hyperion/replay-monitor.log
+StandardError=append:/data/xpr-hyperion/replay-monitor.log
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/data/xpr-hyperion
+
+[Install]
+WantedBy=multi-user.target

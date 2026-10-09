@@ -1,4 +1,4 @@
-use pulsevm_core::{
+use crate::{
     account::AccountDelta,
     crypto::Signature,
     id::Id,

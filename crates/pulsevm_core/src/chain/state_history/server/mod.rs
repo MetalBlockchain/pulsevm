@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use pulsevm_core::controller::Controller;
+use crate::controller::Controller;
 use tokio::{
     net::TcpListener as TokioTcpListener,
     sync::{
@@ -18,10 +18,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    VirtualMachine,
-    state_history::session::Session,
-};
+use self::session::Session;
 
 /// Rewrites a bind address to request an ephemeral port, preserving the host.
 /// Falls back to all interfaces if the host cannot be determined.
@@ -38,10 +35,8 @@ pub struct StateHistoryServer {
 }
 
 impl StateHistoryServer {
-    pub fn new(vm: VirtualMachine) -> Self {
-        Self {
-            controller: vm.controller.clone(),
-        }
+    pub fn new(controller: Arc<RwLock<Controller>>) -> Self {
+        Self { controller }
     }
 
     /// Serves the state history WebSocket API.
