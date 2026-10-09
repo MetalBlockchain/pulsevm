@@ -9,13 +9,15 @@ use pulsevm_core::{
         PermissionLevel,
     },
     config::NEWACCOUNT_NAME,
-    crypto::{
-        PrivateKey,
-        PublicKey,
-    },
+    crypto::PrivateKey,
     name::Name,
     pulse_contract::NewAccount,
     transaction::Action,
+};
+use pulsevm_crypto::{
+    AuthorityPublicKey,
+    MlDsaParameterSet,
+    MlDsaPrivateKey,
 };
 use pulsevm_keosd_client::KeosdClient;
 use spdlog::info;
@@ -72,7 +74,7 @@ pub async fn handle(
                         owner: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight::new(
-                                PublicKey::from_str(&owner_key)?.into_k1(),
+                                AuthorityPublicKey::from_str(&owner_key)?,
                                 1,
                             )],
                             accounts: vec![],
@@ -81,7 +83,7 @@ pub async fn handle(
                         active: Authority {
                             threshold: 1,
                             keys: vec![KeyWeight::new(
-                                PublicKey::from_str(&active_key)?.into_k1(),
+                                AuthorityPublicKey::from_str(&active_key)?,
                                 1,
                             )],
                             accounts: vec![],
@@ -98,6 +100,7 @@ pub async fn handle(
             file,
             to_console,
             r1,
+            key_type,
         } => {
             if r1 {
                 return Err(
@@ -105,12 +108,16 @@ pub async fn handle(
                         .into(),
                 );
             }
-            let private_key = PrivateKey::random();
             // One renderer for both sinks. These were two separate `format!`
             // sites, and they drifted: the console one printed the *public* key
             // under the "Private Key:" label, so a key generated with
             // --to-console was unrecoverable the moment the process exited.
-            let rendered = render_keypair(&private_key);
+            let rendered = if key_type == "K1" {
+                render_keypair(&PrivateKey::random())
+            } else {
+                let key = MlDsaPrivateKey::random(key_type.parse::<MlDsaParameterSet>()?);
+                format!("Private Key: {key}\nPublic Key: {}", key.public_key())
+            };
 
             match file {
                 Some(path) => {

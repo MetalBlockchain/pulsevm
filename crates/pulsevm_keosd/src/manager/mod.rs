@@ -209,6 +209,14 @@ impl WalletManager {
 
     /// Create a new key pair inside the named wallet. Returns the public key.
     pub fn create_key(&mut self, name: &str) -> Result<String, ManagerError> {
+        self.create_key_of_type(name, "K1")
+    }
+
+    pub fn create_key_of_type(
+        &mut self,
+        name: &str,
+        key_type: &str,
+    ) -> Result<String, ManagerError> {
         self.check_timeout();
 
         let wallet = self
@@ -216,7 +224,11 @@ impl WalletManager {
             .get_mut(name)
             .ok_or_else(|| ManagerError::WalletNotFound(name.to_string()))?;
 
-        let pub_key = wallet.create_key()?;
+        let pub_key = if key_type == "K1" {
+            wallet.create_key()?
+        } else {
+            wallet.create_key_of_type(key_type)?
+        };
         Ok(pub_key)
     }
 

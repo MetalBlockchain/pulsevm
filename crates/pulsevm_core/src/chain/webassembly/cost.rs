@@ -69,6 +69,21 @@ pub fn memory(len: u64) -> u64 {
 /// A full secp256k1 recovery (~14.5 µs) -- by far the heaviest intrinsic.
 pub const RECOVER_KEY: u64 = 1_650_000;
 
+/// Provisional FIPS 204 verification pricing, including public-matrix expansion.
+/// See `docs/ml-dsa.md`. Only reachable under protocol version 2.
+pub fn ml_dsa_verify(
+    parameters: pulsevm_crypto::MlDsaParameterSet,
+    message_len: u64,
+    context_len: u64,
+) -> u64 {
+    let base: u64 = match parameters {
+        pulsevm_crypto::MlDsaParameterSet::MlDsa44 => 20_000_000,
+        pulsevm_crypto::MlDsaParameterSet::MlDsa65 => 35_000_000,
+        pulsevm_crypto::MlDsaParameterSet::MlDsa87 => 55_000_000,
+    };
+    base.saturating_add(100u64.saturating_mul(message_len.saturating_add(context_len)))
+}
+
 /// BN254 G1 scalar multiplication (provisional fixed-width pricing).
 pub const ALT_BN128_MUL: u64 = 1_000_000;
 
@@ -209,6 +224,15 @@ mod tests {
         assert_eq!((ripemd160(0), ripemd160(1)), (16_600, 16_876));
         assert_eq!((memory(0), memory(1)), (300, 310));
         assert_eq!(RECOVER_KEY, 1_650_000);
+        use pulsevm_crypto::MlDsaParameterSet::{
+            MlDsa44,
+            MlDsa65,
+            MlDsa87,
+        };
+        assert_eq!(ml_dsa_verify(MlDsa44, 0, 0), 20_000_000);
+        assert_eq!(ml_dsa_verify(MlDsa65, 1, 0), 35_000_100);
+        assert_eq!(ml_dsa_verify(MlDsa87, 0, 1), 55_000_100);
+        assert_eq!(ml_dsa_verify(MlDsa87, u64::MAX, 255), u64::MAX);
         assert_eq!(mod_exp(1, 1, 1), 1_065);
         assert_eq!(
             mod_exp(u32::MAX.into(), u32::MAX.into(), u32::MAX.into()),

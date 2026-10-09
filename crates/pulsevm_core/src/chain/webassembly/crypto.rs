@@ -11,7 +11,10 @@ use bn::{
     pairing_batch,
 };
 use num_bigint::BigUint;
-use pulsevm_crypto::AuthorityPublicKey;
+use pulsevm_crypto::{
+    AuthorityPublicKey,
+    MlDsaParameterSet,
+};
 use pulsevm_serialization::{
     Read,
     Write,
@@ -27,7 +30,170 @@ use super::cost;
 use crate::{
     chain::wasm_runtime::WasmContext,
     crypto::Signature,
+    protocol_features::ProtocolFeature,
 };
+
+/// Maximum message size for the new FIPS 204 host ABI. See `docs/ml-dsa.md`.
+pub const MAX_ML_DSA_MESSAGE_BYTES: u32 = 1_048_576;
+
+/// Verify a detached FIPS 204 signature with a packed ML-DSA public key.
+/// Returns 1 for a valid signature and 0 for a cryptographic failure.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "WASM ABI uses pointer/length pairs"
+)]
+pub fn verify_mldsa(
+    mut env: FunctionEnvMut<WasmContext>,
+    message_ptr: WasmPtr<u8>,
+    message_len: u32,
+    signature_ptr: WasmPtr<u8>,
+    signature_len: u32,
+    key_ptr: WasmPtr<u8>,
+    key_len: u32,
+    context_ptr: WasmPtr<u8>,
+    context_len: u32,
+) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+    if !data.protocol_feature_enabled(ProtocolFeature::MlDsa) {
+        return Err(RuntimeError::new(
+            "ML-DSA intrinsics require protocol version 2",
+        ));
+    }
+    if message_len > MAX_ML_DSA_MESSAGE_BYTES || context_len > 255 {
+        return Err(RuntimeError::new(
+            "ML-DSA message or context exceeds its size limit",
+        ));
+    }
+    let memory = data
+        .memory()
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
+    let view = memory.view(&store);
+    let mut tag = [0u8; 1];
+    key_ptr.slice(&view, 1)?.read_slice(&mut tag)?;
+    let parameters =
+        MlDsaParameterSet::from_tag(tag[0]).map_err(|e| RuntimeError::new(e.to_string()))?;
+    if key_len as usize != 1 + parameters.public_key_len()
+        || signature_len as usize != parameters.signature_len()
+    {
+        return Err(RuntimeError::new("invalid ML-DSA key or signature length"));
+    }
+    // Bill before expanding the key or scanning any message bytes.
+    data.charge(
+        &mut store,
+        cost::ml_dsa_verify(parameters, message_len.into(), context_len.into()),
+    )?;
+    let view = memory.view(&store);
+    let key_slice = key_ptr.slice(&view, key_len)?;
+    let key = key_slice
+        .access()
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    let AuthorityPublicKey::MlDsa(key) = AuthorityPublicKey::from_packed(key.as_ref())
+        .map_err(|e| RuntimeError::new(e.to_string()))?
+    else {
+        return Err(RuntimeError::new("expected an ML-DSA public key"));
+    };
+    let message_slice = message_ptr.slice(&view, message_len)?;
+    let message = message_slice
+        .access()
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    let signature_slice = signature_ptr.slice(&view, signature_len)?;
+    let signature = signature_slice
+        .access()
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    let context_slice = context_ptr.slice(&view, context_len)?;
+    let context = context_slice
+        .access()
+        .map_err(|e| RuntimeError::new(e.to_string()))?;
+    Ok(i32::from(key.verify(
+        message.as_ref(),
+        context.as_ref(),
+        signature.as_ref(),
+    )))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "WASM ABI uses pointer/length pairs"
+)]
+pub fn assert_verify_mldsa(
+    env: FunctionEnvMut<WasmContext>,
+    message_ptr: WasmPtr<u8>,
+    message_len: u32,
+    signature_ptr: WasmPtr<u8>,
+    signature_len: u32,
+    key_ptr: WasmPtr<u8>,
+    key_len: u32,
+    context_ptr: WasmPtr<u8>,
+    context_len: u32,
+) -> Result<(), RuntimeError> {
+    if verify_mldsa(
+        env,
+        message_ptr,
+        message_len,
+        signature_ptr,
+        signature_len,
+        key_ptr,
+        key_len,
+        context_ptr,
+        context_len,
+    )? != 1
+    {
+        return Err(RuntimeError::new(
+            "assertion failed: invalid ML-DSA signature",
+        ));
+    }
+    Ok(())
+}
+
+fn charge_ml_dsa_recovery(
+    data: &WasmContext,
+    store: &mut impl wasmer::AsStoreMut,
+    signature: &Signature,
+    signature_len: u32,
+) -> Result<(), RuntimeError> {
+    if let Some(parameters) = signature.ml_dsa_parameters() {
+        if !data.protocol_feature_enabled(ProtocolFeature::MlDsa) {
+            return Err(RuntimeError::new(
+                "ML-DSA signatures require protocol version 2",
+            ));
+        }
+        if signature_len as usize != 1 + parameters.public_key_len() + parameters.signature_len() {
+            return Err(RuntimeError::new("trailing bytes in ML-DSA signature"));
+        }
+        data.charge(
+            store,
+            cost::ml_dsa_verify(
+                parameters,
+                32,
+                pulsevm_crypto::ML_DSA_TRANSACTION_CONTEXT.len() as u64,
+            ) - cost::RECOVER_KEY,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_ml_dsa_envelope(
+    data: &WasmContext,
+    tag: u8,
+    signature_len: u32,
+) -> Result<(), RuntimeError> {
+    if matches!(tag, 3..=5) {
+        if !data.protocol_feature_enabled(ProtocolFeature::MlDsa) {
+            return Err(RuntimeError::new(
+                "ML-DSA signatures require protocol version 2",
+            ));
+        }
+        let parameters =
+            MlDsaParameterSet::from_tag(tag).map_err(|e| RuntimeError::new(e.to_string()))?;
+        if signature_len as usize != 1 + parameters.public_key_len() + parameters.signature_len() {
+            return Err(RuntimeError::new(
+                "invalid ML-DSA signature envelope length",
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Antelope's activated CRYPTO_PRIMITIVES feature (canonical feature digest).
 pub(crate) const CRYPTO_PRIMITIVES_FEATURE_DIGEST: [u8; 32] = [
@@ -327,12 +493,19 @@ pub fn assert_recover_key(
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
+    if sig_len > 0 {
+        let mut tag = [0u8; 1];
+        sig_ptr.slice(&view, 1)?.read_slice(&mut tag)?;
+        check_ml_dsa_envelope(env_data, tag[0], sig_len)?;
+    }
     let sig_slice = sig_ptr.slice(&view, sig_len)?;
     let mut sig_bytes = vec![0u8; sig_len as usize];
     sig_slice.read_slice(&mut sig_bytes)?;
     let signature = Signature::read(sig_bytes.as_slice(), &mut 0).map_err(|e| {
         RuntimeError::new(format!("failed to read signature from wasm memory: {}", e))
     })?;
+    charge_ml_dsa_recovery(env_data, &mut store, &signature, sig_len)?;
+    let view = memory.view(&store);
     let digest_slice = digest_ptr.slice(&view, 32)?;
     let mut digest_bytes = vec![0u8; 32];
     digest_slice.read_slice(&mut digest_bytes)?;
@@ -343,6 +516,11 @@ pub fn assert_recover_key(
             .expect("digest buffer is exactly 32 bytes"),
     );
     let pub_slice = pub_ptr.slice(&view, pub_len)?;
+    if let Some(parameters) = signature.ml_dsa_parameters()
+        && pub_len as usize != 1 + parameters.public_key_len()
+    {
+        return Err(RuntimeError::new("invalid ML-DSA public key length"));
+    }
     let mut pubkey_bytes = vec![0u8; pub_len as usize];
     pub_slice.read_slice(&mut pubkey_bytes)?;
     let pubkey = AuthorityPublicKey::read(pubkey_bytes.as_slice(), &mut 0).map_err(|e| {
@@ -377,12 +555,19 @@ pub fn recover_key(
         .as_ref()
         .expect("Wasm memory not initialized");
     let view = memory.view(&store);
+    if sig_len > 0 {
+        let mut tag = [0u8; 1];
+        sig_ptr.slice(&view, 1)?.read_slice(&mut tag)?;
+        check_ml_dsa_envelope(env_data, tag[0], sig_len)?;
+    }
     let sig_slice = sig_ptr.slice(&view, sig_len)?;
     let mut sig_bytes = vec![0u8; sig_len as usize];
     sig_slice.read_slice(&mut sig_bytes)?;
     let signature = Signature::read(sig_bytes.as_slice(), &mut 0).map_err(|e| {
         RuntimeError::new(format!("failed to read signature from wasm memory: {}", e))
     })?;
+    charge_ml_dsa_recovery(env_data, &mut store, &signature, sig_len)?;
+    let view = memory.view(&store);
     let digest_slice = digest_ptr.slice(&view, 32)?;
     let mut digest_bytes = vec![0u8; 32];
     digest_slice.read_slice(&mut digest_bytes)?;

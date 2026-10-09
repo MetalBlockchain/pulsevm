@@ -695,6 +695,26 @@ pub struct MempoolAdmissionState {
     protocol_upgrade_schedule: ProtocolUpgradeSchedule,
 }
 
+/// Bound native verification work before recovering any transaction key.
+fn check_ml_dsa_signature_budget(
+    transaction: &SignedTransaction,
+    max_cpu: u32,
+) -> Result<u64, ChainError> {
+    let cpu = transaction.ml_dsa_cpu_usage()?;
+    let header_limit = transaction.transaction().header.max_cpu_usage();
+    let limit = if header_limit == 0 {
+        u64::from(max_cpu)
+    } else {
+        u64::from(max_cpu).min(u64::from(header_limit))
+    };
+    if cpu > limit {
+        return Err(ChainError::TransactionError(
+            "ML-DSA signature verification exceeds transaction CPU limit".into(),
+        ));
+    }
+    Ok(cpu)
+}
+
 impl MempoolAdmissionState {
     pub fn validate_transaction(
         &self,
@@ -713,11 +733,17 @@ impl MempoolAdmissionState {
         let next_block_height = accepted_height
             .checked_add(1)
             .ok_or_else(|| ChainError::InternalError("accepted block height overflow".into()))?;
-        self.protocol_upgrade_schedule
+        let protocol_context = self
+            .protocol_upgrade_schedule
             .execution_context(next_block_height)
             .map_err(|e| ChainError::BlockError(e.to_string()))?;
 
         transaction.validate(pending_block_timestamp)?;
+        signed_transaction.check_signature_protocol(protocol_context)?;
+        check_ml_dsa_signature_budget(
+            &signed_transaction,
+            self.db.chain_config()?.max_transaction_cpu_usage,
+        )?;
 
         let expiration: TimePoint = transaction.header.expiration().into();
         let pending: TimePoint = (*pending_block_timestamp).into();
@@ -793,7 +819,8 @@ impl MempoolAdmissionState {
         AuthorizationManager::check_authorization(
             &self.db,
             &transaction.actions,
-            &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+            &signed_transaction
+                .recovered_authority_keys_with_protocol(&self.chain_id, protocol_context)?,
             &BTreeSet::new(),
             seconds(transaction.header.delay_sec.into()),
             &BTreeSet::new(),
@@ -3289,6 +3316,12 @@ impl Controller {
 
         let transactions_started = replay_profiling.then(Instant::now);
         for receipt in &block.transactions {
+            // Gate new wire variants before replay-only native shortcuts, too.
+            if let Some(transaction) = receipt.packed_trx() {
+                transaction
+                    .get_signed_transaction()
+                    .check_signature_protocol(protocol_context)?;
+            }
             let transaction_resource_mode = match resource_mode {
                 BlockResourceMode::ValidateReceipts => TransactionResourceMode::ValidateReceipt {
                     cpu_us: receipt.cpu_usage_us(),
@@ -4026,6 +4059,11 @@ impl Controller {
 
         let mut execution = (|| {
             let signed_transaction = packed_transaction.get_signed_transaction();
+            signed_transaction.check_signature_protocol(protocol_context)?;
+            let ml_dsa_cpu = check_ml_dsa_signature_budget(
+                &signed_transaction,
+                execution_db.chain_config()?.max_transaction_cpu_usage,
+            )?;
 
             // Verify basic transaction validity
             if !is_deferred {
@@ -4041,7 +4079,8 @@ impl Controller {
                 AuthorizationManager::check_authorization(
                     &mut execution_db,
                     &signed_transaction.transaction().actions,
-                    &signed_transaction.recovered_authority_keys(&self.chain_id)?,
+                    &signed_transaction
+                        .recovered_authority_keys_with_protocol(&self.chain_id, protocol_context)?,
                     &BTreeSet::new(),
                     seconds(signed_transaction.transaction().header.delay_sec.into()),
                     &BTreeSet::new(),
@@ -4093,6 +4132,7 @@ impl Controller {
                     &trx,
                 )?;
             }
+            trx_context.add_cpu_usage(ml_dsa_cpu)?;
             let executed_directly =
                 if matches!(resource_mode, TransactionResourceMode::ReplayReceipt { .. })
                     && !is_deferred
@@ -7220,6 +7260,359 @@ mod tests {
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_accounts_activate_verify_bill_and_survive_restart() -> Result<(), ChainError> {
+        use crate::{
+            OWNER_NAME,
+            pulse_contract::UpdateAuth,
+            transaction::{
+                TransactionReceiptHeader,
+                TransactionStatus,
+            },
+        };
+        use pulsevm_crypto::{
+            AuthorityPublicKey,
+            MlDsaParameterSet,
+            MlDsaPrivateKey,
+        };
+        let (_, private_key, chain_id, _) = init_test_controller()?;
+        let config = serde_json::to_vec(
+            &json!({"producer_name":"pulse", "producer_key":private_key.to_string()}),
+        )
+        .unwrap();
+        let genesis = generate_genesis(&private_key);
+        let upgrades = br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":3}]}"#;
+        let producer_dir = get_temp_dir();
+        let validator_dir = get_temp_dir();
+        let mut producer = Controller::new();
+        let mut validator = Controller::new();
+        producer.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config,
+            &genesis,
+            upgrades,
+            producer_dir.path().to_str().unwrap(),
+        )?;
+        validator.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config,
+            &genesis,
+            upgrades,
+            validator_dir.path().to_str().unwrap(),
+        )?;
+        let accounts =
+            ["mldsaone", "mldsatwo", "mldsathree"].map(|name| Name::from_str(name).unwrap());
+        let keys = [
+            MlDsaParameterSet::MlDsa44,
+            MlDsaParameterSet::MlDsa65,
+            MlDsaParameterSet::MlDsa87,
+        ]
+        .map(|parameters| MlDsaPrivateKey::from_seed(parameters, [13; 32]));
+        let create =
+            |account: Name, key: &MlDsaPrivateKey| -> Result<PackedTransaction, ChainError> {
+                let authority = Authority::new_from_public_key(key.public_key());
+                let action = Action::new(
+                    PULSE_NAME,
+                    NEWACCOUNT_NAME,
+                    NewAccount {
+                        creator: PULSE_NAME,
+                        name: account,
+                        owner: authority.clone(),
+                        active: authority,
+                    }
+                    .pack()?,
+                    vec![PermissionLevel::new(
+                        PULSE_NAME.as_u64(),
+                        ACTIVE_NAME.as_u64(),
+                    )],
+                );
+                PackedTransaction::from_signed_transaction(
+                    Transaction::new(
+                        TransactionHeader::new(
+                            TimePointSec::maximum(),
+                            0,
+                            0,
+                            0u32.into(),
+                            0,
+                            0u32.into(),
+                        ),
+                        vec![],
+                        vec![action],
+                    )
+                    .sign(&private_key, &chain_id)?,
+                )
+            };
+        let timestamp = *producer.last_accepted_block().timestamp();
+        let rejected_creation = create(accounts[0], &keys[0])?;
+        producer.db.arena_start_undo_session();
+        let rejected =
+            producer.execute_transaction(&rejected_creation, &timestamp, &BlockStatus::Building);
+        producer.db.arena_undo();
+        assert!(
+            rejected
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("protocol version 2")
+        );
+        assert!(!producer.db.is_account(accounts[0].as_u64())?);
+
+        let mut p_pool = Mempool::new();
+        let mut v_pool = Mempool::new();
+        // H - 1 retains exactly the legacy block and state behavior.
+        p_pool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("legacy")?,
+            chain_id,
+        )?);
+        let legacy = producer.build_block(&mut p_pool).await?;
+        assert_eq!(legacy.block_num(), 2);
+        validator.verify_block(&legacy, &mut v_pool).await?;
+        producer.accept_block(&legacy.id()?, &mut p_pool)?;
+        validator.accept_block(&legacy.id()?, &mut v_pool)?;
+        producer.set_preferred_id(legacy.id()?);
+        validator.set_preferred_id(legacy.id()?);
+        assert_eq!(
+            producer.db.arena_state_root(),
+            validator.db.arena_state_root()
+        );
+
+        for (account, key) in accounts.iter().zip(&keys) {
+            p_pool.add_transaction(create(*account, key)?);
+        }
+        let activation = producer.build_block(&mut p_pool).await?;
+        assert_eq!(activation.block_num(), 3);
+        assert_eq!(activation.transactions.len(), 3);
+        validator.verify_block(&activation, &mut v_pool).await?;
+        producer.accept_block(&activation.id()?, &mut p_pool)?;
+        validator.accept_block(&activation.id()?, &mut v_pool)?;
+        producer.set_preferred_id(activation.id()?);
+        validator.set_preferred_id(activation.id()?);
+        assert_eq!(
+            producer.db.arena_state_root(),
+            validator.db.arena_state_root()
+        );
+
+        // H + 1: rotate active authorities using the original ML-DSA keys.
+        let replacements = [
+            MlDsaParameterSet::MlDsa44,
+            MlDsaParameterSet::MlDsa65,
+            MlDsaParameterSet::MlDsa87,
+        ]
+        .map(|parameters| MlDsaPrivateKey::from_seed(parameters, [14; 32]));
+        for ((account, key), replacement) in accounts.iter().zip(&keys).zip(&replacements) {
+            let action = Action::new(
+                PULSE_NAME,
+                UPDATEAUTH_NAME,
+                UpdateAuth {
+                    account: *account,
+                    permission: ACTIVE_NAME,
+                    parent: OWNER_NAME,
+                    auth: Authority::new(
+                        2,
+                        vec![
+                            KeyWeight::new(private_key.get_public_key().into_k1(), 1),
+                            KeyWeight::new(replacement.public_key(), 1),
+                        ],
+                        vec![],
+                        vec![],
+                    ),
+                }
+                .pack()?,
+                vec![PermissionLevel::new(account.as_u64(), OWNER_NAME.as_u64())],
+            );
+            let transaction = SignedTransaction::new(
+                Transaction::new(
+                    TransactionHeader::new(
+                        TimePointSec::maximum(),
+                        0,
+                        0,
+                        0u32.into(),
+                        0,
+                        0u32.into(),
+                    ),
+                    vec![],
+                    vec![action],
+                ),
+                vec![],
+                vec![],
+            )
+            .sign_ml_dsa(key, &chain_id)?;
+            p_pool.add_transaction(PackedTransaction::from_signed_transaction(transaction)?);
+        }
+        let signed = producer.build_block(&mut p_pool).await?;
+        assert_eq!(signed.block_num(), 4);
+        assert_eq!(signed.transactions.len(), 3);
+        for receipt in &signed.transactions {
+            let transaction = receipt.packed_trx().unwrap().get_signed_transaction();
+            assert_eq!(
+                u64::from(receipt.cpu_usage_us()),
+                transaction.ml_dsa_cpu_usage()? + 100
+            );
+        }
+        let mut underbilled = signed.clone();
+        let receipt = underbilled.transactions.front().unwrap().clone();
+        *underbilled.transactions.front_mut().unwrap() = TransactionReceipt::new(
+            TransactionReceiptHeader::new(
+                TransactionStatus::Executed,
+                receipt.cpu_usage_us() - 1,
+                receipt.net_usage_words().into(),
+            ),
+            receipt.packed_trx().unwrap().clone(),
+        );
+        underbilled.signed_block_header.signature =
+            private_key.sign(&underbilled.signed_block_header.header.sig_digest()?)?;
+        let before_rejection = validator.db.arena_state_root();
+        assert!(
+            validator
+                .verify_block(&underbilled, &mut v_pool)
+                .await
+                .is_err()
+        );
+        assert_eq!(validator.db.arena_state_root(), before_rejection);
+        validator.verify_block(&signed, &mut v_pool).await?;
+        producer.accept_block(&signed.id()?, &mut p_pool)?;
+        validator.accept_block(&signed.id()?, &mut v_pool)?;
+        assert_eq!(
+            producer.db.arena_state_root(),
+            validator.db.arena_state_root()
+        );
+        producer.set_preferred_id(signed.id()?);
+        validator.set_preferred_id(signed.id()?);
+        for (account, key) in accounts.iter().zip(&replacements) {
+            let action = Action::new(
+                *account,
+                Name::from_str("test")?,
+                vec![],
+                vec![PermissionLevel::new(account.as_u64(), ACTIVE_NAME.as_u64())],
+            );
+            let transaction = SignedTransaction::new(
+                Transaction::new(
+                    TransactionHeader::new(
+                        TimePointSec::maximum(),
+                        0,
+                        0,
+                        0u32.into(),
+                        0,
+                        0u32.into(),
+                    ),
+                    vec![],
+                    vec![action],
+                ),
+                vec![],
+                vec![],
+            )
+            .sign_ml_dsa(key, &chain_id)?
+            .sign(&private_key, &chain_id)?;
+            p_pool.add_transaction(PackedTransaction::from_signed_transaction(transaction)?);
+        }
+        let mixed = producer.build_block(&mut p_pool).await?;
+        assert_eq!(mixed.transactions.len(), 3);
+        validator.verify_block(&mixed, &mut v_pool).await?;
+        producer.accept_block(&mixed.id()?, &mut p_pool)?;
+        validator.accept_block(&mixed.id()?, &mut v_pool)?;
+        assert_eq!(
+            producer.db.arena_state_root(),
+            validator.db.arena_state_root()
+        );
+        let root = producer.db.arena_state_root();
+        producer.shutdown()?;
+        drop(producer);
+        let mut reopened = Controller::new();
+        reopened.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config,
+            &genesis,
+            upgrades,
+            producer_dir.path().to_str().unwrap(),
+        )?;
+        assert_eq!(reopened.db.arena_state_root(), root);
+        for (account, key) in accounts.iter().zip(&replacements) {
+            assert_eq!(
+                reopened
+                    .db
+                    .arena_permission_authority(account.as_u64(), ACTIVE_NAME.as_u64())
+                    .unwrap()
+                    .keys[1]
+                    .key,
+                AuthorityPublicKey::from(key.public_key())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ml_dsa_signature_budget_bounds_are_checked_before_crypto() -> Result<(), ChainError> {
+        use pulsevm_crypto::{
+            MlDsaParameterSet,
+            MlDsaPrivateKey,
+        };
+        let key = MlDsaPrivateKey::from_seed(MlDsaParameterSet::MlDsa65, [1; 32]);
+        let transaction = SignedTransaction::new(Transaction::default(), vec![], vec![])
+            .sign_ml_dsa(&key, &Id::default())?;
+        let cpu = transaction.ml_dsa_cpu_usage()?;
+        assert_eq!(
+            check_ml_dsa_signature_budget(&transaction, cpu as u32)?,
+            cpu
+        );
+        assert!(check_ml_dsa_signature_budget(&transaction, cpu as u32 - 1).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_unused_host_import_rejects_legacy_execution() -> Result<(), ChainError> {
+        let (mut controller, key, chain_id, _dir) = init_test_controller()?;
+        let account = Name::from_str("mldsahost")?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        controller.execute_transaction(
+            &create_account(&key, account, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        let wasm = wat::parse_str(r#"(module
+            (import "env" "verify_mldsa" (func (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (import "env" "assert_verify_mldsa" (func (param i32 i32 i32 i32 i32 i32 i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "apply") (param i64 i64 i64)))"#).unwrap();
+        controller.execute_transaction(
+            &set_code(&key, account, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        let call = call_contract(&key, account, Name::from_str("test")?, &0u8, chain_id)?;
+        controller.db.arena_start_undo_session();
+        let rejected = controller.execute_transaction(&call, &timestamp, &BlockStatus::Building);
+        controller.db.arena_undo();
+        assert!(
+            rejected
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("protocol version 2")
+        );
+        controller.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )
+        .unwrap();
+        controller.db.arena_start_undo_session();
+        let activated = controller.execute_transaction(&call, &timestamp, &BlockStatus::Building);
+        controller.db.arena_undo();
+        activated?;
+        // A cached instance from v2 must not enable imports on a legacy fork.
+        controller.protocol_upgrade_schedule = ProtocolUpgradeSchedule::default();
+        controller.db.arena_start_undo_session();
+        let rejected = controller.execute_transaction(&call, &timestamp, &BlockStatus::Building);
+        controller.db.arena_undo();
+        assert!(
+            rejected
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("protocol version 2")
+        );
+        Ok(())
     }
 
     #[tokio::test]
