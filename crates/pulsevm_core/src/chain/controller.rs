@@ -1661,11 +1661,10 @@ impl Controller {
                     .node_config
                     .as_ref()
                     .is_some_and(|config| config.antelope_block_signatures);
-                let migration_replay = self
-                    .node_config
-                    .as_ref()
-                    .is_some_and(|config| !config.state_history_enabled);
-                let cached_header_state = if migration_replay {
+                let can_use_replay_header_state = self.node_config.as_ref().is_some_and(|config| {
+                    !config.state_history_enabled || config.allow_replay_recovery
+                });
+                let cached_header_state = if can_use_replay_header_state {
                     match Self::load_migration_header_state(
                         db_path,
                         end,
