@@ -105,9 +105,9 @@ uses Hyperion traces when the transaction ID is available.
 The reusable append-only block-log follow mode is in
 [`xpr_blocklog_replay.rs`](../crates/pulsevm_core/examples/xpr_blocklog_replay.rs)
 and can be launched with `XPR_REPLAY_FOLLOW=1` through
-[`run-xpr-full-replay.sh`](../scripts/run-xpr-full-replay.sh). Set
-`XPR_REPLAY_PRODUCER_KEY` to a local key because NodeConfig requires a producer
-key; replay never uses it to sign or produce blocks.
+[`run-xpr-full-replay.sh`](../scripts/run-xpr-full-replay.sh). If
+`XPR_REPLAY_PRODUCER_KEY` is unset, the replay process generates an ephemeral
+local key to satisfy NodeConfig; replay never uses it to sign or produce blocks.
 
 ## Operational checks
 
