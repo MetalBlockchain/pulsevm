@@ -1355,6 +1355,7 @@ async fn main() -> Result<()> {
         // A full-history Hyperion audit emits SHiP data while replay runs. The
         // ordinary state migration keeps it disabled to avoid derived history.
         "state_history_enabled": ship_enabled,
+        "allow_replay_recovery": true,
         "bulk_replay": true,
         "producer_name": "eosio",
         // Required by NodeConfig, but replay never signs or produces blocks.

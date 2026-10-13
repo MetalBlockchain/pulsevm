@@ -1614,14 +1614,13 @@ impl Controller {
                 // prior publication was interrupted; choosing either tip would
                 // silently pair a block with the wrong state.
                 if revision != end as i64 {
-                    let migration_replay = self
-                        .node_config
-                        .as_ref()
-                        .is_some_and(|config| !config.state_history_enabled);
-                    if migration_replay && revision >= i64::from(start) && revision < i64::from(end)
+                    let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
+                        !config.state_history_enabled || config.allow_replay_recovery
+                    });
+                    if replay_recovery && revision >= i64::from(start) && revision < i64::from(end)
                     {
                         warn!(
-                            "migration replay is rewinding block log from {} to durable Arena revision {}",
+                            "replay recovery is rewinding block log from {} to durable Arena revision {}",
                             end, revision
                         );
                         self.block_log
@@ -1630,7 +1629,7 @@ impl Controller {
                             .truncate_after(revision as u32)
                             .map_err(|error| {
                                 ChainError::DatabaseError(format!(
-                                    "failed to rewind migration block log to revision {revision}: {error}"
+                                    "failed to rewind block log to durable Arena revision {revision}: {error}"
                                 ))
                             })?;
                         end = revision as u32;
