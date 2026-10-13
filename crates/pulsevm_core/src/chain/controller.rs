@@ -8134,7 +8134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_replay_rewinds_log_tail_after_last_durable_checkpoint()
+    async fn opted_in_replay_rewinds_all_log_tails_after_last_durable_checkpoint()
     -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -8145,7 +8145,8 @@ mod tests {
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
-            "state_history_enabled": false,
+            "state_history_enabled": true,
+            "allow_replay_recovery": true,
         })
         .to_string()
         .into_bytes();
@@ -8170,6 +8171,8 @@ mod tests {
         controller.accept_block(&orphan_block.id()?, &mut mempool)?;
         assert_eq!(controller.database().revision(), 3);
         assert_eq!(controller.block_log()?.range().unwrap().1, 3);
+        assert_eq!(controller.trace_log().unwrap().range().unwrap().1, 3);
+        assert_eq!(controller.chain_state_log().unwrap().range().unwrap().1, 3);
         drop(controller);
 
         let mut reopened = Controller::new();
@@ -8177,6 +8180,8 @@ mod tests {
         assert_eq!(reopened.last_accepted_block().block_num(), 2);
         assert_eq!(reopened.database().revision(), 2);
         assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 2);
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
         assert!(
             reopened
                 .database()
