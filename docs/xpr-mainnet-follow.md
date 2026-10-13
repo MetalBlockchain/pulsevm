@@ -73,9 +73,10 @@ uses Hyperion traces when the transaction ID is available.
 - `xpr-mainnet-catchup-amd64` is the Leap 5.0.3 Mainnet relay container. Keep
   its data under `/data/xpr-mainnet-leap-relay/node`, separate from PulseVM's
   API-fed block log under `/data/xpr-mainnet-follow-recovery/node`. Bootstrap
-  Leap from a verified XPR Mainnet snapshot, then let it follow P2P. It runs in
-  head mode with chain API and P2P transaction acceptance enabled; its HTTP
-  API is bound to loopback port 8888.
+  Leap from a verified XPR Mainnet snapshot, then let it follow P2P. Keep chain
+  API and P2P transaction acceptance disabled during catch-up; enable them
+  after Leap reaches the live head. Its HTTP API is bound to loopback port
+  8888.
 - The historical `/data/xpr-mainnet-current-node/blocks` log is preserved at
   block 401,802,825. It is not used by the isolated Leap relay or the current
   PulseVM API-fed follower. The full provider block archive download was
@@ -141,6 +142,25 @@ XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-leap-relay/node \
 XPR_NODEOS_SNAPSHOT_FILE=/data/xpr-mainnet-leap-relay/snapshots/latest-snapshot.bin \
 XPR_CONFIG_DIR=/data/xpr-mainnet-follow-config \
 XPR_NODEOS_READ_MODE=head \
+XPR_API_ACCEPT_TRANSACTIONS=0 \
+XPR_P2P_ACCEPT_TRANSACTIONS=0 \
+XPR_WASM_RUNTIME=eos-vm-jit \
+XPR_EOS_VM_OC_ENABLE=all \
+  scripts/run-xpr-mainnet-catchup-amd64.sh start
+```
+
+Keep transaction acceptance disabled during snapshot restore and P2P catch-up.
+Compare Leap's `get_info` head number and time with an independent Mainnet API.
+Once Leap is at the live head, gracefully stop the snapshot-bootstrapped
+container and reopen the same data directory without
+`XPR_NODEOS_SNAPSHOT_FILE`, so Docker restarts use the persisted fork database
+instead of applying the bootstrap snapshot again:
+
+```sh
+sudo docker stop --time 60 xpr-mainnet-catchup-amd64
+XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-leap-relay/node \
+XPR_CONFIG_DIR=/data/xpr-mainnet-follow-config \
+XPR_NODEOS_READ_MODE=head \
 XPR_API_ACCEPT_TRANSACTIONS=1 \
 XPR_P2P_ACCEPT_TRANSACTIONS=1 \
 XPR_WASM_RUNTIME=eos-vm-jit \
@@ -148,9 +168,8 @@ XPR_EOS_VM_OC_ENABLE=all \
   scripts/run-xpr-mainnet-catchup-amd64.sh start
 ```
 
-After Leap reports the expected chain ID and has begun following P2P, configure
-PulseVM with `XPR_REPLAY_TX_RPC_URL=http://127.0.0.1:8888` and restart its
-service. The PulseVM JSON-RPC endpoint remains the configured
+Then configure PulseVM with `XPR_REPLAY_TX_RPC_URL=http://127.0.0.1:8888` and
+restart its service. The PulseVM JSON-RPC endpoint remains the configured
 `XPR_REPLAY_RPC_BIND` address (currently port 9660). A request is:
 
 ```json
