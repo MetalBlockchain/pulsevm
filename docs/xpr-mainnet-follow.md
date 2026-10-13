@@ -113,6 +113,45 @@ the accepted block log is ahead of the durable Arena revision, startup truncates
 that log to the Arena revision and replays the missing source blocks, rebuilding
 SHiP history as it goes. Normal nodes keep strict revision matching.
 
+## Mainnet transaction submission
+
+The replay RPC is a read-only follower. Its PulseVM JSON-RPC methods do not
+broadcast transactions onto XPR Mainnet; PulseVM's regular `issue_tx` path is
+for its MetalGo subnet. Mainnet submissions go through Leap's chain API at
+`/v1/chain/push_transaction`. Caddy already proxies `/v1/chain/*` to the local
+Leap API on `127.0.0.1:8888`. Once Leap accepts the transaction, it relays the
+signed transaction over XPR P2P; PulseVM validates it when the resulting block
+arrives through the block feed.
+
+Leap must run in head mode with both API and P2P transaction acceptance enabled.
+Irreversible read mode disables chain API submissions even when the endpoint is
+reachable. Leap and `pulsevm-xpr-api-block-feed.service` cannot write the same
+block log concurrently. Stop the API feeder before handing that log to Leap;
+PulseVM then reads blocks directly from Leap's log. Start the existing follower
+container with:
+
+```sh
+XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-follow-recovery/node \
+XPR_CONFIG_DIR=/data/xpr-mainnet-follow-config \
+XPR_NODEOS_READ_MODE=head \
+XPR_API_ACCEPT_TRANSACTIONS=1 \
+XPR_P2P_ACCEPT_TRANSACTIONS=1 \
+XPR_ALLOW_EMPTY_REVERSIBLE_DB=1 \
+XPR_WASM_RUNTIME=eos-vm-jit \
+XPR_EOS_VM_OC_ENABLE=all \
+  scripts/run-xpr-mainnet-catchup-amd64.sh start
+```
+
+The runner keeps irreversible read mode and transaction submission disabled by
+default. The submission settings are explicit so a read-only replay deployment
+does not start accepting transactions accidentally. `XPR_ALLOW_EMPTY_REVERSIBLE_DB`
+is appropriate only after confirming the persisted state and block log meet at
+an irreversible block; otherwise restore the matching fork database instead.
+Use a signed transaction
+with a recent TAPoS reference and a short expiration when testing; the API
+acceptance response means Leap accepted and relayed it, not that a producer
+included it. Check inclusion through PulseVM `getBlock` or Hyperion.
+
 ## Operational checks
 
 ```sh

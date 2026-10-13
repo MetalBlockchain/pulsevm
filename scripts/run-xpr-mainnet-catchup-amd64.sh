@@ -11,6 +11,13 @@ readonly NODE_ROOT="${XPR_CORPUS_NODE_ROOT:-/data/xpr-mainnet-current-node}"
 readonly CONFIG_DIR="${XPR_CONFIG_DIR:-/data/xpr-mainnet-source/config}"
 readonly HTTP_ENDPOINT="${XPR_LOCAL_HTTP_ENDPOINT:-127.0.0.1:8888}"
 readonly P2P_ENDPOINT="${XPR_LOCAL_P2P_ENDPOINT:-127.0.0.1:9876}"
+readonly READ_MODE="${XPR_NODEOS_READ_MODE:-irreversible}"
+readonly VALIDATION_MODE="${XPR_NODEOS_VALIDATION_MODE:-light}"
+readonly API_ACCEPT_TRANSACTIONS="${XPR_API_ACCEPT_TRANSACTIONS:-0}"
+readonly P2P_ACCEPT_TRANSACTIONS="${XPR_P2P_ACCEPT_TRANSACTIONS:-$API_ACCEPT_TRANSACTIONS}"
+readonly ALLOW_EMPTY_REVERSIBLE_DB="${XPR_ALLOW_EMPTY_REVERSIBLE_DB:-0}"
+readonly WASM_RUNTIME="${XPR_WASM_RUNTIME:-eos-vm-jit}"
+readonly EOS_VM_OC_ENABLE="${XPR_EOS_VM_OC_ENABLE:-all}"
 readonly DOCKERFILE="$REPO_ROOT/tools/xpr-chainbase-export/localnet/Dockerfile.leap-amd64"
 
 fail() {
@@ -38,14 +45,34 @@ run_docker() {
 }
 
 require_corpus() {
+  [[ "$READ_MODE" == head || "$READ_MODE" == irreversible || "$READ_MODE" == speculative ]] || \
+    fail "XPR_NODEOS_READ_MODE must be head, irreversible, or speculative"
+  [[ "$VALIDATION_MODE" == full || "$VALIDATION_MODE" == light ]] || \
+    fail "XPR_NODEOS_VALIDATION_MODE must be full or light"
+  [[ "$API_ACCEPT_TRANSACTIONS" == 0 || "$API_ACCEPT_TRANSACTIONS" == 1 ]] || \
+    fail "XPR_API_ACCEPT_TRANSACTIONS must be 0 or 1"
+  [[ "$P2P_ACCEPT_TRANSACTIONS" == 0 || "$P2P_ACCEPT_TRANSACTIONS" == 1 ]] || \
+    fail "XPR_P2P_ACCEPT_TRANSACTIONS must be 0 or 1"
+  [[ "$ALLOW_EMPTY_REVERSIBLE_DB" == 0 || "$ALLOW_EMPTY_REVERSIBLE_DB" == 1 ]] || \
+    fail "XPR_ALLOW_EMPTY_REVERSIBLE_DB must be 0 or 1"
+  if [[ "$API_ACCEPT_TRANSACTIONS" == 1 ]]; then
+    [[ "$READ_MODE" == head ]] || \
+      fail "API transaction submission requires XPR_NODEOS_READ_MODE=head"
+    [[ "$P2P_ACCEPT_TRANSACTIONS" == 1 ]] || \
+      fail "API transaction submission requires XPR_P2P_ACCEPT_TRANSACTIONS=1 to relay accepted transactions"
+  fi
   [[ -s "$NODE_ROOT/state/shared_memory.bin" ]] || \
     fail "missing provider chainbase state: $NODE_ROOT/state/shared_memory.bin"
   [[ -s "$NODE_ROOT/blocks/blocks.log" ]] || \
     fail "missing block log: $NODE_ROOT/blocks/blocks.log"
   [[ -s "$NODE_ROOT/blocks/blocks.index" ]] || \
     fail "missing block index: $NODE_ROOT/blocks/blocks.index"
-  [[ -s "$NODE_ROOT/blocks/reversible/fork_db.dat" ]] || \
-    fail "missing matching reversible fork database; restore blocks/reversible/fork_db.dat from the same blocks archive"
+  if [[ ! -s "$NODE_ROOT/blocks/reversible/fork_db.dat" ]]; then
+    [[ "$ALLOW_EMPTY_REVERSIBLE_DB" == 1 && "$READ_MODE" == head && \
+      "$API_ACCEPT_TRANSACTIONS" == 1 ]] || \
+      fail "missing matching reversible fork database; set XPR_ALLOW_EMPTY_REVERSIBLE_DB=1 only for a verified state/log pair that can resume from its irreversible head"
+    echo "warning: starting from an empty reversible database; verify the state/log pair is at an irreversible boundary" >&2
+  fi
   [[ -d "$CONFIG_DIR" ]] || fail "missing nodeos config directory: $CONFIG_DIR"
 }
 
@@ -84,9 +111,12 @@ start_nodeos() {
     "--data-dir=$NODE_ROOT" \
     "--config-dir=$CONFIG_DIR" \
     "--chain-state-db-size-mb=$state_size_mb" \
-    --read-mode=irreversible \
-    --validation-mode=light \
-    --wasm-runtime=eos-vm \
+    "--read-mode=$READ_MODE" \
+    "--validation-mode=$VALIDATION_MODE" \
+    "--api-accept-transactions=$API_ACCEPT_TRANSACTIONS" \
+    "--p2p-accept-transactions=$P2P_ACCEPT_TRANSACTIONS" \
+    "--wasm-runtime=$WASM_RUNTIME" \
+    "--eos-vm-oc-enable=$EOS_VM_OC_ENABLE" \
     "--http-server-address=$HTTP_ENDPOINT" \
     --http-validate-host=false \
     "--p2p-listen-endpoint=$P2P_ENDPOINT" \
@@ -97,6 +127,7 @@ start_nodeos() {
     --p2p-peer-address=proton.protonuk.io:9876
   echo "container=$CONTAINER"
   echo "blocks=$NODE_ROOT/blocks"
+  echo "read_mode=$READ_MODE api_accept_transactions=$API_ACCEPT_TRANSACTIONS p2p_accept_transactions=$P2P_ACCEPT_TRANSACTIONS"
 }
 
 show_status() {
@@ -137,6 +168,13 @@ Environment:
   XPR_CONFIG_DIR         nodeos config directory
   XPR_LOCAL_HTTP_ENDPOINT
   XPR_LOCAL_P2P_ENDPOINT
+  XPR_NODEOS_READ_MODE        irreversible by default; set head to accept API transactions
+  XPR_NODEOS_VALIDATION_MODE  full or light (default: light for the ARM replay host)
+  XPR_API_ACCEPT_TRANSACTIONS 0 by default; set to 1 to enable chain API submission
+  XPR_P2P_ACCEPT_TRANSACTIONS defaults to API setting; must be 1 to relay transactions
+  XPR_ALLOW_EMPTY_REVERSIBLE_DB 1 only for a verified irreversible state/log pair
+  XPR_WASM_RUNTIME            Leap WASM runtime (default: eos-vm-jit)
+  XPR_EOS_VM_OC_ENABLE        OC enable setting (default: all)
 EOF
 }
 
