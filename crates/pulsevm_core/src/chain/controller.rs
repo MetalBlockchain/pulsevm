@@ -4875,9 +4875,10 @@ impl Controller {
         let config = self.node_config.as_ref().ok_or_else(|| {
             ChainError::InternalError("controller is not initialized".to_string())
         })?;
-        if config.state_history_enabled {
+        if config.state_history_enabled && !config.allow_replay_recovery {
             return Err(ChainError::InternalError(
-                "header authentication pipelining is restricted to migration replay".to_string(),
+                "header authentication pipelining is restricted to migration or opted-in replay"
+                    .to_string(),
             ));
         }
         if !self.pending_chain.is_empty() {
