@@ -29,6 +29,12 @@ pub struct NodeConfig {
     /// blocks requires rebasing the state-history logs at the current revision.
     #[serde(default = "default_state_history_enabled")]
     pub state_history_enabled: bool,
+    /// Allow a replay process to truncate accepted block-log entries newer
+    /// than its durable Arena revision and replay those blocks from its source.
+    /// This is only for explicit offline/follow replay jobs; normal nodes keep
+    /// strict block-log and database revision matching.
+    #[serde(default)]
+    pub allow_replay_recovery: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
     // Private key of the block producer, used for signing blocks and transactions
@@ -96,7 +102,17 @@ mod tests {
         assert_eq!(cfg.system_account, Name::from_str("pulse").unwrap());
         assert!(cfg.native_system_contract);
         assert!(cfg.state_history_enabled);
+        assert!(!cfg.allow_replay_recovery);
         assert_eq!(cfg.ram_usage_monitor_max_series, 0);
+    }
+
+    #[test]
+    fn replay_recovery_is_opt_in() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","allow_replay_recovery":true}"#,
+        )
+        .unwrap();
+        assert!(cfg.allow_replay_recovery);
     }
 
     #[test]

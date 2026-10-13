@@ -108,6 +108,10 @@ and can be launched with `XPR_REPLAY_FOLLOW=1` through
 [`run-xpr-full-replay.sh`](../scripts/run-xpr-full-replay.sh). If
 `XPR_REPLAY_PRODUCER_KEY` is unset, the replay process generates an ephemeral
 local key to satisfy NodeConfig; replay never uses it to sign or produce blocks.
+The replay controller opts into recovery from an interrupted checkpoint: when
+the accepted block log is ahead of the durable Arena revision, startup truncates
+that log to the Arena revision and replays the missing source blocks, rebuilding
+SHiP history as it goes. Normal nodes keep strict revision matching.
 
 ## Operational checks
 
