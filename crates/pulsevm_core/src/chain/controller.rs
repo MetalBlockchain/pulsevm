@@ -1613,57 +1613,71 @@ impl Controller {
                 // the corresponding state. Either side being ahead means a
                 // prior publication was interrupted; choosing either tip would
                 // silently pair a block with the wrong state.
-                if revision != end as i64 {
-                    let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
-                        !config.state_history_enabled || config.allow_replay_recovery
-                    });
-                    if replay_recovery && revision >= i64::from(start) && revision < i64::from(end)
-                    {
+                let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
+                    !config.state_history_enabled || config.allow_replay_recovery
+                });
+                if replay_recovery && revision >= i64::from(start) && revision <= i64::from(end) {
+                    if revision != end as i64 {
                         warn!(
                             "replay recovery is rewinding block log from {} to durable Arena revision {}",
                             end, revision
                         );
-                        self.block_log
-                            .as_ref()
-                            .ok_or_else(|| {
+                    } else {
+                        info!(
+                            "checking accepted history logs against durable Arena revision {revision}"
+                        );
+                    }
+                    for (name, log) in [
+                        (
+                            "block",
+                            self.block_log.as_ref().ok_or_else(|| {
                                 ChainError::InternalError(
                                     "block log is not initialized during replay recovery".into(),
                                 )
-                            })?
-                            .truncate_after(revision as u32)
-                            .map_err(|error| {
-                                ChainError::DatabaseError(format!(
-                                    "failed to rewind block log to durable Arena revision {revision}: {error}"
-                                ))
-                            })?;
-                        for (name, log) in [
-                            ("trace", self.trace_log.as_ref()),
-                            ("chain state", self.chain_state_log.as_ref()),
-                        ] {
-                            log.ok_or_else(|| {
-                                ChainError::InternalError(format!(
-                                    "{name} log is not initialized during replay recovery"
-                                ))
-                            })?
-                            .truncate_after(revision as u32)
-                            .map_err(|error| {
+                            })?,
+                        ),
+                        (
+                            "trace",
+                            self.trace_log.as_ref().ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "trace log is not initialized during replay recovery".into(),
+                                )
+                            })?,
+                        ),
+                        (
+                            "chain state",
+                            self.chain_state_log.as_ref().ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "chain state log is not initialized during replay recovery"
+                                        .into(),
+                                )
+                            })?,
+                        ),
+                    ] {
+                        if let Some((_, last)) = log.range()
+                            && last > revision as u32
+                        {
+                            warn!(
+                                "replay recovery is rewinding {name} log from {last} to durable Arena revision {revision}"
+                            );
+                            log.truncate_after(revision as u32).map_err(|error| {
                                 ChainError::DatabaseError(format!(
                                     "failed to rewind {name} log to durable Arena revision {revision}: {error}"
                                 ))
                             })?;
                         }
-                        end = revision as u32;
-                    } else {
-                        error!(
-                            "database revision {} does not match block log end {}",
-                            revision, end
-                        );
-
-                        return Err(ChainError::DatabaseError(format!(
-                            "database revision {} does not match block log end {}",
-                            revision, end
-                        )));
                     }
+                    end = revision as u32;
+                } else if revision != end as i64 {
+                    error!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    );
+
+                    return Err(ChainError::DatabaseError(format!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    )));
                 }
 
                 info!("block log contains blocks from {} to {}", start, end);
