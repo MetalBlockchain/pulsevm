@@ -76,13 +76,13 @@ uses Hyperion traces when the transaction ID is available.
   Leap from a verified XPR Mainnet snapshot, then let it follow P2P. It runs in
   head mode with chain API and P2P transaction acceptance enabled; its HTTP
   API is bound to loopback port 8888.
-- The old `/data/xpr-mainnet-current-node/blocks` log is preserved at block
-  401,802,825, matching the existing Arena and Hyperion checkpoint. It is a
-  historical corpus; the new node root has a copy-on-write clone that Leap is
-  appending to. The full provider block archive download was stopped after the
-  state/log pair initialized successfully. Its partial file remains at
-  `/data/xpr-mainnet-follow-download/blocks.tar.gz` as a fallback. The
-  `pulsevm-xpr-mainnet-catchup-resume.service` unit is installed but disabled.
+- The historical `/data/xpr-mainnet-current-node/blocks` log is preserved at
+  block 401,802,825. It is not used by the isolated Leap relay or the current
+  PulseVM API-fed follower. The full provider block archive download was
+  stopped after its state/log pair initialized successfully. Its partial file
+  remains at `/data/xpr-mainnet-follow-download/blocks.tar.gz` as a fallback.
+  The `pulsevm-xpr-mainnet-catchup-resume.service` unit is installed but
+  disabled.
 - `pulsevm-xpr-replay.service` follows
   `/data/xpr-mainnet-follow-recovery/node/blocks` and resumes from
   `/data/xpr-hyperion/arena`. It is configured with `XPR_REPLAY_FOLLOW=1`, a
