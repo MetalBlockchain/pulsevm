@@ -2023,9 +2023,48 @@ mod tests {
         };
         assert!(validate_push_transaction_params(valid()).is_ok());
 
+        let mut at_limits = valid();
+        at_limits.insert(
+            "signatures".into(),
+            json!(vec!["SIG_K1_valid"; MAX_PUSH_TRANSACTION_SIGNATURES]),
+        );
+        at_limits.insert(
+            "packed_trx".into(),
+            json!("ab".repeat(MAX_PUSH_TRANSACTION_BYTES)),
+        );
+        at_limits.insert(
+            "packed_context_free_data".into(),
+            json!("cd".repeat(MAX_PUSH_TRANSACTION_BYTES)),
+        );
+        assert!(validate_push_transaction_params(at_limits).is_ok());
+
+        let mut missing_signatures = valid();
+        missing_signatures.remove("signatures");
+        assert!(validate_push_transaction_params(missing_signatures).is_err());
+
+        let mut empty_signatures = valid();
+        empty_signatures.insert("signatures".into(), json!([]));
+        assert!(validate_push_transaction_params(empty_signatures).is_err());
+
+        let mut bad_signature = valid();
+        bad_signature.insert("signatures".into(), json!(["not-a-signature"]));
+        assert!(validate_push_transaction_params(bad_signature).is_err());
+
+        let mut bad_compression = valid();
+        bad_compression.insert("compression".into(), json!(2));
+        assert!(validate_push_transaction_params(bad_compression).is_err());
+
         let mut malformed = valid();
         malformed.insert("packed_trx".into(), json!("0g"));
         assert!(validate_push_transaction_params(malformed).is_err());
+
+        let mut empty_packed_trx = valid();
+        empty_packed_trx.insert("packed_trx".into(), json!(""));
+        assert!(validate_push_transaction_params(empty_packed_trx).is_err());
+
+        let mut malformed_context_free_data = valid();
+        malformed_context_free_data.insert("packed_context_free_data".into(), json!("0"));
+        assert!(validate_push_transaction_params(malformed_context_free_data).is_err());
 
         let mut oversized = valid();
         oversized.insert(
@@ -2033,6 +2072,13 @@ mod tests {
             json!("00".repeat(MAX_PUSH_TRANSACTION_BYTES + 1)),
         );
         assert!(validate_push_transaction_params(oversized).is_err());
+
+        let mut oversized_context_free_data = valid();
+        oversized_context_free_data.insert(
+            "packed_context_free_data".into(),
+            json!("00".repeat(MAX_PUSH_TRANSACTION_BYTES + 1)),
+        );
+        assert!(validate_push_transaction_params(oversized_context_free_data).is_err());
 
         let mut too_many_signatures = valid();
         too_many_signatures.insert(
