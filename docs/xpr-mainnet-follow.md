@@ -179,6 +179,22 @@ restart its service. The PulseVM JSON-RPC endpoint remains the configured
 PulseVM's regular `issue_tx` path remains for its MetalGo subnet. It is not a
 Mainnet submission path.
 
+On the EC2 deployment, install and enable
+`scripts/systemd/pulsevm-xpr-relay-after-sync.service` to automate the final
+handoff. Its helper compares Leap with ProtonNZ, requires three consecutive
+checks within 10 blocks and 5 seconds of the reference head, then restarts
+Leap with API and P2P transaction acceptance enabled and configures PulseVM's
+loopback relay. It does not submit a transaction. The helper retries while
+either API is unavailable or Leap remains behind.
+
+```sh
+sudo install -m 0644 scripts/systemd/pulsevm-xpr-relay-after-sync.service \
+  /etc/systemd/system/pulsevm-xpr-relay-after-sync.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pulsevm-xpr-relay-after-sync.service
+sudo journalctl -fu pulsevm-xpr-relay-after-sync.service
+```
+
 The runner keeps irreversible read mode and transaction submission disabled by
 default. Snapshot bootstrap requires a fresh Leap data directory. Use a signed
 transaction with a recent TAPoS reference and short expiration when testing;

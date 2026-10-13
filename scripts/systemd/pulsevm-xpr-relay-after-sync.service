@@ -1,0 +1,18 @@
+[Unit]
+Description=Enable the PulseVM XPR Mainnet relay after local Leap catches up
+Wants=network-online.target
+After=network-online.target docker.service pulsevm-xpr-replay.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pulsevm-mainnet-rpc
+ExecStart=/usr/bin/python3 scripts/enable-xpr-mainnet-relay-after-sync.py
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
