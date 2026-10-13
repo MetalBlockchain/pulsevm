@@ -55,6 +55,7 @@ use pulsevm_core::{
         MigrationBlockAuthenticator,
         PreparedMigrationBlock,
     },
+    crypto::PrivateKey,
     id::Id,
     mempool::Mempool,
     name::Name,
@@ -601,6 +602,17 @@ fn verify_replay_checkpoint_semantics(
         }
     }
     Ok(())
+}
+
+fn replay_producer_key(configured: Option<String>) -> String {
+    configured
+        .filter(|key| !key.trim().is_empty())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "XPR_REPLAY_PRODUCER_KEY is unset; generating an ephemeral key for replay-only NodeConfig"
+            );
+            PrivateKey::random().to_string()
+        })
 }
 
 impl BlockOffsets {
@@ -1335,8 +1347,7 @@ async fn main() -> Result<()> {
     }
 
     let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
-    let producer_key = env::var("XPR_REPLAY_PRODUCER_KEY")
-        .context("XPR_REPLAY_PRODUCER_KEY must contain a local replay signing key")?;
+    let producer_key = replay_producer_key(env::var("XPR_REPLAY_PRODUCER_KEY").ok());
     let config = serde_json::to_vec(&json!({
         "system_account": "eosio",
         "native_system_contract": false,
@@ -1752,6 +1763,18 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_key_defaults_to_ephemeral_and_accepts_a_configured_key() {
+        let generated = replay_producer_key(None);
+        assert!(PrivateKey::from_str(&generated).is_ok());
+
+        assert_eq!(
+            replay_producer_key(Some("configured-key".into())),
+            "configured-key"
+        );
+        assert!(PrivateKey::from_str(&replay_producer_key(Some("  ".into()))).is_ok());
+    }
 
     #[test]
     fn marks_a_fresh_arena() {
