@@ -1261,6 +1261,62 @@ impl TransactionContext {
         }
     }
 
+    /// Walks the creator chain strictly above `action_ordinal` looking for a
+    /// trace whose receiver is `receiver` and, unless `action` is zero, whose
+    /// action name is `action`. Returns whether one was found and how many
+    /// ancestors were visited, so the caller can bill the walk.
+    ///
+    /// Inline actions only run after their creator's WASM has returned, so an
+    /// ancestor is an action whose own code finished but whose inline subtree is
+    /// still executing — the window in which a callback re-enters a contract.
+    /// See docs/reentrancy.md.
+    pub fn find_ancestor(
+        &self,
+        action_ordinal: u32,
+        receiver: u64,
+        action: u64,
+    ) -> Result<(bool, u32), ChainError> {
+        let inner = self.inner.read()?;
+        let traces = &inner.trace.action_traces;
+        let trace_at = |ordinal: u32| {
+            (ordinal as usize)
+                .checked_sub(1)
+                .and_then(|index| traces.get(index))
+                .ok_or_else(|| {
+                    ChainError::TransactionError(format!(
+                        "failed to get action trace by ordinal {}",
+                        ordinal
+                    ))
+                })
+        };
+
+        let mut current = action_ordinal;
+        let mut parent = trace_at(current)?.creator_action_ordinal();
+        let mut levels = 0u32;
+        while parent != 0 {
+            // A creator is always scheduled before the action it creates. Requiring
+            // strictly decreasing ordinals bounds the walk by the trace count even
+            // if that invariant were ever broken.
+            if parent >= current {
+                return Err(ChainError::TransactionError(format!(
+                    "action {} has non-decreasing creator ordinal {}",
+                    current, parent
+                )));
+            }
+            levels += 1;
+            let ancestor = trace_at(parent)?;
+            if ancestor.receiver().as_u64() == receiver
+                && (action == 0 || ancestor.act.name.as_u64() == action)
+            {
+                return Ok((true, levels));
+            }
+            current = parent;
+            parent = ancestor.creator_action_ordinal();
+        }
+
+        Ok((false, levels))
+    }
+
     #[inline]
     fn with_action_trace_mut<R>(
         &self,

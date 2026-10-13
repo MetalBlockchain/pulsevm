@@ -11172,6 +11172,153 @@ mod tests {
         Ok(())
     }
 
+    fn wat_bytes(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("\\{:02x}", byte)).collect()
+    }
+
+    /// Runs `victim::withdraw` against an attacker that re-enters it. Mode bits:
+    /// 1 = victim guards with `has_ancestor`, 2 = re-entered call (set by the
+    /// attacker), 4 = victim reaches the attacker via `require_recipient`
+    /// instead of an inline `attacker::pay`. Returns each trace's receiver and
+    /// the victim's `has_ancestor` result, or the transaction error.
+    fn run_reentrancy_attack(mode: u8) -> Result<Vec<(Name, Option<u64>)>, ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        activate_test_features(&controller, &[ACTION_RETURN_VALUE_FEATURE_DIGEST])?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let status = BlockStatus::Building;
+        let victim = Name::from_str("victim")?;
+        let attacker = Name::from_str("attacker")?;
+        let withdraw = Name::from_str("withdraw")?;
+        // Packed inline actions whose last byte is the one-byte mode payload,
+        // patched at run time.
+        let pay = Action::new(attacker, Name::from_str("pay")?, vec![0], Vec::new()).pack()?;
+        let reenter = Action::new(victim, withdraw, vec![0], Vec::new()).pack()?;
+
+        let victim_wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+              (import "env" "has_ancestor" (func $has_ancestor (param i64 i64) (result i32)))
+              (import "env" "set_action_return_value" (func $return (param i32 i32)))
+              (import "env" "eosio_assert" (func $assert (param i32 i32)))
+              (import "env" "send_inline" (func $inline (param i32 i32)))
+              (import "env" "require_recipient" (func $notify (param i64)))
+              (memory (export "memory") 1)
+              (data (i32.const 32) "reentrant call\00")
+              (data (i32.const 64) "{pay}")
+              (func (export "apply") (param $receiver i64) (param $code i64) (param $action i64)
+                (local $mode i32)
+                (local $found i32)
+                (if (i32.or (i64.ne (local.get $code) (local.get $receiver))
+                            (i64.ne (local.get $action) (i64.const {withdraw})))
+                  (then (return)))
+                (drop (call $read (i32.const 0) (i32.const 1)))
+                (local.set $mode (i32.load8_u (i32.const 0)))
+                (local.set $found (call $has_ancestor (local.get $receiver) (i64.const {withdraw})))
+                (i64.store (i32.const 8) (i64.extend_i32_u (local.get $found)))
+                (call $return (i32.const 8) (i32.const 8))
+                (if (i32.and (i32.and (local.get $mode) (i32.const 1)) (local.get $found))
+                  (then (call $assert (i32.const 0) (i32.const 32))))
+                (if (i32.eqz (i32.and (local.get $mode) (i32.const 2)))
+                  (then
+                    (if (i32.and (local.get $mode) (i32.const 4))
+                      (then (call $notify (i64.const {attacker})))
+                      (else
+                        (i32.store8 (i32.const {pay_mode}) (local.get $mode))
+                        (call $inline (i32.const 64) (i32.const {pay_len}))))))))
+            "#,
+            pay = wat_bytes(&pay),
+            pay_mode = 64 + pay.len() - 1,
+            pay_len = pay.len(),
+            withdraw = withdraw.as_u64(),
+            attacker = attacker.as_u64(),
+        ))
+        .expect("valid victim contract");
+        // Whether reached by `pay` or by a `withdraw` notification, the attacker
+        // immediately calls back into `victim::withdraw`.
+        let attacker_wasm = wat::parse_str(&format!(
+            r#"
+            (module
+              (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+              (import "env" "send_inline" (func $inline (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{reenter}")
+              (func (export "apply") (param i64 i64 i64)
+                (drop (call $read (i32.const 0) (i32.const 1)))
+                (i32.store8 (i32.const {reenter_mode})
+                  (i32.or (i32.load8_u (i32.const 0)) (i32.const 2)))
+                (call $inline (i32.const 64) (i32.const {reenter_len}))))
+            "#,
+            reenter = wat_bytes(&reenter),
+            reenter_mode = 64 + reenter.len() - 1,
+            reenter_len = reenter.len(),
+        ))
+        .expect("valid attacker contract");
+
+        for (account, wasm) in [(victim, victim_wasm), (attacker, attacker_wasm)] {
+            controller.execute_transaction(
+                &create_account(&private_key, account, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+            controller.execute_transaction(
+                &set_code(&private_key, account, wasm, chain_id)?,
+                &timestamp,
+                &status,
+            )?;
+        }
+
+        let result = controller.execute_transaction(
+            &call_contract(&private_key, victim, withdraw, &mode, chain_id)?,
+            &timestamp,
+            &status,
+        )?;
+        Ok(result
+            .trace
+            .action_traces()
+            .iter()
+            .map(|trace| {
+                let found = (trace.receiver == victim)
+                    .then(|| u64::from_le_bytes(trace.return_value[..8].try_into().unwrap()));
+                (trace.receiver, found)
+            })
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn has_ancestor_detects_reentry_through_inline_callback() -> Result<(), ChainError> {
+        let victim = Name::from_str("victim")?;
+        let attacker = Name::from_str("attacker")?;
+        assert_eq!(
+            run_reentrancy_attack(0)?,
+            vec![(victim, Some(0)), (attacker, None), (victim, Some(1))],
+            "unguarded: the callback re-enters withdraw and has_ancestor sees it"
+        );
+        let error = run_reentrancy_attack(1).unwrap_err();
+        assert!(
+            error.to_string().contains("reentrant call"),
+            "guarded: re-entry must abort the transaction, got {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn has_ancestor_detects_reentry_through_notification() -> Result<(), ChainError> {
+        let victim = Name::from_str("victim")?;
+        let attacker = Name::from_str("attacker")?;
+        assert_eq!(
+            run_reentrancy_attack(4)?,
+            vec![(victim, Some(0)), (attacker, None), (victim, Some(1))],
+            "unguarded: an inline sent from a notification handler re-enters withdraw"
+        );
+        let error = run_reentrancy_attack(5).unwrap_err();
+        assert!(
+            error.to_string().contains("reentrant call"),
+            "guarded: re-entry must abort the transaction, got {error}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fixunstfdi_is_registered_and_returns_value() -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
