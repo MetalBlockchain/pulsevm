@@ -1625,13 +1625,33 @@ impl Controller {
                         );
                         self.block_log
                             .as_ref()
-                            .unwrap()
+                            .ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "block log is not initialized during replay recovery".into(),
+                                )
+                            })?
                             .truncate_after(revision as u32)
                             .map_err(|error| {
                                 ChainError::DatabaseError(format!(
                                     "failed to rewind block log to durable Arena revision {revision}: {error}"
                                 ))
                             })?;
+                        for (name, log) in [
+                            ("trace", self.trace_log.as_ref()),
+                            ("chain state", self.chain_state_log.as_ref()),
+                        ] {
+                            log.ok_or_else(|| {
+                                ChainError::InternalError(format!(
+                                    "{name} log is not initialized during replay recovery"
+                                ))
+                            })?
+                            .truncate_after(revision as u32)
+                            .map_err(|error| {
+                                ChainError::DatabaseError(format!(
+                                    "failed to rewind {name} log to durable Arena revision {revision}: {error}"
+                                ))
+                            })?;
+                        }
                         end = revision as u32;
                     } else {
                         error!(
