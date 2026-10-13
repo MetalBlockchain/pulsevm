@@ -90,7 +90,7 @@ For consensus changes, run the frozen replay regression when its fixture archive
 scripts/run-replay-regression.sh /path/to/pulsevm-replay-fixtures.tar.gz
 ```
 
-Run `tests/e2e` only when MetalGo and the VM plugin are available. CI pins MetalGo `v1.13.5`; preserve that protocol compatibility unless the integration is deliberately upgraded.
+Run `tests/e2e` only when MetalGo and the VM plugin are available. CI pins MetalGo `v1.14.2-tahoe` (rpcchainvm protocol 45); preserve that protocol compatibility unless the integration is deliberately upgraded.
 
 ## Test expectations
 
