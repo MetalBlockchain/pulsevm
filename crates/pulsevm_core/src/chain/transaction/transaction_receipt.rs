@@ -60,11 +60,21 @@ impl NumBytes for ReceiptTransaction {
     }
 }
 
+fn serialize_trx<S>(trx: &ReceiptTransaction, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match trx {
+        ReceiptTransaction::Id(id) => serializer.serialize_str(&id.to_string()),
+        ReceiptTransaction::Packed(packed_trx) => packed_trx.serialize(serializer),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransactionReceipt {
     #[serde(flatten)]
     header: TransactionReceiptHeader,
-    #[serde(skip)]
+    #[serde(serialize_with = "serialize_trx")]
     trx: ReceiptTransaction,
     #[serde(skip)]
     cached_digest: Option<Digest>,
@@ -171,5 +181,28 @@ impl TransactionReceipt {
             ReceiptTransaction::Packed(trx) => bytes.extend(trx.packed_digest()?.pack()?),
         }
         Ok(Digest::hash(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::transaction::TransactionStatus;
+    use pulsevm_serialization::VarUint32;
+
+    #[test]
+    fn serializes_generated_transaction_as_its_id() {
+        let id = Id::new([7; 32]);
+        let receipt = TransactionReceipt::for_id(
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 123, VarUint32(4)),
+            id.clone(),
+        );
+
+        let json = serde_json::to_value(receipt).unwrap();
+
+        assert_eq!(json["trx"], id.to_string());
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["cpu_usage_us"], 123);
+        assert_eq!(json["net_usage_words"], 4);
     }
 }
