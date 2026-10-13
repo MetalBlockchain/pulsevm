@@ -115,20 +115,46 @@ SHiP history as it goes. Normal nodes keep strict revision matching.
 
 ## Mainnet transaction submission
 
-The replay RPC is a read-only follower. Its PulseVM JSON-RPC methods do not
-broadcast transactions onto XPR Mainnet; PulseVM's regular `issue_tx` path is
-for its MetalGo subnet. Mainnet submissions go through Leap's chain API at
-`/v1/chain/push_transaction`. Caddy already proxies `/v1/chain/*` to the local
-Leap API on `127.0.0.1:8888`. Once Leap accepts the transaction, it relays the
-signed transaction over XPR P2P; PulseVM validates it when the resulting block
-arrives through the block feed.
+The replay RPC can relay signed packed transactions to an explicitly
+configured XPR Mainnet chain API through `pulsevm.pushTransaction`. This
+forwards to `/v1/chain/push_transaction`; it does not execute the transaction
+locally or use the PulseVM subnet mempool. The relay is disabled when
+`XPR_REPLAY_TX_RPC_URL` is unset. At startup it calls `/v1/chain/get_info` and
+refuses to enable unless the endpoint reports the canonical XPR Mainnet chain
+ID. The endpoint must be an HTTPS origin. The RPC bounds the request body,
+signature count, and packed transaction data, and forwards the chain API's
+acceptance or rejection response. A successful response means the API accepted
+the transaction for relay; PulseVM validates it when a producer includes it in
+a block arriving through the block feed.
 
-Leap must run in head mode with both API and P2P transaction acceptance enabled.
-Irreversible read mode disables chain API submissions even when the endpoint is
-reachable. Leap and `pulsevm-xpr-api-block-feed.service` cannot write the same
-block log concurrently. Stop the API feeder before handing that log to Leap;
-PulseVM then reads blocks directly from Leap's log. Start the existing follower
-container with:
+Configure the replay service with an API origin, for example:
+
+```sh
+XPR_REPLAY_TX_RPC_URL=https://proton.eosusa.io
+```
+
+The replay RPC endpoint remains the configured `XPR_REPLAY_RPC_BIND` address
+(currently port 9660). The JSON-RPC request is:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"pulsevm.pushTransaction","params":{"signatures":["SIG_K1_…"],"compression":0,"packed_context_free_data":"","packed_trx":"…"}}
+```
+
+PulseVM's regular `issue_tx` path remains for its MetalGo subnet. It is not a
+Mainnet submission path.
+
+Alternatively, when a local Leap node is available, its standard chain API
+accepts `/v1/chain/push_transaction` and relays transactions over XPR P2P.
+However, the current recovered EC2 replay data does not have a verified matching
+reversible fork database, so Leap cannot safely open that state in head mode.
+Do not point the block feeder and Leap at the same writable block log at once.
+
+If using local Leap, it must run in head mode with both API and P2P transaction
+acceptance enabled. Irreversible read mode disables chain API submissions even
+when the endpoint is reachable. Leap and `pulsevm-xpr-api-block-feed.service`
+cannot write the same block log concurrently. Stop the API feeder before
+handing that log to Leap; PulseVM then reads blocks directly from Leap's log.
+Start the existing follower container with:
 
 ```sh
 XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-follow-recovery/node \
@@ -143,14 +169,12 @@ XPR_EOS_VM_OC_ENABLE=all \
 ```
 
 The runner keeps irreversible read mode and transaction submission disabled by
-default. The submission settings are explicit so a read-only replay deployment
-does not start accepting transactions accidentally. `XPR_ALLOW_EMPTY_REVERSIBLE_DB`
-is appropriate only after confirming the persisted state and block log meet at
-an irreversible block; otherwise restore the matching fork database instead.
-Use a signed transaction
-with a recent TAPoS reference and a short expiration when testing; the API
-acceptance response means Leap accepted and relayed it, not that a producer
-included it. Check inclusion through PulseVM `getBlock` or Hyperion.
+default. `XPR_ALLOW_EMPTY_REVERSIBLE_DB` is appropriate only after confirming
+the persisted state and block log meet at an irreversible block; otherwise
+restore the matching fork database instead. Use a signed transaction with a
+recent TAPoS reference and a short expiration when testing; API acceptance does
+not mean a producer included it. Check inclusion through PulseVM `getBlock` or
+Hyperion.
 
 ## Operational checks
 
