@@ -409,6 +409,14 @@ mod tests {
             packed,
         );
 
+        let receipt_json = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(
+            receipt_json["trx"]["id"],
+            receipt.transaction_id().to_string()
+        );
+        assert!(receipt_json["trx"]["packed_trx"].is_string());
+        assert!(receipt_json["trx"]["signatures"].is_array());
+
         assert_eq!(
             hex::encode(receipt.digest().unwrap().as_bytes()),
             "1a21a9a9606dca1674921fcdbf5f47a64bfb87584a5a116671cf2b953e7e10b0"

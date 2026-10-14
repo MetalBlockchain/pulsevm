@@ -8192,6 +8192,58 @@ mod tests {
                 .database()
                 .arena_account_exists(orphan_account.as_u64())
         );
+        drop(reopened);
+
+        let mut already_recovered = Controller::new();
+        already_recovered.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        assert_eq!(already_recovered.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_recovery_remains_opt_in_for_state_history_nodes() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "state_history_enabled": true,
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let db_path = temp.path().to_str().unwrap();
+
+        let mut controller = Controller::new();
+        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        let mut mempool = Mempool::new();
+
+        let durable_account = Name::from_str("durable")?;
+        mempool.add_transaction(create_account(&private_key, durable_account, chain_id)?);
+        let durable_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&durable_block.id()?, &mut mempool)?;
+        controller.sync_accepted_logs()?;
+        controller.database().close()?;
+
+        let orphan_account = Name::from_str("orphan")?;
+        mempool.add_transaction(create_account(&private_key, orphan_account, chain_id)?);
+        let orphan_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&orphan_block.id()?, &mut mempool)?;
+        drop(controller);
+
+        let mut reopened = Controller::new();
+        let error = reopened
+            .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database revision 2 does not match block log end 3")
+        );
         Ok(())
     }
 
