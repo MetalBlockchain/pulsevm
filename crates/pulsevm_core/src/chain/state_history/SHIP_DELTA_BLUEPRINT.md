@@ -31,6 +31,20 @@ contract_index64, contract_index128, contract_index256, global_property,
 protocol_state, permission, permission_link, resource_limits, resource_usage,
 resource_limits_state, resource_limits_config.
 
+Two wire shapes (`ShipRowShape`, selected per chain in `Controller::store_chain_state`):
+- **PulseNative** (`native_system_contract = true`): the 16-table order above and a
+  143-byte `global_property` row (no producer-schedule envelope, no deferred-transaction
+  fields). This is exactly what the frozen golden contains.
+- **Leap5** (`native_system_contract = false`: imported XPR checkpoints and XPR history
+  replay): nodeos 5.0's 19 tables, with `contract_index_double` and
+  `contract_index_long_double` after `contract_index256` and `generated_transaction` after
+  `global_property`, and the 157-byte `global_property` row: the empty
+  producer-authority-schedule envelope (`optional` absent, version 0, no producers) before
+  the chain config, and `deferred_trx_expiration_window` / `max_transaction_delay` after
+  `max_transaction_lifetime`. The full-state compare (`xpr_19_table_compare`) uses this
+  shape. A pending proposed schedule is not yet carried (the import does not hydrate one),
+  so a snapshot taken while a schedule change is pending still fails the compare.
+
 full_snapshot (first appended block = block 2): every row, present=true.
 delta (later blocks): from the arena `UndoState` of the block's open undo session
 (pack_deltas runs in store_chain_state BEFORE commit) —

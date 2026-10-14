@@ -3689,7 +3689,9 @@ mod tests {
                 .unwrap(),
             123
         );
-        let packed = parse_table_deltas(&db.pack_deltas(true, &[0; 32])).unwrap();
+        let packed =
+            parse_table_deltas(&db.pack_deltas(true, &[0; 32], crate::ShipRowShape::Leap5))
+                .unwrap();
         let permissions = packed
             .iter()
             .find(|delta| delta.name == "permission")

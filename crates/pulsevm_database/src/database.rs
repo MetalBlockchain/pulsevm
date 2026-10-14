@@ -1497,9 +1497,15 @@ impl Database {
 
     /// The block's SHiP chain-state `table_delta` stream, packed over the arena
     /// (nodeos `pack_deltas`). `full_snapshot` emits all live rows; otherwise the
-    /// open block undo session's changes. Call before the block commits.
-    pub fn pack_deltas(&self, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
-        self.backend.pack_deltas(full_snapshot, chain_id)
+    /// open block undo session's changes. Call before the block commits. `shape`
+    /// selects the PulseVM-native or the Leap 5 wire shape (see [`ShipRowShape`]).
+    pub fn pack_deltas(
+        &self,
+        full_snapshot: bool,
+        chain_id: &[u8; 32],
+        shape: pulsevm_chaindb::ShipRowShape,
+    ) -> Vec<u8> {
+        self.backend.pack_deltas(full_snapshot, chain_id, shape)
     }
 
     /// A contract table's rows as `(primary_key, payer, value)` in primary order,
