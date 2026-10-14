@@ -12,3 +12,6 @@ plugins/build/
 
 .claude/*
 .vscode/settings.json
+
+# Local Docker cluster settings may contain a custom producer key.
+.env.localnet

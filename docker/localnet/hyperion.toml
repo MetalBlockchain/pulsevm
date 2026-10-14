@@ -1,0 +1,26 @@
+[chain]
+name = "pulse-local"
+http = "http://network-runner:9650/ext/bc/pulse/rpc"
+ship = "ws://network-runner:9090"
+api = "pulsevm"
+system_account = "$PULSEVM_SYSTEM_ACCOUNT"
+
+[indexer]
+start_block = 0
+stop_block = 0
+fetch_block = true
+fetch_traces = true
+fetch_deltas = true
+max_messages_in_flight = 32
+batch_size = 500
+flush_interval_ms = 500
+skip_actions = []
+
+[elasticsearch]
+url = "http://elasticsearch:9200"
+shards = 1
+replicas = 0
+
+[api]
+listen = "0.0.0.0:7000"
+max_limit = 1000

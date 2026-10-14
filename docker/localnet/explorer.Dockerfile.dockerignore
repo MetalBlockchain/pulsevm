@@ -1,0 +1,8 @@
+**
+!docker/
+!docker/localnet/
+!docker/localnet/explorer.Dockerfile
+!docker/localnet/bloks-local.ts
+!docker/localnet/configure-bloks.mjs
+!docker/localnet/bloks.env
+!docker/localnet/nginx.conf

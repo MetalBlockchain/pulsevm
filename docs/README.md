@@ -21,6 +21,7 @@ authoritative and the document is a bug.
 | [optimistic-parallel-execution.md](./optimistic-parallel-execution.md) | Consensus-safe ordered speculation, dependency tracking, fallbacks, and rollout gates | Telemetry plus default-off contract-primary overlay foundation |
 | [code-coverage.md](./code-coverage.md) | Coverage CI, Codecov checks and setup, report scope, and local reports | Current workflow |
 | [xpr-mainnet-follow.md](./xpr-mainnet-follow.md) | EC2 XPR mainnet P2P-to-PulseVM-to-Hyperion follow deployment and recovery checks | Operational runbook |
+| [docker-localnet.md](./docker-localnet.md) | Docker Compose local MetalGo cluster, Hyperion indexing, and Bloks explorer | Local development deployment |
 
 ---
 

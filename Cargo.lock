@@ -3724,6 +3724,7 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonrpsee",
+ "pulsevm_abi",
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_grpc",

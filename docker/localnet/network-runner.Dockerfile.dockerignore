@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!chain_config.json
+!src/
+!src/**
+!crates/
+!crates/**
+!docker/
+!docker/localnet/
+!docker/localnet/**
+crates/**/target/

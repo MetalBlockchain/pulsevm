@@ -1,0 +1,133 @@
+name: pulsevm-localnet
+
+x-hyperion-build: &hyperion-build
+  context: .
+  dockerfile: docker/localnet/hyperion.Dockerfile
+  additional_contexts:
+    hyperion: ${HYPERION_SOURCE_DIR:-../hyperion-rs}
+
+services:
+  network-runner:
+    build:
+      context: .
+      dockerfile: docker/localnet/network-runner.Dockerfile
+    init: true
+    environment:
+      NODE_COUNT: ${NODE_COUNT:-5}
+      PULSEVM_PRODUCER_NAME: ${PULSEVM_PRODUCER_NAME:-pulse}
+      # Empty uses the repository's public development key.
+      PULSEVM_PRODUCER_KEY: ${PULSEVM_PRODUCER_KEY:-}
+      PULSEVM_SYSTEM_ACCOUNT: ${PULSEVM_SYSTEM_ACCOUNT:-pulse}
+      PULSEVM_NATIVE_SYSTEM_CONTRACT: ${PULSEVM_NATIVE_SYSTEM_CONTRACT:-true}
+      PULSEVM_DB_SIZE: ${PULSEVM_DB_SIZE:-536870912}
+      CORE_SYMBOL: ${CORE_SYMBOL:-PULSE}
+      CORE_PRECISION: ${CORE_PRECISION:-4}
+    volumes:
+      - type: bind
+        source: ${GENESIS_FILE:-./genesis.json}
+        target: /config/genesis.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - network-data:/data
+      - localnet-config:/localnet
+    ports:
+      - "127.0.0.1:${RUNNER_GRPC_PORT:-8080}:8080"
+      - "127.0.0.1:${RUNNER_HTTP_PORT:-8081}:8081"
+      - "127.0.0.1:${METALGO_HTTP_PORT:-9650}:9650"
+      - "127.0.0.1:${SHIP_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "/opt/localnet/healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      start_period: 5m
+      retries: 12
+    # The bootstrap saves a stopped runner snapshot before exiting.
+    stop_grace_period: 3m
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      bootstrap.memory_lock: "true"
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms1g -Xmx1g}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=3s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  hyperion-indexer:
+    image: pulsevm-localnet-hyperion:local
+    build: *hyperion-build
+    command: ["indexer", "-c", "/localnet/hyperion.toml"]
+    environment:
+      RUST_LOG: ${HYPERION_LOG_LEVEL:-info}
+    volumes:
+      - localnet-config:/localnet:ro
+    depends_on:
+      network-runner:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  hyperion-api:
+    image: pulsevm-localnet-hyperion:local
+    build: *hyperion-build
+    command: ["api", "-c", "/localnet/hyperion.toml"]
+    environment:
+      RUST_LOG: ${HYPERION_LOG_LEVEL:-info}
+    volumes:
+      - localnet-config:/localnet:ro
+    ports:
+      - "127.0.0.1:${HYPERION_PORT:-7000}:7000"
+    depends_on:
+      network-runner:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      # /v2/health returns HTTP 200 even when an upstream reports Error.
+      # An indexer Warning is expected while it catches up, or before block 1.
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://localhost:7000/v2/health | jq -e '[.health[] | select(.service == \"Elasticsearch\" or .service == \"PulseVM-RPC\")] | length == 2 and all(.status == \"OK\")' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  explorer:
+    build:
+      context: .
+      dockerfile: docker/localnet/explorer.Dockerfile
+      additional_contexts:
+        bloks: ${BLOKS_SOURCE_DIR:-../bloks-frontend}
+    volumes:
+      - localnet-config:/localnet:ro
+    ports:
+      - "127.0.0.1:${EXPLORER_PORT:-8000}:80"
+    depends_on:
+      network-runner:
+        condition: service_healthy
+      hyperion-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  network-data:
+  localnet-config:
+  elasticsearch-data:

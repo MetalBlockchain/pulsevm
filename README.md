@@ -59,6 +59,14 @@ The build produces:
 
 ## Run a local network
 
+For a containerized five-node cluster with Hyperion indexing and a Bloks
+explorer, see [Docker local cluster and explorer](docs/docker-localnet.md).
+It accepts your genesis file through `GENESIS_FILE`:
+
+```bash
+GENESIS_FILE=/absolute/path/to/genesis.json docker compose up --build -d
+```
+
 In addition to the build dependencies, you need a compiled MetalGo binary and `metal-network-runner` on your `PATH`. CI tests against MetalGo **v1.14.2-tahoe**; the node and VM must agree on rpcchainvm plugin protocol **45**.
 
 From the repository root, stage the compiled VM under the ID MetalGo uses to discover it:
