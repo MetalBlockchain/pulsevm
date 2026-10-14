@@ -60,11 +60,22 @@ impl NumBytes for ReceiptTransaction {
     }
 }
 
+impl Serialize for ReceiptTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Id(id) => id.serialize(serializer),
+            Self::Packed(trx) => trx.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransactionReceipt {
     #[serde(flatten)]
     header: TransactionReceiptHeader,
-    #[serde(skip)]
     trx: ReceiptTransaction,
     #[serde(skip)]
     cached_digest: Option<Digest>,
