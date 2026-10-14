@@ -28,6 +28,26 @@ use tonic::{
 
 use crate::chain::RpcService;
 
+/// MetalGo's HTTP router requires exact paths for VM handlers. Register every
+/// supported Antelope chain endpoint so standard clients can call
+/// `/v1/chain/{method}` directly.
+pub const CHAIN_HANDLER_METHODS: &[&str] = &[
+    "get_info",
+    "get_account",
+    "get_block",
+    "get_block_info",
+    "get_abi",
+    "get_raw_abi",
+    "get_table_rows",
+    "get_table_by_scope",
+    "get_currency_balance",
+    "get_currency_stats",
+    "get_code_hash",
+    "get_required_keys",
+    "push_transaction",
+    "send_transaction",
+];
+
 pub async fn handle_nodeos_request(
     rpc_service: &RpcService,
     url: &str,
@@ -54,10 +74,24 @@ pub async fn handle_nodeos_request(
 
     Ok(Response::new(http::HandleSimpleHttpResponse {
         code,
-        headers: vec![Element {
-            key: "Content-Type".to_string(),
-            values: vec!["application/json".to_string()],
-        }],
+        headers: vec![
+            Element {
+                key: "Content-Type".to_string(),
+                values: vec!["application/json".to_string()],
+            },
+            Element {
+                key: "Access-Control-Allow-Origin".to_string(),
+                values: vec!["*".to_string()],
+            },
+            Element {
+                key: "Access-Control-Allow-Methods".to_string(),
+                values: vec!["POST, OPTIONS".to_string()],
+            },
+            Element {
+                key: "Access-Control-Allow-Headers".to_string(),
+                values: vec!["Content-Type".to_string()],
+            },
+        ],
         body: body.into_bytes(),
     }))
 }

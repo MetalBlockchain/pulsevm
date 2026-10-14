@@ -63,6 +63,9 @@ For a containerized five-node cluster with Hyperion indexing and a Bloks
 explorer, see [Docker local cluster and explorer](docs/docker-localnet.md).
 It accepts your genesis file through `GENESIS_FILE`:
 
+For the [Metal Dollar local end-to-end workflow](docs/e2e-local-test-guide.md),
+use the same localnet and add the fixture's test keys to `.env.localnet`.
+
 ```bash
 GENESIS_FILE=/absolute/path/to/genesis.json docker compose up --build -d
 ```

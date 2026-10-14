@@ -559,18 +559,19 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::CreateHandlersResponse>, Status> {
-        Ok(Response::new(vm::CreateHandlersResponse {
-            handlers: vec![
-                Handler {
-                    prefix: "/rpc".to_string(),
+        let mut handlers = vec![Handler {
+            prefix: "/rpc".to_string(),
+            server_addr: self.server_addr.to_string(),
+        }];
+        handlers.extend(
+            crate::api::nodeos_compat::CHAIN_HANDLER_METHODS
+                .iter()
+                .map(|method| Handler {
+                    prefix: format!("/v1/chain/{method}"),
                     server_addr: self.server_addr.to_string(),
-                },
-                Handler {
-                    prefix: "/v1/chain".to_string(),
-                    server_addr: self.server_addr.to_string(),
-                },
-            ],
-        }))
+                }),
+        );
+        Ok(Response::new(vm::CreateHandlersResponse { handlers }))
     }
 
     async fn connected(
@@ -1347,6 +1348,26 @@ impl Http for VirtualMachine {
     ) -> Result<tonic::Response<http::HandleSimpleHttpResponse>, Status> {
         let http_req = request.get_ref();
         let url = &http_req.url;
+        if http_req.method.eq_ignore_ascii_case("OPTIONS") {
+            return Ok(Response::new(http::HandleSimpleHttpResponse {
+                code: 204,
+                headers: vec![
+                    Element {
+                        key: "Access-Control-Allow-Origin".to_string(),
+                        values: vec!["*".to_string()],
+                    },
+                    Element {
+                        key: "Access-Control-Allow-Methods".to_string(),
+                        values: vec!["POST, OPTIONS".to_string()],
+                    },
+                    Element {
+                        key: "Access-Control-Allow-Headers".to_string(),
+                        values: vec!["Content-Type".to_string()],
+                    },
+                ],
+                body: Vec::new(),
+            }));
+        }
         let body = std::str::from_utf8(http_req.body.as_slice())
             .map_err(|_| Status::invalid_argument("invalid utf-8"))?;
 
@@ -1364,10 +1385,24 @@ impl Http for VirtualMachine {
             .map_err(|_| Status::internal("failed to handle API request"))?;
         Ok(Response::new(http::HandleSimpleHttpResponse {
             code: 200,
-            headers: vec![Element {
-                key: "Content-Type".to_string(),
-                values: vec!["application/json".to_string()],
-            }],
+            headers: vec![
+                Element {
+                    key: "Content-Type".to_string(),
+                    values: vec!["application/json".to_string()],
+                },
+                Element {
+                    key: "Access-Control-Allow-Origin".to_string(),
+                    values: vec!["*".to_string()],
+                },
+                Element {
+                    key: "Access-Control-Allow-Methods".to_string(),
+                    values: vec!["POST, OPTIONS".to_string()],
+                },
+                Element {
+                    key: "Access-Control-Allow-Headers".to_string(),
+                    values: vec!["Content-Type".to_string()],
+                },
+            ],
             body: resp.into_bytes(),
         }))
     }
@@ -1438,9 +1473,17 @@ mod ram_usage_metric_tests {
         let response = vm.create_handlers(Request::new(())).await.unwrap();
         let handlers = response.into_inner().handlers;
 
-        assert_eq!(handlers.len(), 2);
+        assert_eq!(
+            handlers.len(),
+            1 + crate::api::nodeos_compat::CHAIN_HANDLER_METHODS.len()
+        );
         assert_eq!(handlers[0].prefix, "/rpc");
-        assert_eq!(handlers[1].prefix, "/v1/chain");
+        assert_eq!(handlers[1].prefix, "/v1/chain/get_info");
+        assert!(
+            handlers
+                .iter()
+                .any(|handler| handler.prefix == "/v1/chain/push_transaction")
+        );
         assert!(
             handlers
                 .iter()
@@ -1464,6 +1507,10 @@ mod ram_usage_metric_tests {
             .unwrap()
             .into_inner();
         assert_eq!(nodeos.code, 404);
+        assert!(nodeos.headers.iter().any(|header| {
+            header.key == "Access-Control-Allow-Origin"
+                && header.values.iter().any(|value| value == "*")
+        }));
         assert!(
             String::from_utf8(nodeos.body)
                 .unwrap()
