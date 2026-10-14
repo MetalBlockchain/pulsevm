@@ -164,7 +164,7 @@ struct ListKeysRequest(String, String); // [name, password]
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
-struct CreateKeyRequest(String, String); // [name, key_type] (key_type ignored, always K1)
+struct CreateKeyRequest(String, String); // [name, key_type]
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -276,7 +276,12 @@ async fn wallet_create_key(
 ) -> HttpResponse {
     let req = body.into_inner();
     let mut mgr = data.manager.lock().unwrap();
-    match mgr.create_key(&req.0) {
+    let result = if req.1 == "K1" {
+        mgr.create_key(&req.0)
+    } else {
+        mgr.create_key_of_type(&req.0, &req.1)
+    };
+    match result {
         Ok(pub_key) => HttpResponse::Created().json(pub_key),
         Err(e) => manager_err_to_response(e),
     }

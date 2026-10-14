@@ -107,6 +107,9 @@ pub enum CreateSubcommand {
         /// Generate a key using the R1 curve (iPhone), instead of the K1 curve (Bitcoin)
         #[arg(long, default_value_t = false)]
         r1: bool,
+        /// Key algorithm: K1, MLDSA44, MLDSA65, or MLDSA87
+        #[arg(long, default_value = "K1", conflicts_with = "r1")]
+        key_type: String,
     },
 }
 
@@ -195,7 +198,7 @@ pub enum WalletSubcommand {
         /// Wallet name
         #[arg(default_value = "default")]
         name: String,
-        /// Key type (K1 or R1)
+        /// Key type (K1, MLDSA44, MLDSA65, or MLDSA87)
         #[arg(default_value = "K1")]
         key_type: String,
     },

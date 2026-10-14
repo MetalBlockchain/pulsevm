@@ -14,4 +14,6 @@ bs58 = "0.5"
 ripemd = "0.1"
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying"] }
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = "1"
 pulsevm_serialization = { path = "../pulsevm_serialization" }

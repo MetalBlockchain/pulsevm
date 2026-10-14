@@ -592,6 +592,11 @@ fn decode_public_key(data: &mut &[u8]) -> Result<String, AbiError> {
             let rpid_len = read_varuint32(data)? as usize;
             take(data, rpid_len)?;
         }
+        3..=5 => {
+            let parameters = pulsevm_crypto::MlDsaParameterSet::from_tag(tag)
+                .map_err(|e| AbiError::Crypto(e.to_string()))?;
+            take(data, parameters.public_key_len())?;
+        }
         _ => return Err(AbiError::Crypto(format!("unsupported key type {tag}"))),
     }
     let consumed = original.len() - data.len();
@@ -614,6 +619,14 @@ fn decode_signature(data: &mut &[u8]) -> Result<String, AbiError> {
             let client_json_len = read_varuint32(data)? as usize;
             take(data, client_json_len)?;
         }
+        3..=5 => {
+            let parameters = pulsevm_crypto::MlDsaParameterSet::from_tag(tag)
+                .map_err(|e| AbiError::Crypto(e.to_string()))?;
+            take(
+                data,
+                parameters.public_key_len() + parameters.signature_len(),
+            )?;
+        }
         _ => {
             return Err(AbiError::Crypto(format!(
                 "unsupported signature type {tag}"
@@ -631,6 +644,9 @@ fn decode_signature(data: &mut &[u8]) -> Result<String, AbiError> {
         2 => WebAuthnSignature::from_packed(&original[..consumed])
             .map(|signature| signature.to_string())
             .map_err(|error| AbiError::Crypto(format!("{error:?}"))),
+        3..=5 => pulsevm_crypto::MlDsaSignature::from_packed(&original[..consumed])
+            .map(|signature| signature.to_string())
+            .map_err(|error| AbiError::Crypto(error.to_string())),
         _ => unreachable!(),
     }
 }
@@ -653,6 +669,36 @@ mod crypto_tests {
         0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8,
         0x98, 0xc2, 0x96,
     ];
+
+    #[test]
+    fn abi_decodes_ml_dsa_keys_and_signature_envelopes() {
+        use pulsevm_crypto::{
+            MlDsaParameterSet,
+            MlDsaPrivateKey,
+        };
+        for parameters in [
+            MlDsaParameterSet::MlDsa44,
+            MlDsaParameterSet::MlDsa65,
+            MlDsaParameterSet::MlDsa87,
+        ] {
+            let private = MlDsaPrivateKey::from_seed(parameters, [1; 32]);
+            let key = AuthorityPublicKey::from(private.public_key());
+            let mut packed = key.to_packed();
+            packed.push(42);
+            let mut input = packed.as_slice();
+            assert_eq!(decode_public_key(&mut input).unwrap(), key.to_string());
+            assert_eq!(input, [42]);
+            let signature = private.sign(b"test", b"").unwrap();
+            let mut packed = signature.to_packed();
+            packed.push(42);
+            let mut input = packed.as_slice();
+            assert_eq!(decode_signature(&mut input).unwrap(), signature.to_string());
+            assert_eq!(input, [42]);
+            for length in [0, 1, packed.len() - 2] {
+                assert!(decode_signature(&mut &packed[..length]).is_err());
+            }
+        }
+    }
 
     #[test]
     fn abi_decodes_r1_and_webauthn_public_keys() {

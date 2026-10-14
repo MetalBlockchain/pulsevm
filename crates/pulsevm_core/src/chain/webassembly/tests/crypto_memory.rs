@@ -1,5 +1,346 @@
 use super::*;
 
+fn ml_dsa_host(context_free: bool) -> Host {
+    let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+        br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+    )
+    .unwrap();
+    Host::with_protocol(context_free, schedule.execution_context(2).unwrap())
+}
+
+#[test]
+fn ml_dsa_verify_intrinsics_check_protocol_signature_memory_and_cpu() {
+    use pulsevm_crypto::{
+        MlDsaParameterSet,
+        MlDsaPrivateKey,
+    };
+    let mut legacy = Host::new(false);
+    assert_error(
+        verify_mldsa(
+            legacy.env(),
+            ptr(END),
+            0,
+            ptr(END),
+            0,
+            ptr(END),
+            0,
+            ptr(END),
+            0,
+        ),
+        "protocol version 2",
+    );
+    for parameters in [
+        MlDsaParameterSet::MlDsa44,
+        MlDsaParameterSet::MlDsa65,
+        MlDsaParameterSet::MlDsa87,
+    ] {
+        let key = MlDsaPrivateKey::from_seed(parameters, [25; 32]);
+        let signature = key.sign(b"message", b"context").unwrap();
+        let packed_key = AuthorityPublicKey::from(key.public_key()).pack().unwrap();
+        // Crypto hosts also work in context-free actions.
+        let mut h = ml_dsa_host(true);
+        h.write(11, b"message");
+        h.write(1000, signature.as_bytes());
+        h.write(10000, &packed_key);
+        h.write(20000, b"context");
+        let signature_len = signature.as_bytes().len() as u32;
+        let key_len = packed_key.len() as u32;
+        let price = cost::ml_dsa_verify(parameters, 7, 7);
+        h.budget(price);
+        assert_eq!(
+            verify_mldsa(
+                h.env(),
+                ptr(11),
+                7,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                7
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(h.remaining(), 0);
+        h.budget(price);
+        assert_verify_mldsa(
+            h.env(),
+            ptr(11),
+            7,
+            ptr(1000),
+            signature_len,
+            ptr(10000),
+            key_len,
+            ptr(20000),
+            7,
+        )
+        .unwrap();
+        h.budget(price - 1);
+        assert!(
+            verify_mldsa(
+                h.env(),
+                ptr(11),
+                7,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                7
+            )
+            .is_err()
+        );
+        assert_eq!(h.remaining(), 0);
+        h.budget(u64::MAX);
+        h.write(11, b"Message");
+        assert_eq!(
+            verify_mldsa(
+                h.env(),
+                ptr(11),
+                7,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                7
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            assert_verify_mldsa(
+                h.env(),
+                ptr(11),
+                7,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                7
+            )
+            .is_err()
+        );
+        for len in [signature_len - 1, signature_len + 1, u32::MAX] {
+            assert!(
+                verify_mldsa(
+                    h.env(),
+                    ptr(11),
+                    7,
+                    ptr(1000),
+                    len,
+                    ptr(10000),
+                    key_len,
+                    ptr(20000),
+                    7
+                )
+                .is_err()
+            );
+        }
+        for len in [key_len - 1, key_len + 1, u32::MAX] {
+            assert!(
+                verify_mldsa(
+                    h.env(),
+                    ptr(11),
+                    7,
+                    ptr(1000),
+                    signature_len,
+                    ptr(10000),
+                    len,
+                    ptr(20000),
+                    7
+                )
+                .is_err()
+            );
+        }
+        for (message, sig, key, context) in [
+            (END, 1000, 10000, 20000),
+            (11, END, 10000, 20000),
+            (11, 1000, END, 20000),
+            (11, 1000, 10000, END),
+        ] {
+            assert!(
+                verify_mldsa(
+                    h.env(),
+                    ptr(message),
+                    7,
+                    ptr(sig),
+                    signature_len,
+                    ptr(key),
+                    key_len,
+                    ptr(context),
+                    7
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            verify_mldsa(
+                h.env(),
+                ptr(11),
+                u32::MAX,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                7
+            )
+            .is_err()
+        );
+        assert!(
+            verify_mldsa(
+                h.env(),
+                ptr(11),
+                7,
+                ptr(1000),
+                signature_len,
+                ptr(10000),
+                key_len,
+                ptr(20000),
+                256
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn ml_dsa_host_message_and_context_limits_are_inclusive() {
+    use pulsevm_crypto::{
+        MlDsaParameterSet,
+        MlDsaPrivateKey,
+    };
+    let mut h = ml_dsa_host(false);
+    h.memory.grow(&mut h.store, 16).unwrap();
+    let message = vec![0; MAX_ML_DSA_MESSAGE_BYTES as usize];
+    let key = MlDsaPrivateKey::from_seed(MlDsaParameterSet::MlDsa44, [1; 32]);
+    let context = [1; 255];
+    let signature = key.sign(&message, &context).unwrap();
+    let packed_key = AuthorityPublicKey::from(key.public_key()).pack().unwrap();
+    h.write(65536, &message);
+    h.write(1000, signature.as_bytes());
+    h.write(10000, &packed_key);
+    h.write(20000, &context);
+    h.budget(u64::MAX);
+    assert_eq!(
+        verify_mldsa(
+            h.env(),
+            ptr(65536),
+            MAX_ML_DSA_MESSAGE_BYTES,
+            ptr(1000),
+            signature.as_bytes().len() as u32,
+            ptr(10000),
+            packed_key.len() as u32,
+            ptr(20000),
+            255
+        )
+        .unwrap(),
+        1
+    );
+    assert!(
+        verify_mldsa(
+            h.env(),
+            ptr(65536),
+            MAX_ML_DSA_MESSAGE_BYTES + 1,
+            ptr(1000),
+            signature.as_bytes().len() as u32,
+            ptr(10000),
+            packed_key.len() as u32,
+            ptr(20000),
+            255
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn ml_dsa_recovery_verifies_embedded_key_and_preserves_partial_output() {
+    use pulsevm_crypto::{
+        ML_DSA_TRANSACTION_CONTEXT,
+        MlDsaParameterSet,
+        MlDsaPrivateKey,
+    };
+    let key = MlDsaPrivateKey::from_seed(MlDsaParameterSet::MlDsa65, [3; 32]);
+    let digest = Digest::hash(b"transaction");
+    let signature = key
+        .sign(digest.as_bytes(), ML_DSA_TRANSACTION_CONTEXT)
+        .unwrap();
+    let packed_key = AuthorityPublicKey::from(key.public_key()).pack().unwrap();
+    let packed_signature = signature.to_packed();
+    let mut legacy = Host::new(false);
+    legacy.write(1000, &packed_signature);
+    assert_error(
+        recover_key(
+            legacy.env(),
+            ptr(11),
+            ptr(1000),
+            packed_signature.len() as u32,
+            ptr(OUT),
+            0,
+        ),
+        "protocol version 2",
+    );
+    let mut h = ml_dsa_host(false);
+    h.write(11, digest.as_bytes());
+    h.write(1000, &packed_signature);
+    h.budget(cost::ml_dsa_verify(
+        MlDsaParameterSet::MlDsa65,
+        32,
+        ML_DSA_TRANSACTION_CONTEXT.len() as u64,
+    ));
+    assert_eq!(
+        recover_key(
+            h.env(),
+            ptr(11),
+            ptr(1000),
+            packed_signature.len() as u32,
+            ptr(OUT),
+            10
+        )
+        .unwrap(),
+        packed_key.len() as i32
+    );
+    assert_eq!(h.read(OUT, 10), packed_key[..10]);
+    assert_eq!(h.remaining(), 0);
+    h.budget(u64::MAX);
+    h.write(10000, &packed_key);
+    assert_recover_key(
+        h.env(),
+        ptr(11),
+        ptr(1000),
+        packed_signature.len() as u32,
+        ptr(10000),
+        packed_key.len() as u32,
+    )
+    .unwrap();
+    assert!(
+        recover_key(
+            h.env(),
+            ptr(11),
+            ptr(1000),
+            packed_signature.len() as u32 + 1,
+            ptr(OUT),
+            0
+        )
+        .is_err()
+    );
+    h.write(11, &[0; 32]);
+    assert!(
+        recover_key(
+            h.env(),
+            ptr(11),
+            ptr(1000),
+            packed_signature.len() as u32,
+            ptr(OUT),
+            0
+        )
+        .is_err()
+    );
+}
+
 type Hash =
     fn(FunctionEnvMut<WasmContext>, WasmPtr<u8>, u32, WasmPtr<u8>) -> Result<(), RuntimeError>;
 

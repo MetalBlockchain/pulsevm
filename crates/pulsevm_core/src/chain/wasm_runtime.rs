@@ -136,6 +136,7 @@ use crate::chain::{
         assert_sha224,
         assert_sha256,
         assert_sha512,
+        assert_verify_mldsa,
         check_permission_authorization,
         check_transaction_authorization,
         current_time,
@@ -255,6 +256,7 @@ use crate::chain::{
         tapos_block_num,
         tapos_block_prefix,
         transaction_size,
+        verify_mldsa,
     },
 };
 
@@ -1576,6 +1578,18 @@ impl WasmRuntime {
             }
         };
         let module_elapsed = module_started.map_or(Duration::ZERO, |started| started.elapsed());
+        // Check imports on every execution, including warm instances reused
+        // across forks at different protocol heights.
+        if !apply_context.protocol_feature_enabled(ProtocolFeature::MlDsa)
+            && module.module.imports().any(|import| {
+                import.module() == "env"
+                    && matches!(import.name(), "verify_mldsa" | "assert_verify_mldsa")
+            })
+        {
+            return Err(ChainError::WasmRuntimeError(
+                "ML-DSA intrinsics require protocol version 2".into(),
+            ));
+        }
         let store_started = profiling.then(Instant::now);
         let pooled = STORE_POOL.with(|pool| pool.borrow_mut().pop(&id));
 
@@ -1756,6 +1770,8 @@ impl WasmRuntime {
                 "alt_bn128_pair" => Function::new_typed_with_env(&mut store, &env, alt_bn128_pair),
                 "assert_recover_key" => Function::new_typed_with_env(&mut store, &env, assert_recover_key),
                 "recover_key" => Function::new_typed_with_env(&mut store, &env, recover_key),
+                "verify_mldsa" => Function::new_typed_with_env(&mut store, &env, verify_mldsa),
+                "assert_verify_mldsa" => Function::new_typed_with_env(&mut store, &env, assert_verify_mldsa),
                 "mod_exp" => Function::new_typed_with_env(&mut store, &env, mod_exp),
                 "alt_bn128_mul" => Function::new_typed_with_env(&mut store, &env, alt_bn128_mul),
                 "sha1" => Function::new_typed_with_env(&mut store, &env, sha1),

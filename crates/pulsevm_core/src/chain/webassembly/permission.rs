@@ -23,6 +23,7 @@ use super::cost;
 use crate::{
     authorization_manager::AuthorizationManager,
     chain::webassembly::context_aware_check,
+    protocol_features::ProtocolFeature,
     transaction::Transaction,
     wasm_runtime::WasmContext,
 };
@@ -97,6 +98,7 @@ pub fn check_transaction_authorization(
             })?;
     }
 
+    check_ml_dsa_keys(env_data, &provided_keys)?;
     let mut db = env_data.db_mut();
 
     match AuthorizationManager::check_authorization(
@@ -178,6 +180,7 @@ pub fn check_permission_authorization(
             .map_err(|e| RuntimeError::new(format!("failed to unpack perms: {}", e)))?;
     }
 
+    check_ml_dsa_keys(env_data, &provided_keys)?;
     let permission = PermissionLevel::new(account, permission);
 
     match AuthorizationManager::check_permission_authorization(
@@ -191,6 +194,20 @@ pub fn check_permission_authorization(
         Ok(_) => Ok(1),
         Err(_) => Ok(0),
     }
+}
+
+fn check_ml_dsa_keys(
+    context: &WasmContext,
+    keys: &BTreeSet<AuthorityPublicKey>,
+) -> Result<(), RuntimeError> {
+    if !context.protocol_feature_enabled(ProtocolFeature::MlDsa)
+        && keys
+            .iter()
+            .any(|key| matches!(key, AuthorityPublicKey::MlDsa(_)))
+    {
+        return Err(RuntimeError::new("ML-DSA keys require protocol version 2"));
+    }
+    Ok(())
 }
 
 pub fn get_permission_last_used(

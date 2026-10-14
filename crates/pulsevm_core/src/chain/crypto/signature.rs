@@ -16,6 +16,9 @@ use pulsevm_crypto::{
     Digest,
     FixedBytes,
     K1Signature,
+    ML_DSA_TRANSACTION_CONTEXT,
+    MlDsaParameterSet,
+    MlDsaSignature,
     R1Signature,
     WebAuthnSignature,
 };
@@ -34,10 +37,11 @@ use serde::{
 
 use crate::crypto::PublicKey;
 
-/// A recoverable Antelope transaction signature.
+/// An Antelope transaction signature or a PulseVM ML-DSA signature envelope.
 ///
 /// K1 and R1 are fixed-size variants. WebAuthn includes browser assertion data
 /// and is consequently variable-size on the wire.
+/// ML-DSA carries a public key which must verify before authorizing an account.
 #[derive(Clone)]
 pub struct Signature {
     inner: SignatureInner,
@@ -48,9 +52,23 @@ enum SignatureInner {
     K1(K1Signature),
     R1(R1Signature),
     WebAuthn(WebAuthnSignature),
+    MlDsa(MlDsaSignature),
 }
 
 impl Signature {
+    pub fn new_ml_dsa(inner: MlDsaSignature) -> Self {
+        Self {
+            inner: SignatureInner::MlDsa(inner),
+        }
+    }
+
+    pub fn ml_dsa_parameters(&self) -> Option<MlDsaParameterSet> {
+        match &self.inner {
+            SignatureInner::MlDsa(signature) => Some(signature.public_key().parameters()),
+            _ => None,
+        }
+    }
+
     pub fn new(inner: K1Signature) -> Self {
         Signature {
             inner: SignatureInner::K1(inner),
@@ -102,6 +120,14 @@ impl Signature {
         check_canonical: bool,
     ) -> Result<AuthorityPublicKey, ChainError> {
         match &self.inner {
+            SignatureInner::MlDsa(signature) => {
+                if !signature.verify(digest.as_bytes(), ML_DSA_TRANSACTION_CONTEXT) {
+                    return Err(ChainError::TransactionError(
+                        "invalid ML-DSA signature".into(),
+                    ));
+                }
+                Ok(AuthorityPublicKey::MlDsa(signature.public_key().clone()))
+            }
             SignatureInner::K1(signature) => if check_canonical {
                 signature.recover(digest.as_bytes())
             } else {
@@ -129,16 +155,17 @@ impl Signature {
             AuthorityPublicKey::K1(point) => pulsevm_crypto::K1PublicKey::from_compressed(&point)
                 .map(PublicKey::new)
                 .map_err(|e| ChainError::TransactionError(e.to_string())),
-            AuthorityPublicKey::R1(_) | AuthorityPublicKey::WebAuthn { .. } => {
-                Err(ChainError::TransactionError(
-                    "R1/WebAuthn signatures are not valid for this K1-only intrinsic".into(),
-                ))
-            }
+            AuthorityPublicKey::R1(_)
+            | AuthorityPublicKey::WebAuthn { .. }
+            | AuthorityPublicKey::MlDsa(_) => Err(ChainError::TransactionError(
+                "non-K1 signatures are not valid for this K1-only operation".into(),
+            )),
         }
     }
 
     fn to_string(&self) -> String {
         match &self.inner {
+            SignatureInner::MlDsa(signature) => signature.to_string(),
             SignatureInner::K1(signature) => signature.to_string(),
             SignatureInner::R1(signature) => signature.to_string(),
             SignatureInner::WebAuthn(signature) => signature.to_string(),
@@ -222,6 +249,7 @@ impl<'de> Deserialize<'de> for Signature {
 impl NumBytes for Signature {
     fn num_bytes(&self) -> usize {
         match &self.inner {
+            SignatureInner::MlDsa(signature) => signature.packed_len(),
             SignatureInner::K1(_) | SignatureInner::R1(_) => 66,
             SignatureInner::WebAuthn(signature) => signature.packed_len(),
         }
@@ -249,6 +277,18 @@ impl Read for Signature {
                         .map_err(|e| ReadError::CustomError(e.to_string()))?,
                 )
             }
+            3..=5 => {
+                let parameters = MlDsaParameterSet::from_tag(tag)
+                    .map_err(|e| ReadError::CustomError(e.to_string()))?;
+                let end = pos
+                    .checked_add(1 + parameters.public_key_len() + parameters.signature_len())
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or(ReadError::NotEnoughBytes)?;
+                let signature = MlDsaSignature::from_packed(&bytes[*pos..end])
+                    .map_err(|e| ReadError::CustomError(e.to_string()))?;
+                *pos = end;
+                SignatureInner::MlDsa(signature)
+            }
             tag => {
                 return Err(ReadError::CustomError(format!(
                     "unsupported packed signature type {tag}"
@@ -268,8 +308,12 @@ impl Write for Signature {
             SignatureInner::R1(signature) => {
                 FixedBytes::<66>(signature.to_packed()).write(bytes, pos)
             }
-            SignatureInner::WebAuthn(signature) => {
-                let packed = signature.to_packed();
+            SignatureInner::WebAuthn(_) | SignatureInner::MlDsa(_) => {
+                let packed = match &self.inner {
+                    SignatureInner::WebAuthn(signature) => signature.to_packed(),
+                    SignatureInner::MlDsa(signature) => signature.to_packed(),
+                    _ => return Err(WriteError::NotEnoughSpace),
+                };
                 let end = pos
                     .checked_add(packed.len())
                     .filter(|end| *end <= bytes.len())
@@ -306,6 +350,10 @@ impl FromStr for Signature {
         } else if s.starts_with("SIG_WA_") {
             SignatureInner::WebAuthn(WebAuthnSignature::from_string(s).map_err(|e| {
                 ChainError::TransactionError(format!("failed to parse WebAuthn signature: {e}"))
+            })?)
+        } else if s.starts_with("SIG_MLDSA") {
+            SignatureInner::MlDsa(MlDsaSignature::from_string(s).map_err(|e| {
+                ChainError::TransactionError(format!("failed to parse ML-DSA signature: {e}"))
             })?)
         } else {
             return Err(ChainError::TransactionError(

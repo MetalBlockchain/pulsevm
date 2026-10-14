@@ -18,17 +18,16 @@ those build flags never activate chain behavior. Protocol features are not
 runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
-> **Current status:** the genesis, minimum-supported, and maximum-supported
-> protocol versions are all `1`. Both normal and `nightly` builds therefore
-> report maximum version `1`; `nightly` does not aggregate any unfinished
-> `protocol_feature_*` flag yet. `Baseline` is the only feature, and no
-> post-genesis behavior is gated. Schedule parsing, height selection,
-> fail-closed support checks, and RPC observability are wired, but the feature
-> helper has no production call site yet. A schedule that activates version `2`
-> or later makes the current binary refuse transaction admission, block
-> building, verification, replay, and state-sync application at that height.
-> Do not schedule version `2` until a
-> released binary reports support for it.
+> **Current status:** genesis and minimum-supported versions remain `1`.
+> Stable and nightly binaries support through version `2`. `Baseline` maps to
+> version `1`; `MlDsa` maps permanently to version `2` and enables
+> [ML-DSA account keys and verification intrinsics](./ml-dsa.md). Both build
+> profiles contain the complete implementation, and no unfinished Cargo feature
+> is currently aggregated by `nightly`. New rules select the candidate block's
+> support-checked context. Version `3` or later remains unsupported: the binary
+> refuses admission, building, verification, replay, and state sync at such an
+> activation height. Installing version-2 support still leaves unscheduled
+> chains under version-1 rules.
 
 The code is authoritative. Start with
 [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
@@ -56,8 +55,8 @@ safe rollout into a chain halt.
 | `PLUGIN_VERSION` | Compatibility version for the rpcchainvm connection between MetalGo and the PulseVM process. It does not select chain rules. |
 | `GENESIS_PROTOCOL_VERSION` | Protocol version used before the first scheduled upgrade. It is currently `1`. |
 | `MIN_SUPPORTED_PROTOCOL_VERSION` | Oldest chain protocol this binary can execute. It is currently `1`. |
-| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `1`. |
-| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `1`. |
+| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `2`. |
+| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `2`. |
 | `PROTOCOL_VERSION` | Newest version this particular binary can execute: stable maximum normally, nightly maximum in a `nightly` build. It is not the version active at the current head. |
 | `protocol_feature_*` Cargo feature | Temporary compile-time gate that includes one unfinished implementation. It does not activate the implementation. |
 | `nightly` Cargo feature | Aggregate compile-time gate for all unfinished protocol implementations. It is unrelated to the Rust nightly toolchain. |
@@ -87,16 +86,16 @@ activation:
 | Cargo `#[cfg(feature = "protocol_feature_...")]` | At compilation | Whether unfinished implementation code exists in the binary | Which rules a block uses |
 | `ProtocolExecutionContext::feature_enabled(feature)` | While evaluating a block | Whether compiled legacy or new rules apply at that height | Whether the new code was compiled |
 
-The expected lifecycle for a future version `2` is:
+The expected lifecycle for a future version `3` is:
 
 1. A temporary `protocol_feature_*` flag hides the implementation from normal
    builds and is included by `nightly`.
 2. A nightly binary compiles the implementation and advertises nightly maximum
-   version `2`, but still executes version-1 rules before activation.
+   version `3`, but still executes the scheduled legacy rules before activation.
 3. After review and testing, the implementation is compiled into the normal
-   production build and the stable maximum becomes `2`.
+   production build and the stable maximum becomes `3`.
 4. Operators deploy that stable binary everywhere.
-5. Only then does the common height schedule activate version `2`.
+5. Only then does the common height schedule activate version `3`.
 
 This prevents unfinished code from entering stable artifacts while preserving
 historical replay in binaries that do contain the new implementation.
@@ -211,8 +210,8 @@ JSON object with this shape:
 }
 ```
 
-This example explains the schema; it is **not deployable with the current
-version-1 binary**. The file may contain a future version before the binary can
+The version-2 entry is supported. Version `3` in this example is a future
+unsupported version. The file may contain a future version before the binary can
 execute it, but at activation the unsupported-version behavior in
 [section 6](#6-failure-behavior) applies to startup, building, verification, and
 state sync.
@@ -363,7 +362,7 @@ The response includes these fields:
 ```json
 {
   "protocol_version": 1,
-  "supported_protocol_version": 1,
+  "supported_protocol_version": 2,
   "protocol_upgrade_schedule_hash": "e73c3b500964300ce82280695d0608e80d9b50602531b560e9ec33e04e09e914",
   "next_protocol_upgrade": {
     "protocol_version": 2,
@@ -439,11 +438,11 @@ rollout normally means two rolling restarts: one to deploy supporting code, then
 one to load the canonical schedule. Leave enough time between those phases to
 verify every node before activation.
 
-With the code currently in this branch, no post-genesis upgrade can safely
-activate: a target must be greater than genesis version `1`, while this binary's
-maximum is still `1`. The parser accepts a future entry before activation, but
-the supporting binary must be deployed before that height. There is no released
-version-2 behavior yet.
+Version `2` activates the ML-DSA extension. Its cryptographic review and
+provisional-price calibration are release requirements described in
+[ml-dsa.md](./ml-dsa.md). Version `3` remains a future unsupported target. The
+parser accepts a future entry before activation, but the supporting binary must
+be deployed before that height.
 
 ## 9. Adding a protocol feature
 
@@ -463,7 +462,7 @@ Hide the unfinished implementation—not the legacy path—behind that feature:
 ```rust
 #[cfg(feature = "protocol_feature_canonical_transaction_ordering")]
 fn apply_canonical_ordering() {
-    // Version-2 implementation.
+    // Version-3 implementation.
 }
 ```
 
@@ -477,6 +476,7 @@ enables it in `ProtocolFeature::protocol_version`:
 ```rust
 pub enum ProtocolFeature {
     Baseline,
+    MlDsa,
     CanonicalTransactionOrdering,
 }
 
@@ -484,7 +484,8 @@ impl ProtocolFeature {
     const fn protocol_version(self) -> ProtocolVersion {
         match self {
             Self::Baseline => 1,
-            Self::CanonicalTransactionOrdering => 2,
+            Self::MlDsa => 2,
+            Self::CanonicalTransactionOrdering => 3,
         }
     }
 }
