@@ -1,4 +1,7 @@
-use std::io::Read as IoRead;
+use std::{
+    io::Read as IoRead,
+    str::FromStr,
+};
 
 use flate2::read::ZlibDecoder;
 use pulsevm_constants::{
@@ -33,6 +36,12 @@ use crate::{
     crypto::Signature,
 };
 
+/// Maximum accepted hex length for pushed blobs: twice the uncompressed byte
+/// cap, since hex doubles the encoded length. Checked before any allocation
+/// beyond the input string itself.
+const MAX_PUSH_HEX_CHARS: usize = 2 * MAX_UNCOMPRESSED_PACKED_TRX_SIZE;
+/// Maximum accepted signatures per pushed transaction.
+const MAX_PUSH_SIGNATURES: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTransaction {
     // Signature order is consensus data: packed_digest() hashes this vector
@@ -105,6 +114,80 @@ impl PackedTransaction {
             ),
             trx_id: trx_id,
             packed_digest,
+        })
+    }
+
+    /// Build from an Antelope `push_transaction` JSON object (`signatures`,
+    /// `compression`, `packed_context_free_data`, `packed_trx`). Cheap bounds
+    /// run before signature recovery, decompression, or execution, and every
+    /// malformed input fails with [`ChainError::TransactionError`]. Transport
+    /// layers map the error to their own status code.
+    pub fn from_push_transaction_json(
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, ChainError> {
+        let signatures = params
+            .get("signatures")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                ChainError::TransactionError("missing signatures array".to_string())
+            })?;
+        if signatures.is_empty() || signatures.len() > MAX_PUSH_SIGNATURES {
+            return Err(ChainError::TransactionError(format!(
+                "signature count out of bounds: {}",
+                signatures.len()
+            )));
+        }
+        let mut parsed_signatures = Vec::with_capacity(signatures.len());
+        for signature in signatures {
+            let text = signature.as_str().ok_or_else(|| {
+                ChainError::TransactionError("signature entry is not a string".to_string())
+            })?;
+            parsed_signatures.push(Signature::from_str(text).map_err(|error| {
+                ChainError::TransactionError(format!("invalid signature: {error}"))
+            })?);
+        }
+        let compression = match params
+            .get("compression")
+            .and_then(|value| value.as_str())
+            .unwrap_or("none")
+        {
+            "none" => TransactionCompression::None,
+            "zlib" => TransactionCompression::Zlib,
+            other => {
+                return Err(ChainError::TransactionError(format!(
+                    "unsupported compression: {other}"
+                )));
+            }
+        };
+        let hex_field = |name: &str| -> Result<Vec<u8>, ChainError> {
+            let text = params
+                .get(name)
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if text.len() > MAX_PUSH_HEX_CHARS {
+                return Err(ChainError::TransactionError(format!(
+                    "{name} exceeds size bound"
+                )));
+            }
+            hex::decode(text).map_err(|error| {
+                ChainError::TransactionError(format!("invalid hex in {name}: {error}"))
+            })
+        };
+        let packed_trx = hex_field("packed_trx")?;
+        if packed_trx.is_empty() {
+            return Err(ChainError::TransactionError(
+                "missing packed_trx".to_string(),
+            ));
+        }
+        let packed_context_free_data = hex_field("packed_context_free_data")?;
+        Self::new(
+            parsed_signatures,
+            compression,
+            Bytes(packed_context_free_data),
+            Bytes(packed_trx),
+        )
+        .map_err(|error| {
+            ChainError::TransactionError(format!("invalid packed transaction: {error}"))
         })
     }
 
@@ -469,5 +552,82 @@ mod tests {
                 expected_digest
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod push_transaction_json_tests {
+    use super::*;
+
+    // Real XPR mainnet transfer from block 408596000. The exact client
+    // payload must keep parsing, so wallet submissions stay decodable.
+    const MAINNET_PACKED_TRX: &str = "ee93cf6ad5ac8ce6fafd0000000001000000d6c5864d5c000000c0ba380dc201000020dedc8aad8b00000000a8ed323229000020dedc8aad8b5af72200000000000100000098aba9a059000000000000000004584d440000000000";
+    const MAINNET_SIGNATURE: &str = "SIG_K1_K636MwCVdtdikv8mP58Jfnq1RzAARH1KEGYXQJzjkUt9cvJAkZdFEEFJeEubYnmZfcbSvu1hVGoF3322oZLAvE4nz8vC2r";
+
+    fn mainnet_params() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_value(serde_json::json!({
+            "signatures": [MAINNET_SIGNATURE],
+            "compression": "none",
+            "packed_context_free_data": "",
+            "packed_trx": MAINNET_PACKED_TRX,
+        }))
+        .expect("test fixture must be an object")
+    }
+
+    #[test]
+    fn parses_real_mainnet_push_payload() {
+        let packed = PackedTransaction::from_push_transaction_json(&mainnet_params()).unwrap();
+        assert_eq!(packed.get_transaction().actions.len(), 1);
+    }
+
+    #[test]
+    fn rejects_missing_packed_trx() {
+        let mut params = mainnet_params();
+        params.remove("packed_trx");
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_empty_signatures() {
+        let mut params = mainnet_params();
+        params.insert(
+            "signatures".to_string(),
+            serde_json::Value::Array(Vec::new()),
+        );
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_bad_signature() {
+        let mut params = mainnet_params();
+        params.insert(
+            "signatures".to_string(),
+            serde_json::json!(["NOT_A_SIGNATURE"]),
+        );
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_unknown_compression() {
+        let mut params = mainnet_params();
+        params.insert("compression".to_string(), serde_json::json!("snappy"));
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_non_hex_payload() {
+        let mut params = mainnet_params();
+        params.insert("packed_trx".to_string(), serde_json::json!("zz"));
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_oversize_payload() {
+        let mut params = mainnet_params();
+        params.insert(
+            "packed_trx".to_string(),
+            serde_json::json!(str::repeat("ab", MAX_PUSH_HEX_CHARS)),
+        );
+        PackedTransaction::from_push_transaction_json(&params).unwrap_err();
     }
 }
