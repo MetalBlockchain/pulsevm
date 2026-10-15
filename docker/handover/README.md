@@ -1,0 +1,47 @@
+# Handover rehearsal
+
+Rehearses the shadow-then-promote migration on one machine: a
+single-producer Leap chain ("normal XPR") produces blocks, a PulseVM shadow
+replays them in real time, the producer halts at `TERMINAL_HEIGHT`, and a
+five-node PulseVM network boots from the checkpointed shadow state and
+continues numbering at H+1.
+
+```bash
+# ~10 minutes at the default 1200 blocks (0.5s block time).
+docker/handover/run-handover.sh start
+docker/handover/run-handover.sh stop
+```
+
+## What it models
+
+| Step | Models |
+|---|---|
+| Leap produces, shadow follows | Live XPR replay (today's EC2 follower) |
+| `stop xpr-producer` at H | The producer halt commitment (all BPs stop) |
+| Snapshot, export, checkpoint | Canonical export plus independent validation |
+| Five-node boot from checkpoint | A-Chain validator boot from identical state |
+| Parent-linkage plus liveness asserts | Continuity gate: H+1 builds on H |
+
+`TERMINAL_HEIGHT` sets the cutover (default 1200; 100000 is ~14 hours).
+`HANDOVER_WORK_DIR` must stay below `/tmp` for the nodeos-docker adapter.
+
+## Prerequisites
+
+Host Rust with LLVM 22 (for the checkpoint importer), Docker with the
+`pulsevm-handover` compose project, an XPR core checkout for export
+preflight (`XPR_CORE_DIR`, default `/src/antelope-leap`), and MetalGo plus
+the network runner for the five-node boot (`METALGO_EXEC_PATH`, same
+defaults as `scripts/run-local.sh`).
+
+## Known delta vs the real migration
+
+Promotion currently re-identifies the chain: the migration genesis commits
+to the checkpoint hash, so the five-node network reports a different chain
+ID than the Leap chain. The rehearsal asserts state continuity (parent link
+H to H+1, advancing head) across that re-identification. Same-ID
+in-process promotion — the shadow process itself starting to author at H —
+needs block production inside the replay binary and is not modeled here.
+
+Rehearsal-only support: `XPR_REPLAY_GENESIS_FILE` lets the replay binary
+follow a non-mainnet fixture chain. It is default-off; without it every
+mainnet pin behaves exactly as before.

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Rehearse the shadow-then-promote handover: Leap produces, PulseVM shadows,
+# the producer halts at TERMINAL_HEIGHT, and a five-node PulseVM network
+# boots from the checkpointed shadow state and continues at H+1.
+#
+# Phase 2 note: promotion currently re-identifies the chain (the migration
+# genesis commits to the checkpoint hash). Same-ID in-process promotion is
+# future work; this rehearsal validates follow, halt, checkpoint, boot,
+# parent linkage, and liveness.
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+readonly TERMINAL_HEIGHT="${TERMINAL_HEIGHT:-1200}"
+readonly WORK_DIR="${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}"
+readonly LEAP_API="http://127.0.0.1:${LEAP_HTTP_PORT:-8888}"
+readonly SHADOW_RPC="http://127.0.0.1:${SHADOW_RPC_PORT:-9660}"
+readonly XPR_CORE_DIR="${XPR_CORE_DIR:-/src/antelope-leap}"
+readonly NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO_ROOT/../metal-network-runner/bin/metal-network-runner}"
+readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
+
+fail() { echo "handover: $*" >&2; exit 1; }
+
+leap_info() {
+    curl --fail --silent --max-time 10 -X POST "$LEAP_API/v1/chain/get_info" \
+        -H 'Content-Type: application/json' -d '{}'
+}
+shadow_head() {
+    curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])'
+}
+chain_rpc_url() {
+    "$NETWORK_RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT" 2>/dev/null \
+        | sed $'s/\033\[[0-9;]*m//g' \
+        | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+' | head -1
+}
+rpc_call() {
+    curl --fail --silent --max-time 15 -X POST "$1" \
+        -H 'Content-Type: application/json' -d "$2"
+}
+
+cmd_start() {
+    [[ ! -e "$WORK_DIR" ]] || fail "work directory exists: $WORK_DIR (run stop first)"
+    mkdir -p "$WORK_DIR"
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --build --detach)
+    echo "handover: waiting for the Leap producer..."
+    for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
+    leap_info >/dev/null || fail "Leap producer did not become ready"
+    echo "handover: shadowing until height $TERMINAL_HEIGHT..."
+    while true; do
+        head="$(shadow_head 2>/dev/null || echo 0)"
+        echo "handover: shadow head $head / $TERMINAL_HEIGHT"
+        [[ "$head" -ge "$TERMINAL_HEIGHT" ]] && break
+        sleep 5
+    done
+    cmd_halt
+}
+
+cmd_halt() {
+    leap_head="$(leap_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
+    shadow_head_now="$(shadow_head)"
+    [[ "$leap_head" == "$shadow_head_now" ]] || fail "heads disagree at halt: leap $leap_head shadow $shadow_head_now"
+    H="$leap_head"
+    H_ID="$(leap_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_id"])')"
+    echo "$H" >"$WORK_DIR/H"
+    echo "$H_ID" >"$WORK_DIR/H_ID"
+    echo "handover: H=$H id=$H_ID; snapshotting then halting the producer (models the BP halt commitment)..."
+    snap="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
+        -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
+    [[ -n "$snap" ]] || fail "snapshot request failed"
+    mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
+    echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer)
+    echo "handover: halted at H=$H snapshot=$(cat "$WORK_DIR/snapshot")"
+    cmd_checkpoint
+}
+
+cmd_checkpoint() {
+    [[ -d "$XPR_CORE_DIR" ]] || fail "missing XPR core checkout for export preflight: $XPR_CORE_DIR"
+    # The export work dir must sit below /tmp for the nodeos-docker adapter.
+    export_dir="$(mktemp -d /tmp/pulsevm-handover-export.XXXXXX)"
+    echo "$export_dir" >"$WORK_DIR/export-dir"
+    (cd "$REPO_ROOT" && tools/xpr-chainbase-export/export.sh \
+        --nodeos tools/xpr-chainbase-export/localnet/nodeos-docker \
+        --snapshot "$(cat "$WORK_DIR/snapshot")" \
+        --work-dir "$export_dir" \
+        --source-revision leap-5.0.3) || fail "export failed"
+    (cd "$REPO_ROOT" && cargo run --locked -p pulsevm_database --example xpr_import_check -- \
+        "$export_dir/state-history/chain_state_history.log" \
+        "$export_dir/arena" \
+        "$export_dir/migration.snapshot") || fail "checkpoint import failed"
+    (cd "$REPO_ROOT" && tools/xpr-chainbase-export/validate-mainnet-export.sh \
+        --export-dir "$export_dir" \
+        --checkpoint "$export_dir/migration.snapshot" \
+        --arena-dir "$export_dir/arena") || fail "export validation failed"
+    echo "handover: checkpoint ready: $export_dir/migration.snapshot"
+    cmd_boot "$export_dir/migration.snapshot"
+}
+
+cmd_boot() {
+    checkpoint="${1:?checkpoint required}"
+    H="$(cat "$WORK_DIR/H")"
+    H_ID="$(cat "$WORK_DIR/H_ID")"
+    echo "handover: booting the five-node network from the H=$H checkpoint (background)..."
+    (cd "$REPO_ROOT" && \
+        METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
+        PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
+        PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node" \
+        PULSEVM_VERIFY_FIVE_NODE=false \
+        scripts/run-local.sh >"$WORK_DIR/five-node.log" 2>&1 &
+        echo $! >"$WORK_DIR/five-node.pid")
+    echo "handover: waiting for the new network to pass H..."
+    rpc_url=""
+    for _ in $(seq 1 60); do
+        rpc_url="$(chain_rpc_url || true)"
+        [[ -n "$rpc_url" ]] || { sleep 5; continue; }
+        new_head="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])' 2>/dev/null || echo 0)"
+        [[ "$new_head" -gt "$H" ]] && break
+        sleep 5
+    done
+    [[ "$new_head" -gt "$H" ]] || fail "new network never passed H=$H (see $WORK_DIR/five-node.log)"
+    next_id="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getBlock","params":{"block_num_or_id":'"$((H + 1))"'}}' \
+        | python3 -c 'import json,sys; b=json.load(sys.stdin)["result"]; print(b["previous"], b["block_num"])')"
+    [[ "$next_id" == "$H_ID $((H + 1))" ]] || fail "continuity broken: block H+1 parent is $next_id, expected parent $H_ID"
+    old_chain="$(shadow_head >/dev/null 2>&1; curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])' 2>/dev/null || echo stopped)"
+    new_chain="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])')"
+    echo "handover: PASS: block $((H + 1)) builds on halt block $H_ID; shadow chain $old_chain -> new chain $new_chain"
+    echo "handover: new network RPC: $rpc_url (left running; run stop to tear down)"
+}
+
+cmd_stop() {
+    if [[ -f "$WORK_DIR/five-node.pid" ]]; then
+        kill "$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
+        pkill -f metal-network-runner 2>/dev/null || true
+    fi
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml down --volumes 2>/dev/null) || true
+    rm -rf "$WORK_DIR"
+    echo "handover: stopped"
+}
+
+case "${1:-}" in
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    *) echo "usage: run-handover.sh start|stop" >&2
+       echo "env: TERMINAL_HEIGHT (default 1200, ~10 min at 0.5s blocks)," >&2
+       echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
+       echo "     LEAP_HTTP_PORT, SHADOW_RPC_PORT" >&2
+       exit 2 ;;
+esac
