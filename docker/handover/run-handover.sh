@@ -84,7 +84,11 @@ cmd_halt() {
     echo "$H" >"$WORK_DIR/H"
     echo "$H_ID" >"$WORK_DIR/H_ID"
     mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
-    if [[ "$snap" = /* ]]; then
+    # nodeos reports container paths: absolute names start at its /data dir,
+    # which is the shared leap-data volume on the host.
+    if [[ "$snap" = /data/* ]]; then
+        echo "$mountpoint/${snap#/data/}" >"$WORK_DIR/snapshot"
+    elif [[ "$snap" = /* ]]; then
         echo "$snap" >"$WORK_DIR/snapshot"
     else
         echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
@@ -168,8 +172,11 @@ cmd_stop() {
 
 case "${1:-}" in
     start) cmd_start ;;
+    # Resume a halted rehearsal from the checkpoint phase (H, H_ID and
+    # snapshot files already in HANDOVER_WORK_DIR).
+    resume-checkpoint) cmd_checkpoint ;;
     stop) cmd_stop ;;
-    *) echo "usage: run-handover.sh start|stop" >&2
+    *) echo "usage: run-handover.sh start|resume-checkpoint|stop" >&2
        echo "env: TERMINAL_HEIGHT (default 1200, ~10 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
        echo "     LEAP_HTTP_PORT, SHADOW_RPC_PORT" >&2
