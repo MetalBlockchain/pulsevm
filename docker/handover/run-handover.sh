@@ -113,7 +113,9 @@ cmd_checkpoint() {
     # here; import-time manifest checks still apply. Mainnet exports must
     # keep the full validation path.
     # The export work dir must sit below /tmp for the nodeos-docker adapter.
-    export_dir="$(mktemp -d /tmp/pulsevm-handover-export.XXXXXX)"
+    # mktemp -u reserves the name without creating it: export.sh requires a
+    # non-existing work dir.
+    export_dir="$(mktemp -du /tmp/pulsevm-handover-export.XXXXXX)"
     echo "$export_dir" >"$WORK_DIR/export-dir"
     (cd "$REPO_ROOT" && tools/xpr-chainbase-export/export.sh \
         --nodeos tools/xpr-chainbase-export/localnet/nodeos-docker \
