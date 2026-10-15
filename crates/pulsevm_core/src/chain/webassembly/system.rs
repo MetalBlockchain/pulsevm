@@ -233,6 +233,28 @@ pub fn get_sender(mut env: FunctionEnvMut<WasmContext>) -> Result<u64, RuntimeEr
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
+/// Returns 1 if an action above the current one in its creator chain has
+/// receiver `receiver` and, unless `action` is zero, action name `action`.
+/// Contracts use it as a reentrancy guard; see docs/reentrancy.md.
+///
+/// PulseVM extension with no Antelope equivalent. It is not gated by a
+/// protocol feature, so introducing it is a coordinated upgrade.
+pub fn has_ancestor(
+    mut env: FunctionEnvMut<WasmContext>,
+    receiver: u64,
+    action: u64,
+) -> Result<i32, RuntimeError> {
+    context_aware_check(&env)?;
+    let (env_data, mut store) = env.data_and_store_mut();
+    env_data.charge(&mut store, cost::BASE)?;
+    let (found, levels) = env_data
+        .apply_context()
+        .find_ancestor(receiver, action)
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+    env_data.charge(&mut store, cost::ancestor_walk(levels.into()))?;
+    Ok(found as i32)
+}
+
 pub fn get_block_num(mut env: FunctionEnvMut<WasmContext>) -> Result<u32, RuntimeError> {
     context_aware_check(&env)?;
     let (env_data, mut store) = env.data_and_store_mut();

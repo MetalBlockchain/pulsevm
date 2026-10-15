@@ -411,3 +411,85 @@ fn assertions_handle_success_messages_codes_and_exit() {
         17
     );
 }
+
+#[test]
+fn find_ancestor_walks_creator_chain_through_notifications() {
+    let h = Host::new(false);
+    let name = |s: &str| Name::from_str(s).unwrap();
+    let (victim, attacker, token) = (name("victim"), name("attacker"), name("token"));
+    let withdraw = Action::new(victim, name("withdraw"), Vec::new(), Vec::new());
+    let transfer = Action::new(token, name("transfer"), Vec::new(), Vec::new());
+    let mut trx = h.trx.clone();
+    // 1: pulse::test (top level)
+    // 2: victim::withdraw         inline from 1
+    // 3: token::transfer          inline from 2
+    // 4: attacker <- transfer     notification of 3
+    // 5: victim::withdraw         inline from 4 (the re-entry)
+    assert_eq!(
+        trx.schedule_action(withdraw.clone(), &victim, false, 1, 1)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        trx.schedule_action(transfer, &token, false, 2, 2).unwrap(),
+        3
+    );
+    assert_eq!(
+        trx.schedule_action_from_ordinal(3, &attacker, false, 3, 3)
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        trx.schedule_action(withdraw, &victim, false, 4, 4).unwrap(),
+        5
+    );
+
+    let (v, w) = (victim.as_u64(), name("withdraw").as_u64());
+    assert_eq!(trx.find_ancestor(5, v, w).unwrap(), (true, 3));
+    assert_eq!(trx.find_ancestor(5, v, 0).unwrap(), (true, 3));
+    assert_eq!(
+        trx.find_ancestor(5, attacker.as_u64(), name("transfer").as_u64())
+            .unwrap(),
+        (true, 1),
+        "a notification trace matches on the notified receiver"
+    );
+    assert_eq!(
+        trx.find_ancestor(5, v, name("deposit").as_u64()).unwrap(),
+        (false, 4),
+        "an action-name mismatch walks to the root"
+    );
+    assert_eq!(
+        trx.find_ancestor(5, PULSE_NAME.as_u64(), name("test").as_u64())
+            .unwrap(),
+        (true, 4)
+    );
+    assert_eq!(
+        trx.find_ancestor(2, v, w).unwrap(),
+        (false, 1),
+        "the current action is not its own ancestor"
+    );
+    assert_eq!(trx.find_ancestor(1, v, 0).unwrap(), (false, 0));
+    assert!(trx.find_ancestor(0, v, 0).is_err());
+    assert!(trx.find_ancestor(99, v, 0).is_err());
+
+    // A corrupt forward creator link must fail instead of looping.
+    let bogus = Action::new(victim, name("bogus"), Vec::new(), Vec::new());
+    assert_eq!(trx.schedule_action(bogus, &victim, false, 7, 7).unwrap(), 6);
+    assert!(trx.find_ancestor(6, v, 0).is_err());
+}
+
+#[test]
+fn has_ancestor_charges_base_and_rejects_context_free_actions() {
+    let mut h = Host::new(false);
+    h.budget(1_000);
+    assert_eq!(has_ancestor(h.env(), PULSE_NAME.as_u64(), 0).unwrap(), 0);
+    assert_eq!(h.remaining(), 1_000 - cost::BASE);
+    h.budget(cost::BASE - 1);
+    assert!(has_ancestor(h.env(), PULSE_NAME.as_u64(), 0).is_err());
+
+    let mut cf = Host::new(true);
+    assert_error(
+        has_ancestor(cf.env(), PULSE_NAME.as_u64(), 0),
+        "context-free action",
+    );
+}
