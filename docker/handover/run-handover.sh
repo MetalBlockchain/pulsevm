@@ -129,6 +129,7 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot") || fail "checkpoint import failed"
+    echo "$export_dir/migration.snapshot" >"$WORK_DIR/checkpoint"
     echo "handover: checkpoint ready: $export_dir/migration.snapshot"
     cmd_boot "$export_dir/migration.snapshot"
 }
@@ -138,9 +139,13 @@ cmd_boot() {
     H="$(cat "$WORK_DIR/H")"
     H_ID="$(cat "$WORK_DIR/H_ID")"
     echo "handover: booting the five-node network from the H=$H checkpoint (background)..."
+    # Dedicated plugin dir: the repo build/plugins file may be mapped by
+    # another live network on a shared host (ETXTBSY on overwrite).
+    mkdir -p "$WORK_DIR/plugins"
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
+        PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins" \
         PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node" \
         PULSEVM_VERIFY_FIVE_NODE=false \
         scripts/run-local.sh >"$WORK_DIR/five-node.log" 2>&1 &
@@ -180,8 +185,10 @@ case "${1:-}" in
     # Resume a halted rehearsal from the checkpoint phase (H, H_ID and
     # snapshot files already in HANDOVER_WORK_DIR).
     resume-checkpoint) cmd_checkpoint ;;
+    # Resume a checkpointed rehearsal from the five-node boot.
+    resume-boot) cmd_boot "$(cat "${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/checkpoint")" ;;
     stop) cmd_stop ;;
-    *) echo "usage: run-handover.sh start|resume-checkpoint|stop" >&2
+    *) echo "usage: run-handover.sh start|resume-checkpoint|resume-boot|stop" >&2
        echo "env: TERMINAL_HEIGHT (default 1200, ~10 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
        echo "     LEAP_HTTP_PORT, SHADOW_RPC_PORT" >&2
