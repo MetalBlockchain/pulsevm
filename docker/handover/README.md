@@ -19,6 +19,7 @@ docker/handover/run-handover.sh stop
 | Leap produces, shadow follows | Live XPR replay (today's EC2 follower) |
 | `stop xpr-producer` at H | The producer halt commitment (all BPs stop) |
 | Snapshot, export, checkpoint | Canonical export plus independent validation |
+| Source-block anchor | Id-exact empty block H attached to the manifest so new nodes adopt H as tip |
 | Five-node boot from checkpoint | A-Chain validator boot from identical state |
 | Parent-linkage plus liveness asserts | Continuity gate: H+1 builds on H |
 

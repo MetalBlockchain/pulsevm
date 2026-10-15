@@ -86,6 +86,12 @@ cmd_halt() {
         -d "{\"block_num_or_id\":\"$H_ID\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["block_num"])')"
     echo "$H" >"$WORK_DIR/H"
     echo "$H_ID" >"$WORK_DIR/H_ID"
+    # The migration anchor needs the id-exact source block. Fetch it while
+    # the producer still serves reads; it must be empty (no transactions,
+    # no schedule change) for the attach tool.
+    curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+        -d "{\"block_num_or_id\":\"$H\"}" >"$WORK_DIR/block-H.json" || fail "get_block H=$H failed"
     mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
     # nodeos reports container paths: absolute names start at its /data dir,
     # which is the shared leap-data volume on the host.
@@ -131,6 +137,15 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot") || fail "checkpoint import failed"
+    # Anchor the id-exact source block so new nodes adopt H as their tip
+    # instead of failing on an empty block log.
+    (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
+        || fail "attach tool build failed"
+    manifest="$export_dir/migration.snapshot.manifest.json"
+    "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
+        "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+        || fail "source block attach failed (H must be an empty block)"
+    mv "$manifest.attached" "$manifest"
     echo "$export_dir/migration.snapshot" >"$WORK_DIR/checkpoint"
     echo "handover: checkpoint ready: $export_dir/migration.snapshot"
     cmd_boot "$export_dir/migration.snapshot"
