@@ -11494,6 +11494,108 @@ mod tests {
         Ok(())
     }
 
+    /// Genesis identical to [`generate_genesis`] except for the transaction
+    /// CPU cap and floor, so tests can model row budgets far below the
+    /// point-denominated metering (as seen with microsecond-denominated
+    /// imported mainnet state).
+    fn generate_genesis_with_tx_cpu_limits(
+        private_key: &PrivateKey,
+        max_transaction_cpu_usage: u64,
+        min_transaction_cpu_usage: u64,
+    ) -> Vec<u8> {
+        let mut genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(private_key))
+                .expect("test genesis must parse");
+        genesis["initial_configuration"]["max_transaction_cpu_usage"] =
+            serde_json::json!(max_transaction_cpu_usage);
+        genesis["initial_configuration"]["min_transaction_cpu_usage"] =
+            serde_json::json!(min_transaction_cpu_usage);
+        genesis.to_string().into_bytes()
+    }
+
+    fn init_controller_with_tx_cpu_limits(
+        max_transaction_cpu_usage: u64,
+        min_transaction_cpu_usage: u64,
+    ) -> Result<(Controller, PrivateKey, TempDir), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes =
+            generate_genesis_with_tx_cpu_limits(&private_key, max_transaction_cpu_usage, min_transaction_cpu_usage);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        Ok((controller, private_key, temp_path))
+    }
+
+    #[tokio::test]
+    async fn simulate_transaction_reconciles_row_scale_budgets() -> Result<(), ChainError> {
+        // A plain account creation measured in points with a negligible
+        // floor, so the row cap below is provably smaller than its true cost
+        // no matter how pricing evolves.
+        let (mut standard, private_key, _temp) = init_controller_with_tx_cpu_limits(1_000_000_000, 1)?;
+        let standard_ts = standard.last_accepted_block().timestamp().clone();
+        let status = BlockStatus::Building;
+        let chain_id = standard.chain_id().clone();
+        let packed = create_account(&private_key, Name::from_str("scaled")?, chain_id)?;
+        let measured = standard
+            .simulate_transaction(&packed, &standard_ts, &status, u64::MAX)?
+            .billed_cpu_time_us as u64;
+        assert!(measured > 0, "execution must report a cost");
+        // Rows cap the same transfer below its measured cost: the
+        // row-derived path must reject it while the scaled simulation
+        // admits it. This is the imported-mainnet unit gap in miniature
+        // (there, microsecond rows meet point metering at ~38000x).
+        let row_cap = measured / 2;
+        assert!(row_cap > 0, "fixture must cost more than 1 point");
+        let (mut controller, private_key, _temp) = init_controller_with_tx_cpu_limits(row_cap, 1)?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let packed = create_account(
+            &private_key,
+            Name::from_str("scaled")?,
+            controller.chain_id().clone(),
+        )?;
+        match controller.push_transaction(&packed, &pending_block_timestamp, &status) {
+            Ok(_) => panic!("row-scale budget must reject the transfer"),
+            Err(_) => {}
+        }
+        let scaled_budget = row_cap * crate::config::POINTS_PER_US;
+        let result = controller.simulate_transaction(
+            &packed,
+            &pending_block_timestamp,
+            &status,
+            scaled_budget,
+        )?;
+        assert_eq!(
+            result.trace.receipt.status,
+            crate::transaction::TransactionStatus::Executed
+        );
+        assert_eq!(result.billed_cpu_time_us as u64, measured);
+        assert!(
+            (result.billed_cpu_time_us as u64) < scaled_budget,
+            "measured cost must fit the scaled budget"
+        );
+        assert!(
+            !controller
+                .database()
+                .is_known_unexpired_transaction(&packed.id().0.0)?
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn mempool_admission_refuses_a_payer_that_cannot_afford_the_transaction()
     -> Result<(), ChainError> {
