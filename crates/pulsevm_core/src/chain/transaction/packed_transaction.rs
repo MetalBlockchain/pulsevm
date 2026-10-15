@@ -128,9 +128,7 @@ impl PackedTransaction {
         let signatures = params
             .get("signatures")
             .and_then(|value| value.as_array())
-            .ok_or_else(|| {
-                ChainError::TransactionError("missing signatures array".to_string())
-            })?;
+            .ok_or_else(|| ChainError::TransactionError("missing signatures array".to_string()))?;
         if signatures.is_empty() || signatures.len() > MAX_PUSH_SIGNATURES {
             return Err(ChainError::TransactionError(format!(
                 "signature count out of bounds: {}",

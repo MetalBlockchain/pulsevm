@@ -11503,9 +11503,8 @@ mod tests {
         max_transaction_cpu_usage: u64,
         min_transaction_cpu_usage: u64,
     ) -> Vec<u8> {
-        let mut genesis: serde_json::Value =
-            serde_json::from_slice(&generate_genesis(private_key))
-                .expect("test genesis must parse");
+        let mut genesis: serde_json::Value = serde_json::from_slice(&generate_genesis(private_key))
+            .expect("test genesis must parse");
         genesis["initial_configuration"]["max_transaction_cpu_usage"] =
             serde_json::json!(max_transaction_cpu_usage);
         genesis["initial_configuration"]["min_transaction_cpu_usage"] =
@@ -11523,8 +11522,11 @@ mod tests {
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
-        let genesis_bytes =
-            generate_genesis_with_tx_cpu_limits(&private_key, max_transaction_cpu_usage, min_transaction_cpu_usage);
+        let genesis_bytes = generate_genesis_with_tx_cpu_limits(
+            &private_key,
+            max_transaction_cpu_usage,
+            min_transaction_cpu_usage,
+        );
         let temp_path = get_temp_dir();
         let config_bytes = json!({
             "producer_name": "pulse",
@@ -11546,7 +11548,8 @@ mod tests {
         // A plain account creation measured in points with a negligible
         // floor, so the row cap below is provably smaller than its true cost
         // no matter how pricing evolves.
-        let (mut standard, private_key, _temp) = init_controller_with_tx_cpu_limits(1_000_000_000, 1)?;
+        let (mut standard, private_key, _temp) =
+            init_controller_with_tx_cpu_limits(1_000_000_000, 1)?;
         let standard_ts = standard.last_accepted_block().timestamp().clone();
         let status = BlockStatus::Building;
         let chain_id = standard.chain_id().clone();
