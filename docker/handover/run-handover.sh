@@ -21,6 +21,8 @@ readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
 
 # Set early so every compose invocation (including stop) interpolates.
 export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
+# Host Rust toolchain for the checkpoint importer and the replay build.
+export PATH="$HOME/.cargo/bin:$PATH"
 
 fail() { echo "handover: $*" >&2; exit 1; }
 
@@ -50,7 +52,6 @@ cmd_start() {
     [[ ! -e "$WORK_DIR" ]] || fail "work directory exists: $WORK_DIR (run stop first)"
     mkdir -p "$WORK_DIR"
     echo "handover: building the replay binary on the host..."
-    export PATH="$HOME/.cargo/bin:$PATH"
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
     [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN (run-handover.sh builds this first)"
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-producer)
