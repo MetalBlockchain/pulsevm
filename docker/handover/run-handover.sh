@@ -39,7 +39,9 @@ shadow_head() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])'
 }
 chain_rpc_url() {
-    "$NETWORK_RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT" 2>/dev/null \
+    # Bound the call: a dead endpoint otherwise stalls each poll iteration
+    # for the runner client timeout.
+    timeout 15 "$NETWORK_RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT" 2>/dev/null \
         | sed $'s/\033\[[0-9;]*m//g' \
         | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+' | head -1
 }
@@ -150,7 +152,7 @@ cmd_boot() {
     # Node ports are reassigned when taken, with dynamic allocation as the
     # backstop: the rehearsal shares the host with other live networks.
     export RUNNER_REASSIGN_PORTS_IF_USED=true
-    export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports"
+    export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports --request-timeout 10m"
     # The fixture checkpoint's system account is eosio, not pulse: the new
     # network must adopt the fixture identities, with the fixture dev key
     # (disposable rehearsal only, never used on mainnet).
