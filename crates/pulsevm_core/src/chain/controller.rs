@@ -5008,7 +5008,20 @@ impl Controller {
         // `db.commit`, so removed rows are still resolvable.
         let full_snapshot = log.range().is_none();
         let chain_id = self.genesis_chain_id.0.0;
-        let deltas = self.db.pack_deltas(full_snapshot, &chain_id);
+        // Chains carrying Antelope state (an imported XPR checkpoint, XPR history
+        // replay) use the Leap 5 wire shape so SHiP consumers see every table and the
+        // full global_property row; PulseVM-native chains keep their frozen shape.
+        // Same selector as `antelope_genesis` in `initialize`.
+        let shape = if self
+            .node_config
+            .as_ref()
+            .is_some_and(|c| !c.native_system_contract)
+        {
+            pulsevm_database::ShipRowShape::Leap5
+        } else {
+            pulsevm_database::ShipRowShape::PulseNative
+        };
+        let deltas = self.db.pack_deltas(full_snapshot, &chain_id, shape);
         log.append(block_id.clone(), &deltas).map_err(|e| {
             ChainError::InternalError(format!("failed to append to chain state log: {}", e))
         })?;

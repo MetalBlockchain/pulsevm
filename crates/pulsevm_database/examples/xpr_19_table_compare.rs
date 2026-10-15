@@ -449,7 +449,11 @@ fn main() -> ExitCode {
         eprintln!("cannot restore Arena checkpoint: {error}");
         return ExitCode::from(1);
     }
-    let arena_rows = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
+    let arena_rows = match parse_framed_tables(&database.pack_deltas(
+        true,
+        &chain_id,
+        pulsevm_database::ShipRowShape::Leap5,
+    )) {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("cannot parse Arena SHiP snapshot: {error}");

@@ -26,6 +26,8 @@ use std::{
 
 mod history;
 
+pub use history::ShipRowShape;
+
 use pulsevm_arena::{
     ArenaObject,
     BlobRef,
@@ -1705,9 +1707,14 @@ impl ChainDatabase {
     /// session commits, so removed rows (and their held blobs) are still
     /// resolvable. `chain_id` supplies the one `global_property` field the arena
     /// does not store.
-    pub fn pack_deltas(&self, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
+    pub fn pack_deltas(
+        &self,
+        full_snapshot: bool,
+        chain_id: &[u8; 32],
+        shape: ShipRowShape,
+    ) -> Vec<u8> {
         let db = self.read();
-        history::pack_deltas(&db, full_snapshot, chain_id)
+        history::pack_deltas(&db, full_snapshot, chain_id, shape)
     }
 
     pub fn set_revision(&self, revision: i64) -> Result<(), DbError> {
