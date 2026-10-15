@@ -120,7 +120,7 @@ cmd_checkpoint() {
     (cd "$REPO_ROOT" && \
         XPR_NODEOS_IMAGE="${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}" \
         tools/xpr-chainbase-export/export.sh \
-        --nodeos tools/xpr-chainbase-export/localnet/nodeos-docker \
+        --nodeos "$SCRIPT_DIR/nodeos-docker-handover" \
         --snapshot "$(cat "$WORK_DIR/snapshot")" \
         --work-dir "$export_dir" \
         --source-revision leap-5.0.3) || fail "export failed"
