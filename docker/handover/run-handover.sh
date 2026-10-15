@@ -44,7 +44,12 @@ rpc_call() {
 cmd_start() {
     [[ ! -e "$WORK_DIR" ]] || fail "work directory exists: $WORK_DIR (run stop first)"
     mkdir -p "$WORK_DIR"
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --build --detach)
+    echo "handover: building the replay binary on the host..."
+    export PATH="$HOME/.cargo/bin:$PATH"
+    (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
+    export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
+    [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN"
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach)
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
     leap_info >/dev/null || fail "Leap producer did not become ready"

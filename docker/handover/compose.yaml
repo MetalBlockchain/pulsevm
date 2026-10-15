@@ -44,10 +44,9 @@ services:
       retries: 60
 
   shadow:
-    build:
-      context: ../..
-      dockerfile: docker/handover/Dockerfile.shadow
-    platform: linux/amd64
+    # Runs the host-built replay binary (built by run-handover.sh before
+    # compose starts) in a slim runtime matching the host glibc.
+    image: ubuntu:24.04
     depends_on:
       xpr-producer:
         condition: service_healthy
@@ -57,6 +56,10 @@ services:
       XPR_REPLAY_GENESIS_FILE: /config/genesis.json
     volumes:
       - type: bind
+        source: ${PULSEVM_REPLAY_BIN:?run-handover.sh builds this first}
+        target: /usr/local/bin/xpr_blocklog_replay
+        read_only: true
+      - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
         target: /config/genesis.json
         read_only: true
@@ -64,6 +67,7 @@ services:
       - shadow-arena:/arena
     ports:
       - "127.0.0.1:${SHADOW_RPC_PORT:-9660}:9660"
+    entrypoint: ["/usr/local/bin/xpr_blocklog_replay", "/leap-data/blocks", "/arena"]
 
 volumes:
   leap-data:
