@@ -47,3 +47,11 @@ needs block production inside the replay binary and is not modeled here.
 Rehearsal-only support: `XPR_REPLAY_GENESIS_FILE` lets the replay binary
 follow a non-mainnet fixture chain. It is default-off; without it every
 mainnet pin behaves exactly as before.
+
+Producer schedule: a migration restore starts a new schedule seeded from the
+migration genesis initial key (the source schedule is not carried over), so
+the boot wires `PULSEVM_GENESIS_INITIAL_KEY` from the fixture genesis the
+Leap producer uses. With a foreign key every build fails closed at the
+signing gate (`refusing to produce`, now logged by the VM) and the new
+network never passes H. The real migration ceremony must write the actual
+producers' keys into the migration genesis the same way.

@@ -10387,6 +10387,192 @@ mod tests {
         Ok(())
     }
 
+    // A migration restore starts a new producer schedule seeded from the
+    // migration genesis initial key (the source schedule is deliberately not
+    // carried over). The producing node must hold that key: with a foreign
+    // key every build fails closed at the signing gate instead of emitting
+    // an unverifiable block. These tests pin both sides with a
+    // self-contained checkpoint.
+    async fn migration_checkpoint_with_schedule_key(
+        temp: &TempDir,
+        schedule_key: &PrivateKey,
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64), ChainError> {
+        // Build a real source chain so the checkpoint carries complete state
+        // (accounts, permissions, resources, chain config): fresh genesis,
+        // one accepted block, then a portable snapshot of that state.
+        let genesis_bytes = generate_genesis(schedule_key);
+        let source_chain_id =
+            Id::new(pulsevm_database::GenesisState::from_bytes(&genesis_bytes)?.compute_chain_id());
+        let source_config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let source_path = temp.path().join("source");
+        let mut source = Controller::new();
+        source.initialize(
+            &source_chain_id,
+            &source_config,
+            &genesis_bytes,
+            source_path.to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut source_mempool = Mempool::new();
+        source_mempool.add_transaction(create_account_with_expiration(
+            schedule_key,
+            Name::from_str("alice")?,
+            source_chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = source.build_block(&mut source_mempool).await?;
+        source.accept_block(&first.id()?, &mut source_mempool)?;
+        let source_block = source.last_accepted_block().clone();
+        let source_block_id = source_block.id()?;
+        let source_revision = source.database().revision();
+        let imported_transactions = source.database().arena_transaction_count() as u64;
+        let checkpoint = source.database().snapshot_bytes()?;
+        source.shutdown()?;
+        drop(source);
+        let checkpoint_path = temp.path().join("migration.snapshot");
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("migration.manifest.json");
+        let mut manifest = MigrationManifest::new(
+            b"controller migration schedule test source",
+            source_block_id.0.0,
+            &checkpoint,
+            source_revision,
+            pulsevm_database::ImportSummary {
+                input_transactions: imported_transactions,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&genesis_bytes).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let genesis_state = pulsevm_database::GenesisState::from_bytes(&migration_genesis)?;
+        let chain_id = Id::new(genesis_state.compute_chain_id());
+        Ok((
+            checkpoint_path.to_str().unwrap().to_string(),
+            manifest_path.to_str().unwrap().to_string(),
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block.block_num(),
+            source_revision,
+        ))
+    }
+
+    #[tokio::test]
+    async fn migration_restore_builds_with_matching_schedule_key() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        // A realistic head-relative expiry: TimePointSec::maximum() exceeds
+        // the deployment max_transaction_lifetime and is dropped at build.
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.block_num(), source_block_num + 1);
+        assert_eq!(*block.previous_id(), source_block_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_to_produce_with_foreign_schedule_key()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let foreign_key = PrivateKey::random();
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            _source_block_id,
+            _source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": foreign_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let error = controller.build_block(&mut mempool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "a node without the schedule key must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn producer_schedule_reconstructed_from_block_log() -> Result<(), ChainError> {
         // A schedule change rides in the signed block header, so it is recovered

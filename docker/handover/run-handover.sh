@@ -174,6 +174,12 @@ cmd_boot() {
     export PULSEVM_SYSTEM_ACCOUNT="eosio"
     export PULSEVM_PRODUCER_NAME="eosio"
     export PULSEVM_PRODUCER_KEY="5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3"
+    # The migration restore starts a new producer schedule seeded from the
+    # migration genesis initial key, so the new chain must be seeded with a
+    # key the nodes hold. Derive it from the same fixture genesis the Leap
+    # producer boots from: with a foreign key every build fails closed at the
+    # signing gate and the new network never passes H.
+    export PULSEVM_GENESIS_INITIAL_KEY="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
