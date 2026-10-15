@@ -16,11 +16,12 @@ name: pulsevm-handover
 
 services:
   xpr-producer:
-    build:
-      context: ../../tools/xpr-chainbase-export/localnet
+    # Pinned Leap 5.0.3 image (v5.0.3-d133c64), prebuilt on the host. To
+    # rebuild from source instead, replace `image` with a build of
+    # ../../tools/xpr-chainbase-export/localnet.
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
     platform: linux/amd64
     command:
-      - nodeos
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
