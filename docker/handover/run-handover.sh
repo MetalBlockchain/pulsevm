@@ -117,7 +117,9 @@ cmd_checkpoint() {
     # non-existing work dir.
     export_dir="$(mktemp -du /tmp/pulsevm-handover-export.XXXXXX)"
     echo "$export_dir" >"$WORK_DIR/export-dir"
-    (cd "$REPO_ROOT" && tools/xpr-chainbase-export/export.sh \
+    (cd "$REPO_ROOT" && \
+        XPR_NODEOS_IMAGE="${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}" \
+        tools/xpr-chainbase-export/export.sh \
         --nodeos tools/xpr-chainbase-export/localnet/nodeos-docker \
         --snapshot "$(cat "$WORK_DIR/snapshot")" \
         --work-dir "$export_dir" \
