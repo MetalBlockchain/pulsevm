@@ -21,9 +21,11 @@ readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
 
 fail() { echo "handover: $*" >&2; exit 1; }
 
+# Leap validates the HTTP Host header against its listening port, so
+# requests arriving via a remapped host port must forge the inside name.
 leap_info() {
     curl --fail --silent --max-time 10 -X POST "$LEAP_API/v1/chain/get_info" \
-        -H 'Content-Type: application/json' -d '{}'
+        -H 'Content-Type: application/json' -H 'Host: 127.0.0.1:8888' -d '{}'
 }
 shadow_head() {
     curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
@@ -49,10 +51,11 @@ cmd_start() {
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
     export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
     [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN"
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach)
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-producer)
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
     leap_info >/dev/null || fail "Leap producer did not become ready"
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
     echo "handover: shadowing until height $TERMINAL_HEIGHT..."
     while true; do
         head="$(shadow_head 2>/dev/null || echo 0)"
@@ -73,7 +76,7 @@ cmd_halt() {
     echo "$H_ID" >"$WORK_DIR/H_ID"
     echo "handover: H=$H id=$H_ID; snapshotting then halting the producer (models the BP halt commitment)..."
     snap="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
-        -H 'Content-Type: application/json' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
+        -H 'Content-Type: application/json' -H 'Host: 127.0.0.1:8888' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
     [[ -n "$snap" ]] || fail "snapshot request failed"
     mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
     echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"

@@ -37,19 +37,16 @@ services:
       - leap-data:/data
     ports:
       - "127.0.0.1:${LEAP_HTTP_PORT:-8888}:8888"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8888/v1/chain/get_info"]
-      interval: 5s
-      timeout: 5s
-      retries: 60
+    # No healthcheck: the Leap image ships no HTTP client, and the
+    # orchestrator polls get_info (with a matching Host header) and
+    # starts the shadow only once the producer answers.
 
   shadow:
     # Runs the host-built replay binary (built by run-handover.sh before
     # compose starts) in a slim runtime matching the host glibc.
     image: ubuntu:24.04
     depends_on:
-      xpr-producer:
-        condition: service_healthy
+      - xpr-producer
     environment:
       XPR_REPLAY_FOLLOW: "1"
       XPR_REPLAY_RPC_BIND: "0.0.0.0:9660"
