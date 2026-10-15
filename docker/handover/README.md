@@ -28,10 +28,11 @@ docker/handover/run-handover.sh stop
 ## Prerequisites
 
 Host Rust with LLVM 22 (for the checkpoint importer), Docker with the
-`pulsevm-handover` compose project, an XPR core checkout for export
-preflight (`XPR_CORE_DIR`, default `/src/antelope-leap`), and MetalGo plus
-the network runner for the five-node boot (`METALGO_EXEC_PATH`, same
-defaults as `scripts/run-local.sh`).
+`pulsevm-handover` compose project, and MetalGo plus the network runner
+for the five-node boot (`METALGO_EXEC_PATH`, same defaults as
+`scripts/run-local.sh`). No XPR core checkout is needed: preflight and the
+deferred sidecar are mainnet provenance guards, and the fixture chain has
+no deferred activity, so the rehearsal skips them by design.
 
 ## Known delta vs the real migration
 

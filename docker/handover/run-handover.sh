@@ -78,7 +78,11 @@ cmd_halt() {
 }
 
 cmd_checkpoint() {
-    [[ -d "$XPR_CORE_DIR" ]] || fail "missing XPR core checkout for export preflight: $XPR_CORE_DIR"
+    # No --xpr-core: preflight and the deferred sidecar are mainnet
+    # provenance guards, and the fixture chain has no deferred activity.
+    # The sidecar-gated validate-mainnet-export.sh is therefore skipped
+    # here; import-time manifest checks still apply. Mainnet exports must
+    # keep the full validation path.
     # The export work dir must sit below /tmp for the nodeos-docker adapter.
     export_dir="$(mktemp -d /tmp/pulsevm-handover-export.XXXXXX)"
     echo "$export_dir" >"$WORK_DIR/export-dir"
@@ -91,10 +95,6 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot") || fail "checkpoint import failed"
-    (cd "$REPO_ROOT" && tools/xpr-chainbase-export/validate-mainnet-export.sh \
-        --export-dir "$export_dir" \
-        --checkpoint "$export_dir/migration.snapshot" \
-        --arena-dir "$export_dir/arena") || fail "export validation failed"
     echo "handover: checkpoint ready: $export_dir/migration.snapshot"
     cmd_boot "$export_dir/migration.snapshot"
 }
