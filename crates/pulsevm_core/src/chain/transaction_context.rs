@@ -1666,6 +1666,15 @@ impl TransactionContext {
         ))
     }
 
+    /// Override the objective CPU budget after initialization. Advisory
+    /// simulation only: replay and production always use the limit derived
+    /// from chain state. The override replaces every seeded value, including
+    /// the block, config, header, and account clips.
+    pub fn set_cpu_limit(&self, limit: i64) -> Result<(), ChainError> {
+        self.inner.write()?.cpu_limit = limit;
+        Ok(())
+    }
+
     /// Whether this transaction is replaying a producer-recorded receipt.
     /// Migration-only native accelerators use this to remain unreachable from
     /// normal mempool execution, where local WASM metering is authoritative.

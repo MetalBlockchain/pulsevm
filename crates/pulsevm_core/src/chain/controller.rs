@@ -2198,6 +2198,7 @@ impl Controller {
                 &block_status,
                 TransactionResourceMode::Measure,
                 AuthorizationCheck::Required,
+                None,
             );
 
             match transaction_result {
@@ -3494,6 +3495,7 @@ impl Controller {
                             transaction_resource_mode,
                             AuthorizationCheck::AlreadyValidated,
                             true,
+                            None,
                         )?
                     }
                     crate::chain::transaction::TransactionStatus::SoftFail => {
@@ -3574,6 +3576,7 @@ impl Controller {
                     block_status,
                     transaction_resource_mode,
                     authorization_check,
+                    None,
                 )?;
                 (result, receipt.clone())
             };
@@ -3808,9 +3811,51 @@ impl Controller {
             block_status,
             TransactionResourceMode::Measure,
             AuthorizationCheck::Required,
+            None,
         );
         // Mempool admission is advisory: revert the arena session on both the
         // success and error paths.
+        db.arena_undo();
+        result
+    }
+
+    /// Advisory execution with an explicit CPU budget in metering points.
+    /// Same preamble and discard semantics as [`Self::push_transaction`],
+    /// but the metering budget comes from the caller instead of chain-state
+    /// rows. The caller converts the payer quota with
+    /// `config::POINTS_PER_US` when those rows use a different unit than
+    /// local metering (e.g. XPR mainnet microseconds vs points); on a native
+    /// chain the rows already are points and no override is needed.
+    pub fn simulate_transaction(
+        &mut self,
+        transaction: &PackedTransaction,
+        pending_block_timestamp: &BlockTimestamp,
+        block_status: &BlockStatus,
+        cpu_budget_points: u64,
+    ) -> Result<TransactionResult, ChainError> {
+        let parent_id = self.preferred_id;
+        let mut replay_mempool = Mempool::new();
+        self.replay_accepted_state_to(parent_id, block_status, &mut replay_mempool)?;
+        let block_height = BlockHeader::num_from_id(&parent_id) + 1;
+        let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        let schedule_state = self.schedule_state_for_parent(&parent_id)?;
+        self.block_active_schedule = schedule_state.active;
+        self.block_pending_schedule = schedule_state.pending;
+        let db = self.db.clone();
+        db.arena_start_undo_session();
+        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+            db.arena_undo();
+            return Err(error);
+        }
+        let result = self.execute_transaction_with_protocol(
+            transaction,
+            protocol_context,
+            pending_block_timestamp,
+            block_status,
+            TransactionResourceMode::Measure,
+            AuthorizationCheck::Required,
+            Some(cpu_budget_points),
+        );
         db.arena_undo();
         result
     }
@@ -3832,6 +3877,7 @@ impl Controller {
             block_status,
             TransactionResourceMode::Measure,
             AuthorizationCheck::Required,
+            None,
         )
     }
 
@@ -3993,9 +4039,13 @@ impl Controller {
             resource_mode,
             authorization_check,
             is_deferred,
+            None,
         )
     }
 
+    // Nine context arguments plus the advisory budget override; grouping them
+    // would churn every block-production and replay call site for no benefit.
+    #[allow(clippy::too_many_arguments)]
     fn execute_transaction_with_protocol(
         &mut self,
         packed_transaction: &PackedTransaction,
@@ -4004,6 +4054,7 @@ impl Controller {
         block_status: &BlockStatus,
         resource_mode: TransactionResourceMode,
         authorization_check: AuthorizationCheck,
+        explicit_cpu_budget: Option<u64>,
     ) -> Result<TransactionResult, ChainError> {
         self.execute_transaction_with_protocol_authorization(
             packed_transaction,
@@ -4013,9 +4064,12 @@ impl Controller {
             resource_mode,
             authorization_check,
             false,
+            explicit_cpu_budget,
         )
     }
 
+    // Same arity note as `execute_transaction_with_protocol` above.
+    #[allow(clippy::too_many_arguments)]
     fn execute_transaction_with_protocol_authorization(
         &mut self,
         packed_transaction: &PackedTransaction,
@@ -4025,6 +4079,7 @@ impl Controller {
         resource_mode: TransactionResourceMode,
         authorization_check: AuthorizationCheck,
         is_deferred: bool,
+        explicit_cpu_budget: Option<u64>,
     ) -> Result<TransactionResult, ChainError> {
         let trx = packed_transaction.get_transaction();
         let track_subjective_failure = resource_mode == TransactionResourceMode::Measure
@@ -4124,6 +4179,13 @@ impl Controller {
                     packed_transaction.get_prunable_size()?,
                     &trx,
                 )?;
+            }
+            // Advisory simulation runs against state whose CPU rows may use a
+            // different unit than local metering (e.g. XPR mainnet
+            // microseconds vs points); the caller then supplies the budget in
+            // points explicitly instead of deriving it from those rows.
+            if let Some(budget) = explicit_cpu_budget {
+                trx_context.set_cpu_limit(budget.min(i64::MAX as u64) as i64)?;
             }
             let executed_directly =
                 if matches!(resource_mode, TransactionResourceMode::ReplayReceipt { .. })
@@ -11448,6 +11510,182 @@ mod tests {
             .is_known_unexpired_transaction(&result.trace.id.0.0)?;
         assert!(!found);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_transaction_honors_the_explicit_cpu_budget() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let block_status = BlockStatus::Building;
+        let packed = create_account(&private_key, Name::from_str("budgeted")?, chain_id)?;
+        // A 1-point budget cannot cover even the cheapest execution.
+        let error = match controller.simulate_transaction(
+            &packed,
+            &pending_block_timestamp,
+            &block_status,
+            1,
+        ) {
+            Ok(_) => panic!("tiny budget must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        assert!(
+            message.contains("exhausted")
+                || message.contains("exceeded")
+                || message.contains("too high"),
+            "unexpected error: {message}"
+        );
+        // No trace of the failed run may persist.
+        assert!(
+            !controller
+                .database()
+                .is_known_unexpired_transaction(&packed.id().0.0)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simulate_transaction_executes_under_a_scaled_budget() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let block_status = BlockStatus::Building;
+        let packed = create_account(&private_key, Name::from_str("simulated")?, chain_id)?;
+        // Generous point budget: executes fully and reports the measured cost.
+        let first = controller.simulate_transaction(
+            &packed,
+            &pending_block_timestamp,
+            &block_status,
+            1_000_000_000,
+        )?;
+        assert_eq!(
+            first.trace.receipt.status,
+            crate::transaction::TransactionStatus::Executed
+        );
+        assert!(first.billed_cpu_time_us > 0);
+        // Repeat runs are deterministic.
+        let second = controller.simulate_transaction(
+            &packed,
+            &pending_block_timestamp,
+            &block_status,
+            1_000_000_000,
+        )?;
+        assert_eq!(first.billed_cpu_time_us, second.billed_cpu_time_us);
+        // Admission without an override behaves exactly as before.
+        let admitted =
+            controller.push_transaction(&packed, &pending_block_timestamp, &block_status)?;
+        assert_eq!(admitted.trace.receipt.status, first.trace.receipt.status);
+        // None of the three advisory runs may persist.
+        assert!(
+            !controller
+                .database()
+                .is_known_unexpired_transaction(&packed.id().0.0)?
+        );
+        Ok(())
+    }
+
+    /// Genesis identical to [`generate_genesis`] except for the transaction
+    /// CPU cap and floor, so tests can model row budgets far below the
+    /// point-denominated metering (as seen with microsecond-denominated
+    /// imported mainnet state).
+    fn generate_genesis_with_tx_cpu_limits(
+        private_key: &PrivateKey,
+        max_transaction_cpu_usage: u64,
+        min_transaction_cpu_usage: u64,
+    ) -> Vec<u8> {
+        let mut genesis: serde_json::Value = serde_json::from_slice(&generate_genesis(private_key))
+            .expect("test genesis must parse");
+        genesis["initial_configuration"]["max_transaction_cpu_usage"] =
+            serde_json::json!(max_transaction_cpu_usage);
+        genesis["initial_configuration"]["min_transaction_cpu_usage"] =
+            serde_json::json!(min_transaction_cpu_usage);
+        genesis.to_string().into_bytes()
+    }
+
+    fn init_controller_with_tx_cpu_limits(
+        max_transaction_cpu_usage: u64,
+        min_transaction_cpu_usage: u64,
+    ) -> Result<(Controller, PrivateKey, TempDir), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis_with_tx_cpu_limits(
+            &private_key,
+            max_transaction_cpu_usage,
+            min_transaction_cpu_usage,
+        );
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        Ok((controller, private_key, temp_path))
+    }
+
+    #[tokio::test]
+    async fn simulate_transaction_reconciles_row_scale_budgets() -> Result<(), ChainError> {
+        // A plain account creation measured in points with a negligible
+        // floor, so the row cap below is provably smaller than its true cost
+        // no matter how pricing evolves.
+        let (mut standard, private_key, _temp) =
+            init_controller_with_tx_cpu_limits(1_000_000_000, 1)?;
+        let standard_ts = standard.last_accepted_block().timestamp().clone();
+        let status = BlockStatus::Building;
+        let chain_id = standard.chain_id().clone();
+        let packed = create_account(&private_key, Name::from_str("scaled")?, chain_id)?;
+        let measured = standard
+            .simulate_transaction(&packed, &standard_ts, &status, u64::MAX)?
+            .billed_cpu_time_us as u64;
+        assert!(measured > 0, "execution must report a cost");
+        // Rows cap the same transfer below its measured cost: the
+        // row-derived path must reject it while the scaled simulation
+        // admits it. This is the imported-mainnet unit gap in miniature
+        // (there, microsecond rows meet point metering at ~38000x).
+        let row_cap = measured / 2;
+        assert!(row_cap > 0, "fixture must cost more than 1 point");
+        let (mut controller, private_key, _temp) = init_controller_with_tx_cpu_limits(row_cap, 1)?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let packed = create_account(
+            &private_key,
+            Name::from_str("scaled")?,
+            controller.chain_id().clone(),
+        )?;
+        match controller.push_transaction(&packed, &pending_block_timestamp, &status) {
+            Ok(_) => panic!("row-scale budget must reject the transfer"),
+            Err(_) => {}
+        }
+        let scaled_budget = row_cap * crate::config::POINTS_PER_US;
+        let result = controller.simulate_transaction(
+            &packed,
+            &pending_block_timestamp,
+            &status,
+            scaled_budget,
+        )?;
+        assert_eq!(
+            result.trace.receipt.status,
+            crate::transaction::TransactionStatus::Executed
+        );
+        assert_eq!(result.billed_cpu_time_us as u64, measured);
+        assert!(
+            (result.billed_cpu_time_us as u64) < scaled_budget,
+            "measured cost must fit the scaled budget"
+        );
+        assert!(
+            !controller
+                .database()
+                .is_known_unexpired_transaction(&packed.id().0.0)?
+        );
         Ok(())
     }
 
