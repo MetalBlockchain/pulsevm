@@ -142,6 +142,11 @@ cmd_boot() {
     # Dedicated plugin dir: the repo build/plugins file may be mapped by
     # another live network on a shared host (ETXTBSY on overwrite).
     mkdir -p "$WORK_DIR/plugins"
+    # Rehearsal runner ports avoid the host status server (:8080) and any
+    # other live network on this box.
+    export METAL_NETWORK_RUNNER_PORT=":18080"
+    export METAL_NETWORK_RUNNER_GATEWAY_PORT=":18081"
+    export METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:18080"
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
@@ -152,6 +157,7 @@ cmd_boot() {
         echo $! >"$WORK_DIR/five-node.pid")
     echo "handover: waiting for the new network to pass H..."
     rpc_url=""
+    new_head=0
     for _ in $(seq 1 60); do
         rpc_url="$(chain_rpc_url || true)"
         [[ -n "$rpc_url" ]] || { sleep 5; continue; }
