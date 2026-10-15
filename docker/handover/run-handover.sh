@@ -21,11 +21,11 @@ readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
 
 fail() { echo "handover: $*" >&2; exit 1; }
 
-# Leap validates the HTTP Host header against its listening port, so
-# requests arriving via a remapped host port must forge the inside name.
+# Leap validates the HTTP Host header against its listening address, so
+# requests arriving via a remapped host port must forge 0.0.0.0:8888.
 leap_info() {
     curl --fail --silent --max-time 10 -X POST "$LEAP_API/v1/chain/get_info" \
-        -H 'Content-Type: application/json' -H 'Host: 127.0.0.1:8888' -d '{}'
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}'
 }
 shadow_head() {
     curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
@@ -76,7 +76,7 @@ cmd_halt() {
     echo "$H_ID" >"$WORK_DIR/H_ID"
     echo "handover: H=$H id=$H_ID; snapshotting then halting the producer (models the BP halt commitment)..."
     snap="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
-        -H 'Content-Type: application/json' -H 'Host: 127.0.0.1:8888' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
     [[ -n "$snap" ]] || fail "snapshot request failed"
     mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
     echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
