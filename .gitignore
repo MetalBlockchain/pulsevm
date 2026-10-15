@@ -15,3 +15,4 @@ plugins/build/
 
 # Local Docker cluster settings may contain a custom producer key.
 .env.localnet
+.env

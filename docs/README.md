@@ -22,6 +22,8 @@ authoritative and the document is a bug.
 | [code-coverage.md](./code-coverage.md) | Coverage CI, Codecov checks and setup, report scope, and local reports | Current workflow |
 | [xpr-mainnet-follow.md](./xpr-mainnet-follow.md) | EC2 XPR mainnet P2P-to-PulseVM-to-Hyperion follow deployment and recovery checks | Operational runbook |
 | [docker-localnet.md](./docker-localnet.md) | Docker Compose local MetalGo cluster, Hyperion indexing, and Bloks explorer | Local development deployment |
+| [e2e-local-test-guide.md](./e2e-local-test-guide.md) | Metal Dollar contracts, signed mint/redeem flow, and frontend against local PulseVM | Local integration workflow |
+| [http-api-compatibility.md](./http-api-compatibility.md) | Antelope `/v1/chain/{method}` routes and browser CORS behavior | Current behavior |
 
 ---
 
