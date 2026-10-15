@@ -40,7 +40,10 @@ use anyhow::{
 };
 use jsonrpsee::{
     RpcModule,
-    server::ServerBuilder,
+    server::{
+        ServerBuilder,
+        ServerConfig,
+    },
     types::{
         ErrorObjectOwned,
         Params,
@@ -55,6 +58,7 @@ use pulsevm_core::{
         MigrationBlockAuthenticator,
         PreparedMigrationBlock,
     },
+    crypto::PrivateKey,
     id::Id,
     mempool::Mempool,
     name::Name,
@@ -88,6 +92,9 @@ const REPLAY_SEMANTICS_VERSION: u32 = 4;
 // is unsafe to resume; version 3 added chainbase's reserved permission id 0,
 // while earlier versions also predate secondary-index and deferred fixes.
 const REPLAY_SEMANTICS_FILE: &str = "xpr_replay_semantics_version";
+const MAX_PUSH_TRANSACTION_BYTES: usize = 1024 * 1024;
+const MAX_PUSH_TRANSACTION_SIGNATURES: usize = 100;
+const MAX_CHAIN_API_RESPONSE_BYTES: usize = 1024 * 1024;
 const ONLY_LINK_TO_EXISTING_PERMISSION_FEATURE_DIGEST: [u8; 32] = [
     0x1a, 0x99, 0xa5, 0x9d, 0x87, 0xe0, 0x6e, 0x09, 0xec, 0x5b, 0x02, 0x8a, 0x9c, 0xbb, 0x77, 0x49,
     0xb4, 0xa5, 0xad, 0x88, 0x19, 0x00, 0x43, 0x65, 0xd0, 0x2d, 0xc4, 0x37, 0x9a, 0x8b, 0x72, 0x41,
@@ -110,6 +117,26 @@ fn params_object(
         serde_json::Value::Object(object) => Ok(object),
         _ => Err(replay_rpc_error(400, "parameters must be a JSON object")),
     }
+}
+
+async fn read_bounded_json_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<serde_json::Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("chain API response exceeds {max_bytes} bytes");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            bail!("chain API response exceeds {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("decode chain API JSON response")
 }
 
 fn parameter_string(
@@ -492,15 +519,172 @@ async fn replay_get_producers(
     }))
 }
 
+#[derive(Clone)]
+struct MainnetTransactionRelay {
+    client: reqwest::Client,
+    endpoint: reqwest::Url,
+}
+
+impl MainnetTransactionRelay {
+    async fn from_env() -> Result<Option<Self>> {
+        let Some(configured) = env::var("XPR_REPLAY_TX_RPC_URL").ok() else {
+            return Ok(None);
+        };
+        let mut endpoint = reqwest::Url::parse(&configured)
+            .context("XPR_REPLAY_TX_RPC_URL must be an absolute HTTP(S) URL")?;
+        let local_http = endpoint.scheme() == "http"
+            && matches!(
+                endpoint.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            );
+        if (endpoint.scheme() != "https" && !local_http)
+            || endpoint.username() != ""
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || endpoint.path() != "/"
+        {
+            bail!(
+                "XPR_REPLAY_TX_RPC_URL must be a credential-free HTTPS origin (loopback HTTP is allowed for development)"
+            );
+        }
+        endpoint.set_path("/v1/chain/");
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let info_url = endpoint.join("get_info")?;
+        let response = client
+            .get(info_url)
+            .send()
+            .await
+            .context("check XPR transaction RPC chain id")?
+            .error_for_status()
+            .context("XPR transaction RPC get_info failed")?;
+        let response = read_bounded_json_response(response, MAX_CHAIN_API_RESPONSE_BYTES).await?;
+        if response.get("chain_id").and_then(serde_json::Value::as_str) != Some(XPR_CHAIN_ID) {
+            bail!("XPR_REPLAY_TX_RPC_URL returned a chain id other than XPR Mainnet");
+        }
+        eprintln!("Mainnet transaction relay configured for {}", endpoint);
+        Ok(Some(Self { client, endpoint }))
+    }
+
+    async fn push(&self, params: Params<'_>) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let params = validate_push_transaction_params(params_object(params)?)?;
+        let endpoint = self
+            .endpoint
+            .join("push_transaction")
+            .map_err(|_| replay_rpc_error(500, "invalid configured transaction endpoint"))?;
+        let response = self
+            .client
+            .post(endpoint)
+            .json(&serde_json::Value::Object(params))
+            .send()
+            .await
+            .map_err(|error| {
+                replay_rpc_error(502, format!("XPR transaction API unavailable: {error}"))
+            })?;
+        let status = response.status();
+        let payload = read_bounded_json_response(response, MAX_CHAIN_API_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                replay_rpc_error(
+                    502,
+                    format!("invalid XPR transaction API response: {error}"),
+                )
+            })?;
+        if !status.is_success() {
+            return Err(ErrorObjectOwned::owned(
+                502,
+                "XPR transaction API rejected the transaction",
+                Some(payload),
+            ));
+        }
+        Ok(payload)
+    }
+}
+
+fn validate_push_transaction_params(
+    params: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, ErrorObjectOwned> {
+    let signatures = params
+        .get("signatures")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| replay_rpc_error(400, "signatures must be an array"))?;
+    if signatures.is_empty() || signatures.len() > MAX_PUSH_TRANSACTION_SIGNATURES {
+        return Err(replay_rpc_error(
+            400,
+            "signature count is outside allowed bounds",
+        ));
+    }
+    if signatures.iter().any(|signature| {
+        signature
+            .as_str()
+            .is_none_or(|value| value.len() > 256 || !value.starts_with("SIG_"))
+    }) {
+        return Err(replay_rpc_error(
+            400,
+            "signatures must contain valid-sized signature strings",
+        ));
+    }
+    let compression = params
+        .get("compression")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| replay_rpc_error(400, "compression must be 0 (none) or 1 (zlib)"))?;
+    if compression > 1 {
+        return Err(replay_rpc_error(
+            400,
+            "compression must be 0 (none) or 1 (zlib)",
+        ));
+    }
+    for field in ["packed_trx", "packed_context_free_data"] {
+        if let Some(value) = params.get(field) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| replay_rpc_error(400, format!("{field} must be hex")))?;
+            if value.len() > MAX_PUSH_TRANSACTION_BYTES * 2
+                || value.len() % 2 != 0
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || (field == "packed_trx" && value.is_empty())
+            {
+                return Err(replay_rpc_error(
+                    400,
+                    format!("{field} is malformed or too large"),
+                ));
+            }
+        } else {
+            return Err(replay_rpc_error(400, format!("missing parameter {field}")));
+        }
+    }
+    Ok(params)
+}
+
 async fn start_replay_rpc(
     controller: ReplayController,
     bind: &str,
+    tx_relay: Option<MainnetTransactionRelay>,
 ) -> Result<jsonrpsee::server::ServerHandle> {
     let address = bind
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("invalid XPR_REPLAY_RPC_BIND {bind}"))?;
-    let server = ServerBuilder::default().build(address).await?;
+    let config = ServerConfig::builder()
+        .max_request_body_size(5 * 1024 * 1024)
+        .build();
+    let server = ServerBuilder::with_config(config).build(address).await?;
     let mut module = RpcModule::new(controller);
+    module.register_async_method("pulsevm.pushTransaction", move |params, _, _| {
+        let relay = tx_relay.clone();
+        async move {
+            match relay {
+                Some(relay) => relay.push(params).await,
+                None => Err(replay_rpc_error(
+                    503,
+                    "Mainnet transaction submission is disabled; configure XPR_REPLAY_TX_RPC_URL",
+                )),
+            }
+        }
+    })?;
     module.register_async_method("pulsevm.getInfo", |_, controller, _| async move {
         replay_get_info(controller.as_ref()).await
     })?;
@@ -601,6 +785,17 @@ fn verify_replay_checkpoint_semantics(
         }
     }
     Ok(())
+}
+
+fn replay_producer_key(configured: Option<String>) -> String {
+    configured
+        .filter(|key| !key.trim().is_empty())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "XPR_REPLAY_PRODUCER_KEY is unset; generating an ephemeral key for replay-only NodeConfig"
+            );
+            PrivateKey::random().to_string()
+        })
 }
 
 impl BlockOffsets {
@@ -1335,8 +1530,7 @@ async fn main() -> Result<()> {
     }
 
     let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
-    let producer_key = env::var("XPR_REPLAY_PRODUCER_KEY")
-        .context("XPR_REPLAY_PRODUCER_KEY must contain a local replay signing key")?;
+    let producer_key = replay_producer_key(env::var("XPR_REPLAY_PRODUCER_KEY").ok());
     let config = serde_json::to_vec(&json!({
         "system_account": "eosio",
         "native_system_contract": false,
@@ -1344,6 +1538,7 @@ async fn main() -> Result<()> {
         // A full-history Hyperion audit emits SHiP data while replay runs. The
         // ordinary state migration keeps it disabled to avoid derived history.
         "state_history_enabled": ship_enabled,
+        "allow_replay_recovery": true,
         "bulk_replay": true,
         "producer_name": "eosio",
         // Required by NodeConfig, but replay never signs or produces blocks.
@@ -1499,7 +1694,8 @@ async fn main() -> Result<()> {
         .transpose()?;
     let controller = Arc::new(RwLock::new(controller));
     let _rpc_handle = if let Some(bind) = rpc_bind.as_deref() {
-        Some(start_replay_rpc(controller.clone(), bind).await?)
+        let tx_relay = MainnetTransactionRelay::from_env().await?;
+        Some(start_replay_rpc(controller.clone(), bind, tx_relay).await?)
     } else {
         None
     };
@@ -1754,6 +1950,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replay_key_defaults_to_ephemeral_and_accepts_a_configured_key() {
+        let generated = replay_producer_key(None);
+        assert!(PrivateKey::from_str(&generated).is_ok());
+
+        assert_eq!(
+            replay_producer_key(Some("configured-key".into())),
+            "configured-key"
+        );
+        assert!(PrivateKey::from_str(&replay_producer_key(Some("  ".into()))).is_ok());
+    }
+
+    #[test]
     fn marks_a_fresh_arena() {
         let temp = tempfile::tempdir().unwrap();
         verify_replay_checkpoint_semantics(temp.path(), 1, true).unwrap();
@@ -1798,5 +2006,85 @@ mod tests {
 
         payload[10] = 4;
         assert!(setcode_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn mainnet_push_requires_bounded_packed_transaction_fields() {
+        let valid = || {
+            json!({
+                "signatures": ["SIG_K1_valid-shaped"],
+                "compression": 0,
+                "packed_context_free_data": "",
+                "packed_trx": "00"
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        assert!(validate_push_transaction_params(valid()).is_ok());
+
+        let mut at_limits = valid();
+        at_limits.insert(
+            "signatures".into(),
+            json!(vec!["SIG_K1_valid"; MAX_PUSH_TRANSACTION_SIGNATURES]),
+        );
+        at_limits.insert(
+            "packed_trx".into(),
+            json!("ab".repeat(MAX_PUSH_TRANSACTION_BYTES)),
+        );
+        at_limits.insert(
+            "packed_context_free_data".into(),
+            json!("cd".repeat(MAX_PUSH_TRANSACTION_BYTES)),
+        );
+        assert!(validate_push_transaction_params(at_limits).is_ok());
+
+        let mut missing_signatures = valid();
+        missing_signatures.remove("signatures");
+        assert!(validate_push_transaction_params(missing_signatures).is_err());
+
+        let mut empty_signatures = valid();
+        empty_signatures.insert("signatures".into(), json!([]));
+        assert!(validate_push_transaction_params(empty_signatures).is_err());
+
+        let mut bad_signature = valid();
+        bad_signature.insert("signatures".into(), json!(["not-a-signature"]));
+        assert!(validate_push_transaction_params(bad_signature).is_err());
+
+        let mut bad_compression = valid();
+        bad_compression.insert("compression".into(), json!(2));
+        assert!(validate_push_transaction_params(bad_compression).is_err());
+
+        let mut malformed = valid();
+        malformed.insert("packed_trx".into(), json!("0g"));
+        assert!(validate_push_transaction_params(malformed).is_err());
+
+        let mut empty_packed_trx = valid();
+        empty_packed_trx.insert("packed_trx".into(), json!(""));
+        assert!(validate_push_transaction_params(empty_packed_trx).is_err());
+
+        let mut malformed_context_free_data = valid();
+        malformed_context_free_data.insert("packed_context_free_data".into(), json!("0"));
+        assert!(validate_push_transaction_params(malformed_context_free_data).is_err());
+
+        let mut oversized = valid();
+        oversized.insert(
+            "packed_trx".into(),
+            json!("00".repeat(MAX_PUSH_TRANSACTION_BYTES + 1)),
+        );
+        assert!(validate_push_transaction_params(oversized).is_err());
+
+        let mut oversized_context_free_data = valid();
+        oversized_context_free_data.insert(
+            "packed_context_free_data".into(),
+            json!("00".repeat(MAX_PUSH_TRANSACTION_BYTES + 1)),
+        );
+        assert!(validate_push_transaction_params(oversized_context_free_data).is_err());
+
+        let mut too_many_signatures = valid();
+        too_many_signatures.insert(
+            "signatures".into(),
+            json!(vec!["SIG_K1_valid"; MAX_PUSH_TRANSACTION_SIGNATURES + 1]),
+        );
+        assert!(validate_push_transaction_params(too_many_signatures).is_err());
     }
 }

@@ -70,20 +70,20 @@ uses Hyperion traces when the transaction ID is available.
 
 ## EC2 services and paths
 
-- `xpr-mainnet-catchup-amd64` is the persistent Leap 5.0.3 container. It uses
-  the clean provider state and block log under
-  `/data/xpr-mainnet-follow-recovery/node`, then follows XPR P2P. It runs with
-  `--wasm-runtime=eos-vm-jit --eos-vm-oc-enable=all`: JIT alone still trapped
-  on a delayed `xprconf::register` execution, while OC tier-up for all contracts
-  passed the canonical block. Its pinned catch-up target is in
-  `/data/xpr-mainnet-follow-download/catchup-target.json`.
-- The old `/data/xpr-mainnet-current-node/blocks` log is preserved at block
-  401,802,825, matching the existing Arena and Hyperion checkpoint. It is a
-  historical corpus; the new node root has a copy-on-write clone that Leap is
-  appending to. The full provider block archive download was stopped after the
-  state/log pair initialized successfully. Its partial file remains at
-  `/data/xpr-mainnet-follow-download/blocks.tar.gz` as a fallback. The
-  `pulsevm-xpr-mainnet-catchup-resume.service` unit is installed but disabled.
+- `xpr-mainnet-catchup-amd64` is the Leap 5.0.3 Mainnet relay container. Keep
+  its data under `/data/xpr-mainnet-leap-relay/node`, separate from PulseVM's
+  API-fed block log under `/data/xpr-mainnet-follow-recovery/node`. Bootstrap
+  Leap from a verified XPR Mainnet snapshot, then let it follow P2P. Keep chain
+  API and P2P transaction acceptance disabled during catch-up; enable them
+  after Leap reaches the live head. Its HTTP API is bound to loopback port
+  8888.
+- The historical `/data/xpr-mainnet-current-node/blocks` log is preserved at
+  block 401,802,825. It is not used by the isolated Leap relay or the current
+  PulseVM API-fed follower. The full provider block archive download was
+  stopped after its state/log pair initialized successfully. Its partial file
+  remains at `/data/xpr-mainnet-follow-download/blocks.tar.gz` as a fallback.
+  The `pulsevm-xpr-mainnet-catchup-resume.service` unit is installed but
+  disabled.
 - `pulsevm-xpr-replay.service` follows
   `/data/xpr-mainnet-follow-recovery/node/blocks` and resumes from
   `/data/xpr-hyperion/arena`. It is configured with `XPR_REPLAY_FOLLOW=1`, a
@@ -105,9 +105,101 @@ uses Hyperion traces when the transaction ID is available.
 The reusable append-only block-log follow mode is in
 [`xpr_blocklog_replay.rs`](../crates/pulsevm_core/examples/xpr_blocklog_replay.rs)
 and can be launched with `XPR_REPLAY_FOLLOW=1` through
-[`run-xpr-full-replay.sh`](../scripts/run-xpr-full-replay.sh). Set
-`XPR_REPLAY_PRODUCER_KEY` to a local key because NodeConfig requires a producer
-key; replay never uses it to sign or produce blocks.
+[`run-xpr-full-replay.sh`](../scripts/run-xpr-full-replay.sh). If
+`XPR_REPLAY_PRODUCER_KEY` is unset, the replay process generates an ephemeral
+local key to satisfy NodeConfig; replay never uses it to sign or produce blocks.
+The replay controller opts into recovery from an interrupted checkpoint: when
+the accepted block log is ahead of the durable Arena revision, startup truncates
+that log to the Arena revision and replays the missing source blocks, rebuilding
+SHiP history as it goes. Normal nodes keep strict revision matching.
+
+## Mainnet transaction submission
+
+Clients submit to PulseVM's `pulsevm.pushTransaction` method. PulseVM forwards
+the signed packed transaction to the local Leap API at
+`http://127.0.0.1:8888/v1/chain/push_transaction`; Leap validates and relays it
+to XPR Mainnet peers. PulseVM itself remains a read-only block follower and
+does not use its MetalGo subnet mempool for Mainnet. Its relay is disabled when
+`XPR_REPLAY_TX_RPC_URL` is unset. At startup it calls Leap's `get_info` and
+refuses to enable the relay unless Leap reports the canonical XPR Mainnet chain
+ID. The RPC bounds request and response sizes and forwards Leap's acceptance or
+rejection. Acceptance means Leap admitted the transaction for relay; PulseVM
+validates it when a producer includes it in a block arriving through the block
+feed.
+
+The Leap node must use an isolated data directory and a verified recent
+snapshot. The currently recovered block-feed directory has no matching Leap
+reversible fork database. Do not reuse its state, copy the old fork database,
+or let Leap and the API feeder write the same block log. The XPR Mainnet
+snapshot service publishes a `latest.json` containing the snapshot block,
+chain ID, and SHA-256. Verify all three before restoring it. For the ProtonNZ
+snapshot, download `latest-snapshot.bin.zst` from
+`https://p2p2.protonnz.com/snapshots/`, verify its hash against
+`https://p2p2.protonnz.com/snapshots/latest.json`, decompress it, then run:
+
+```sh
+XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-leap-relay/node \
+XPR_NODEOS_SNAPSHOT_FILE=/data/xpr-mainnet-leap-relay/snapshots/latest-snapshot.bin \
+XPR_CONFIG_DIR=/data/xpr-mainnet-follow-config \
+XPR_NODEOS_READ_MODE=head \
+XPR_API_ACCEPT_TRANSACTIONS=0 \
+XPR_P2P_ACCEPT_TRANSACTIONS=0 \
+XPR_WASM_RUNTIME=eos-vm-jit \
+XPR_EOS_VM_OC_ENABLE=all \
+  scripts/run-xpr-mainnet-catchup-amd64.sh start
+```
+
+Keep transaction acceptance disabled during snapshot restore and P2P catch-up.
+Compare Leap's `get_info` head number and time with an independent Mainnet API.
+Once Leap is at the live head, gracefully stop the snapshot-bootstrapped
+container and reopen the same data directory without
+`XPR_NODEOS_SNAPSHOT_FILE`, so Docker restarts use the persisted fork database
+instead of applying the bootstrap snapshot again:
+
+```sh
+sudo docker stop --time 60 xpr-mainnet-catchup-amd64
+XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-leap-relay/node \
+XPR_CONFIG_DIR=/data/xpr-mainnet-follow-config \
+XPR_NODEOS_READ_MODE=head \
+XPR_API_ACCEPT_TRANSACTIONS=1 \
+XPR_P2P_ACCEPT_TRANSACTIONS=1 \
+XPR_WASM_RUNTIME=eos-vm-jit \
+XPR_EOS_VM_OC_ENABLE=all \
+  scripts/run-xpr-mainnet-catchup-amd64.sh start
+```
+
+Then configure PulseVM with `XPR_REPLAY_TX_RPC_URL=http://127.0.0.1:8888` and
+restart its service. The PulseVM JSON-RPC endpoint remains the configured
+`XPR_REPLAY_RPC_BIND` address (currently port 9660). A request is:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"pulsevm.pushTransaction","params":{"signatures":["SIG_K1_…"],"compression":0,"packed_context_free_data":"","packed_trx":"…"}}
+```
+
+PulseVM's regular `issue_tx` path remains for its MetalGo subnet. It is not a
+Mainnet submission path.
+
+On the EC2 deployment, install and enable
+`scripts/systemd/pulsevm-xpr-relay-after-sync.service` to automate the final
+handoff. Its helper compares Leap with ProtonNZ, requires three consecutive
+checks within 10 blocks and 5 seconds of the reference head, then restarts
+Leap with API and P2P transaction acceptance enabled and configures PulseVM's
+loopback relay. It does not submit a transaction. The helper retries while
+either API is unavailable or Leap remains behind.
+
+```sh
+sudo install -m 0644 scripts/systemd/pulsevm-xpr-relay-after-sync.service \
+  /etc/systemd/system/pulsevm-xpr-relay-after-sync.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pulsevm-xpr-relay-after-sync.service
+sudo journalctl -fu pulsevm-xpr-relay-after-sync.service
+```
+
+The runner keeps irreversible read mode and transaction submission disabled by
+default. Snapshot bootstrap requires a fresh Leap data directory. Use a signed
+transaction with a recent TAPoS reference and short expiration when testing;
+Leap's acceptance response does not mean a producer included it. Check
+inclusion through PulseVM `getBlock` or Hyperion.
 
 ## Operational checks
 
@@ -126,12 +218,11 @@ Check `chain_id` in the PulseVM response against the canonical XPR Mainnet ID
 PulseVM’s `head_block_num` advances, Hyperion’s indexed watermark follows it,
 and their lag remains below 300,000 blocks.
 
-The current setup reuses the matching existing block log with a reflink clone,
-so Leap can immediately validate the restored state and follow peers without
-extracting the full archive. The original block log and existing Arena remain
-untouched. To rebuild through the slower full-archive path, re-enable the
-resume unit and let its download/extraction and pinned-block check finish.
-Then start the follower and Hyperion indexer:
+The PulseVM block feed and the Leap transaction relay now have separate data
+directories. The original block log and existing Arena remain untouched. To
+rebuild PulseVM's replay source through the slower full-archive path, re-enable
+the resume unit and let its download/extraction and pinned-block check finish.
+Then start the replay follower and Hyperion indexer:
 
 ```sh
 XPR_CORPUS_NODE_ROOT=/data/xpr-mainnet-follow-recovery/node \

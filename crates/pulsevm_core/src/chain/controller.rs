@@ -1613,38 +1613,71 @@ impl Controller {
                 // the corresponding state. Either side being ahead means a
                 // prior publication was interrupted; choosing either tip would
                 // silently pair a block with the wrong state.
-                if revision != end as i64 {
-                    let migration_replay = self
-                        .node_config
-                        .as_ref()
-                        .is_some_and(|config| !config.state_history_enabled);
-                    if migration_replay && revision >= i64::from(start) && revision < i64::from(end)
-                    {
+                let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
+                    !config.state_history_enabled || config.allow_replay_recovery
+                });
+                if replay_recovery && revision >= i64::from(start) && revision <= i64::from(end) {
+                    if revision != end as i64 {
                         warn!(
-                            "migration replay is rewinding block log from {} to durable Arena revision {}",
+                            "replay recovery is rewinding block log from {} to durable Arena revision {}",
                             end, revision
                         );
-                        self.block_log
-                            .as_ref()
-                            .unwrap()
-                            .truncate_after(revision as u32)
-                            .map_err(|error| {
+                    } else {
+                        info!(
+                            "checking accepted history logs against durable Arena revision {revision}"
+                        );
+                    }
+                    for (name, log) in [
+                        (
+                            "block",
+                            self.block_log.as_ref().ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "block log is not initialized during replay recovery".into(),
+                                )
+                            })?,
+                        ),
+                        (
+                            "trace",
+                            self.trace_log.as_ref().ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "trace log is not initialized during replay recovery".into(),
+                                )
+                            })?,
+                        ),
+                        (
+                            "chain state",
+                            self.chain_state_log.as_ref().ok_or_else(|| {
+                                ChainError::InternalError(
+                                    "chain state log is not initialized during replay recovery"
+                                        .into(),
+                                )
+                            })?,
+                        ),
+                    ] {
+                        if let Some((_, last)) = log.range()
+                            && last > revision as u32
+                        {
+                            warn!(
+                                "replay recovery is rewinding {name} log from {last} to durable Arena revision {revision}"
+                            );
+                            log.truncate_after(revision as u32).map_err(|error| {
                                 ChainError::DatabaseError(format!(
-                                    "failed to rewind migration block log to revision {revision}: {error}"
+                                    "failed to rewind {name} log to durable Arena revision {revision}: {error}"
                                 ))
                             })?;
-                        end = revision as u32;
-                    } else {
-                        error!(
-                            "database revision {} does not match block log end {}",
-                            revision, end
-                        );
-
-                        return Err(ChainError::DatabaseError(format!(
-                            "database revision {} does not match block log end {}",
-                            revision, end
-                        )));
+                        }
                     }
+                    end = revision as u32;
+                } else if revision != end as i64 {
+                    error!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    );
+
+                    return Err(ChainError::DatabaseError(format!(
+                        "database revision {} does not match block log end {}",
+                        revision, end
+                    )));
                 }
 
                 info!("block log contains blocks from {} to {}", start, end);
@@ -1662,11 +1695,10 @@ impl Controller {
                     .node_config
                     .as_ref()
                     .is_some_and(|config| config.antelope_block_signatures);
-                let migration_replay = self
-                    .node_config
-                    .as_ref()
-                    .is_some_and(|config| !config.state_history_enabled);
-                let cached_header_state = if migration_replay {
+                let can_use_replay_header_state = self.node_config.as_ref().is_some_and(|config| {
+                    !config.state_history_enabled || config.allow_replay_recovery
+                });
+                let cached_header_state = if can_use_replay_header_state {
                     match Self::load_migration_header_state(
                         db_path,
                         end,
@@ -4877,9 +4909,10 @@ impl Controller {
         let config = self.node_config.as_ref().ok_or_else(|| {
             ChainError::InternalError("controller is not initialized".to_string())
         })?;
-        if config.state_history_enabled {
+        if config.state_history_enabled && !config.allow_replay_recovery {
             return Err(ChainError::InternalError(
-                "header authentication pipelining is restricted to migration replay".to_string(),
+                "header authentication pipelining is restricted to migration or opted-in replay"
+                    .to_string(),
             ));
         }
         if !self.pending_chain.is_empty() {
@@ -8101,7 +8134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_replay_rewinds_log_tail_after_last_durable_checkpoint()
+    async fn opted_in_replay_rewinds_all_log_tails_after_last_durable_checkpoint()
     -> Result<(), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -8112,7 +8145,8 @@ mod tests {
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
-            "state_history_enabled": false,
+            "state_history_enabled": true,
+            "allow_replay_recovery": true,
         })
         .to_string()
         .into_bytes();
@@ -8137,6 +8171,8 @@ mod tests {
         controller.accept_block(&orphan_block.id()?, &mut mempool)?;
         assert_eq!(controller.database().revision(), 3);
         assert_eq!(controller.block_log()?.range().unwrap().1, 3);
+        assert_eq!(controller.trace_log().unwrap().range().unwrap().1, 3);
+        assert_eq!(controller.chain_state_log().unwrap().range().unwrap().1, 3);
         drop(controller);
 
         let mut reopened = Controller::new();
@@ -8144,6 +8180,8 @@ mod tests {
         assert_eq!(reopened.last_accepted_block().block_num(), 2);
         assert_eq!(reopened.database().revision(), 2);
         assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 2);
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
         assert!(
             reopened
                 .database()
@@ -8153,6 +8191,58 @@ mod tests {
             !reopened
                 .database()
                 .arena_account_exists(orphan_account.as_u64())
+        );
+        drop(reopened);
+
+        let mut already_recovered = Controller::new();
+        already_recovered.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        assert_eq!(already_recovered.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_recovery_remains_opt_in_for_state_history_nodes() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let genesis_bytes = generate_genesis(&private_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "state_history_enabled": true,
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let db_path = temp.path().to_str().unwrap();
+
+        let mut controller = Controller::new();
+        controller.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
+        let mut mempool = Mempool::new();
+
+        let durable_account = Name::from_str("durable")?;
+        mempool.add_transaction(create_account(&private_key, durable_account, chain_id)?);
+        let durable_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&durable_block.id()?, &mut mempool)?;
+        controller.sync_accepted_logs()?;
+        controller.database().close()?;
+
+        let orphan_account = Name::from_str("orphan")?;
+        mempool.add_transaction(create_account(&private_key, orphan_account, chain_id)?);
+        let orphan_block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&orphan_block.id()?, &mut mempool)?;
+        drop(controller);
+
+        let mut reopened = Controller::new();
+        let error = reopened
+            .initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("database revision 2 does not match block log end 3")
         );
         Ok(())
     }

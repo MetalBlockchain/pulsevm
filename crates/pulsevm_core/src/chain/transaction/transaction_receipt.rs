@@ -184,3 +184,25 @@ impl TransactionReceipt {
         Ok(Digest::hash(bytes))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsevm_serialization::VarUint32;
+
+    #[test]
+    fn serializes_generated_transaction_as_its_id() {
+        let id = Id::new([7; 32]);
+        let receipt = TransactionReceipt::for_id(
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 123, VarUint32(4)),
+            id.clone(),
+        );
+
+        let json = serde_json::to_value(receipt).unwrap();
+
+        assert_eq!(json["trx"], id.to_string());
+        assert_eq!(json["status"], "executed");
+        assert_eq!(json["cpu_usage_us"], 123);
+        assert_eq!(json["net_usage_words"], 4);
+    }
+}

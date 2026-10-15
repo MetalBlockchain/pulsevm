@@ -95,7 +95,6 @@ start_replay() {
     (( SHIP_RETAIN_BLOCKS < SHIP_MAX_LAG )) || \
       fail "XPR_REPLAY_SHIP_RETAIN_BLOCKS must be smaller than XPR_REPLAY_SHIP_MAX_LAG"
   fi
-  [[ -n "$PRODUCER_KEY" ]] || fail "XPR_REPLAY_PRODUCER_KEY is required by NodeConfig"
   [[ -z "$LAST_BLOCK" ]] || validate_uint "$LAST_BLOCK" XPR_REPLAY_LAST_BLOCK
   [[ -x "$BINARY" ]] || fail "replay binary is missing; run '$0 build' first"
   [[ -s "$SOURCE_DIR/blocks.log" ]] || fail "missing $SOURCE_DIR/blocks.log"
@@ -118,8 +117,10 @@ start_replay() {
     env "XPR_REPLAY_CHECKPOINT_INTERVAL=$CHECKPOINT_INTERVAL"
     "XPR_REPLAY_SIGNATURE_THREADS=$SIGNATURE_THREADS"
     "PULSEVM_WASM_PRECOMPILE_THREADS=$WASM_PRECOMPILE_THREADS"
-    "XPR_REPLAY_PRODUCER_KEY=$PRODUCER_KEY"
   )
+  if [[ -n "$PRODUCER_KEY" ]]; then
+    command+=("XPR_REPLAY_PRODUCER_KEY=$PRODUCER_KEY")
+  fi
   if [[ "$FOLLOW" == 1 ]]; then
     command+=("XPR_REPLAY_FOLLOW=1")
   fi
@@ -206,7 +207,7 @@ Environment:
   XPR_REPLAY_SERVICE             systemd user service name without .service
   XPR_REPLAY_LAST_BLOCK          Optional pinned terminal block
   XPR_REPLAY_FOLLOW              Follow an append-only Leap blocks.index indefinitely
-  XPR_REPLAY_PRODUCER_KEY        Local config key required by NodeConfig; never signs replay blocks
+  XPR_REPLAY_PRODUCER_KEY        Optional local config key; replay never signs blocks
   XPR_REPLAY_RPC_BIND            JSON-RPC bind address (default: 127.0.0.1:9660; empty disables)
   XPR_REPLAY_SHIP_ENABLED        Enable SHiP WebSocket (default: 1 in follow mode)
   XPR_REPLAY_SHIP_BIND           SHiP bind address (default: 127.0.0.1:9091)
