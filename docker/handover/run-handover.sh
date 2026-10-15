@@ -151,6 +151,12 @@ cmd_boot() {
     # backstop: the rehearsal shares the host with other live networks.
     export RUNNER_REASSIGN_PORTS_IF_USED=true
     export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports"
+    # The fixture checkpoint's system account is eosio, not pulse: the new
+    # network must adopt the fixture identities, with the fixture dev key
+    # (disposable rehearsal only, never used on mainnet).
+    export PULSEVM_SYSTEM_ACCOUNT="eosio"
+    export PULSEVM_PRODUCER_NAME="eosio"
+    export PULSEVM_PRODUCER_KEY="5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3"
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
