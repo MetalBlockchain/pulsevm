@@ -41,9 +41,11 @@ shadow_head() {
 chain_rpc_url() {
     # Bound the call: a dead endpoint otherwise stalls each poll iteration
     # for the runner client timeout.
+    # list-rpcs reports the full handler URL including the /rpc suffix: keep
+    # it, since the bare /ext/bc/<id> base answers 404.
     timeout 15 "$NETWORK_RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT" 2>/dev/null \
         | sed $'s/\033\[[0-9;]*m//g' \
-        | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+' | head -1
+        | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+/rpc' | head -1
 }
 rpc_call() {
     curl --fail --silent --max-time 15 -X POST "$1" \
