@@ -44,6 +44,12 @@ fi
 if [[ "$RUNNER_REASSIGN_PORTS_IF_USED" == "true" ]]; then
   RUNNER_START_ARGS+=(--reassign-ports-if-used)
 fi
+# Space-separated extra flags appended to `control start` (e.g.
+# "--dynamic-ports" for shared hosts). Empty by default; no behavior change.
+if [[ -n "${PULSEVM_RUNNER_START_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  RUNNER_START_ARGS+=(${PULSEVM_RUNNER_START_EXTRA_ARGS})
+fi
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
   echo "error: set METALGO_EXEC_PATH to a metalgo binary (rpcchainvm protocol 43)." >&2

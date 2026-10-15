@@ -147,9 +147,10 @@ cmd_boot() {
     export METAL_NETWORK_RUNNER_PORT=":18080"
     export METAL_NETWORK_RUNNER_GATEWAY_PORT=":18081"
     export METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:18080"
-    # Node ports are reassigned when taken: the rehearsal shares the host
-    # with other live MetalGo networks.
+    # Node ports are reassigned when taken, with dynamic allocation as the
+    # backstop: the rehearsal shares the host with other live networks.
     export RUNNER_REASSIGN_PORTS_IF_USED=true
+    export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports"
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
