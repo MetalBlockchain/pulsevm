@@ -19,6 +19,9 @@ readonly XPR_CORE_DIR="${XPR_CORE_DIR:-/src/antelope-leap}"
 readonly NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO_ROOT/../metal-network-runner/bin/metal-network-runner}"
 readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
 
+# Set early so every compose invocation (including stop) interpolates.
+export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
+
 fail() { echo "handover: $*" >&2; exit 1; }
 
 # Leap validates the HTTP Host header against its listening address, so
@@ -49,8 +52,7 @@ cmd_start() {
     echo "handover: building the replay binary on the host..."
     export PATH="$HOME/.cargo/bin:$PATH"
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
-    export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
-    [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN"
+    [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN (run-handover.sh builds this first)"
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-producer)
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
@@ -67,21 +69,36 @@ cmd_start() {
 }
 
 cmd_halt() {
-    leap_head="$(leap_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
-    shadow_head_now="$(shadow_head)"
-    [[ "$leap_head" == "$shadow_head_now" ]] || fail "heads disagree at halt: leap $leap_head shadow $shadow_head_now"
-    H="$leap_head"
-    H_ID="$(leap_info | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_id"])')"
+    # H is the snapshot height, not the live head: blocks produced between
+    # the snapshot and the stop are stragglers past the declared cutoff and
+    # are ignored, exactly as post-H XPR blocks are ignored by the A-Chain.
+    echo "handover: snapshotting, then halting the producer (models the BP halt commitment)..."
+    snap_json="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}')"
+    snap="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
+    H_ID="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_id"])')"
+    [[ -n "$snap" && -n "$H_ID" ]] || fail "snapshot request failed"
+    H="$(curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+        -d "{\"block_num_or_id\":\"$H_ID\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["block_num"])')"
     echo "$H" >"$WORK_DIR/H"
     echo "$H_ID" >"$WORK_DIR/H_ID"
-    echo "handover: H=$H id=$H_ID; snapshotting then halting the producer (models the BP halt commitment)..."
-    snap="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
-        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
-    [[ -n "$snap" ]] || fail "snapshot request failed"
     mountpoint="$(docker volume inspect --format '{{.Mountpoint}}' pulsevm-handover_leap-data)"
-    echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
+    if [[ "$snap" = /* ]]; then
+        echo "$snap" >"$WORK_DIR/snapshot"
+    else
+        echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
+    fi
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer)
-    echo "handover: halted at H=$H snapshot=$(cat "$WORK_DIR/snapshot")"
+    echo "handover: halted; H=$H id=$H_ID; waiting for the shadow to absorb H..."
+    for _ in $(seq 1 36); do
+        shadow_h="$(shadow_head 2>/dev/null || echo 0)"
+        [[ "$shadow_h" -ge "$H" ]] && break
+        sleep 5
+    done
+    shadow_h="$(shadow_head)"
+    [[ "$shadow_h" -ge "$H" ]] || fail "shadow never absorbed H=$H (stuck at $shadow_h)"
+    echo "handover: shadow absorbed H (shadow $shadow_h); checkpointing..."
     cmd_checkpoint
 }
 
