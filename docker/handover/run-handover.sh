@@ -136,12 +136,19 @@ cmd_halt() {
     # nodeos reports container paths: absolute names start at its /data dir,
     # which is the shared leap-data volume on the host.
     if [[ "$snap" = /data/* ]]; then
-        echo "$mountpoint/${snap#/data/}" >"$WORK_DIR/snapshot"
+        snap_host="$mountpoint/${snap#/data/}"
     elif [[ "$snap" = /* ]]; then
-        echo "$snap" >"$WORK_DIR/snapshot"
+        snap_host="$snap"
     else
-        echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
+        snap_host="$mountpoint/$snap"
     fi
+    # The volume is root-owned, so the export (running host checks as the
+    # local user) cannot read the snapshot in place: stage a readable copy
+    # in the work dir, which is also bind-mounted into export containers.
+    docker run --rm -v pulsevm-handover_leap-data:/d:ro -v "$WORK_DIR:/out" ubuntu:24.04 \
+        cp "/d/snapshots/$(basename "$snap_host")" /out/snapshot.bin \
+        || fail "snapshot stage failed"
+    echo "$WORK_DIR/snapshot.bin" >"$WORK_DIR/snapshot"
     # Full network halt: stop the producer and both validators. The XPR
     # chain must freeze: no new blocks may appear in the shared block log
     # after the stop.
