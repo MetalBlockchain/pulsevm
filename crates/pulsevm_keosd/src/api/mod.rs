@@ -403,7 +403,22 @@ async fn wallet_sign_transaction(
     let _transaction = req.0;
     let public_keys = req.1;
     let chain_id = req.2;
-    let digest = _transaction.signing_digest(&chain_id, &Vec::new()).unwrap(); // TODO: Handle error gracefully
+    // The transaction and chain_id come from the RPC client, so packing can
+    // fail on malformed input. Never unwrap here: return a wallet error
+    // instead (same 3120000 shape as the guards above) so one bad request
+    // cannot panic the handler.
+    let digest = match _transaction.signing_digest(&chain_id, &Vec::new()) {
+        Ok(d) => d,
+        Err(e) => {
+            return error_response(
+                500,
+                3120000,
+                "wallet_exception",
+                "Wallet exception",
+                &e.to_string(),
+            );
+        }
+    };
 
     let mut mgr = data.manager.lock().unwrap();
     match mgr.sign_digest(&digest, &public_keys) {
