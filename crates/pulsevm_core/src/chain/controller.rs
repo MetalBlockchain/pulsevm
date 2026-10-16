@@ -5299,6 +5299,7 @@ mod tests {
                 NewAccount,
                 SetAbi,
                 SetCode,
+                UpdateAuth,
             },
             transaction::{
                 Action,
@@ -10569,6 +10570,87 @@ mod tests {
         assert!(
             error.to_string().contains("refusing to produce"),
             "a node without the schedule key must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The bullish rehearsal rotates an account's authority before the halt
+    // and re-checks it after promotion: pin updateauth execution, the path
+    // that pre-halt traffic relies on.
+    #[tokio::test]
+    async fn updateauth_rotates_active_authority() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let genesis_bytes = generate_genesis(&schedule_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp.path().to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("alice")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&first.id()?, &mut mempool)?;
+
+        let rotated_key = PrivateKey::random();
+        let rotation = Authority::new(
+            1,
+            vec![KeyWeight::new(rotated_key.get_public_key().into_k1(), 1)],
+            vec![],
+            vec![],
+        );
+        let alice = Name::from_str("alice")?;
+        let rotate = Transaction::new(
+            TransactionHeader::new(
+                TimePointSec::new(now + 1800),
+                0,
+                0,
+                0u32.into(),
+                0,
+                0u32.into(),
+            ),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                UPDATEAUTH_NAME,
+                UpdateAuth {
+                    account: alice,
+                    permission: ACTIVE_NAME,
+                    parent: Name::from_str("owner")?,
+                    auth: rotation.clone(),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&schedule_key, &chain_id)?;
+        mempool.add_transaction(PackedTransaction::from_signed_transaction(rotate)?);
+        let second = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&second.id()?, &mut mempool)?;
+        assert_eq!(
+            controller
+                .database()
+                .arena_permission_authority(alice.as_u64(), ACTIVE_NAME.as_u64()),
+            Some(rotation)
         );
         Ok(())
     }

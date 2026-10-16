@@ -45,11 +45,26 @@ in-process promotion — the shadow process itself starting to author at H —
 needs block production inside the replay binary and is not modeled here.
 
 Full run: `TERMINAL_HEIGHT=300 ./run-handover.sh start` runs everything
-unattended — three-node Leap consensus, shadow follow to N, full network
-halt with a freeze proof, checkpoint, five-node boot, the network's own
-first transaction (empty blocks are gated, so H+1 needs one), and the
-continuity asserts. It ends with `handover: PASS` and leaves the new
-network running.
+unattended and ends with `handover: PASS`, leaving the new network
+running:
+
+1. Three-node Leap consensus (producer + two validating peers, equal head
+   and LIB), then pre-halt traffic: three accounts (one born under a
+   rotated key) plus a live key rotation, captured to
+   `pre-halt-accounts.json`.
+2. Shadow follow to N, snapshot at H, full network halt with a block-log
+   freeze proof.
+3. Checkpoint export, five-node boot, the network's own first transaction
+   (empty blocks are gated, so H+1 needs one).
+4. Continuity assert (H+1's parent is H) **and** a state-equivalence gate:
+   every pre-halt account reads back on the new network with
+   byte-identical authorities (key strings differ by format, so payloads
+   are compared, not strings).
+
+`CHAOS_KILL_NODE=1` drops one validator before the first transaction, so
+H+1 must finalize on 4/5 quorum (slower Snowman convergence; longer wait
+budget). `stop` archives the workdir instead of deleting it, preserving
+the evidence trail.
 
 Rehearsal-only support: `XPR_REPLAY_GENESIS_FILE` lets the replay binary
 follow a non-mainnet fixture chain. It is default-off; without it every

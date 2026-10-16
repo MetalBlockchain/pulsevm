@@ -44,6 +44,21 @@ leap_head_lib() {
     leap_node_info "$1" 2>/dev/null \
         | python3 -c 'import json,sys; i=json.load(sys.stdin); print(i["head_block_num"], i["last_irreversible_block_num"])' 2>/dev/null || true
 }
+# POST to a Leap API path with the forged Host header Leap requires.
+leap_post() {
+    curl --fail --silent --max-time 15 -X POST "$1$2" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$3"
+}
+# Submit an issueTx-format body to Leap's send_transaction; prints the txid.
+leap_send() {
+    leap_post "$LEAP_API" /v1/chain/send_transaction "$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])'
+}
+# "chain_id head_num head_id" for a Leap node.
+leap_chain_head() {
+    leap_node_info "$1" \
+        | python3 -c 'import json,sys; i=json.load(sys.stdin); print(i["chain_id"], i["head_block_num"], i["head_block_id"])'
+}
 shadow_head() {
     curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
         -H 'Content-Type: application/json' \
@@ -67,9 +82,12 @@ rpc_call() {
 cmd_start() {
     [[ ! -e "$WORK_DIR" ]] || fail "work directory exists: $WORK_DIR (run stop first)"
     mkdir -p "$WORK_DIR"
-    echo "handover: building the replay binary on the host..."
+    echo "handover: building the replay binary and the probe-tx tool on the host..."
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
     [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN (run-handover.sh builds this first)"
+    (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) || fail "probe tool build failed"
+    PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
+    [[ -x "$PROBE_BIN" ]] || fail "probe tool missing: $PROBE_BIN"
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-producer)
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
@@ -100,6 +118,46 @@ cmd_start() {
         sleep 2
     done
     [[ "$converged" == true ]] || fail "XPR nodes never reached consensus"
+    # Seed pre-halt traffic the equivalence gate re-checks after promotion:
+    # three accounts (one born under a rotated key) plus a live key rotation.
+    # These land hundreds of blocks before N, hence deep in irreversibility.
+    echo "handover: seeding pre-halt traffic on XPR..."
+    read -r TRAFFIC_WIF TRAFFIC_PUB <<<"$("$PROBE_BIN" newkey)"
+    echo "$TRAFFIC_WIF $TRAFFIC_PUB" >"$WORK_DIR/traffic-key"
+    read -r leap_chain leap_head leap_head_id <<<"$(leap_chain_head "$LEAP_API")"
+    leap_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$leap_head_id')[8:12], 'little'))")"
+    leap_exp="$(($(date +%s) + 1800))"
+    leap_ref="$((leap_head & 0xffff))"
+    # Fixture dev key (disposable rehearsal only, never used on mainnet).
+    DEV_KEY="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
+    submit_leap() {
+        leap_send "$("$PROBE_BIN" "$@")"
+    }
+    echo "handover: traffic t1: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t1 "$TRAFFIC_PUB")"
+    echo "handover: traffic t2: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t2)"
+    echo "handover: traffic t3: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t3)"
+    echo "handover: traffic rotate t3: $(submit_leap updateauth "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t3 active owner "$TRAFFIC_PUB")"
+    echo "handover: waiting for the traffic accounts to exist..."
+    for _ in $(seq 1 60); do
+        leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t1"}' >/dev/null 2>&1 \
+        && leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t2"}' >/dev/null 2>&1 \
+        && leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t3"}' >/dev/null 2>&1 && break
+        sleep 2
+    done
+    python3 -c '
+import json, subprocess, sys
+api, out = sys.argv[1], sys.argv[2]
+accts = {}
+for name in ["eosio", "t1", "t2", "t3"]:
+    p = subprocess.run(["curl", "--fail", "--silent", "--max-time", "15", "-X", "POST",
+                        api + "/v1/chain/get_account", "-H", "Content-Type: application/json",
+                        "-H", "Host: 0.0.0.0:8888", "-d", json.dumps({"account_name": name})],
+                       capture_output=True, text=True)
+    p.check_returncode()
+    accts[name] = json.loads(p.stdout)
+json.dump(accts, open(out, "w"), indent=1)
+' "$LEAP_API" "$WORK_DIR/pre-halt-accounts.json" || fail "pre-halt state capture failed"
+    echo "handover: pre-halt state captured for eosio,t1,t2,t3"
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
     echo "handover: shadowing until height $TERMINAL_HEIGHT..."
     while true; do
@@ -268,22 +326,40 @@ cmd_boot() {
     read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
     [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
+    # Optional chaos: drop one validator before the first transaction, so
+    # H+1 must finalize on 4/5 quorum. Off by default; the dead node is left
+    # down (a restart path is future work).
+    if [[ "${CHAOS_KILL_NODE:-0}" == 1 ]]; then
+        victim="$(pgrep -f 'node5/configs' | head -1 || true)"
+        [[ -n "$victim" ]] || victim="$(pgrep -f 'metalgo-tahoe' | head -1 || true)"
+        [[ -n "$victim" ]] || fail "chaos requested but no node process found"
+        kill -9 "$victim" && echo "handover: chaos: killed node pid $victim; H+1 must land on 4/5"
+    fi
     echo "handover: new network at head $new_head; submitting its first transaction..."
+    probe_name=bob
+    if rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getAccount","params":{"account_name":"bob"}}' 2>/dev/null \
+        | python3 -c 'import json,sys; json.load(sys.stdin)["result"]' >/dev/null 2>&1; then
+        probe_name=carol
+        echo "handover: bob already exists here; probing as carol"
+    fi
     ref_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$new_head_id')[8:12], 'little'))")"
     exp="$(($(date +%s) + 1800))"
-    probe_tx="$("$PROBE_BIN" "$new_chain" "$PULSEVM_PRODUCER_KEY" "$new_head" "$ref_prefix" "$exp" bob)"
+    probe_tx="$("$PROBE_BIN" newaccount "$new_chain" "$PULSEVM_PRODUCER_KEY" "$new_head" "$ref_prefix" "$exp" "$probe_name")"
     txid="$(rpc_call "$rpc_url" "$probe_tx" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["txID"])')" \
         || fail "first-transaction submission failed"
     echo "handover: first transaction $txid submitted; waiting for the new network to pass H..."
+    wait_iters=60
+    [[ "${CHAOS_KILL_NODE:-0}" == 1 ]] && wait_iters=150
     rpc_url=""
     new_head=0
-    for _ in $(seq 1 60); do
+    for i in $(seq 1 $wait_iters); do
         rpc_url="$(chain_rpc_url || true)"
         [[ -n "$rpc_url" ]] || { sleep 5; continue; }
         new_head="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])' 2>/dev/null || echo 0)"
         [[ "$new_head" -gt "$H" ]] && break
+        [[ $((i % 6)) == 0 ]] && echo "handover: still at $new_head, waiting for H+1 ($i/$wait_iters)..."
         sleep 5
     done
     [[ "$new_head" -gt "$H" ]] || fail "new network never passed H=$H (see $WORK_DIR/five-node.log)"
@@ -292,9 +368,63 @@ cmd_boot() {
     next_id="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getBlock","params":{"block_num_or_id":"'"$((H + 1))"'"}}' \
         | python3 -c 'import json,sys; b=json.load(sys.stdin)["result"]; print(b["previous"], b["block_num"])')"
     [[ "$next_id" == "$H_ID $((H + 1))" ]] || fail "continuity broken: block H+1 parent is $next_id, expected parent $H_ID"
+    # State equivalence: every pre-halt traffic account must read back on
+    # the new network with byte-identical authorities. Key strings differ
+    # by format (EOS legacy vs PUB_K1_) but carry the same 33-byte payload,
+    # so compare decoded payloads, not strings.
+    echo "handover: proving migrated state equals pre-halt XPR state..."
+    python3 - "$WORK_DIR/pre-halt-accounts.json" "$rpc_url" <<'PYEOF' || fail "migrated state mismatch"
+import json, sys, urllib.request
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(s):
+    n = 0
+    for c in s:
+        n = n * 58 + B58.index(c)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return b"\x00" * (len(s) - len(s.lstrip("1"))) + raw
+def keybytes(s):
+    assert s.startswith("EOS") or s.startswith("PUB_K1_"), f"unexpected key format {s}"
+    payload = b58decode(s)[:-4]
+    assert len(payload) == 33, f"bad payload length for {s}"
+    return payload.hex()
+def norm_auth(a):
+    return {
+        "threshold": a["threshold"],
+        "keys": sorted((keybytes(k["key"]), k["weight"]) for k in a.get("keys", [])),
+        "accounts": sorted((x["permission"]["actor"], x["permission"]["permission"], x["weight"]) for x in a.get("accounts", [])),
+        "waits": sorted((x["wait_sec"], x["weight"]) for x in a.get("waits", [])),
+    }
+def norm_perms(acct):
+    return {p["perm_name"]: (p["parent"], norm_auth(p["required_auth"])) for p in acct["permissions"]}
+def get_account(rpc, name):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "pulsevm.getAccount",
+                       "params": {"account_name": name}}).encode()
+    req = urllib.request.Request(rpc, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)["result"]
+pre, rpc = sys.argv[1], sys.argv[2]
+old = json.load(open(pre))
+bad = 0
+for name, old_acct in sorted(old.items()):
+    try:
+        new_perms = norm_perms(get_account(rpc, name))
+    except Exception as e:
+        print(f"  {name}: MISSING on new network ({e})")
+        bad += 1
+        continue
+    if new_perms == norm_perms(old_acct):
+        print(f"  {name}: identical")
+    else:
+        print(f"  {name}: MISMATCH")
+        print(f"    old: {json.dumps(norm_perms(old_acct), sort_keys=True)}")
+        print(f"    new: {json.dumps(new_perms, sort_keys=True)}")
+        bad += 1
+print(f"equivalence: {len(old) - bad}/{len(old)} accounts identical")
+sys.exit(1 if bad else 0)
+PYEOF
     old_chain="$(shadow_head >/dev/null 2>&1; curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])' 2>/dev/null || echo stopped)"
     new_chain="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])')"
-    echo "handover: PASS: block $((H + 1)) builds on halt block $H_ID; shadow chain $old_chain -> new chain $new_chain"
+    echo "handover: PASS: block $((H + 1)) builds on halt block $H_ID with identical migrated state; shadow chain $old_chain -> new chain $new_chain"
     echo "handover: new network RPC: $rpc_url (left running; run stop to tear down)"
 }
 
@@ -304,8 +434,14 @@ cmd_stop() {
         pkill -f metal-network-runner 2>/dev/null || true
     fi
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml down --volumes 2>/dev/null) || true
-    rm -rf "$WORK_DIR"
-    echo "handover: stopped"
+    # Archive instead of deleting: the workdir holds the evidence trail
+    # (H, checkpoint pointer, pre-halt state) for post-mortems and resumes.
+    if [[ -e "$WORK_DIR" ]]; then
+        bak="$WORK_DIR.bak-$(date +%s)"
+        mv "$WORK_DIR" "$bak" && echo "handover: stopped (workdir archived at $bak)"
+    else
+        echo "handover: stopped"
+    fi
 }
 
 case "${1:-}" in
@@ -319,6 +455,7 @@ case "${1:-}" in
     *) echo "usage: run-handover.sh start|resume-checkpoint|resume-boot|stop" >&2
        echo "env: TERMINAL_HEIGHT (default 300, ~3 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
-       echo "     LEAP_HTTP_PORT, LEAP_V1_HTTP_PORT, LEAP_V2_HTTP_PORT, SHADOW_RPC_PORT" >&2
+       echo "     LEAP_HTTP_PORT, LEAP_V1_HTTP_PORT, LEAP_V2_HTTP_PORT, SHADOW_RPC_PORT," >&2
+       echo "     CHAOS_KILL_NODE=1 (drop one validator before H+1; default off)" >&2
        exit 2 ;;
 esac
