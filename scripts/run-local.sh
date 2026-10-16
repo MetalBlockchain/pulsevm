@@ -13,6 +13,10 @@
 #     of authoring normal Arena genesis state.
 #   * PULSEVM_GENESIS_PATH (optional) — genesis JSON to use. Set this to
 #     tools/xpr-chainbase-export/xpr-mainnet-genesis.json for XPR Mainnet.
+#   * PULSEVM_GENESIS_INITIAL_KEY (optional) — overrides the migration
+#     genesis initial key, which seeds the new chain's producer schedule.
+#     Required for migration boots unless the genesis file already names a
+#     key the producing nodes hold.
 #   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
@@ -43,6 +47,12 @@ if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
 fi
 if [[ "$RUNNER_REASSIGN_PORTS_IF_USED" == "true" ]]; then
   RUNNER_START_ARGS+=(--reassign-ports-if-used)
+fi
+# Space-separated extra flags appended to `control start` (e.g.
+# "--dynamic-ports" for shared hosts). Empty by default; no behavior change.
+if [[ -n "${PULSEVM_RUNNER_START_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  RUNNER_START_ARGS+=(${PULSEVM_RUNNER_START_EXTRA_ARGS})
 fi
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
@@ -137,9 +147,22 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   fi
   CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256 | select(type == "string" and test("^[[:xdigit:]]{64}$"))' "$MIGRATION_MANIFEST")"
   MIGRATION_GENESIS="$(mktemp "${TMPDIR:-/tmp}/pulsevm-xpr-migration-genesis.XXXXXX")"
-  jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-    '. + {migration_checkpoint_sha256: $checkpoint_sha256}' \
-    "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+  # A migration restore starts a new producer schedule seeded from the
+  # migration genesis initial key. PULSEVM_GENESIS_INITIAL_KEY overrides that
+  # key (e.g. with the source fixture's key for rehearsals, or the real
+  # producer key in a migration ceremony): without it the schedule names a
+  # key no node holds and every build fails closed at the signing gate.
+  if [[ -n "${PULSEVM_GENESIS_INITIAL_KEY:-}" ]]; then
+    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+      --arg initial_key "$PULSEVM_GENESIS_INITIAL_KEY" \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256, initial_key: $initial_key}' \
+      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+    echo "==> Migration genesis initial key overridden with PULSEVM_GENESIS_INITIAL_KEY"
+  else
+    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256}' \
+      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+  fi
   # This development key corresponds to genesis.json's initial_key. Override it
   # for a real producer deployment; it is part of the node-local VM config.
   CHAIN_CONFIG="$(jq -cn \

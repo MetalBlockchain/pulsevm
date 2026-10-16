@@ -1366,6 +1366,25 @@ impl Controller {
                 )));
             }
             migration_source_block = Self::migration_source_block(&manifest)?;
+            // The new network only promotes state the old network agreed to
+            // freeze: when the manifest carries the producers' signed halt
+            // commitment, verify it against the terminal block before the
+            // checkpoint is trusted.
+            if let Some(commitment) = manifest.halt_commitment.as_ref() {
+                let source_block = migration_source_block.as_ref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration halt commitment requires an attached source block".into(),
+                    )
+                })?;
+                let source_id = source_block.id()?;
+                commitment
+                    .verify(source_block.block_num(), &source_id.0.0)
+                    .map_err(|error| {
+                        ChainError::GenesisError(format!(
+                            "migration halt commitment rejected: {error}"
+                        ))
+                    })?;
+            }
             if self.db.revision() <= 0 {
                 let header = self
                     .db
@@ -5299,6 +5318,7 @@ mod tests {
                 NewAccount,
                 SetAbi,
                 SetCode,
+                UpdateAuth,
             },
             transaction::{
                 Action,
@@ -10383,6 +10403,414 @@ mod tests {
             error
                 .to_string()
                 .contains("input-transaction dedupe rows but manifest commits")
+        );
+        Ok(())
+    }
+
+    // A migration restore starts a new producer schedule seeded from the
+    // migration genesis initial key (the source schedule is deliberately not
+    // carried over). The producing node must hold that key: with a foreign
+    // key every build fails closed at the signing gate instead of emitting
+    // an unverifiable block. These tests pin both sides with a
+    // self-contained checkpoint.
+    async fn migration_checkpoint_with_schedule_key(
+        temp: &TempDir,
+        schedule_key: &PrivateKey,
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64), ChainError> {
+        // Build a real source chain so the checkpoint carries complete state
+        // (accounts, permissions, resources, chain config): fresh genesis,
+        // one accepted block, then a portable snapshot of that state.
+        let genesis_bytes = generate_genesis(schedule_key);
+        let source_chain_id =
+            Id::new(pulsevm_database::GenesisState::from_bytes(&genesis_bytes)?.compute_chain_id());
+        let source_config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let source_path = temp.path().join("source");
+        let mut source = Controller::new();
+        source.initialize(
+            &source_chain_id,
+            &source_config,
+            &genesis_bytes,
+            source_path.to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut source_mempool = Mempool::new();
+        source_mempool.add_transaction(create_account_with_expiration(
+            schedule_key,
+            Name::from_str("alice")?,
+            source_chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = source.build_block(&mut source_mempool).await?;
+        source.accept_block(&first.id()?, &mut source_mempool)?;
+        let source_block = source.last_accepted_block().clone();
+        let source_block_id = source_block.id()?;
+        let source_revision = source.database().revision();
+        let imported_transactions = source.database().arena_transaction_count() as u64;
+        let checkpoint = source.database().snapshot_bytes()?;
+        source.shutdown()?;
+        drop(source);
+        let checkpoint_path = temp.path().join("migration.snapshot");
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("migration.manifest.json");
+        let mut manifest = MigrationManifest::new(
+            b"controller migration schedule test source",
+            source_block_id.0.0,
+            &checkpoint,
+            source_revision,
+            pulsevm_database::ImportSummary {
+                input_transactions: imported_transactions,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&genesis_bytes).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let genesis_state = pulsevm_database::GenesisState::from_bytes(&migration_genesis)?;
+        let chain_id = Id::new(genesis_state.compute_chain_id());
+        Ok((
+            checkpoint_path.to_str().unwrap().to_string(),
+            manifest_path.to_str().unwrap().to_string(),
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block.block_num(),
+            source_revision,
+        ))
+    }
+
+    // Signs the old network's halt commitment over a migration source block
+    // with the schedule key, as the halt ceremony does. When tamper is set
+    // the signature is corrupted to prove the restore fails closed.
+    fn attach_halt_commitment(
+        manifest_path: &str,
+        source_block_num: u32,
+        source_block_id: &Id,
+        schedule_key_wif: &str,
+        tamper: bool,
+    ) -> Result<(), ChainError> {
+        let signing_key = pulsevm_crypto::K1PrivateKey::from_string(schedule_key_wif)
+            .map_err(|e| ChainError::InternalError(format!("bad schedule key: {e:?}")))?;
+        let producer_key = signing_key.public_key().to_string();
+        let digest =
+            pulsevm_database::HaltCommitment::digest(source_block_num, &source_block_id.0.0);
+        let mut signature = signing_key.sign(&digest).to_string();
+        if tamper {
+            signature.pop();
+            signature.push('1');
+        }
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        manifest["halt_commitment"] = json!({
+            "version": 1,
+            "halt_height": source_block_num,
+            "halt_block_id": hex::encode(source_block_id.as_bytes()),
+            "producer_keys": [producer_key.clone()],
+            "signatures": [{
+                "producer": "pulse",
+                "key": producer_key,
+                "signature": signature,
+            }],
+        });
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_builds_with_matching_schedule_key() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        // A realistic head-relative expiry: TimePointSec::maximum() exceeds
+        // the deployment max_transaction_lifetime and is dropped at build.
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.block_num(), source_block_num + 1);
+        assert_eq!(*block.previous_id(), source_block_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_to_produce_with_foreign_schedule_key()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let foreign_key = PrivateKey::random();
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            _source_block_id,
+            _source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": foreign_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let error = controller.build_block(&mut mempool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "a node without the schedule key must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The new network only promotes committed state: a manifest carrying
+    // a valid halt commitment restores and builds.
+    #[tokio::test]
+    async fn migration_restore_accepts_signed_halt_commitment() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        attach_halt_commitment(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("carol")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.block_num(), source_block_num + 1);
+        Ok(())
+    }
+
+    // A corrupted halt commitment fails the restore closed: no signature,
+    // no promotion.
+    #[tokio::test]
+    async fn migration_restore_rejects_tampered_halt_commitment() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        attach_halt_commitment(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            true,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a tampered commitment must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The bullish rehearsal rotates an account's authority before the halt
+    // and re-checks it after promotion: pin updateauth execution, the path
+    // that pre-halt traffic relies on.
+    #[tokio::test]
+    async fn updateauth_rotates_active_authority() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let genesis_bytes = generate_genesis(&schedule_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp.path().to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("alice")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&first.id()?, &mut mempool)?;
+
+        let rotated_key = PrivateKey::random();
+        let rotation = Authority::new(
+            1,
+            vec![KeyWeight::new(rotated_key.get_public_key().into_k1(), 1)],
+            vec![],
+            vec![],
+        );
+        let alice = Name::from_str("alice")?;
+        let rotate = Transaction::new(
+            TransactionHeader::new(
+                TimePointSec::new(now + 1800),
+                0,
+                0,
+                0u32.into(),
+                0,
+                0u32.into(),
+            ),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                UPDATEAUTH_NAME,
+                UpdateAuth {
+                    account: alice,
+                    permission: ACTIVE_NAME,
+                    parent: Name::from_str("owner")?,
+                    auth: rotation.clone(),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&schedule_key, &chain_id)?;
+        mempool.add_transaction(PackedTransaction::from_signed_transaction(rotate)?);
+        let second = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&second.id()?, &mut mempool)?;
+        assert_eq!(
+            controller
+                .database()
+                .arena_permission_authority(alice.as_u64(), ACTIVE_NAME.as_u64()),
+            Some(rotation)
         );
         Ok(())
     }

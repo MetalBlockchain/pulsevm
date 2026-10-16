@@ -157,6 +157,12 @@ pub struct MigrationManifest {
     pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
+    /// The old network's signed halt commitment. Optional for legacy
+    /// manifests; when present the restore verifies it against the source
+    /// block before trusting the checkpoint, so a node never promotes state
+    /// the source chain did not agree to freeze.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_commitment: Option<pulsevm_chain_types::HaltCommitment>,
     /// Commits the chainbase sidecar that supplies every field SHiP v0 omits,
     /// including replay-protection rows. The field keeps its original name for
     /// migration-manifest compatibility.
@@ -184,6 +190,7 @@ impl MigrationManifest {
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
             deferred_transaction_sidecar_sha256: None,
+            halt_commitment: None,
             import_summary,
         }
     }

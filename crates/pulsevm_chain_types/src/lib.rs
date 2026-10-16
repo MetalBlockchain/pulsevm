@@ -10,6 +10,7 @@ mod block_timestamp;
 mod config;
 mod elastic_limit_parameters;
 mod genesis;
+mod migration;
 mod time;
 mod time_point_sec;
 
@@ -33,6 +34,12 @@ pub use elastic_limit_parameters::{
     Ratio,
 };
 pub use genesis::GenesisState;
+pub use migration::{
+    HALT_DOMAIN,
+    HaltCommitment,
+    HaltRosterEntry,
+    HaltSignature,
+};
 pub use time::{
     Microseconds,
     TimePoint,
