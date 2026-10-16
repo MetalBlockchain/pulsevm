@@ -63,7 +63,7 @@ impl HaltCommitment {
 
     /// Signing digest for a halt.
     pub fn digest(halt_height: u32, halt_block_id: &[u8; 32]) -> [u8; 32] {
-        *Digest::hash(&Self::message_bytes(halt_height, halt_block_id)).as_bytes()
+        *Digest::hash(Self::message_bytes(halt_height, halt_block_id)).as_bytes()
     }
 
     /// Shared terminal-block check: version, height, and id must match.
@@ -217,6 +217,25 @@ pub struct HaltRosterEntry {
     pub producer: String,
     pub key: K1PublicKey,
     pub weight: u64,
+}
+fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("must be 64 hexadecimal characters".into());
+    }
+    let mut bytes = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        bytes[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -426,25 +445,5 @@ mod tests {
         committed
             .verify(HEIGHT, &id)
             .expect("v1 path must keep working");
-    }
-}
-
-fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("must be 64 hexadecimal characters".into());
-    }
-    let mut bytes = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
-        bytes[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
-    }
-    Ok(bytes)
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => 0,
     }
 }
