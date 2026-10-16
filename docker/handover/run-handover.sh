@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Rehearse the shadow-then-promote handover: Leap produces, PulseVM shadows,
-# the producer halts at TERMINAL_HEIGHT, and a five-node PulseVM network
-# boots from the checkpointed shadow state and continues at H+1.
+# Rehearse the shadow-then-promote handover: a three-node Leap network runs
+# XPR under consensus, PulseVM shadows it, the whole XPR network halts at
+# TERMINAL_HEIGHT, and a five-node PulseVM network boots from the
+# checkpointed shadow state, takes its own first transaction, and continues
+# at H+1.
 #
 # Phase 2 note: promotion currently re-identifies the chain (the migration
 # genesis commits to the checkpoint hash). Same-ID in-process promotion is
@@ -11,9 +13,11 @@ set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-readonly TERMINAL_HEIGHT="${TERMINAL_HEIGHT:-1200}"
+readonly TERMINAL_HEIGHT="${TERMINAL_HEIGHT:-300}"
 readonly WORK_DIR="${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}"
 readonly LEAP_API="http://127.0.0.1:${LEAP_HTTP_PORT:-8888}"
+readonly LEAP_V1_API="http://127.0.0.1:${LEAP_V1_HTTP_PORT:-18881}"
+readonly LEAP_V2_API="http://127.0.0.1:${LEAP_V2_HTTP_PORT:-18882}"
 readonly SHADOW_RPC="http://127.0.0.1:${SHADOW_RPC_PORT:-9660}"
 readonly XPR_CORE_DIR="${XPR_CORE_DIR:-/src/antelope-leap}"
 readonly NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO_ROOT/../metal-network-runner/bin/metal-network-runner}"
@@ -28,9 +32,17 @@ fail() { echo "handover: $*" >&2; exit 1; }
 
 # Leap validates the HTTP Host header against its listening address, so
 # requests arriving via a remapped host port must forge 0.0.0.0:8888.
-leap_info() {
-    curl --fail --silent --max-time 10 -X POST "$LEAP_API/v1/chain/get_info" \
+leap_node_info() {
+    curl --fail --silent --max-time 10 -X POST "$1/v1/chain/get_info" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}'
+}
+leap_info() {
+    leap_node_info "$LEAP_API"
+}
+# "head lib" for one XPR node; empty on failure.
+leap_head_lib() {
+    leap_node_info "$1" 2>/dev/null \
+        | python3 -c 'import json,sys; i=json.load(sys.stdin); print(i["head_block_num"], i["last_irreversible_block_num"])' 2>/dev/null || true
 }
 shadow_head() {
     curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
@@ -62,6 +74,32 @@ cmd_start() {
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
     leap_info >/dev/null || fail "Leap producer did not become ready"
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-validator-1 xpr-validator-2)
+    echo "handover: waiting for the two validators to answer..."
+    for _ in $(seq 1 90); do
+        leap_node_info "$LEAP_V1_API" >/dev/null 2>&1 && leap_node_info "$LEAP_V2_API" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    leap_node_info "$LEAP_V1_API" >/dev/null || fail "validator 1 did not become ready"
+    leap_node_info "$LEAP_V2_API" >/dev/null || fail "validator 2 did not become ready"
+    echo "handover: waiting for three-node consensus (equal head and LIB on all nodes)..."
+    converged=false
+    for _ in $(seq 1 60); do
+        p="$(leap_head_lib "$LEAP_API")"
+        v1="$(leap_head_lib "$LEAP_V1_API")"
+        v2="$(leap_head_lib "$LEAP_V2_API")"
+        echo "handover: producer [$p] validator-1 [$v1] validator-2 [$v2]"
+        if [[ -n "$p" && "$p" == "$v1" && "$p" == "$v2" ]]; then
+            head="${p%% *}"
+            if [[ "$head" -ge 10 ]]; then
+                echo "handover: consensus at head $head"
+                converged=true
+                break
+            fi
+        fi
+        sleep 2
+    done
+    [[ "$converged" == true ]] || fail "XPR nodes never reached consensus"
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
     echo "handover: shadowing until height $TERMINAL_HEIGHT..."
     while true; do
@@ -104,8 +142,18 @@ cmd_halt() {
     else
         echo "$mountpoint/$snap" >"$WORK_DIR/snapshot"
     fi
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer)
-    echo "handover: halted; H=$H id=$H_ID; waiting for the shadow to absorb H..."
+    # Full network halt: stop the producer and both validators. The XPR
+    # chain must freeze: no new blocks may appear in the shared block log
+    # after the stop.
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer xpr-validator-1 xpr-validator-2)
+    blocks_log="$mountpoint/blocks/blocks.log"
+    size_before="$(stat -c '%s' "$blocks_log" 2>/dev/null || stat -f '%z' "$blocks_log")"
+    echo "handover: XPR network stopped at H=$H; proving the freeze (blocks.log $size_before bytes)..."
+    sleep 10
+    size_after="$(stat -c '%s' "$blocks_log" 2>/dev/null || stat -f '%z' "$blocks_log")"
+    [[ "$size_before" == "$size_after" ]] \
+        || fail "XPR network did not freeze: blocks.log grew $size_before -> $size_after after the stop"
+    echo "handover: halted and frozen; H=$H id=$H_ID; waiting for the shadow to absorb H..."
     for _ in $(seq 1 36); do
         shadow_h="$(shadow_head 2>/dev/null || echo 0)"
         [[ "$shadow_h" -ge "$H" ]] && break
@@ -190,7 +238,33 @@ cmd_boot() {
         PULSEVM_VERIFY_FIVE_NODE=false \
         scripts/run-local.sh >"$WORK_DIR/five-node.log" 2>&1 &
         echo $! >"$WORK_DIR/five-node.pid")
-    echo "handover: waiting for the new network to pass H..."
+    echo "handover: building the probe-tx tool..."
+    (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) \
+        || fail "probe tool build failed"
+    PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
+    # The new network only builds on demand: empty blocks are gated, so H+1
+    # needs a transaction. Submit the network's first transaction itself.
+    echo "handover: waiting for the new network RPC..."
+    rpc_url=""
+    for _ in $(seq 1 60); do
+        rpc_url="$(chain_rpc_url || true)"
+        [[ -n "$rpc_url" ]] || { sleep 5; continue; }
+        rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' >/dev/null 2>&1 && break
+        rpc_url=""
+        sleep 5
+    done
+    [[ -n "$rpc_url" ]] || fail "new network RPC never came up (see $WORK_DIR/five-node.log)"
+    read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
+        | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
+    [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
+    echo "handover: new network at head $new_head; submitting its first transaction..."
+    ref_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$new_head_id')[8:12], 'little'))")"
+    exp="$(($(date +%s) + 1800))"
+    probe_tx="$("$PROBE_BIN" "$new_chain" "$PULSEVM_PRODUCER_KEY" "$new_head" "$ref_prefix" "$exp" bob)"
+    txid="$(rpc_call "$rpc_url" "$probe_tx" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["txID"])')" \
+        || fail "first-transaction submission failed"
+    echo "handover: first transaction $txid submitted; waiting for the new network to pass H..."
     rpc_url=""
     new_head=0
     for _ in $(seq 1 60); do
@@ -232,8 +306,8 @@ case "${1:-}" in
     resume-boot) cmd_boot "$(cat "${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/checkpoint")" ;;
     stop) cmd_stop ;;
     *) echo "usage: run-handover.sh start|resume-checkpoint|resume-boot|stop" >&2
-       echo "env: TERMINAL_HEIGHT (default 1200, ~10 min at 0.5s blocks)," >&2
+       echo "env: TERMINAL_HEIGHT (default 300, ~3 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
-       echo "     LEAP_HTTP_PORT, SHADOW_RPC_PORT" >&2
+       echo "     LEAP_HTTP_PORT, LEAP_V1_HTTP_PORT, LEAP_V2_HTTP_PORT, SHADOW_RPC_PORT" >&2
        exit 2 ;;
 esac

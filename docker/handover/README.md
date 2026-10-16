@@ -44,6 +44,13 @@ H to H+1, advancing head) across that re-identification. Same-ID
 in-process promotion — the shadow process itself starting to author at H —
 needs block production inside the replay binary and is not modeled here.
 
+Full run: `TERMINAL_HEIGHT=300 ./run-handover.sh start` runs everything
+unattended — three-node Leap consensus, shadow follow to N, full network
+halt with a freeze proof, checkpoint, five-node boot, the network's own
+first transaction (empty blocks are gated, so H+1 needs one), and the
+continuity asserts. It ends with `handover: PASS` and leaves the new
+network running.
+
 Rehearsal-only support: `XPR_REPLAY_GENESIS_FILE` lets the replay binary
 follow a non-mainnet fixture chain. It is default-off; without it every
 mainnet pin behaves exactly as before.
