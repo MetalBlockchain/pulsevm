@@ -30,8 +30,10 @@ docker/handover/run-handover.sh stop
 
 Host Rust with LLVM 22 (for the checkpoint importer), Docker with the
 `pulsevm-handover` compose project, and MetalGo plus the network runner
-for the five-node boot (`METALGO_EXEC_PATH`, same defaults as
-`scripts/run-local.sh`). No XPR core checkout is needed: preflight and the
+for the five-node boot (`METALGO_EXEC_PATH`, default
+`../metalgo-tahoe/build/metalgo`: the plugin speaks rpcchainvm 45, so a
+pre-tahoe MetalGo fails the handshake and the boot never comes up). No
+XPR core checkout is needed: preflight and the
 deferred sidecar are mainnet provenance guards, and the fixture chain has
 no deferred activity, so the rehearsal skips them by design.
 

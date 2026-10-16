@@ -373,7 +373,7 @@ cmd_boot() {
     # signing gate and the new network never passes H.
     export PULSEVM_GENESIS_INITIAL_KEY="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
     (cd "$REPO_ROOT" && \
-        METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo/build/metalgo}" \
+        METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
         PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins" \
         PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node" \
