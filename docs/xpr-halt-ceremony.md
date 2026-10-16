@@ -1,7 +1,9 @@
 # XPR Validator Halt Commitment: On-Chain Vote Strategy
 
-Status: strategy (not yet implemented). Decided: validators commit **on XPR
-itself**, quorum is **2/3 of producer-schedule weight**. Companion docs:
+Status: strategy; the quorum verifier is **implemented and tested**
+(`HaltCommitment::verify_weighted_quorum` + 9 boundary tests, see
+“Implementation status”). Decided: validators commit **on XPR itself**,
+quorum is **2/3 of producer-schedule weight**. Companion docs:
 [rehearsal proof](xpr-handover-rehearsal.md), full migration design
 (`docs/xpr-achain-migration.md` on `docs/xpr-achain-migration`).
 
@@ -60,14 +62,20 @@ side: restore fails closed unless the on-chain quorum verifies.
   disagrees about the vote set disagrees about state — caught by the existing
   state-equivalence gate before promotion is even considered.
 
-## Implementation sketch (when approved)
+## Implementation status
 
-1. Commit contract (`haltcommit`): tables `roster` (pinned at R), `votes`,
-   `attests`; actions `setroster` (privileged, once), `commit`, `attest`;
-   unit tests against a local schedule.
-2. Exporter: read the three tables into `MigrationManifest` (new fields,
-   format-versioned; v1 single-key path stays valid).
-3. Restore path: replace/augment the `halt_commitment` check with quorum
-   verification recomputed from replayed state; fail closed.
-4. Rehearsal: distinct per-validator keys, scripted Phase A + B, negative
-   test (quorum shortfall refuses promotion).
+- [x] Quorum verifier: `HaltCommitment::verify_weighted_quorum` in
+  `crates/pulsevm_chain_types/src/migration.rs` — schedule membership, K1
+  recovery per signature, one-weight-per-producer dedupe, integer
+  `signed*3 >= total*2` threshold, fail-closed empty/zero rosters; 9
+  boundary tests (exact quorum, shortfall, double-sign, non-roster,
+  tampered terminal/version) plus v1-compat test.
+- [ ] Commit contract (`haltcommit`): tables `roster` (pinned at R), `votes`,
+  `attests`; actions `setroster` (privileged, once), `commit`, `attest`;
+  unit tests against a local schedule.
+- [ ] Exporter: read the three tables into `MigrationManifest` (new fields,
+  format-versioned; v1 single-key path stays valid).
+- [ ] Restore path: feed the roster from replayed state into the quorum
+  check at the `halt_commitment` restore gate; fail closed.
+- [ ] Rehearsal: distinct per-validator keys, scripted Phase A + B, negative
+  test (quorum shortfall refuses promotion).
