@@ -146,11 +146,15 @@ cmd_halt() {
     # chain must freeze: no new blocks may appear in the shared block log
     # after the stop.
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer xpr-validator-1 xpr-validator-2)
-    blocks_log="$mountpoint/blocks/blocks.log"
-    size_before="$(stat -c '%s' "$blocks_log" 2>/dev/null || stat -f '%z' "$blocks_log")"
+    # The block log lives in a root-owned Docker volume: read its size from
+    # a throwaway container rather than stat(1) on the host mountpoint.
+    blocks_bytes() {
+        docker run --rm -v pulsevm-handover_leap-data:/d:ro ubuntu:24.04 stat -c '%s' /d/blocks/blocks.log
+    }
+    size_before="$(blocks_bytes)"
     echo "handover: XPR network stopped at H=$H; proving the freeze (blocks.log $size_before bytes)..."
     sleep 10
-    size_after="$(stat -c '%s' "$blocks_log" 2>/dev/null || stat -f '%z' "$blocks_log")"
+    size_after="$(blocks_bytes)"
     [[ "$size_before" == "$size_after" ]] \
         || fail "XPR network did not freeze: blocks.log grew $size_before -> $size_after after the stop"
     echo "handover: halted and frozen; H=$H id=$H_ID; waiting for the shadow to absorb H..."
