@@ -1366,6 +1366,25 @@ impl Controller {
                 )));
             }
             migration_source_block = Self::migration_source_block(&manifest)?;
+            // The new network only promotes state the old network agreed to
+            // freeze: when the manifest carries the producers' signed halt
+            // commitment, verify it against the terminal block before the
+            // checkpoint is trusted.
+            if let Some(commitment) = manifest.halt_commitment.as_ref() {
+                let source_block = migration_source_block.as_ref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration halt commitment requires an attached source block".into(),
+                    )
+                })?;
+                let source_id = source_block.id()?;
+                commitment
+                    .verify(source_block.block_num(), &source_id.0.0)
+                    .map_err(|error| {
+                        ChainError::GenesisError(format!(
+                            "migration halt commitment rejected: {error}"
+                        ))
+                    })?;
+            }
             if self.db.revision() <= 0 {
                 let header = self
                     .db
@@ -10477,6 +10496,46 @@ mod tests {
         ))
     }
 
+    // Signs the old network's halt commitment over a migration source block
+    // with the schedule key, as the halt ceremony does. When tamper is set
+    // the signature is corrupted to prove the restore fails closed.
+    fn attach_halt_commitment(
+        manifest_path: &str,
+        source_block_num: u32,
+        source_block_id: &Id,
+        schedule_key_wif: &str,
+        tamper: bool,
+    ) -> Result<(), ChainError> {
+        let signing_key = pulsevm_crypto::K1PrivateKey::from_string(schedule_key_wif)
+            .map_err(|e| ChainError::InternalError(format!("bad schedule key: {e:?}")))?;
+        let producer_key = signing_key.public_key().to_string();
+        let digest =
+            pulsevm_database::HaltCommitment::digest(source_block_num, &source_block_id.0.0);
+        let mut signature = signing_key.sign(&digest).to_string();
+        if tamper {
+            signature.pop();
+            signature.push('1');
+        }
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        manifest["halt_commitment"] = json!({
+            "version": 1,
+            "halt_height": source_block_num,
+            "halt_block_id": hex::encode(source_block_id.as_bytes()),
+            "producer_keys": [producer_key.clone()],
+            "signatures": [{
+                "producer": "pulse",
+                "key": producer_key,
+                "signature": signature,
+            }],
+        });
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn migration_restore_builds_with_matching_schedule_key() -> Result<(), ChainError> {
         let schedule_key =
@@ -10570,6 +10629,107 @@ mod tests {
         assert!(
             error.to_string().contains("refusing to produce"),
             "a node without the schedule key must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The new network only promotes committed state: a manifest carrying
+    // a valid halt commitment restores and builds.
+    #[tokio::test]
+    async fn migration_restore_accepts_signed_halt_commitment() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        attach_halt_commitment(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("carol")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.block_num(), source_block_num + 1);
+        Ok(())
+    }
+
+    // A corrupted halt commitment fails the restore closed: no signature,
+    // no promotion.
+    #[tokio::test]
+    async fn migration_restore_rejects_tampered_halt_commitment() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        attach_halt_commitment(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            true,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a tampered commitment must fail closed, got: {error}"
         );
         Ok(())
     }

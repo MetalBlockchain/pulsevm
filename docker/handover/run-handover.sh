@@ -174,6 +174,68 @@ cmd_halt() {
     # the snapshot and the stop are stragglers past the declared cutoff and
     # are ignored, exactly as post-H XPR blocks are ignored by the A-Chain.
     echo "handover: snapshotting, then halting the producer (models the BP halt commitment)..."
+    # Boundary traffic, phase 1: customer transactions that must land on the
+    # OLD network (at or below H). They are submitted now and driven to
+    # irreversibility before the snapshot, so the audit can later prove none
+    # were lost in the swap.
+    read -r b_leap_chain b_leap_head b_leap_head_id <<<"$(leap_chain_head "$LEAP_API")"
+    b_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$b_leap_head_id')[8:12], 'little'))")"
+    b_exp="$(($(date +%s) + 1800))"
+    b_ref="$((b_leap_head & 0xffff))"
+    b_dev="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
+    phase1='[]'
+    for cname in c1 c2 c3 c4 c5; do
+        txid="$(leap_send "$("$PROBE_BIN" newaccount "$b_leap_chain" "$b_dev" "$b_ref" "$b_prefix" "$b_exp" "$cname")")"
+        echo "handover: boundary tx $cname: $txid"
+        phase1="$(printf '%s' "$phase1" | python3 -c "import json,sys; l=json.load(sys.stdin); l.append({\"name\": \"$cname\", \"txid\": \"$txid\"}); print(json.dumps(l))")"
+    done
+    echo "handover: waiting for boundary traffic to exist and go irreversible..."
+    for _ in $(seq 1 60); do
+        leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"c5"}' >/dev/null 2>&1 && break
+        sleep 2
+    done
+    leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"c5"}' >/dev/null \
+        || fail "boundary traffic never landed"
+    for _ in $(seq 1 60); do
+        b_now="$(leap_head_lib "$LEAP_API")"
+        [[ "${b_now##* }" -ge "$b_leap_head" ]] && break
+        sleep 2
+    done
+    [[ "${b_now##* }" -ge "$b_leap_head" ]] || fail "boundary traffic never went irreversible"
+    python3 -c 'import json,sys; json.dump({"submit_head": int(sys.argv[1]), "phase1": json.loads(sys.argv[2]), "phase3": []}, open(sys.argv[3], "w"), indent=1)' \
+        "$b_leap_head" "$phase1" "$WORK_DIR/boundary-txns.json"
+    echo "handover: confirming boundary traffic landed pre-halt..."
+    python3 - "$WORK_DIR/boundary-txns.json" "$LEAP_API" <<'PYEOF' || fail "boundary traffic missing pre-halt"
+import json, sys, urllib.request
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Host": "0.0.0.0:8888"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+rec = json.load(open(sys.argv[1]))
+api = sys.argv[2]
+want = {t["txid"] for t in rec["phase1"]}
+lo = rec["submit_head"]
+hi = post(api + "/v1/chain/get_info", {})["head_block_num"]
+found = set()
+for num in range(lo, hi + 1):
+    block = post(api + "/v1/chain/get_block", {"block_num_or_id": str(num)})
+    for t in block.get("transactions", []):
+        trx = t.get("trx", t)
+        tid = trx.get("id") if isinstance(trx, dict) else trx
+        if isinstance(tid, str) and len(tid) == 64:
+            found.add(tid)
+missing = sorted(w for w in want if w not in found)
+if missing:
+    print(f"  missing pre-halt: {missing}")
+    sys.exit(1)
+rec["old_ids"] = sorted(found)
+rec["phase1_hi"] = hi
+json.dump(rec, open(sys.argv[1], "w"), indent=1)
+print(f"  phase 1 confirmed in old chain blocks [{lo},{hi}]")
+PYEOF
+    echo "handover: boundary phase 1 sealed at LIB (submit head $b_leap_head)"
     snap_json="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}')"
     snap="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
@@ -231,6 +293,11 @@ cmd_halt() {
     shadow_h="$(shadow_head)"
     [[ "$shadow_h" -ge "$H" ]] || fail "shadow never absorbed H=$H (stuck at $shadow_h)"
     echo "handover: shadow absorbed H (shadow $shadow_h); checkpointing..."
+    # The replay's job ends here: it absorbed the terminal block, and the
+    # checkpoint is sealed from static artifacts. Stop it explicitly — from
+    # this point only the new network may write.
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop shadow)
+    echo "handover: replay stopped; only the new network writes from here"
     cmd_checkpoint
 }
 
@@ -261,10 +328,16 @@ cmd_checkpoint() {
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
         || fail "attach tool build failed"
     manifest="$export_dir/migration.snapshot.manifest.json"
+    # The halt ceremony signs the freeze over H with the old schedule's key;
+    # the new network verifies this commitment before promoting.
+    # Fixture dev key doubles as the old schedule key (rehearsal only).
+    halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
     "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
         "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+        --halt-key "$halt_key" \
         || fail "source block attach failed (H must be an empty block)"
     mv "$manifest.attached" "$manifest"
+    echo "handover: halt commitment signed over H=$H"
     echo "$export_dir/migration.snapshot" >"$WORK_DIR/checkpoint"
     echo "handover: checkpoint ready: $export_dir/migration.snapshot"
     cmd_boot "$export_dir/migration.snapshot"
@@ -335,20 +408,28 @@ cmd_boot() {
         [[ -n "$victim" ]] || fail "chaos requested but no node process found"
         kill -9 "$victim" && echo "handover: chaos: killed node pid $victim; H+1 must land on 4/5"
     fi
-    echo "handover: new network at head $new_head; submitting its first transaction..."
-    probe_name=bob
-    if rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getAccount","params":{"account_name":"bob"}}' 2>/dev/null \
-        | python3 -c 'import json,sys; json.load(sys.stdin)["result"]' >/dev/null 2>&1; then
-        probe_name=carol
-        echo "handover: bob already exists here; probing as carol"
-    fi
+    echo "handover: new network at head $new_head; submitting its first transactions..."
+    # Timestamp-suffixed names stay unique across reboots of one checkpoint.
+    dtag="d$(date +%s)"
     ref_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$new_head_id')[8:12], 'little'))")"
     exp="$(($(date +%s) + 1800))"
-    probe_tx="$("$PROBE_BIN" newaccount "$new_chain" "$PULSEVM_PRODUCER_KEY" "$new_head" "$ref_prefix" "$exp" "$probe_name")"
-    txid="$(rpc_call "$rpc_url" "$probe_tx" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["txID"])')" \
-        || fail "first-transaction submission failed"
-    echo "handover: first transaction $txid submitted; waiting for the new network to pass H..."
+    phase3='[]'
+    for i in 1 2 3 4 5; do
+        dname="${dtag}${i}"
+        probe_tx="$("$PROBE_BIN" newaccount "$new_chain" "$PULSEVM_PRODUCER_KEY" "$new_head" "$ref_prefix" "$exp" "$dname")"
+        txid="$(rpc_call "$rpc_url" "$probe_tx" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["txID"])')" \
+            || fail "first-transaction submission failed"
+        echo "handover: new-network tx $dname: $txid"
+        phase3="$(printf '%s' "$phase3" | python3 -c "import json,sys; l=json.load(sys.stdin); l.append({\"name\": \"$dname\", \"txid\": \"$txid\"}); print(json.dumps(l))")"
+    done
+    # Older checkpoints predate boundary traffic: start an empty record so
+    # the audit still covers phase 3.
+    [[ -f "$WORK_DIR/boundary-txns.json" ]] \
+        || echo '{"submit_head": 0, "phase1": [], "phase3": []}' >"$WORK_DIR/boundary-txns.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["phase3"] = json.loads(sys.argv[2]); d["new_head"] = int(sys.argv[3]); json.dump(d, open(sys.argv[1], "w"), indent=1)' \
+        "$WORK_DIR/boundary-txns.json" "$phase3" "$new_head"
+    echo "handover: boundary phase 3 submitted; waiting for the new network to pass H..."
     wait_iters=60
     [[ "${CHAOS_KILL_NODE:-0}" == 1 ]] && wait_iters=150
     rpc_url=""
@@ -429,7 +510,59 @@ sys.exit(1 if bad else 0)
 PYEOF
     old_chain="$(shadow_head >/dev/null 2>&1; curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])' 2>/dev/null || echo stopped)"
     new_chain="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])')"
-    echo "handover: PASS: block $((H + 1)) builds on halt block $H_ID with identical migrated state; shadow chain $old_chain -> new chain $new_chain"
+    # Boundary audit: from the customer's seat the network never stops, it
+    # swaps. Every phase-1 tx must sit at or below H on the old chain, every
+    # phase-3 tx strictly above H on the new chain, and no txid may appear
+    # on both sides: none lost, none duplicated.
+    echo "handover: auditing exactly-once across the swap..."
+    python3 - "$WORK_DIR/boundary-txns.json" "$rpc_url" "$H" <<'PYEOF' || fail "boundary audit failed"
+import json, sys, urllib.request
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+def pulse_trx_ids(rpc, num):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "pulsevm.getBlock",
+            "params": {"block_num_or_id": str(num)}}
+    block = post(rpc, body)["result"]
+    ids = set()
+    for t in block.get("transactions", []):
+        trx = t.get("trx", t)
+        tid = trx.get("id") if isinstance(trx, dict) else trx
+        if isinstance(tid, str) and len(tid) == 64:
+            ids.add(tid)
+    return ids
+rec = json.load(open(sys.argv[1]))
+rpc, H = sys.argv[2], int(sys.argv[3])
+phase1 = {t["txid"] for t in rec.get("phase1", [])}
+phase3 = {t["txid"] for t in rec.get("phase3", [])}
+old_ids = set(rec.get("old_ids", []))
+new_ids = set()
+head = post(rpc, {"jsonrpc": "2.0", "id": 1, "method": "pulsevm.getInfo",
+                  "params": {}})["result"]["head_block_num"]
+for num in range(H + 1, head + 1):
+    new_ids |= pulse_trx_ids(rpc, num)
+print(f"  old chain pre-halt scan: {len(old_ids)} txs; new chain blocks [{H + 1},{head}]: {len(new_ids)} txs")
+bad = 0
+for tid in sorted(phase1):
+    if tid not in old_ids:
+        print(f"  LOST pre-halt tx {tid}")
+        bad += 1
+for tid in sorted(phase3):
+    if tid not in new_ids:
+        print(f"  LOST post-halt tx {tid}")
+        bad += 1
+if phase1 & new_ids:
+    print(f"  DUPLICATED across swap: {sorted(phase1 & new_ids)}")
+    bad += 1
+if phase3 & old_ids:
+    print(f"  DUPLICATED across swap: {sorted(phase3 & old_ids)}")
+    bad += 1
+print(f"boundary: {len(phase1) + len(phase3) - bad}/{len(phase1) + len(phase3)} txs exactly-once")
+sys.exit(1 if bad else 0)
+PYEOF
+    echo "handover: PASS: block $((H + 1)) builds on committed halt block $H_ID with identical migrated state and exactly-once boundary traffic; shadow chain $old_chain -> new chain $new_chain"
     echo "handover: new network RPC: $rpc_url (left running; run stop to tear down)"
 }
 

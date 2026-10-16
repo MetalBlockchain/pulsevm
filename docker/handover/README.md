@@ -56,10 +56,18 @@ running:
    freeze proof.
 3. Checkpoint export, five-node boot, the network's own first transaction
    (empty blocks are gated, so H+1 needs one).
-4. Continuity assert (H+1's parent is H) **and** a state-equivalence gate:
-   every pre-halt account reads back on the new network with
-   byte-identical authorities (key strings differ by format, so payloads
-   are compared, not strings).
+4. Continuity assert (H+1's parent is H), a state-equivalence gate
+   (every pre-halt account reads back with byte-identical authorities),
+   and a boundary audit: customer transactions submitted just before the
+   halt land at or below H, transactions submitted after boot land above
+   H, none lost, none duplicated — from the customer's seat the network
+   never stops, it swaps.
+
+The halt is a signed commitment, not just stopped containers: the attach
+step signs H over the old schedule's key into the manifest, and the new
+network verifies that commitment before promoting (tampered commitments
+fail the restore closed). The replay container is stopped explicitly once
+the shadow absorbs H — from there only the new network writes.
 
 `CHAOS_KILL_NODE=1` drops one validator before the first transaction, so
 H+1 must finalize on 4/5 quorum (slower Snowman convergence; longer wait

@@ -4,6 +4,10 @@
 //! boundaries with transactions or schedule changes are deliberately rejected;
 //! choose an empty boundary block so the migration anchor can be independently
 //! reconstructed and checked without trusting pruned transaction JSON.
+//!
+//! With `--halt-key <wif>` the tool additionally signs the old network's halt
+//! commitment over the boundary block and embeds it in the manifest, so the
+//! new network verifies the producers agreed to freeze before promoting.
 
 use std::{
     collections::VecDeque,
@@ -25,9 +29,14 @@ use pulsevm_core::{
     id::Id,
     name::Name,
 };
-use pulsevm_crypto::Digest;
+use pulsevm_crypto::{
+    Digest,
+    K1PrivateKey,
+};
 use pulsevm_database::{
     BlockTimestamp,
+    HaltCommitment,
+    HaltSignature,
     MigrationManifest,
 };
 use pulsevm_serialization::Write;
@@ -35,7 +44,7 @@ use serde_json::Value;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json>"
+        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>]"
     );
 }
 
@@ -47,11 +56,25 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
-    if args.next().is_some() {
-        usage();
-        return ExitCode::from(2);
+    let mut halt_key: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--halt-key" {
+            let Some(wif) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_key = Some(wif.to_string_lossy().into_owned());
+        } else {
+            usage();
+            return ExitCode::from(2);
+        }
     }
-    match attach(Path::new(&manifest), Path::new(&block), Path::new(&output)) {
+    match attach(
+        Path::new(&manifest),
+        Path::new(&block),
+        Path::new(&output),
+        halt_key.as_deref(),
+    ) {
         Ok((height, id)) => {
             println!("attached migration source block {height} {id}");
             ExitCode::SUCCESS
@@ -67,6 +90,7 @@ fn attach(
     manifest_path: &Path,
     block_path: &Path,
     output_path: &Path,
+    halt_key: Option<&str>,
 ) -> Result<(u32, Id), String> {
     let mut manifest: MigrationManifest = serde_json::from_slice(
         &fs::read(manifest_path).map_err(|error| format!("read manifest: {error}"))?,
@@ -151,6 +175,26 @@ fn attach(
             .pack()
             .map_err(|error| format!("pack source block: {error}"))?,
     ));
+    // The halt ceremony signs the freeze over the boundary block: the new
+    // network verifies this commitment against the old schedule before it
+    // promotes the checkpoint.
+    if let Some(wif) = halt_key {
+        let signing = K1PrivateKey::from_string(wif)
+            .map_err(|error| format!("halt key invalid: {error:?}"))?;
+        let producer_key = signing.public_key().to_string();
+        let digest = HaltCommitment::digest(height, &id.0.0);
+        manifest.halt_commitment = Some(HaltCommitment {
+            version: HaltCommitment::VERSION,
+            halt_height: height,
+            halt_block_id: hex::encode(id.as_bytes()),
+            producer_keys: vec![producer_key.clone()],
+            signatures: vec![HaltSignature {
+                producer: block.signed_block_header.header.producer.to_string(),
+                key: producer_key,
+                signature: signing.sign(&digest).to_string(),
+            }],
+        });
+    }
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("serialize manifest: {error}"))?;
     let temporary = output_path.with_extension(format!("tmp-{}", std::process::id()));
