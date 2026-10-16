@@ -21,7 +21,12 @@ readonly LEAP_V2_API="http://127.0.0.1:${LEAP_V2_HTTP_PORT:-18882}"
 readonly SHADOW_RPC="http://127.0.0.1:${SHADOW_RPC_PORT:-9660}"
 readonly XPR_CORE_DIR="${XPR_CORE_DIR:-/src/antelope-leap}"
 readonly NETWORK_RUNNER="${METAL_NETWORK_RUNNER_PATH:-$REPO_ROOT/../metal-network-runner/bin/metal-network-runner}"
-readonly RUNNER_ENDPOINT="${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
+runner_endpoint() {
+    # Resolved lazily (not readonly at load): cmd_boot exports the rehearsal
+    # endpoint (18080) after startup, and polling must follow it, not the
+    # load-time default.
+    printf '%s' "${METAL_NETWORK_RUNNER_ENDPOINT:-127.0.0.1:8081}"
+}
 
 # Set early so every compose invocation (including stop) interpolates.
 export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
@@ -70,7 +75,7 @@ chain_rpc_url() {
     # for the runner client timeout.
     # list-rpcs reports the full handler URL including the /rpc suffix: keep
     # it, since the bare /ext/bc/<id> base answers 404.
-    timeout 15 "$NETWORK_RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT" 2>/dev/null \
+    timeout 15 "$NETWORK_RUNNER" control list-rpcs --endpoint="$(runner_endpoint)" 2>/dev/null \
         | sed $'s/\033\[[0-9;]*m//g' \
         | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+/rpc' | head -1
 }
