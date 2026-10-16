@@ -33,7 +33,16 @@ export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examp
 # Host Rust toolchain for the checkpoint importer and the replay build.
 export PATH="$HOME/.cargo/bin:$PATH"
 
-fail() { echo "handover: $*" >&2; exit 1; }
+fail() {
+    echo "handover: $*" >&2
+    # Never leave a booted five-node network behind a failed run: take the
+    # supervisor down with us (nodes stay up only after an explicit PASS).
+    if [[ -f "${WORK_DIR:-/nonexistent}/five-node.pid" ]]; then
+        kill "$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
+        pkill -f 'metal-network-runne[r]' 2>/dev/null || true
+    fi
+    exit 1
+}
 
 # Leap validates the HTTP Host header against its listening address, so
 # requests arriving via a remapped host port must forge 0.0.0.0:8888.
@@ -377,14 +386,18 @@ cmd_boot() {
     # producer boots from: with a foreign key every build fails closed at the
     # signing gate and the new network never passes H.
     export PULSEVM_GENESIS_INITIAL_KEY="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
+    # Fully detached (double-fork via setsid): the boot supervisor must neither
+    # stall this script's exit (a shell waits for its children on the way
+    # out) nor die with it — after PASS the network stays up until `stop`.
+    # The supervisor records its own PID for `stop`/fail cleanup.
     (cd "$REPO_ROOT" && \
         METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}" \
         PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
         PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins" \
         PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node" \
         PULSEVM_VERIFY_FIVE_NODE=false \
-        scripts/run-local.sh >"$WORK_DIR/five-node.log" 2>&1 &
-        echo $! >"$WORK_DIR/five-node.pid")
+        setsid -f bash -c 'echo $$ >"$1"; exec ./scripts/run-local.sh >"$2" 2>&1' \
+            _ "$WORK_DIR/five-node.pid" "$WORK_DIR/five-node.log")
     echo "handover: building the probe-tx tool..."
     (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) \
         || fail "probe tool build failed"
@@ -415,7 +428,16 @@ cmd_boot() {
     fi
     echo "handover: new network at head $new_head; submitting its first transactions..."
     # Timestamp-suffixed names stay unique across reboots of one checkpoint.
-    dtag="d$(date +%s)"
+    # EOS names only allow a-z, 1-5 and '.': decimal epochs contain 0 and
+    # 6-9, so encode the epoch in base 5 (digits mapped to 1-5). Mod 5^10
+    # keeps 10 chars, unique for ~113 days of reboots.
+    dtag="d$(python3 -c "
+e = int(__import__('time').time()) % 9765625
+s = ''
+for _ in range(10):
+    s = '12345'[e % 5] + s
+    e //= 5
+print(s)")"
     ref_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$new_head_id')[8:12], 'little'))")"
     exp="$(($(date +%s) + 1800))"
     phase3='[]'
