@@ -99,6 +99,7 @@ pub use pulsevm_chain_types::{
     GenesisState,
     HALT_DOMAIN,
     HaltCommitment,
+    HaltRosterEntry,
     HaltSignature,
     KeyWeight,
     Microseconds,

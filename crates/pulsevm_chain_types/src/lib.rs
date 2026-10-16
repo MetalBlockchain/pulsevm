@@ -37,6 +37,7 @@ pub use genesis::GenesisState;
 pub use migration::{
     HALT_DOMAIN,
     HaltCommitment,
+    HaltRosterEntry,
     HaltSignature,
 };
 pub use time::{
