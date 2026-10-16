@@ -383,8 +383,13 @@ def b58decode(s):
     raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return b"\x00" * (len(s) - len(s.lstrip("1"))) + raw
 def keybytes(s):
-    assert s.startswith("EOS") or s.startswith("PUB_K1_"), f"unexpected key format {s}"
-    payload = b58decode(s)[:-4]
+    if s.startswith("PUB_K1_"):
+        body = s[len("PUB_K1_"):]
+    elif s.startswith("EOS"):
+        body = s[len("EOS"):]
+    else:
+        assert False, f"unexpected key format {s}"
+    payload = b58decode(body)[:-4]
     assert len(payload) == 33, f"bad payload length for {s}"
     return payload.hex()
 def norm_auth(a):
