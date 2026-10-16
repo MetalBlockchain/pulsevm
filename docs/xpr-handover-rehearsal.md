@@ -2,7 +2,8 @@
 
 Status: proven on EC2 (2026-10-16), twice — clean run and chaos run.
 Branch: `feat/handover-rehearsal`. Companion design doc:
-`docs/xpr-achain-migration.md` (on `docs/xpr-achain-migration`).
+`docs/xpr-achain-migration.md` (on `docs/xpr-achain-migration`); validator
+commitment strategy: [halt ceremony](xpr-halt-ceremony.md).
 
 ## What was proven
 
