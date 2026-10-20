@@ -1898,6 +1898,24 @@ impl Controller {
         Ok(())
     }
 
+    /// Return successfully executed input transactions to the mempool when a
+    /// build failure discards the block session. `build_block` pops
+    /// transactions before executing them, so without this step a refusal
+    /// (or any later failure) silently drops transactions the node already
+    /// executed — after acknowledging them. Generated receipts carry no
+    /// bytes (`for_id`); their Arena records are restored by the session
+    /// undo that accompanies every such failure, so only input receipts
+    /// requeue here. Requeued transactions keep their signed expiration
+    /// and are pruned normally on the next build; a transaction that fails
+    /// execution is still dropped, never requeued.
+    fn requeue_executed_inputs(mempool: &mut Mempool, receipts: &VecDeque<TransactionReceipt>) {
+        for receipt in receipts {
+            if let Some(transaction) = receipt.packed_trx() {
+                mempool.add_transaction(transaction.clone());
+            }
+        }
+    }
+
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
@@ -2237,8 +2255,20 @@ impl Controller {
         }
 
         // Create a new block
-        let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
-        let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
+        let transaction_mroot = match self.calculate_trx_merkle(&transaction_receipts) {
+            Ok(root) => root,
+            Err(error) => {
+                Self::requeue_executed_inputs(mempool, &transaction_receipts);
+                return Err(error);
+            }
+        };
+        let action_mroot = match self.calculate_action_merkle(&mut action_receipt_digests) {
+            Ok(root) => root,
+            Err(error) => {
+                Self::requeue_executed_inputs(mempool, &transaction_receipts);
+                return Err(error);
+            }
+        };
         let mut block = SignedBlock::new(
             self.preferred_id,
             timestamp,
@@ -2247,10 +2277,14 @@ impl Controller {
             transaction_mroot,
             action_mroot,
         );
-        block
+        if let Err(error) = block
             .signed_block_header
             .header
-            .set_protocol_feature_activations(&protocol_feature_activations)?;
+            .set_protocol_feature_activations(&protocol_feature_activations)
+        {
+            Self::requeue_executed_inputs(mempool, &block.transactions);
+            return Err(error);
+        }
 
         // Refuse to produce a block this node isn't authorized to sign:
         // if our key isn't that schedule's key for our producer, the block would
@@ -2263,6 +2297,7 @@ impl Controller {
             Some(scheduled) if *scheduled == signing_key => {}
             _ => {
                 db.arena_undo(); // discard this block's session
+                Self::requeue_executed_inputs(mempool, &block.transactions);
                 return Err(ChainError::BlockError(format!(
                     "node key is not the active schedule key for producer {}; refusing to produce",
                     producer
@@ -2275,17 +2310,37 @@ impl Controller {
 
         // Sign the block with the producer's key over the full header — including
         // any schedule change — so validators authenticate it against the schedule.
-        let sig_digest = if node.antelope_block_signatures {
-            self.header_signing_state_for_parent(&self.preferred_id)?
-                .signing_digest(&block.signed_block_header.header)?
+        let sig_digest = match if node.antelope_block_signatures {
+            self.header_signing_state_for_parent(&self.preferred_id)
+                .and_then(|signing_state| {
+                    signing_state.signing_digest(&block.signed_block_header.header)
+                })
         } else {
-            block.signed_block_header.header.sig_digest()?
+            block.signed_block_header.header.sig_digest()
+        } {
+            Ok(digest) => digest,
+            Err(error) => {
+                Self::requeue_executed_inputs(mempool, &block.transactions);
+                return Err(error);
+            }
         };
-        block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
+        match node.producer_key.sign(&sig_digest) {
+            Ok(signature) => block.signed_block_header.signature = signature,
+            Err(error) => {
+                Self::requeue_executed_inputs(mempool, &block.transactions);
+                return Err(error);
+            }
+        }
 
         // We built this block so no need to verify it again. Delay exposing it
         // as verified until every fallible end-of-block write succeeds.
-        let block_id = block.id()?;
+        let block_id = match block.id() {
+            Ok(id) => id,
+            Err(error) => {
+                Self::requeue_executed_inputs(mempool, &block.transactions);
+                return Err(error);
+            }
+        };
 
         // The permission rewrite is block state: keep it in the block's undo
         // session so forks unwind it and SHiP observes it before accept/commit.
@@ -2295,7 +2350,10 @@ impl Controller {
         // on the current tip). The arena session opened with `block_session` stays
         // open in lockstep — committed if this block is accepted, undone if the
         // chain unwinds past it.
-        self.finalize_block_resources(block.block_num())?;
+        if let Err(error) = self.finalize_block_resources(block.block_num()) {
+            Self::requeue_executed_inputs(mempool, &block.transactions);
+            return Err(error);
+        }
         self.verified_blocks.insert(block_id, block.clone());
         self.pending_chain.push(PendingBlock {
             id: block_id,
@@ -7567,7 +7625,126 @@ mod tests {
         Ok(())
     }
 
+    // A block carrying both an input transaction and an expired generated
+    // transaction serializes both receipt forms Leap serves in one
+    // `get_block`: the input as a full packed-transaction object, the
+    // generated as its bare id. Receipts are exactly admitted inputs plus
+    // due generated, in scheduled-first build order — no phantom receipts.
     #[tokio::test]
+    async fn block_with_input_and_expired_deferred_serializes_both_receipt_forms()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let scheduled = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("noop")?,
+            &Vec::<u8>::new(),
+            chain_id,
+        )?;
+        let scheduled_id = scheduled.id().clone();
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            0x99aa_bbcc_ddee_ff00_1122_3344_5566_7788,
+            PULSE_NAME.as_u64(),
+            scheduled_id.as_bytes().try_into().unwrap(),
+            0,
+            0, // already expired: retired as id-only without executing
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+
+        let expiration = TimePointSec::new(TimePointSec::now().sec_since_epoch() + 60);
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &private_key,
+            Name::from_str("mixed")?,
+            chain_id,
+            expiration,
+        )?);
+
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 2);
+
+        let json = serde_json::to_value(&block).unwrap();
+        let txns = json["transactions"].as_array().unwrap();
+        assert_eq!(txns.len(), 2);
+        assert_eq!(txns[0]["trx"], scheduled_id.to_string());
+        assert_eq!(txns[0]["status"], "expired");
+        assert!(txns[1]["trx"].is_object());
+        assert_eq!(txns[1]["status"], "executed");
+        Ok(())
+    }
+
+    // Refusing to produce (schedule key mismatch) must not lose executed
+    // transactions: they return to the mempool and build fine once the node
+    // holds the scheduled key again. This is the defined retry behaviour
+    // for a refused build — the transaction was already acknowledged, so
+    // dropping it would be a silent loss.
+    #[tokio::test]
+    async fn refused_block_returns_executed_transactions_to_mempool() -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        // An expired generated transaction rides along: it carries no bytes,
+        // so the requeue must skip it (its Arena record is restored by the
+        // session undo instead) while still returning the input transaction.
+        let scheduled = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("noop")?,
+            &Vec::<u8>::new(),
+            chain_id,
+        )?;
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            0x99aa_bbcc_ddee_ff00_1122_3344_5566_7788,
+            PULSE_NAME.as_u64(),
+            scheduled.id().as_bytes().try_into().unwrap(),
+            0,
+            0, // already expired: retired as id-only without executing
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        let expiration = TimePointSec::new(TimePointSec::now().sec_since_epoch() + 60);
+        let tx = create_account_with_expiration(
+            &private_key,
+            Name::from_str("retryme")?,
+            chain_id,
+            expiration,
+        )?;
+        let tx_id = tx.id().clone();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(tx);
+
+        // Tamper the node key so the schedule check refuses after execution.
+        let scheduled_key = controller
+            .node_config
+            .as_ref()
+            .unwrap()
+            .producer_key
+            .clone();
+        controller.node_config.as_mut().unwrap().producer_key =
+            PrivateKey::from_str("PVT_K1_2pjSqJxTbRHq8h8aHHTux81Ypscb36Q2syB8UJbZcUmxbfZdnT")?;
+        let error = controller
+            .build_block(&mut mempool)
+            .await
+            .expect_err("schedule mismatch must refuse");
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            mempool.contains(&tx_id),
+            "executed transaction must be requeued after refusal"
+        );
+
+        // Retry with the scheduled key: both the requeued input and the
+        // restored generated transaction build and land.
+        controller.node_config.as_mut().unwrap().producer_key = scheduled_key;
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 2);
+        assert_eq!(block.transactions[1].transaction_id(), &tx_id);
+        Ok(())
+    }
+
     async fn failed_deferred_transaction_runs_onerror_as_soft_fail() -> Result<(), ChainError> {
         fn install_onerror_handler(
             controller: &mut Controller,
