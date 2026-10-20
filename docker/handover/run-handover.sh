@@ -41,6 +41,9 @@ fail() {
         kill "$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
         pkill -f 'metal-network-runne[r]' 2>/dev/null || true
     fi
+    if [[ -f "${WORK_DIR:-/nonexistent}/shadow.pid" ]]; then
+        kill "$(cat "$WORK_DIR/shadow.pid")" 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -64,14 +67,37 @@ leap_post() {
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$3"
 }
 # Submit an issueTx-format body to Leap's send_transaction; prints the txid.
+# Fails LOUD: curl errors used to be swallowed by --fail --silent inside a
+# pipefail pipeline, so a duplicate or rejected transaction killed the run
+# via a bare set -e exit with no diagnosis (stale chain data from a reused
+# compose volume made every rerun hit "account already exists"). Retries
+# cover transient connection stalls; a persistent rejection aborts here.
 leap_send() {
-    leap_post "$LEAP_API" /v1/chain/send_transaction "$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])'
+    local body send_out attempt
+    body="$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
+        || { echo "handover: leap_send: refusing to submit an unparseable issueTx body" >&2; return 1; }
+    for attempt in 1 2 3; do
+        send_out="$(curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$body" 2>&1)" && break
+        echo "handover: leap_send attempt $attempt failed: $send_out" >&2
+        sleep 3
+    done
+    [[ -n "${send_out:-}" ]] || { echo "handover: leap_send: send_transaction unreachable after 3 attempts" >&2; return 1; }
+    printf '%s' "$send_out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])' 2>/dev/null \
+        || { echo "handover: leap_send: send_transaction rejected the transaction: $send_out" >&2; return 1; }
 }
-# "chain_id head_num head_id" for a Leap node.
+# "chain_id head_num head_id" for a Leap node. Retries: callers feed the
+# result straight into arithmetic under `set -e`, so a single transient
+# read (node serving get_info mid-block) must not silently kill the run.
 leap_chain_head() {
-    leap_node_info "$1" \
-        | python3 -c 'import json,sys; i=json.load(sys.stdin); print(i["chain_id"], i["head_block_num"], i["head_block_id"])'
+    local out attempt
+    for attempt in 1 2 3 4 5; do
+        out="$(leap_node_info "$1" 2>/dev/null | python3 -c 'import json,sys; i=json.load(sys.stdin); print(i["chain_id"], i["head_block_num"], i["head_block_id"])' 2>/dev/null)" && [[ -n "$out" ]] && break
+        out=""
+        sleep 2
+    done
+    [[ -n "${out:-}" ]] || { echo "handover: leap_chain_head: get_info unreadable after 5 attempts" >&2; return 1; }
+    printf '%s\n' "$out"
 }
 shadow_head() {
     curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" \
@@ -80,11 +106,15 @@ shadow_head() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])'
 }
 chain_rpc_url() {
-    # Bound the call: a dead endpoint otherwise stalls each poll iteration
-    # for the runner client timeout.
+    # Bound the call: a dead endpoint otherwise stalls each poll iteration.
+    # Uses the runner's own dial/request timeouts instead of GNU `timeout`,
+    # which does not exist on macOS (without this, discovery silently
+    # returns empty on Mac hosts and every boot dies with "RPC never came
+    # up" while the network underneath is healthy).
     # list-rpcs reports the full handler URL including the /rpc suffix: keep
     # it, since the bare /ext/bc/<id> base answers 404.
-    timeout 15 "$NETWORK_RUNNER" control list-rpcs --endpoint="$(runner_endpoint)" 2>/dev/null \
+    "$NETWORK_RUNNER" control list-rpcs --endpoint="$(runner_endpoint)" \
+        --dial-timeout 5s --request-timeout 15s 2>/dev/null \
         | sed $'s/\033\[[0-9;]*m//g' \
         | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+/rpc' | head -1
 }
@@ -102,6 +132,12 @@ cmd_start() {
     (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) || fail "probe tool build failed"
     PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
     [[ -x "$PROBE_BIN" ]] || fail "probe tool missing: $PROBE_BIN"
+    # A rehearsal proves a halt at H on a FRESH chain: drop the compose
+    # volumes first. Without this, reruns resume the previous run's chain
+    # from its named volume, so traffic/boundary account creation collides
+    # with already-existing accounts ("account already exists") and the
+    # terminal height is already passed — a resumed chain, not a migration.
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml down --volumes 2>/dev/null) || true
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-producer)
     echo "handover: waiting for the Leap producer..."
     for _ in $(seq 1 90); do leap_info >/dev/null 2>&1 && break; sleep 1; done
@@ -172,14 +208,34 @@ for name in ["eosio", "t1", "t2", "t3"]:
 json.dump(accts, open(out, "w"), indent=1)
 ' "$LEAP_API" "$WORK_DIR/pre-halt-accounts.json" || fail "pre-halt state capture failed"
     echo "handover: pre-halt state captured for eosio,t1,t2,t3"
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
+    # Native shadow (Mac hosts): the host-built replay binary is Mach-O and
+    # cannot run in the Linux shadow container, so it starts after the halt
+    # on a staged static copy of the frozen block log instead of following
+    # live. Real-time follow is already proven by containerized rehearsals.
+    if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" ]]; then
+        echo "handover: native shadow deferred until halt (static log replay)"
+    else
+        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
+    fi
     echo "handover: shadowing until height $TERMINAL_HEIGHT..."
-    while true; do
-        head="$(shadow_head 2>/dev/null || echo 0)"
-        echo "handover: shadow head $head / $TERMINAL_HEIGHT"
-        [[ "$head" -ge "$TERMINAL_HEIGHT" ]] && break
-        sleep 5
-    done
+    if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" ]]; then
+        # No live shadow here; wait for XPR itself to reach the terminal
+        # height, then halt. The static native shadow absorbs H afterwards.
+        while true; do
+            head="$(leap_head_lib "$LEAP_API" 2>/dev/null | cut -d' ' -f1)"
+            head="${head:-0}"
+            echo "handover: XPR head $head / $TERMINAL_HEIGHT"
+            [[ "$head" -ge "$TERMINAL_HEIGHT" ]] && break
+            sleep 5
+        done
+    else
+        while true; do
+            head="$(shadow_head 2>/dev/null || echo 0)"
+            echo "handover: shadow head $head / $TERMINAL_HEIGHT"
+            [[ "$head" -ge "$TERMINAL_HEIGHT" ]] && break
+            sleep 5
+        done
+    fi
     cmd_halt
 }
 
@@ -199,7 +255,8 @@ cmd_halt() {
     b_dev="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
     phase1='[]'
     for cname in c1 c2 c3 c4 c5; do
-        txid="$(leap_send "$("$PROBE_BIN" newaccount "$b_leap_chain" "$b_dev" "$b_ref" "$b_prefix" "$b_exp" "$cname")")"
+        txid="$(leap_send "$("$PROBE_BIN" newaccount "$b_leap_chain" "$b_dev" "$b_ref" "$b_prefix" "$b_exp" "$cname")")" \
+            || fail "boundary submit $cname failed (see leap_send diagnosis above)"
         echo "handover: boundary tx $cname: $txid"
         phase1="$(printf '%s' "$phase1" | python3 -c "import json,sys; l=json.load(sys.stdin); l.append({\"name\": \"$cname\", \"txid\": \"$txid\"}); print(json.dumps(l))")"
     done
@@ -220,7 +277,7 @@ cmd_halt() {
         "$b_leap_head" "$phase1" "$WORK_DIR/boundary-txns.json"
     echo "handover: confirming boundary traffic landed pre-halt..."
     python3 - "$WORK_DIR/boundary-txns.json" "$LEAP_API" <<'PYEOF' || fail "boundary traffic missing pre-halt"
-import json, sys, urllib.request
+import json, sys, time, urllib.request
 def post(url, body):
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json",
@@ -231,16 +288,25 @@ rec = json.load(open(sys.argv[1]))
 api = sys.argv[2]
 want = {t["txid"] for t in rec["phase1"]}
 lo = rec["submit_head"]
-hi = post(api + "/v1/chain/get_info", {})["head_block_num"]
-found = set()
-for num in range(lo, hi + 1):
-    block = post(api + "/v1/chain/get_block", {"block_num_or_id": str(num)})
-    for t in block.get("transactions", []):
-        trx = t.get("trx", t)
-        tid = trx.get("id") if isinstance(trx, dict) else trx
-        if isinstance(tid, str) and len(tid) == 64:
-            found.add(tid)
-missing = sorted(w for w in want if w not in found)
+# One clean pass is the norm; retry a few rounds so a transient read
+# (node serving a block while it is still being built) cannot fail a
+# healthy handover, while genuinely lost traffic still fails closed.
+missing = []
+for attempt in range(4):
+    hi = post(api + "/v1/chain/get_info", {})["head_block_num"]
+    found = set()
+    for num in range(lo, hi + 1):
+        block = post(api + "/v1/chain/get_block", {"block_num_or_id": str(num)})
+        for t in block.get("transactions", []):
+            trx = t.get("trx", t)
+            tid = trx.get("id") if isinstance(trx, dict) else trx
+            if isinstance(tid, str) and len(tid) == 64:
+                found.add(tid)
+    missing = sorted(w for w in want if w not in found)
+    print(f"  confirm pass {attempt + 1}: [{lo},{hi}] found {len(found)} want {len(want)}")
+    if not missing:
+        break
+    time.sleep(10)
 if missing:
     print(f"  missing pre-halt: {missing}")
     sys.exit(1)
@@ -250,19 +316,39 @@ json.dump(rec, open(sys.argv[1], "w"), indent=1)
 print(f"  phase 1 confirmed in old chain blocks [{lo},{hi}]")
 PYEOF
     echo "handover: boundary phase 1 sealed at LIB (submit head $b_leap_head)"
-    snap_json="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
-        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}')"
-    snap="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
-    H_ID="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_id"])')"
-    [[ -n "$snap" && -n "$H_ID" ]] || fail "snapshot request failed"
-    H="$(curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
-        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
-        -d "{\"block_num_or_id\":\"$H_ID\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["block_num"])')"
+    # The migration anchor must be an empty block (no transactions, no
+    # schedule change) for the id-exact attach. Snapshot heads usually are,
+    # but a boundary transaction can land in one; retry until empty.
+    snap=""
+    H=""
+    H_ID=""
+    for _ in $(seq 1 8); do
+        snap_json="$(curl --fail --silent --max-time 30 -X POST "$LEAP_API/v1/producer/create_snapshot" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}')"
+        snap="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["snapshot_name"])')"
+        H_ID="$(printf '%s' "$snap_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_id"])')"
+        [[ -n "$snap" && -n "$H_ID" ]] || fail "snapshot request failed"
+        H="$(curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+            -d "{\"block_num_or_id\":\"$H_ID\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["block_num"])')"
+        block_json="$(curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+            -d "{\"block_num_or_id\":\"$H\"}")" || fail "get_block H=$H failed"
+        if printf '%s' "$block_json" | python3 -c 'import json,sys; b=json.load(sys.stdin); sys.exit(0 if (not b.get("transactions") and not b.get("new_producers")) else 1)'; then
+            echo "handover: snapshot boundary H=$H is empty"
+            break
+        fi
+        echo "handover: snapshot boundary H=$H carries traffic; retrying snapshot..."
+        snap=""
+        H=""
+        H_ID=""
+        sleep 2
+    done
+    [[ -n "$H" && -n "$H_ID" && -n "$snap" ]] || fail "no empty snapshot boundary after retries"
     echo "$H" >"$WORK_DIR/H"
     echo "$H_ID" >"$WORK_DIR/H_ID"
     # The migration anchor needs the id-exact source block. Fetch it while
-    # the producer still serves reads; it must be empty (no transactions,
-    # no schedule change) for the attach tool.
+    # the producer still serves reads.
     curl --fail --silent --max-time 15 -X POST "$LEAP_API/v1/chain/get_block" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
         -d "{\"block_num_or_id\":\"$H\"}" >"$WORK_DIR/block-H.json" || fail "get_block H=$H failed"
@@ -299,6 +385,17 @@ PYEOF
     [[ "$size_before" == "$size_after" ]] \
         || fail "XPR network did not freeze: blocks.log grew $size_before -> $size_after after the stop"
     echo "handover: halted and frozen; H=$H id=$H_ID; waiting for the shadow to absorb H..."
+    if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" ]]; then
+        echo "handover: staging frozen block log for the native shadow..."
+        docker run --rm -v pulsevm-handover_leap-data:/d:ro -v "$WORK_DIR:/out" ubuntu:24.04 \
+            cp -r /d/blocks /out/leap-blocks || fail "block log stage failed"
+        XPR_REPLAY_FOLLOW=1 \
+        XPR_REPLAY_RPC_BIND="127.0.0.1:${SHADOW_RPC_PORT:-9660}" \
+        XPR_REPLAY_GENESIS_FILE="$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json" \
+            "$PULSEVM_REPLAY_BIN" "$WORK_DIR/leap-blocks" "$WORK_DIR/shadow-arena" \
+            >"$WORK_DIR/shadow.log" 2>&1 &
+        echo "$!" >"$WORK_DIR/shadow.pid"
+    fi
     for _ in $(seq 1 36); do
         shadow_h="$(shadow_head 2>/dev/null || echo 0)"
         [[ "$shadow_h" -ge "$H" ]] && break
@@ -310,7 +407,11 @@ PYEOF
     # The replay's job ends here: it absorbed the terminal block, and the
     # checkpoint is sealed from static artifacts. Stop it explicitly — from
     # this point only the new network may write.
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop shadow)
+    if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" && -f "$WORK_DIR/shadow.pid" ]]; then
+        kill "$(cat "$WORK_DIR/shadow.pid")" 2>/dev/null || true
+    else
+        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop shadow)
+    fi
     echo "handover: replay stopped; only the new network writes from here"
     cmd_checkpoint
 }
@@ -346,10 +447,24 @@ cmd_checkpoint() {
     # the new network verifies this commitment before promoting.
     # Fixture dev key doubles as the old schedule key (rehearsal only).
     halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
-    "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
-        "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
-        --halt-key "$halt_key" \
-        || fail "source block attach failed (H must be an empty block)"
+    # HALT_V2=1 exercises the checkpoint-bound commitment plus the weighted
+    # roster path with a self-contained single-member ceremony: roster
+    # {eosio, fixture key, 1} satisfies the 2/3 quorum on its own. The
+    # fixture chain carries no producers table, so the state cross-check
+    # logs its skip exactly as designed for table-less fixtures.
+    if [[ "${HALT_V2:-0}" == "1" ]]; then
+        roster_key="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
+        printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
+        "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
+            "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+            --halt-key-v2 "$halt_key" --halt-roster "$WORK_DIR/roster.json" \
+            || fail "source block attach failed (H must be an empty block)"
+    else
+        "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
+            "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+            --halt-key "$halt_key" \
+            || fail "source block attach failed (H must be an empty block)"
+    fi
     mv "$manifest.attached" "$manifest"
     echo "handover: halt commitment signed over H=$H"
     echo "$export_dir/migration.snapshot" >"$WORK_DIR/checkpoint"
@@ -366,10 +481,11 @@ cmd_boot() {
     # another live network on a shared host (ETXTBSY on overwrite).
     mkdir -p "$WORK_DIR/plugins"
     # Rehearsal runner ports avoid the host status server (:8080) and any
-    # other live network on this box.
-    export METAL_NETWORK_RUNNER_PORT=":18080"
-    export METAL_NETWORK_RUNNER_GATEWAY_PORT=":18081"
-    export METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:18080"
+    # other live network on this box. Override with PULSEVM_RUNNER_PORT /
+    # PULSEVM_RUNNER_GATEWAY_PORT where those defaults are taken.
+    export METAL_NETWORK_RUNNER_PORT=":${PULSEVM_RUNNER_PORT:-18080}"
+    export METAL_NETWORK_RUNNER_GATEWAY_PORT=":${PULSEVM_RUNNER_GATEWAY_PORT:-18081}"
+    export METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:${PULSEVM_RUNNER_PORT:-18080}"
     # Node ports are reassigned when taken, with dynamic allocation as the
     # backstop: the rehearsal shares the host with other live networks.
     export RUNNER_REASSIGN_PORTS_IF_USED=true
@@ -386,18 +502,63 @@ cmd_boot() {
     # producer boots from: with a foreign key every build fails closed at the
     # signing gate and the new network never passes H.
     export PULSEVM_GENESIS_INITIAL_KEY="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
-    # Fully detached (double-fork via setsid): the boot supervisor must neither
-    # stall this script's exit (a shell waits for its children on the way
-    # out) nor die with it — after PASS the network stays up until `stop`.
-    # The supervisor records its own PID for `stop`/fail cleanup.
-    (cd "$REPO_ROOT" && \
-        METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}" \
-        PULSEVM_MIGRATION_CHECKPOINT="$checkpoint" \
-        PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins" \
-        PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node" \
-        PULSEVM_VERIFY_FIVE_NODE=false \
-        setsid -f bash -c 'echo $$ >"$1"; exec ./scripts/run-local.sh >"$2" 2>&1' \
-            _ "$WORK_DIR/five-node.pid" "$WORK_DIR/five-node.log")
+    # Fail fast when the runner endpoint is already bound (e.g. a status
+    # server or a stale network squats the default :18080): otherwise the
+    # boot below burns the whole RPC wait and dies with a mystery timeout.
+    # A few spaced attempts: host services on shared boxes come and go, and
+    # a transient squatter must not kill an otherwise healthy rehearsal.
+    bound=0
+    for _ in 1 2 3; do
+        if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "${PULSEVM_RUNNER_PORT:-18080}"; then
+            bound=1
+        else
+            bound=0
+            break
+        fi
+        sleep 10
+    done
+    # NOTE: the connect_ex probe must compare `== 0` (0 means the connect
+    # succeeded, i.e. the port IS bound). An earlier revision omitted the
+    # comparison, which inverted the test and failed healthy runs.
+    [[ "$bound" == 0 ]] || fail "runner port ${PULSEVM_RUNNER_PORT:-18080} is already bound — stop the stale network or set PULSEVM_RUNNER_PORT/PULSEVM_RUNNER_GATEWAY_PORT"
+    # Fully detached (python double-fork + setsid): the boot supervisor must
+    # neither stall this script's exit (a shell waits for its children on the
+    # way out) nor die with it — after PASS the network stays up until
+    # `stop`. The supervisor records its own PID for `stop`/fail cleanup.
+    # A bare nohup/& background stays in this script's process group, so any
+    # supervisor that reaps the group (CI cleanup, tooling, session end)
+    # would SIGTERM the network with it; setsid(2) escapes the group on both
+    # Linux and macOS (which ships no `setsid` binary, hence python3).
+    export METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}"
+    export PULSEVM_MIGRATION_CHECKPOINT="$checkpoint"
+    export PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins"
+    export PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node"
+    export PULSEVM_VERIFY_FIVE_NODE=false
+    (cd "$REPO_ROOT" && python3 - "$WORK_DIR/five-node.pid" "$WORK_DIR/five-node.log" <<'EOF'
+import os, sys
+pidfile, logfile = sys.argv[1], sys.argv[2]
+if os.fork() != 0:
+    sys.exit(0)
+os.setsid()
+if os.fork() != 0:
+    os._exit(0)
+open(pidfile, "w").write(str(os.getpid()) + "\n")
+os.chdir(os.getcwd())
+for fd in (0, 1, 2):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+os.open("/dev/null", os.O_RDONLY)
+os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.dup2(1, 2)
+# PEP 446: os.open fds are non-inheritable (CLOEXEC) — without this the
+# exec'd supervisor starts with std fds closed and every echo fails.
+for fd in (0, 1, 2):
+    os.set_inheritable(fd, True)
+os.execvpe("./scripts/run-local.sh", ["./scripts/run-local.sh"], os.environ)
+EOF
+    ) || fail "five-node boot supervisor failed to start"
     echo "handover: building the probe-tx tool..."
     (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) \
         || fail "probe tool build failed"

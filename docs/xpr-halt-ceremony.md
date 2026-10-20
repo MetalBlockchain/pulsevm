@@ -5,7 +5,7 @@ Status: strategy; the quorum verifier is **implemented and tested**
 “Implementation status”). Decided: validators commit **on XPR itself**,
 quorum is **2/3 of producer-schedule weight**. Companion docs:
 [rehearsal proof](xpr-handover-rehearsal.md), full migration design
-(`docs/xpr-achain-migration.md` on `docs/xpr-achain-migration`).
+([`xpr-achain-migration.md`](xpr-achain-migration.md)).
 
 ## Why on-chain
 
@@ -73,9 +73,17 @@ side: restore fails closed unless the on-chain quorum verifies.
 - [ ] Commit contract (`haltcommit`): tables `roster` (pinned at R), `votes`,
   `attests`; actions `setroster` (privileged, once), `commit`, `attest`;
   unit tests against a local schedule.
-- [ ] Exporter: read the three tables into `MigrationManifest` (new fields,
-  format-versioned; v1 single-key path stays valid).
-- [ ] Restore path: feed the roster from replayed state into the quorum
-  check at the `halt_commitment` restore gate; fail closed.
+- [x] Exporter: `xpr_attach_source_block --halt-roster <roster.json>`
+  attaches the weighted roster (manifest version 2); `--halt-key-v2` signs
+  a checkpoint-bound version 2 commitment. v1 single-key path stays valid.
+- [x] Restore path: the `halt_commitment` restore gate in `controller.rs`
+  verifies the weighted quorum when the manifest carries a roster (v1 and
+  v2 commitments) and the checkpoint binding for version 2; fail closed.
+- [x] Roster-to-state binding: after restore, every rostered name must
+  resolve to the same signing key in the checkpoint's own `producers`
+  table (`migration_state_producer_keys` + `check_halt_roster_against_state`
+  in `xpr_import.rs`). Weights and `is_active` are not cross-checked —
+  both legitimately drift between the roster reference and the checkpoint —
+  so full R-pinned weight semantics still belong to the on-chain ceremony.
 - [ ] Rehearsal: distinct per-validator keys, scripted Phase A + B, negative
   test (quorum shortfall refuses promotion).

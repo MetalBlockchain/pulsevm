@@ -36,6 +36,7 @@ pub use elastic_limit_parameters::{
 pub use genesis::GenesisState;
 pub use migration::{
     HALT_DOMAIN,
+    HALT_DOMAIN_V2,
     HaltCommitment,
     HaltRosterEntry,
     HaltSignature,

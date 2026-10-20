@@ -24,6 +24,9 @@ use serde::{
 
 /// Domain separator for the signed halt message (versioned with the format).
 pub const HALT_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-v1";
+/// Domain separator for version 2, which additionally binds the migration
+/// checkpoint hash so a commitment cannot be replayed onto another export.
+pub const HALT_DOMAIN_V2: &[u8] = b"PULSEVM-XPR-HALT-v2";
 
 /// One producer's signature over the halt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +47,10 @@ pub struct HaltCommitment {
     pub halt_height: u32,
     /// 64-hex id of the terminal block.
     pub halt_block_id: String,
+    /// 64-hex SHA-256 of the migration checkpoint this halt is bound to.
+    /// `None` for version 1 commitments; required for version 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_sha256: Option<String>,
     /// Old-schedule producer keys a commitment signature may come from.
     pub producer_keys: Vec<String>,
     pub signatures: Vec<HaltSignature>,
@@ -51,6 +58,7 @@ pub struct HaltCommitment {
 
 impl HaltCommitment {
     pub const VERSION: u16 = 1;
+    pub const VERSION_V2: u16 = 2;
 
     /// Canonical message: domain || height-be64 || block-id.
     pub fn message_bytes(halt_height: u32, halt_block_id: &[u8; 32]) -> Vec<u8> {
@@ -64,6 +72,34 @@ impl HaltCommitment {
     /// Signing digest for a halt.
     pub fn digest(halt_height: u32, halt_block_id: &[u8; 32]) -> [u8; 32] {
         *Digest::hash(Self::message_bytes(halt_height, halt_block_id)).as_bytes()
+    }
+
+    /// Canonical version 2 message: v2 domain || height || block-id || checkpoint.
+    pub fn message_bytes_v2(
+        halt_height: u32,
+        halt_block_id: &[u8; 32],
+        checkpoint_sha256: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut message = Vec::with_capacity(HALT_DOMAIN_V2.len() + 4 + 32 + 32);
+        message.extend_from_slice(HALT_DOMAIN_V2);
+        message.extend_from_slice(&halt_height.to_be_bytes());
+        message.extend_from_slice(halt_block_id);
+        message.extend_from_slice(checkpoint_sha256);
+        message
+    }
+
+    /// Signing digest for a checkpoint-bound version 2 halt.
+    pub fn digest_v2(
+        halt_height: u32,
+        halt_block_id: &[u8; 32],
+        checkpoint_sha256: &[u8; 32],
+    ) -> [u8; 32] {
+        *Digest::hash(Self::message_bytes_v2(
+            halt_height,
+            halt_block_id,
+            checkpoint_sha256,
+        ))
+        .as_bytes()
     }
 
     /// Shared terminal-block check: version, height, and id must match.
@@ -208,6 +244,163 @@ impl HaltCommitment {
         }
         Ok(())
     }
+
+    /// Shared version 2 terminal-block check: version, height, id, and the
+    /// checkpoint binding must all match. Returns the decoded block id and
+    /// checkpoint hash.
+    fn check_terminal_v2(
+        &self,
+        expected_height: u32,
+        expected_block_id: &[u8; 32],
+        expected_checkpoint: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32]), ChainError> {
+        if self.version != Self::VERSION_V2 {
+            return Err(ChainError::InternalError(format!(
+                "unsupported halt commitment version {} (expected {})",
+                self.version,
+                Self::VERSION_V2
+            )));
+        }
+        if self.halt_height != expected_height {
+            return Err(ChainError::InternalError(format!(
+                "halt commitment height {} does not match terminal height {}",
+                self.halt_height, expected_height
+            )));
+        }
+        let committed_id = decode_hex_32(&self.halt_block_id).map_err(|e| {
+            ChainError::InternalError(format!("halt commitment block id invalid: {e}"))
+        })?;
+        if committed_id != *expected_block_id {
+            return Err(ChainError::InternalError(
+                "halt commitment block id does not match the terminal block".into(),
+            ));
+        }
+        let Some(bound) = self.checkpoint_sha256.as_deref() else {
+            return Err(ChainError::InternalError(
+                "version 2 halt commitment carries no checkpoint binding".into(),
+            ));
+        };
+        let committed_checkpoint = decode_hex_32(bound).map_err(|e| {
+            ChainError::InternalError(format!("halt commitment checkpoint binding invalid: {e}"))
+        })?;
+        if committed_checkpoint != *expected_checkpoint {
+            return Err(ChainError::InternalError(
+                "halt commitment checkpoint binding does not match the migration checkpoint".into(),
+            ));
+        }
+        Ok((committed_id, committed_checkpoint))
+    }
+
+    /// Verify a version 2 checkpoint-bound commitment: same single-key rule
+    /// as [`Self::verify`], but signatures must be over the v2 digest that
+    /// binds the migration checkpoint hash.
+    pub fn verify_v2(
+        &self,
+        expected_height: u32,
+        expected_block_id: &[u8; 32],
+        expected_checkpoint: &[u8; 32],
+    ) -> Result<(), ChainError> {
+        let (committed_id, committed_checkpoint) =
+            self.check_terminal_v2(expected_height, expected_block_id, expected_checkpoint)?;
+        let schedule: Vec<K1PublicKey> = self
+            .producer_keys
+            .iter()
+            .map(|key| {
+                K1PublicKey::from_string(key).map_err(|e| {
+                    ChainError::InternalError(format!("halt producer key invalid: {e:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let digest = Self::digest_v2(self.halt_height, &committed_id, &committed_checkpoint);
+        let mut valid = 0u32;
+        for entry in &self.signatures {
+            let claimed = K1PublicKey::from_string(&entry.key).map_err(|e| {
+                ChainError::InternalError(format!("halt signature key invalid: {e:?}"))
+            })?;
+            if !schedule.contains(&claimed) {
+                return Err(ChainError::InternalError(format!(
+                    "halt signature from producer {} is not in the committed schedule",
+                    entry.producer
+                )));
+            }
+            let signature = K1Signature::from_string(&entry.signature).map_err(|e| {
+                ChainError::InternalError(format!("halt signature malformed: {e:?}"))
+            })?;
+            let recovered = signature.recover(&digest).map_err(|e| {
+                ChainError::InternalError(format!("halt signature unrecoverable: {e:?}"))
+            })?;
+            if recovered != claimed {
+                return Err(ChainError::InternalError(format!(
+                    "halt signature from producer {} does not verify",
+                    entry.producer
+                )));
+            }
+            valid += 1;
+        }
+        if valid == 0 {
+            return Err(ChainError::InternalError(
+                "halt commitment carries no valid producer signature".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify a version 2 commitment against a weighted producer roster:
+    /// same two-thirds rule as [`Self::verify_weighted_quorum`], over the
+    /// checkpoint-bound v2 digest.
+    pub fn verify_weighted_quorum_v2(
+        &self,
+        expected_height: u32,
+        expected_block_id: &[u8; 32],
+        expected_checkpoint: &[u8; 32],
+        roster: &[HaltRosterEntry],
+    ) -> Result<(), ChainError> {
+        let (committed_id, committed_checkpoint) =
+            self.check_terminal_v2(expected_height, expected_block_id, expected_checkpoint)?;
+        let total: u128 = roster.iter().map(|entry| entry.weight as u128).sum();
+        if roster.is_empty() || total == 0 {
+            return Err(ChainError::InternalError(
+                "halt commitment roster carries no weight".into(),
+            ));
+        }
+        let digest = Self::digest_v2(self.halt_height, &committed_id, &committed_checkpoint);
+        let mut signed: std::collections::HashSet<K1PublicKey> = std::collections::HashSet::new();
+        for entry in &self.signatures {
+            let claimed = K1PublicKey::from_string(&entry.key).map_err(|e| {
+                ChainError::InternalError(format!("halt signature key invalid: {e:?}"))
+            })?;
+            if !roster.iter().any(|rostered| rostered.key == claimed) {
+                return Err(ChainError::InternalError(format!(
+                    "halt signature from producer {} is not in the committed schedule",
+                    entry.producer
+                )));
+            }
+            let signature = K1Signature::from_string(&entry.signature).map_err(|e| {
+                ChainError::InternalError(format!("halt signature malformed: {e:?}"))
+            })?;
+            let recovered = signature.recover(&digest).map_err(|e| {
+                ChainError::InternalError(format!("halt signature unrecoverable: {e:?}"))
+            })?;
+            if recovered != claimed {
+                return Err(ChainError::InternalError(format!(
+                    "halt signature from producer {} does not verify",
+                    entry.producer
+                )));
+            }
+            signed.insert(claimed);
+        }
+        let signed_weight: u128 = roster
+            .iter()
+            .filter(|entry| signed.contains(&entry.key))
+            .map(|entry| entry.weight as u128)
+            .sum();
+        if signed_weight * 3 < total * 2 {
+            return Err(ChainError::InternalError(format!(
+                "halt commitment weight {signed_weight} below two-thirds quorum of {total}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One roster entry for weighted quorum verification: a scheduled
@@ -287,6 +480,7 @@ mod tests {
             version: HaltCommitment::VERSION,
             halt_height: HEIGHT,
             halt_block_id: block_id_hex(),
+            checkpoint_sha256: None,
             producer_keys: Vec::new(),
             signatures,
         }
@@ -445,5 +639,98 @@ mod tests {
         committed
             .verify(HEIGHT, &id)
             .expect("v1 path must keep working");
+    }
+
+    fn checkpoint() -> [u8; 32] {
+        [0x77; 32]
+    }
+
+    fn hex_encode(bytes: &[u8; 32]) -> String {
+        const NIBBLE: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for byte in bytes {
+            out.push(NIBBLE[(byte >> 4) as usize] as char);
+            out.push(NIBBLE[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn sign_v2(
+        signing: &K1PrivateKey,
+        producer: &str,
+        height: u32,
+        id: &[u8; 32],
+    ) -> HaltSignature {
+        let digest = HaltCommitment::digest_v2(height, id, &checkpoint());
+        HaltSignature {
+            producer: producer.to_string(),
+            key: signing.public_key().to_string(),
+            signature: signing.sign(&digest).to_string(),
+        }
+    }
+
+    fn commitment_v2(signatures: Vec<HaltSignature>) -> HaltCommitment {
+        HaltCommitment {
+            version: HaltCommitment::VERSION_V2,
+            halt_height: HEIGHT,
+            halt_block_id: block_id_hex(),
+            checkpoint_sha256: Some(hex_encode(&checkpoint())),
+            producer_keys: Vec::new(),
+            signatures,
+        }
+    }
+
+    #[test]
+    fn v2_digest_differs_from_v1_and_binds_checkpoint() {
+        let id = block_id();
+        let v1 = HaltCommitment::digest(HEIGHT, &id);
+        let v2 = HaltCommitment::digest_v2(HEIGHT, &id, &checkpoint());
+        assert_ne!(v1, v2, "v2 digest must be domain-separated from v1");
+        let other = HaltCommitment::digest_v2(HEIGHT, &id, &[0x78; 32]);
+        assert_ne!(v2, other, "v2 digest must bind the checkpoint hash");
+    }
+
+    #[test]
+    fn v2_verify_accepts_bound_checkpoint() {
+        let (keys, roster) = roster();
+        let id = block_id();
+        let committed = HaltCommitment {
+            producer_keys: roster.iter().map(|entry| entry.key.to_string()).collect(),
+            ..commitment_v2(vec![sign_v2(&keys[0], &roster[0].producer, HEIGHT, &id)])
+        };
+        committed
+            .verify_v2(HEIGHT, &id, &checkpoint())
+            .expect("v2 commitment must verify against its bound checkpoint");
+    }
+
+    #[test]
+    fn v2_verify_rejects_wrong_checkpoint() {
+        let (keys, roster) = roster();
+        let id = block_id();
+        let committed = HaltCommitment {
+            producer_keys: roster.iter().map(|entry| entry.key.to_string()).collect(),
+            ..commitment_v2(vec![sign_v2(&keys[0], &roster[0].producer, HEIGHT, &id)])
+        };
+        assert!(committed.verify_v2(HEIGHT, &id, &[0x78; 32]).is_err());
+        assert!(committed.verify(HEIGHT, &id).is_err());
+    }
+
+    #[test]
+    fn v2_weighted_quorum_accepts_and_rejects_shortfall() {
+        let (keys, roster) = roster();
+        let id = block_id();
+        let quorum: Vec<HaltSignature> = [0, 1]
+            .iter()
+            .map(|&i| sign_v2(&keys[i], &roster[i].producer, HEIGHT, &id))
+            .collect();
+        commitment_v2(quorum)
+            .verify_weighted_quorum_v2(HEIGHT, &id, &checkpoint(), &roster)
+            .expect("v2 quorum weight must verify");
+        let shortfall = vec![sign_v2(&keys[2], &roster[2].producer, HEIGHT, &id)];
+        assert!(
+            commitment_v2(shortfall)
+                .verify_weighted_quorum_v2(HEIGHT, &id, &checkpoint(), &roster)
+                .is_err()
+        );
     }
 }

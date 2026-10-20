@@ -151,7 +151,9 @@ use pulsevm_database::{
     PermissionLevelWeight,
     TimePoint,
     TransactionDependencies,
+    check_halt_roster_against_state,
     estimate_parallel_waves,
+    migration_state_producer_keys,
     seconds,
 };
 use pulsevm_error::ChainError;
@@ -1334,6 +1336,7 @@ impl Controller {
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
         let mut migration_source_block = None;
+        let mut migration_roster: Option<Vec<pulsevm_database::HaltRosterEntry>> = None;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
@@ -1369,21 +1372,37 @@ impl Controller {
             // The new network only promotes state the old network agreed to
             // freeze: when the manifest carries the producers' signed halt
             // commitment, verify it against the terminal block before the
-            // checkpoint is trusted.
-            if let Some(commitment) = manifest.halt_commitment.as_ref() {
+            // checkpoint is trusted. The shared dispatch covers version 1
+            // (single key) and version 2 (checkpoint-bound), with a weighted
+            // two-thirds quorum when the manifest carries a roster.
+            if manifest.halt_commitment.is_some() {
                 let source_block = migration_source_block.as_ref().ok_or_else(|| {
                     ChainError::GenesisError(
                         "migration halt commitment requires an attached source block".into(),
                     )
                 })?;
                 let source_id = source_block.id()?;
-                commitment
-                    .verify(source_block.block_num(), &source_id.0.0)
-                    .map_err(|error| {
-                        ChainError::GenesisError(format!(
-                            "migration halt commitment rejected: {error}"
-                        ))
-                    })?;
+                let roster = manifest.roster_entries().map_err(|error| {
+                    ChainError::GenesisError(format!("migration halt roster rejected: {error}"))
+                })?;
+                migration_roster = roster.clone();
+                let checkpoint_bytes = hex::decode(&manifest.checkpoint_sha256).map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "migration manifest checkpoint hash invalid: {e}"
+                    ))
+                })?;
+                let checkpoint_arr: [u8; 32] = checkpoint_bytes.try_into().map_err(|_| {
+                    ChainError::GenesisError(
+                        "migration manifest checkpoint hash has the wrong length".into(),
+                    )
+                })?;
+                pulsevm_database::verify_migration_halt_commitment(
+                    &manifest,
+                    source_block.block_num(),
+                    &source_id.0.0,
+                    &checkpoint_arr,
+                )
+                .map_err(ChainError::GenesisError)?;
             }
             if self.db.revision() <= 0 {
                 let header = self
@@ -1464,6 +1483,32 @@ impl Controller {
                         "migration checkpoint contains {imported_transactions} input-transaction dedupe rows but manifest commits to {}",
                         manifest.import_summary.input_transactions
                     )));
+                }
+            }
+            // Bind the transported roster to checkpoint content now that the
+            // state is restored: every rostered name must resolve to the
+            // same signing key in the checkpoint's own producers table, so
+            // the exporter cannot invent members. Real XPR checkpoints
+            // always carry that table; synthetic fixtures without one skip
+            // the check (logged) instead of failing.
+            if let Some(roster) = migration_roster.as_ref() {
+                let state_keys = migration_state_producer_keys(&self.db).map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "migration producers table unreadable: {error}"
+                    ))
+                })?;
+                if state_keys.is_empty() {
+                    warn!(
+                        "migration roster state cross-check skipped: no producers table in checkpoint state"
+                    );
+                } else {
+                    let bound =
+                        check_halt_roster_against_state(roster, &state_keys).map_err(|error| {
+                            ChainError::GenesisError(format!(
+                                "migration halt roster rejected by checkpoint state: {error}"
+                            ))
+                        })?;
+                    info!("migration halt roster bound to checkpoint state: {bound} producers");
                 }
             }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
@@ -10730,6 +10775,287 @@ mod tests {
         assert!(
             error.to_string().contains("halt commitment"),
             "a tampered commitment must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // Attaches a version 2 checkpoint-bound halt commitment plus a weighted
+    // roster, as the on-chain ceremony exporter does. Only `sign_subset`
+    // indices sign; when `tamper_checkpoint` is set the binding points at a
+    // different checkpoint so the restore must fail closed.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_halt_commitment_v2(
+        manifest_path: &str,
+        source_block_num: u32,
+        source_block_id: &Id,
+        keys: &[pulsevm_crypto::K1PrivateKey],
+        producers: &[&str],
+        weights: &[u64],
+        sign_subset: &[usize],
+        tamper_checkpoint: bool,
+    ) -> Result<(), ChainError> {
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let checkpoint_hex = manifest["checkpoint_sha256"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?;
+        let mut checkpoint = hex::decode(checkpoint_hex)
+            .map_err(|e| ChainError::InternalError(format!("bad checkpoint hash: {e}")))?;
+        if tamper_checkpoint {
+            checkpoint[0] ^= 0xff;
+        }
+        let checkpoint_arr: [u8; 32] = checkpoint
+            .clone()
+            .try_into()
+            .map_err(|_| ChainError::InternalError("bad checkpoint hash length".into()))?;
+        let digest = pulsevm_database::HaltCommitment::digest_v2(
+            source_block_num,
+            &source_block_id.0.0,
+            &checkpoint_arr,
+        );
+        let mut signatures = Vec::new();
+        for &index in sign_subset {
+            signatures.push(json!({
+                "producer": producers[index],
+                "key": keys[index].public_key().to_string(),
+                "signature": keys[index].sign(&digest).to_string(),
+            }));
+        }
+        let roster: Vec<serde_json::Value> = keys
+            .iter()
+            .zip(producers.iter())
+            .zip(weights.iter())
+            .map(|((key, producer), weight)| {
+                json!({
+                    "producer": producer,
+                    "key": key.public_key().to_string(),
+                    "weight": weight,
+                })
+            })
+            .collect();
+        manifest["halt_roster"] = json!(roster);
+        manifest["halt_commitment"] = json!({
+            "version": 2,
+            "halt_height": source_block_num,
+            "halt_block_id": hex::encode(source_block_id.as_bytes()),
+            "checkpoint_sha256": hex::encode(&checkpoint),
+            "producer_keys": [],
+            "signatures": signatures,
+        });
+        manifest["version"] = json!(2);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
+    fn halt_v2_keys() -> Result<Vec<pulsevm_crypto::K1PrivateKey>, ChainError> {
+        ["halt-restore-1", "halt-restore-2"]
+            .iter()
+            .map(|seed| {
+                pulsevm_crypto::K1PrivateKey::from_seed_string(seed)
+                    .map_err(|e| ChainError::InternalError(format!("bad test key: {e:?}")))
+            })
+            .collect()
+    }
+
+    // A version 2 checkpoint-bound commitment with a weighted roster quorum
+    // restores and builds: the ceremony path, not just the v1 single key.
+    #[tokio::test]
+    async fn migration_restore_accepts_v2_weighted_quorum() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let keys = halt_v2_keys()?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        Ok(())
+    }
+
+    // Quorum shortfall on the weighted path refuses promotion: one of three
+    // weight units cannot carry a two-thirds quorum.
+    #[tokio::test]
+    async fn migration_restore_rejects_v2_quorum_shortfall() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let keys = halt_v2_keys()?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[1],
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a quorum shortfall must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // A version 2 commitment bound to a different checkpoint cannot promote
+    // this checkpoint: the binding is cryptographic, not advisory.
+    #[tokio::test]
+    async fn migration_restore_rejects_v2_checkpoint_mismatch() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let keys = halt_v2_keys()?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+            true,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a checkpoint mismatch must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // An unsupported manifest version fails closed before any checkpoint is
+    // trusted, even when every other field is well-formed.
+    #[tokio::test]
+    async fn migration_restore_rejects_unsupported_manifest_version() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            _source_block_id,
+            _source_block_num,
+            _source_revision,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        manifest["version"] = json!(99);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("migration manifest"),
+            "an unsupported manifest version must fail closed, got: {error}"
         );
         Ok(())
     }

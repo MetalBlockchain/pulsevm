@@ -2,7 +2,7 @@
 
 Status: proven on EC2 (2026-10-16), twice — clean run and chaos run.
 Branch: `feat/handover-rehearsal`. Companion design doc:
-`docs/xpr-achain-migration.md` (on `docs/xpr-achain-migration`); validator
+[xpr-achain-migration.md](xpr-achain-migration.md); validator
 commitment strategy: [halt ceremony](xpr-halt-ceremony.md).
 
 ## What was proven
@@ -46,13 +46,43 @@ HANDOVER_WORK_DIR=<archived-workdir> ./docker/handover/run-handover.sh resume-bo
 
 Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../docker/handover/README.md).
 
+## Rehearsal-harness lessons (Oct 2026 local runs)
+
+- `start` drops the compose volumes first, so every rehearsal halts a FRESH
+  chain. Before this, reruns silently resumed the previous run's chain from
+  its named volume: traffic/boundary account creation then collided with
+  already-existing accounts and the terminal height was already passed.
+  (The earlier H=330 PASS is still a valid cutover proof for that chain,
+  but it was not a fresh-chain run; the H=328 PASS below is.)
+- `leap_send` fails loud (curl errors, retries, rejection bodies) instead of
+  masking failures inside a pipefail pipeline, where a duplicate or rejected
+  transaction used to kill the run via a bare `set -e` exit with no
+  diagnosis. Boundary submits and `leap_chain_head` reads retry transient
+  failures for the same reason.
+- `chain_rpc_url` uses the runner's own `--dial-timeout`/`--request-timeout`
+  instead of GNU `timeout`, which does not exist on macOS: with the wrapper,
+  discovery silently returned empty on Mac hosts and every boot died with
+  "new network RPC never came up" while the five-node network underneath
+  was healthy (consensus running, tip == H).
+- The five-node supervisor detaches with a python double-fork + `setsid(2)`
+  (with `os.set_inheritable` on std fds — CLOEXEC would otherwise break the
+  exec'd supervisor's stdout) so the network survives its launcher; a bare
+  `nohup ... &` stays in the launcher's process group and dies with it.
+- `cmd_boot` fails fast when the runner port is already bound (three spaced
+  probes), instead of burning the whole RPC wait on a squatted port.
+- Record: fresh-chain v2 rehearsal (`HALT_V2=1`) PASS — halt commitment over
+  H=328, five-node restore with tip 328 == H and head id equal to the
+  committed halt block, H+1=329 parent-linked, state equivalence 4/4, boundary
+  traffic 10/10 exactly-once.
+
 ## What this does NOT prove (do not merge as migration-complete)
 
 - Promotion re-identifies the chain; same-ID in-process promotion is unmodeled.
-- The halt ceremony here is single-key. Real cutover needs distinct
-  per-validator keys, a voted schedule, a 2/3 weight threshold, and a signed
-  artifact distribution path — format-compatible (no manifest change), but
-  the ceremony itself is undefined.
+- The halt ceremony here is single-key. The restore gate now supports a
+  weighted 2/3 roster quorum and checkpoint-bound version 2 commitments
+  (see [halt ceremony](xpr-halt-ceremony.md)), but a live rehearsal with
+  distinct per-validator keys, a voted schedule, and a signed roster
+  distribution path is still unproven.
 - CEX freeze/re-enable, gateway cutover, and Hyperion reindex runbooks live
   in the migration design doc, not in this rehearsal.
 - Resuming boot into the same workdir overwrites the plugin binary and kills

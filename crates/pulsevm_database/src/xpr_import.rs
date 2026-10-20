@@ -134,6 +134,16 @@ pub struct ImportSummary {
     pub index_long_double_rows: u64,
 }
 
+/// One weighted-roster entry for halt-quorum verification, in the
+/// human-inspectable string-key form the manifest stores. Keys parse to
+/// [`pulsevm_chain_types::HaltRosterEntry`] via [`MigrationManifest::roster_entries`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationHaltRosterEntry {
+    pub producer: String,
+    pub key: String,
+    pub weight: u64,
+}
+
 /// A durable, human-inspectable commitment to one XPR-to-Arena conversion.
 ///
 /// The arena checkpoint envelope protects its payload, while this manifest
@@ -168,11 +178,17 @@ pub struct MigrationManifest {
     /// migration-manifest compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_transaction_sidecar_sha256: Option<String>,
+    /// Weighted producer roster for halt-quorum verification. Absent for
+    /// version 1 manifests, whose restore falls back to the single-key path.
+    /// Present implies version 2 (see [`MigrationManifest::with_halt_roster`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_roster: Option<Vec<MigrationHaltRosterEntry>>,
     pub import_summary: ImportSummary,
 }
 
 impl MigrationManifest {
     pub const VERSION: u16 = 1;
+    pub const VERSION_V2: u16 = 2;
 
     pub fn new(
         source_state_history: &[u8],
@@ -191,6 +207,7 @@ impl MigrationManifest {
             checkpoint_revision,
             deferred_transaction_sidecar_sha256: None,
             halt_commitment: None,
+            halt_roster: None,
             import_summary,
         }
     }
@@ -210,17 +227,58 @@ impl MigrationManifest {
         self
     }
 
+    /// Attach the weighted producer roster for halt-quorum verification and
+    /// mark the manifest version 2. Version 1 manifests (no roster) keep the
+    /// single-key restore path.
+    pub fn with_halt_roster(mut self, roster: Vec<MigrationHaltRosterEntry>) -> Self {
+        self.version = Self::VERSION_V2;
+        self.halt_roster = Some(roster);
+        self
+    }
+
+    /// Parse the manifest roster into verifier entries. Returns `Ok(None)`
+    /// when the manifest carries no roster (version 1 single-key path).
+    pub fn roster_entries(
+        &self,
+    ) -> Result<Option<Vec<pulsevm_chain_types::HaltRosterEntry>>, String> {
+        let Some(roster) = self.halt_roster.as_ref() else {
+            return Ok(None);
+        };
+        roster
+            .iter()
+            .map(|entry| {
+                let key =
+                    pulsevm_crypto::k1::K1PublicKey::from_string(&entry.key).map_err(|e| {
+                        format!("halt roster key for {} invalid: {e:?}", entry.producer)
+                    })?;
+                Ok(pulsevm_chain_types::HaltRosterEntry {
+                    producer: entry.producer.clone(),
+                    key,
+                    weight: entry.weight,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some)
+    }
+
+    /// Supported manifest versions: 1 (single-key halt) and 2 (roster +
+    /// checkpoint-bound halt). Anything else fails closed.
+    fn check_version(&self) -> Result<(), String> {
+        if self.version != Self::VERSION && self.version != Self::VERSION_V2 {
+            return Err(format!(
+                "unsupported migration manifest version {} (expected {} or {})",
+                self.version,
+                Self::VERSION,
+                Self::VERSION_V2
+            ));
+        }
+        Ok(())
+    }
     /// Verify that `checkpoint` is precisely the artifact this manifest
     /// describes. The checkpoint envelope itself is checked by restore; this
     /// method establishes its migration provenance before restore begins.
     pub fn verify_checkpoint(&self, checkpoint: &[u8]) -> Result<(), String> {
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let actual = hex::encode(Digest::hash(checkpoint).as_bytes());
         if actual != self.checkpoint_sha256 {
             return Err(format!(
@@ -243,13 +301,7 @@ impl MigrationManifest {
     /// multi-gigabyte envelope in the controller process.
     pub fn verify_checkpoint_path(&self, checkpoint: impl AsRef<Path>) -> Result<(), String> {
         let path = checkpoint.as_ref();
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let mut file = File::open(path)
             .map_err(|error| format!("cannot read checkpoint {}: {error}", path.display()))?;
         let length = file
@@ -298,6 +350,176 @@ impl MigrationManifest {
             ));
         }
         Ok(())
+    }
+}
+
+/// One `eosio.system` `producers`-table row as restored from checkpoint
+/// state: the block-signing key bound to a producer name.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StateProducerKey {
+    pub key: [u8; 33],
+    pub is_active: bool,
+    /// Vote weight as recorded on-chain. Quorum math runs over the
+    /// transported roster's integer weights, not this float; it is exposed
+    /// so roster builders start from the same source of truth.
+    pub total_votes: f64,
+}
+
+/// Decode one `producer_info` row in Leap 5.0.3 `fc::raw` layout: owner,
+/// `total_votes`, key type, 33-byte key, `is_active`, url, unpaid blocks,
+/// last claim time, location. Vote weights are consumed but not returned:
+/// they drift every block between the roster reference and the checkpoint,
+/// so the cross-check binds names to keys and leaves weights to the quorum
+/// math over the transported roster.
+fn decode_producer_info_row(bytes: &[u8]) -> Result<(u64, StateProducerKey), XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    let owner = row.u64()?;
+    let total_votes = f64::from_le_bytes(row.fixed::<8>()?);
+    if row.varuint()? != 0 {
+        return Err(bad("XPR producer uses a non-K1 signing key"));
+    }
+    let key = row.fixed::<33>()?;
+    let is_active = row.bool()?;
+    let _url = row.bytes()?;
+    let _unpaid_blocks = row.u32()?;
+    let _last_claim_time = row.i64()?;
+    let _location = row.u16()?;
+    row.finish()?;
+    Ok((
+        owner,
+        StateProducerKey {
+            key,
+            is_active,
+            total_votes,
+        },
+    ))
+}
+
+/// Derive the producer-name to signing-key map from restored checkpoint
+/// state (`eosio.system` scope, `producers` table). Returns an empty map
+/// when the table is absent, which only happens for synthetic fixtures:
+/// real XPR checkpoints always carry the system producers table.
+pub fn migration_state_producer_keys(
+    db: &Database,
+) -> Result<BTreeMap<u64, StateProducerKey>, String> {
+    use std::str::FromStr;
+    let system = pulsevm_name::Name::from_str("eosio.system")
+        .map_err(|e| format!("invalid system account name: {e}"))?
+        .as_u64();
+    let producers = pulsevm_name::Name::from_str("producers")
+        .map_err(|e| format!("invalid producers table name: {e}"))?
+        .as_u64();
+    let mut map = BTreeMap::new();
+    for (primary, value) in db.arena_table_range(system, system, producers) {
+        let (owner, entry) = decode_producer_info_row(&value)
+            .map_err(|e| format!("producers row {primary} undecodable: {e}"))?;
+        if owner != primary {
+            return Err(format!(
+                "producers row {primary} carries a mismatched owner {owner}"
+            ));
+        }
+        if map.insert(owner, entry).is_some() {
+            return Err(format!("duplicate producers row for owner {owner}"));
+        }
+    }
+    Ok(map)
+}
+
+/// Emit a starting-point halt roster from checkpoint state: active
+/// producers with weights truncated from on-chain `total_votes` (saturating
+/// `f64 as u64`). The operator — or the on-chain ceremony — pins the final
+/// roster; weights drift every block, so a template built earlier is stale
+/// and the roster must be rebuilt at H.
+pub fn migration_halt_roster_template(
+    db: &Database,
+) -> Result<Vec<MigrationHaltRosterEntry>, String> {
+    let mut roster = Vec::new();
+    for (owner, entry) in migration_state_producer_keys(db)? {
+        if !entry.is_active {
+            continue;
+        }
+        let key = pulsevm_crypto::k1::K1PublicKey::from_compressed(&entry.key)
+            .map_err(|e| format!("producers row {owner} holds an invalid key: {e:?}"))?;
+        roster.push(MigrationHaltRosterEntry {
+            producer: pulsevm_name::Name::new(owner).to_string(),
+            key: key.to_string(),
+            weight: entry.total_votes as u64,
+        });
+    }
+    Ok(roster)
+}
+
+/// Bind a transported halt roster to checkpoint content: every rostered
+/// producer name must resolve to exactly the same signing key in the
+/// restored state. Returns the number of bound entries. Weights are
+/// deliberately not compared: they move every block, so a weight pinned
+/// at the roster reference legitimately differs from checkpoint state.
+/// `is_active` is likewise not enforced here (a producer may retire
+/// between the reference and the checkpoint); activity enforcement
+/// belongs to the on-chain ceremony that pins the roster.
+pub fn check_halt_roster_against_state(
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    state: &BTreeMap<u64, StateProducerKey>,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let mut matched = 0;
+    for entry in roster {
+        let name = pulsevm_name::Name::from_str(&entry.producer)
+            .map_err(|e| format!("halt roster producer name invalid: {e}"))?
+            .as_u64();
+        let state_key = state.get(&name).ok_or_else(|| {
+            format!(
+                "halt roster producer {} is not present in checkpoint state",
+                entry.producer
+            )
+        })?;
+        if state_key.key != entry.key.compressed() {
+            return Err(format!(
+                "halt roster key for {} does not match checkpoint state",
+                entry.producer
+            ));
+        }
+        matched += 1;
+    }
+    Ok(matched)
+}
+
+/// Verify a manifest's halt commitment against the terminal block it names.
+/// Version 1 verifies a single producer key; version 2 verifies a
+/// checkpoint-bound commitment, with a weighted two-thirds quorum when the
+/// manifest carries a roster. Anything else fails closed. This is the same
+/// check the restore gate runs; the offline verifier reuses it so a
+/// manifest can be validated without booting a node.
+pub fn verify_migration_halt_commitment(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    checkpoint_sha256: &[u8; 32],
+) -> Result<(), String> {
+    use pulsevm_chain_types::HaltCommitment;
+    let commitment = manifest
+        .halt_commitment
+        .as_ref()
+        .ok_or_else(|| "migration manifest carries no halt commitment".to_string())?;
+    let roster = manifest.roster_entries()?;
+    match commitment.version {
+        HaltCommitment::VERSION => match roster.as_ref() {
+            Some(roster) => commitment
+                .verify_weighted_quorum(height, block_id, roster)
+                .map_err(|e| format!("migration halt commitment rejected: {e}")),
+            None => commitment
+                .verify(height, block_id)
+                .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        },
+        HaltCommitment::VERSION_V2 => match roster.as_ref() {
+            Some(roster) => commitment
+                .verify_weighted_quorum_v2(height, block_id, checkpoint_sha256, roster)
+                .map_err(|e| format!("migration halt commitment rejected: {e}")),
+            None => commitment
+                .verify_v2(height, block_id, checkpoint_sha256)
+                .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        },
+        other => Err(format!("unsupported halt commitment version {other}")),
     }
 }
 
@@ -4163,6 +4385,338 @@ mod tests {
         assert_eq!(manifest.import_summary.accounts, 3);
         assert_eq!(manifest.import_summary.deferred_transactions, 0);
         assert_eq!(manifest.import_summary.input_transactions, 0);
+    }
+
+    #[test]
+    fn migration_manifest_v2_roster_roundtrips_and_parses() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq".to_string(),
+            weight: 50,
+        }]);
+        assert_eq!(manifest.version, MigrationManifest::VERSION_V2);
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: MigrationManifest = serde_json::from_str(&json).unwrap();
+        let roster = parsed
+            .roster_entries()
+            .expect("roster must parse")
+            .expect("v2 manifest must carry a roster");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].producer, "prod.a");
+        assert_eq!(roster[0].weight, 50);
+        assert!(parsed.verify_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn migration_manifest_rejects_unsupported_version() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let mut manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        manifest.version = 99;
+        assert!(manifest.verify_checkpoint(&checkpoint).is_err());
+    }
+
+    use std::str::FromStr as _;
+
+    fn pack_producer_info(
+        owner: u64,
+        key_bytes: &[u8; 33],
+        key_type: u64,
+        is_active: bool,
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        fn varuint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        let mut row = Vec::new();
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&12345.0f64.to_le_bytes());
+        varuint(key_type, &mut row);
+        row.extend_from_slice(key_bytes);
+        row.push(u8::from(is_active));
+        varuint(3, &mut row);
+        row.extend_from_slice(b"url");
+        row.extend_from_slice(&0u32.to_le_bytes());
+        row.extend_from_slice(&0i64.to_le_bytes());
+        row.extend_from_slice(&0u16.to_le_bytes());
+        row.extend_from_slice(trailing);
+        row
+    }
+
+    fn test_key(seed: &str) -> pulsevm_crypto::k1::K1PublicKey {
+        pulsevm_crypto::k1::K1PrivateKey::from_seed_string(seed)
+            .expect("deterministic test key")
+            .public_key()
+    }
+
+    #[test]
+    fn migration_state_producer_keys_decodes_producer_info_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let row = pack_producer_info(owner, &key.compressed(), 0, true, &[]);
+        let (decoded_owner, decoded) =
+            decode_producer_info_row(&row).expect("valid row must decode");
+        assert_eq!(decoded_owner, owner);
+        assert_eq!(decoded.key, key.compressed());
+        assert!(decoded.is_active);
+    }
+
+    #[test]
+    fn migration_state_producer_keys_rejects_bad_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        // Non-K1 key type.
+        assert!(
+            decode_producer_info_row(&pack_producer_info(owner, &key.compressed(), 1, true, &[]))
+                .is_err()
+        );
+        // Trailing bytes.
+        assert!(
+            decode_producer_info_row(&pack_producer_info(owner, &key.compressed(), 0, true, &[0]))
+                .is_err()
+        );
+        // Truncated row.
+        let mut short = pack_producer_info(owner, &key.compressed(), 0, true, &[]);
+        short.truncate(short.len() - 2);
+        assert!(decode_producer_info_row(&short).is_err());
+    }
+
+    fn state_key(key: &[u8; 33]) -> StateProducerKey {
+        StateProducerKey {
+            key: *key,
+            is_active: true,
+            total_votes: 0.0,
+        }
+    }
+
+    #[test]
+    fn halt_roster_cross_check_binds_keys_to_checkpoint_state() {
+        let key_a = test_key("state-roster-1");
+        let key_b = test_key("state-roster-2");
+        let owner_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let owner_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        let mut state = BTreeMap::new();
+        state.insert(owner_a, state_key(&key_a.compressed()));
+        state.insert(owner_b, state_key(&key_b.compressed()));
+        let roster = vec![
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: key_a,
+                weight: 2,
+            },
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: key_b,
+                weight: 1,
+            },
+        ];
+        assert_eq!(check_halt_roster_against_state(&roster, &state).unwrap(), 2);
+        // Swapped key must fail: the roster no longer matches checkpoint state.
+        let forged = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: key_b,
+            weight: 2,
+        }];
+        assert!(check_halt_roster_against_state(&forged, &state).is_err());
+        // Unknown producer must fail.
+        let unknown = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: key_b,
+            weight: 1,
+        }];
+        assert!(check_halt_roster_against_state(&unknown, &state).is_err());
+    }
+
+    #[test]
+    fn migration_state_producer_keys_derive_from_hydrated_state() {
+        let system = pulsevm_name::Name::from_str("eosio.system")
+            .unwrap()
+            .as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut kv_row = secondary_prefix(system, system, producers, owner, payer);
+        bytes(
+            &mut kv_row,
+            &pack_producer_info(owner, &key.compressed(), 0, true, &[]),
+        );
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("contract_table", table_row),
+                delta("contract_row", kv_row),
+            ],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state(&mut db, &entry).unwrap();
+        let map = migration_state_producer_keys(&db).expect("derivation must succeed");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&owner].key, key.compressed());
+        // The template carries the same key with the on-chain vote weight.
+        let template = migration_halt_roster_template(&db).unwrap();
+        assert_eq!(template.len(), 1);
+        assert_eq!(template[0].producer, "prod.a");
+        assert_eq!(template[0].weight, 12345);
+        let parsed = pulsevm_chain_types::HaltRosterEntry {
+            producer: template[0].producer.clone(),
+            key: pulsevm_crypto::k1::K1PublicKey::from_string(&template[0].key).unwrap(),
+            weight: template[0].weight,
+        };
+        assert_eq!(parsed.key.compressed(), key.compressed());
+        let roster = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key,
+            weight: 2,
+        }];
+        assert_eq!(check_halt_roster_against_state(&roster, &map).unwrap(), 1);
+    }
+
+    fn halt_test_manifest() -> (MigrationManifest, [u8; 32], [u8; 32]) {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        let hash: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        (manifest, [9; 32], hash)
+    }
+
+    fn halt_v1_commitment(
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        producer: &str,
+        height: u32,
+        id: &[u8; 32],
+    ) -> pulsevm_chain_types::HaltCommitment {
+        let digest = pulsevm_chain_types::HaltCommitment::digest(height, id);
+        pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION,
+            halt_height: height,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: None,
+            producer_keys: vec![signing.public_key().to_string()],
+            signatures: vec![pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: signing.public_key().to_string(),
+                signature: signing.sign(&digest).to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_migration_halt_accepts_v1_single_key() {
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        manifest.halt_commitment = Some(halt_v1_commitment(&signing, "prod.a", 7, &id));
+        verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).unwrap();
+    }
+
+    #[test]
+    fn verify_migration_halt_accepts_v2_roster_quorum_and_rejects_shortfall() {
+        let (manifest, id, checkpoint) = halt_test_manifest();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-2").unwrap();
+        let roster = vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: 2,
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: 1,
+            },
+        ];
+        let sign = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            let digest = pulsevm_chain_types::HaltCommitment::digest_v2(7, &id, &checkpoint);
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&digest).to_string(),
+            }
+        };
+        let mut full = manifest.clone().with_halt_roster(roster);
+        let checkpoint_hex = full.checkpoint_sha256.clone();
+        full.halt_commitment = Some(pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION_V2,
+            halt_height: 7,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: Some(checkpoint_hex),
+            producer_keys: vec![],
+            signatures: vec![sign(&k1, "prod.a"), sign(&k2, "prod.b")],
+        });
+        verify_migration_halt_commitment(&full, 7, &id, &checkpoint).unwrap();
+        // Only prod.b (weight 1 of 3) signs: below the two-thirds quorum.
+        let mut short = full.clone();
+        short.halt_commitment.as_mut().unwrap().signatures = vec![sign(&k2, "prod.b")];
+        assert!(verify_migration_halt_commitment(&short, 7, &id, &checkpoint).is_err());
+    }
+
+    #[test]
+    fn verify_migration_halt_rejects_bad_version_and_bad_checkpoint() {
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = 7;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).is_err());
+        let (mut manifest, id, _) = halt_test_manifest();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = pulsevm_chain_types::HaltCommitment::VERSION_V2;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &[8; 32]).is_err());
+    }
+
+    #[test]
+    fn migration_manifest_roster_rejects_invalid_key() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: "not-a-key".to_string(),
+            weight: 10,
+        }]);
+        assert!(manifest.roster_entries().is_err());
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

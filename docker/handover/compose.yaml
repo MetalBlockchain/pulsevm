@@ -21,7 +21,9 @@ services:
     # rebuild from source instead, replace `image` with a build of
     # ../../tools/xpr-chainbase-export/localnet.
     image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
-    platform: linux/amd64
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
     command:
       - --data-dir=/data
       - --config-dir=/config
@@ -48,7 +50,9 @@ services:
   # validator config; each keeps its own data volume and host HTTP port.
   xpr-validator-1:
     image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
-    platform: linux/amd64
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
     command:
       - --data-dir=/data
       - --config-dir=/config
@@ -68,7 +72,9 @@ services:
 
   xpr-validator-2:
     image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
-    platform: linux/amd64
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
     command:
       - --data-dir=/data
       - --config-dir=/config

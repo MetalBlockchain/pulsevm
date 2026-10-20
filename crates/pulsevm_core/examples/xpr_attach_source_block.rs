@@ -44,7 +44,13 @@ use serde_json::Value;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>]"
+        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>]"
+    );
+    eprintln!(
+        "  --halt-key-v2 signs a version 2 checkpoint-bound commitment; --halt-roster attaches a"
+    );
+    eprintln!(
+        "  weighted roster JSON array ([{{\"producer\", \"key\", \"weight\"}}]) for quorum verification."
     );
 }
 
@@ -57,6 +63,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let mut halt_key: Option<String> = None;
+    let mut halt_key_v2: Option<String> = None;
+    let mut halt_roster: Option<String> = None;
     while let Some(arg) = args.next() {
         if arg == "--halt-key" {
             let Some(wif) = args.next() else {
@@ -64,16 +72,34 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             halt_key = Some(wif.to_string_lossy().into_owned());
+        } else if arg == "--halt-key-v2" {
+            let Some(wif) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_key_v2 = Some(wif.to_string_lossy().into_owned());
+        } else if arg == "--halt-roster" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_roster = Some(path.to_string_lossy().into_owned());
         } else {
             usage();
             return ExitCode::from(2);
         }
+    }
+    if halt_key.is_some() && halt_key_v2.is_some() {
+        eprintln!("cannot attach migration source block: --halt-key and --halt-key-v2 conflict");
+        return ExitCode::from(2);
     }
     match attach(
         Path::new(&manifest),
         Path::new(&block),
         Path::new(&output),
         halt_key.as_deref(),
+        halt_key_v2.as_deref(),
+        halt_roster.as_deref(),
     ) {
         Ok((height, id)) => {
             println!("attached migration source block {height} {id}");
@@ -91,6 +117,8 @@ fn attach(
     block_path: &Path,
     output_path: &Path,
     halt_key: Option<&str>,
+    halt_key_v2: Option<&str>,
+    halt_roster: Option<&str>,
 ) -> Result<(u32, Id), String> {
     let mut manifest: MigrationManifest = serde_json::from_slice(
         &fs::read(manifest_path).map_err(|error| format!("read manifest: {error}"))?,
@@ -187,6 +215,7 @@ fn attach(
             version: HaltCommitment::VERSION,
             halt_height: height,
             halt_block_id: hex::encode(id.as_bytes()),
+            checkpoint_sha256: None,
             producer_keys: vec![producer_key.clone()],
             signatures: vec![HaltSignature {
                 producer: block.signed_block_header.header.producer.to_string(),
@@ -194,6 +223,43 @@ fn attach(
                 signature: signing.sign(&digest).to_string(),
             }],
         });
+    }
+    // Version 2 binds the checkpoint hash into the signed digest so the
+    // commitment cannot be replayed onto another export of the same block.
+    if let Some(wif) = halt_key_v2 {
+        let signing = K1PrivateKey::from_string(wif)
+            .map_err(|error| format!("halt key invalid: {error:?}"))?;
+        let producer_key = signing.public_key().to_string();
+        let checkpoint: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+            .map_err(|error| format!("manifest checkpoint hash invalid: {error}"))?
+            .try_into()
+            .map_err(|_| "manifest checkpoint hash has the wrong length".to_string())?;
+        let digest = HaltCommitment::digest_v2(height, &id.0.0, &checkpoint);
+        manifest.halt_commitment = Some(HaltCommitment {
+            version: HaltCommitment::VERSION_V2,
+            halt_height: height,
+            halt_block_id: hex::encode(id.as_bytes()),
+            checkpoint_sha256: Some(manifest.checkpoint_sha256.clone()),
+            producer_keys: vec![producer_key.clone()],
+            signatures: vec![HaltSignature {
+                producer: block.signed_block_header.header.producer.to_string(),
+                key: producer_key,
+                signature: signing.sign(&digest).to_string(),
+            }],
+        });
+    }
+    // A weighted roster moves the restore from the single-key path to the
+    // two-thirds quorum path (version 1 and 2 commitments alike).
+    if let Some(roster_path) = halt_roster {
+        let bytes =
+            fs::read(roster_path).map_err(|error| format!("read roster {roster_path}: {error}"))?;
+        let roster: Vec<pulsevm_database::MigrationHaltRosterEntry> =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("parse roster {roster_path}: {error}"))?;
+        if roster.is_empty() {
+            return Err(format!("roster {roster_path} carries no entries"));
+        }
+        manifest = manifest.with_halt_roster(roster);
     }
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("serialize manifest: {error}"))?;
