@@ -351,12 +351,21 @@ impl Serialize for PackedTransaction {
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("PackedTransaction", 5)?;
+        // Leap `get_block` packed-transaction shape: id, signatures,
+        // compression, packed_context_free_data, packed_trx, the unpacked
+        // `transaction`, plus `context_free_data` (array of hex blobs,
+        // empty when the transaction carries none). Keep the full set so
+        // Leap-schema consumers see no missing field.
+        let mut state = serializer.serialize_struct("PackedTransaction", 7)?;
         state.serialize_field("id", &self.trx_id)?;
         state.serialize_field("signatures", &self.signatures)?;
         state.serialize_field("compression", &self.compression)?;
         state.serialize_field("packed_trx", &self.packed_trx)?;
         state.serialize_field("packed_context_free_data", &self.packed_context_free_data)?;
+        state.serialize_field(
+            "context_free_data",
+            &self.get_signed_transaction().context_free_data(),
+        )?;
         state.serialize_field("transaction", &self.unpacked_trx.transaction())?;
         state.end()
     }
@@ -465,6 +474,74 @@ mod tests {
             "newaccount"
         );
         assert_eq!(transaction.packed_trx_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn receipt_trx_matches_leap_field_shape_for_live_testnet_tx() {
+        // Real XPR testnet transaction from block 412057614 (flexdex:exec
+        // x2, two SIG_K1 signatures), captured from a Leap `get_block`
+        // response. Pins the receipt `trx` object to Leap's exact field set
+        // and values, so schema-strict consumers never see a missing field.
+        let leap_packed_trx = "68c7d76ab97ed1ba919ce4a70200000002000000a0abd4555c00000000008054570220b06189d38b7a5a00000000a8ed32320000001219837a5a00000000a8ed32322e0000001219837a5a010007000000000000007dc800000000000001010f0000000000000072c00000000000000001000000a0abd4555c0000000000805457010000003719837a5a00000000a8ed3232510000003719837a5a020007000000000000007ffd14000000000001010e000000000000008d26140000000000000900000000000000abf003000000000001010e0000000000000020c8030000000000000100";
+        let packed = PackedTransaction::new(
+            vec![
+                Signature::from_str("SIG_K1_KhapDaDWZGreCsavuYkhZd1WSPGPyedHMJdFQm9VuAxHUBLM8mmufV3zJQidjqo28zBpKbhXFQ5ZN9STvxnGghpaQP7qzE").unwrap(),
+                Signature::from_str("SIG_K1_JwDY4znzhS9Zgejazp1t2TaqCAzBapQqgB4RZcpy5LoUe5HumQar5nWWu4cMbpYR1FFYnrHZxxFinKwv7wZJGrmBxcYheG").unwrap(),
+            ],
+            TransactionCompression::None,
+            Bytes::default(),
+            hex::decode(leap_packed_trx).unwrap().into(),
+        )
+        .unwrap();
+        let receipt = TransactionReceipt::new(
+            TransactionReceiptHeader::new(TransactionStatus::Executed, 2_606, VarUint32(18)),
+            packed,
+        );
+
+        // The digest path must reproduce Leap's transaction id: receipts,
+        // merkles, and block ids all commit to it.
+        assert_eq!(
+            receipt.transaction_id().to_string(),
+            "d25a04b1b56bcb05e4f6b07d462ff387fc624ef46dcd607c0d7a03a665bd2e3a"
+        );
+
+        let v = serde_json::to_value(&receipt).unwrap();
+        let trx = &v["trx"];
+        let mut keys: Vec<String> = trx
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "compression",
+                "context_free_data",
+                "id",
+                "packed_context_free_data",
+                "packed_trx",
+                "signatures",
+                "transaction"
+            ]
+        );
+        assert_eq!(
+            trx["id"].as_str().unwrap(),
+            "d25a04b1b56bcb05e4f6b07d462ff387fc624ef46dcd607c0d7a03a665bd2e3a"
+        );
+        assert_eq!(trx["packed_trx"].as_str().unwrap(), leap_packed_trx);
+        assert_eq!(trx["packed_context_free_data"].as_str().unwrap(), "");
+        assert_eq!(trx["context_free_data"], serde_json::json!([]));
+        assert_eq!(trx["compression"].as_str().unwrap(), "none");
+        assert_eq!(trx["signatures"].as_array().unwrap().len(), 2);
+        let actions = trx["transaction"]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|a| a["account"] == "flexdex" && a["name"] == "exec")
+        );
     }
 
     #[test]
