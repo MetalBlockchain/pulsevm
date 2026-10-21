@@ -84,7 +84,7 @@ pdf.multi_cell(0, 7, "How the old validator set commits on-chain to stop at bloc
 pdf.ln(10)
 pdf.set_font("Helvetica", "", 10)
 pdf.set_text_color(120, 120, 120)
-pdf.multi_cell(0, 6, "Status: rehearsal PASS at H=163 (fresh chain, 11/11 state identical, 10/10 boundary txs exactly-once).\nCode is authoritative where this document and the implementation disagree.")
+pdf.multi_cell(0, 6, "Status: rehearsal PASS at H=170 (five nodes, platform-bound confirmation, H+1 parent-linked, 5/5 head agreement, 4/4 state identical, 10/10 boundary txs exactly-once).\nCode is authoritative where this document and the implementation disagree.")
 
 # ---------- 1. system ----------
 pdf.add_page()
@@ -132,9 +132,9 @@ pdf.grid(
     [
         ["Pair mandatory", "No declaration + confirmation pair: no restore. A manifest without it is refused before any state is trusted."],
         ["Strict 2/3+1 by weight", "Recovered signer weights summed as u128 integers; signed x 3 > total x 2. Exactly-two-thirds fails. Contract and verifier use bit-identical math."],
-        ["Roster provenance", "The set is frozen on-chain from the live producers table, never supplied by a coordinator. The gate re-checks names, keys AND weights against the checkpoint state (light-client rule)."],
+        ["Roster provenance", "The set is frozen on-chain from the live producers table, never supplied by a coordinator. The gate re-checks names and keys against the checkpoint state (light-client rule); weights are pinned by the frozen on-chain tally, because vote totals drift every block."],
         ["Provable timing", "Votes must land before H, proven by on-chain ceremony votes or by a recorded on-chain inclusion (memo / multisig block). A pair with neither fails closed."],
-        ["Bindings", "Checkpoint hash is recomputed from the artifact; confirmation binds H, block id, checkpoint and successor chain id. Replays across heights, exports or chains cannot verify."],
+        ["Bindings", "Checkpoint hash is recomputed from the artifact; confirmation binds H, block id, checkpoint, successor chain id, and the platform chain id. Replays across heights, exports, chains, or platforms cannot verify."],
     ],
     widths=[38, 136],
 )
@@ -208,7 +208,7 @@ pdf.body(
 pdf.bullets([
     "BP action reduces to: install the update, drop in the config plus key file, stay online through H. The two touchpoints disappear.",
     "No new secrets: keys live in owner-only files the daemon refuses to start without -- never on the command line, never in logs; it only signs the two ceremony digests.",
-    "Refuses closed on anything but the exact freeze: wrong H, chain, or digest; non-BP keys; double votes; votes at or after H; an unfinalized ceremony; coordinator data that disagrees with the local node. Dry-run mode rehearses without signing.",
+    "Refuses closed on anything but the exact freeze: wrong H, chain, or digest; non-BP keys; double votes; votes at or after H; an unfinalized ceremony; a staged schedule change (rotation fails closed); coordinator data that disagrees with the local node. Dry-run mode rehearses without signing; print-digest mode emits the exact confirmation bytes for an external agent to sign, so the agent and the voter never disagree.",
     "Fallback intact: if a producer disables automation, the manual CLI path produces byte-identical votes; mixed fleets verify together.",
 ])
 pdf.body(
@@ -248,9 +248,9 @@ pdf.body(
 pdf.bullets([
     "Pair mandatory: a manifest with no halt declaration restores nothing; roster-less commitments are rejected everywhere.",
     "Declaration: version and H must match; every signature must recover to a declared-set key over the declaration digest; the signers' weight must clear strict 2/3+1 in integer math (signed*3 > total*2 over u128, so exactly two-thirds fails).",
-    "Set equality, the light-client rule: the declared set must equal the active XPR schedule read from the checkpoint's own producers table -- same producers, same keys, same weights. The exporter cannot invent members or inflate weights; a rotation between freeze and H fails closed and restarts the ceremony.",
+    "Set equality, the light-client rule: the declared set must equal the active XPR schedule read from the checkpoint's own producers table -- same producers, same keys; weights pinned by the frozen tally. The exporter cannot invent members or inflate weights; a rotation between freeze and H fails closed and restarts the ceremony.",
     "Contract replay: the captured ceremony singleton must be finalized on the same digest; every vote must be a rostered schedule key with its vote block strictly before H, so all timing is XPR consensus, never an asserted timestamp; the recorded tally must equal the recomputed signer weight; the schedule version must be unanimous.",
-    "Confirmation: chains the verified declaration digest to the terminal block id, the checkpoint hash being imported, and this chain's id; the same set's quorum signs that digest. Inclusion must postdate H (it references H_ID) and meet the H+J deadline.",
+    "Confirmation: chains the verified declaration digest to the terminal block id, the checkpoint hash being imported, this chain's id, and the platform chain id it was issued against; the same set's quorum signs that digest. Inclusion must postdate H (it references H_ID) and meet the H+J deadline.",
     "Chain separation: the successor id is derived from the migration genesis committed to the checkpoint hash, so XPR signatures cannot replay onto the A-Chain.",
 ])
 pdf.h2("5.2 H+1 is a start, not a resume")
@@ -266,7 +266,7 @@ pdf.h1("6. Verification status")
 pdf.bullets([
     "Restore gate: pair mandatory; roster-less commitments rejected; strict 2/3+1 integer quorum; roster cross-checked against checkpoint state; timing provable via ceremony or recorded inclusion.",
     "Tests: 317 core + 109 database + 6 verifier tests green, including rejection of pair-less manifests, short quorums, tampered signatures, late votes and inflated tallies; contract fixture 14/14.",
-    "Full rehearsal PASS (fresh chain, H=163): offline pair verification green, flip gate opened, H+1 parent-linked, 11/11 accounts identical, 10/10 boundary transactions exactly-once.",
+    "Full rehearsal PASS (five nodes, H=170): offline pair verification green with platform binding, flip gate opened, H+1 parent-linked, 5/5 head agreement, 4/4 accounts identical, 10/10 boundary transactions exactly-once; a wrong-platform confirmation was refused live before the corrected one opened the gate.",
 ])
 pdf.h2("6.1 Known limits")
 pdf.bullets([

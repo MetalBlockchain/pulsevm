@@ -53,6 +53,12 @@ use pulsevm_database::{
 };
 use serde::Deserialize;
 
+macro_rules! log_line {
+    ($($arg:tt)*) => {{
+        println!("[cutover-voter {}] {}", now_stamp(), format!($($arg)*));
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -90,6 +96,12 @@ struct ConfirmationConfig {
     out_file: String,
     migration_genesis: Option<String>,
     checkpoint_sha256: Option<String>,
+    /// The MetalGo blockchain id wallets sign under, from the ceremony
+    /// config. Bound into the confirmation digest; the restore gate fails
+    /// closed without it, so an unset value warns loudly and stays a
+    /// rehearsal-only mode.
+    #[serde(default)]
+    platform_chain_id: Option<String>,
 }
 
 fn default_poll_secs() -> u64 {
@@ -243,6 +255,10 @@ struct CeremonyView {
     lib_num: u32,
     singleton: Option<CeremonyRow>,
     member: Option<MemberRow>,
+    /// A schedule change is staged (pending or proposed): the frozen set
+    /// may no longer name the active set, so the vote refuses until the
+    /// freeze is re-taken on the new set.
+    schedule_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +306,12 @@ fn decide(config: &LoadedConfig, view: &CeremonyView) -> Decision {
     if singleton.digest != hex::encode(config.expected_digest) {
         return Decision::Refuse(
             "ceremony digest does not match the locally recomputed declaration: refusing to sign a foreign freeze"
+                .to_string(),
+        );
+    }
+    if view.schedule_blocked {
+        return Decision::Refuse(
+            "a producer schedule change is staged (pending or proposed): refusing to sign until the freeze names the active set"
                 .to_string(),
         );
     }
@@ -407,6 +429,42 @@ async fn get_table_rows(
         .ok_or_else(|| format!("get_table_rows {table} missing rows"))
 }
 
+/// Whether a producer schedule change is staged. Leap reports the staged
+/// slots as null when empty; any present slot with producers means the
+/// active set is about to change and the freeze may name a stale set.
+/// Unknown shapes fail closed (blocked): signing on a schedule we cannot
+/// read is exactly what the gate would reject downstream.
+fn schedule_staged(value: &serde_json::Value) -> bool {
+    for slot in ["pending", "proposed"] {
+        let Some(staged) = value.get(slot) else {
+            continue;
+        };
+        if staged.is_null() {
+            continue;
+        }
+        let empty = staged
+            .get("producers")
+            .and_then(|producers| producers.as_array())
+            .map(|producers| producers.is_empty())
+            .unwrap_or(false);
+        if !empty {
+            return true;
+        }
+    }
+    false
+}
+
+async fn read_schedule_blocked(client: &reqwest::Client, base: &str) -> Result<bool, String> {
+    let schedule = post_json(
+        client,
+        &format!("{base}/v1/chain/get_producer_schedule"),
+        &serde_json::json!({}),
+    )
+    .await
+    .map_err(|error| format!("producer schedule unreadable: {error}"))?;
+    Ok(schedule_staged(&schedule))
+}
+
 /// Leap renders contract bools inconsistently across versions (JSON bool
 /// vs 0/1); accept both rather than failing a healthy freeze.
 fn parse_abi_bool(value: &serde_json::Value, field: &str) -> Result<bool, String> {
@@ -487,11 +545,13 @@ async fn read_view(
             break;
         }
     }
+    let schedule_blocked = read_schedule_blocked(client, base).await?;
     Ok(CeremonyView {
         head_num,
         lib_num,
         singleton,
         member,
+        schedule_blocked,
     })
 }
 
@@ -666,6 +726,8 @@ struct CoordinatorParams {
     checkpoint_sha256: String,
     new_chain_id: String,
     source_chain_id: String,
+    #[serde(default)]
+    platform_chain_id: Option<String>,
 }
 
 async fn fetch_coordinator_params(
@@ -694,10 +756,15 @@ fn successor_from_genesis(genesis_path: &str) -> Result<String, String> {
     Ok(hex::encode(genesis.compute_chain_id()))
 }
 
-async fn submit_confirmation(
+/// The unsigned confirmation template plus its signing digest, without
+/// signing or delivering anything. Shared by the submit path and
+/// `--print-digest`: an external agent signs exactly these bytes with its
+/// own key management, so the digest below and a locally signed vote are
+/// the same commitment.
+async fn unsigned_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
-) -> Result<String, String> {
+) -> Result<(HaltConfirmation, [u8; 32]), String> {
     let height = config.inner.height;
     let local_block_id = fetch_block_id(client, &config.inner.nodeos_url, height).await?;
     // Checkpoint and successor id: explicit config wins; the coordinator may
@@ -708,6 +775,7 @@ async fn submit_confirmation(
         Some(path) => Some(successor_from_genesis(path)?),
         None => None,
     };
+    let mut platform = config.inner.confirmation.platform_chain_id.clone();
     if let Some(url) = config.inner.confirmation.coordinator_url.as_deref() {
         let params = fetch_coordinator_params(client, url).await?;
         if params.halt_height != height {
@@ -740,6 +808,31 @@ async fn submit_confirmation(
         } else {
             new_chain = Some(params.new_chain_id);
         }
+        // The platform id is the one value that must agree three ways
+        // (config, coordinator, boot): wallets sign under it while the
+        // ceremony commits to it, so any mismatch refuses loudly. Either
+        // side may use hex or the base58 log rendering; bytes are compared.
+        match (platform.as_deref(), params.platform_chain_id.as_deref()) {
+            (Some(configured), Some(coordinated)) => {
+                let configured_id = pulsevm_crypto::parse_chain_id(configured)
+                    .map_err(|error| format!("configured platform chain id: {error}"))?;
+                let coordinated_id = pulsevm_crypto::parse_chain_id(coordinated)
+                    .map_err(|error| format!("coordinator platform chain id: {error}"))?;
+                if configured_id != coordinated_id {
+                    return Err(
+                        "coordinator platform chain id does not match configured platform chain id"
+                            .to_string(),
+                    );
+                }
+                platform = Some(pulsevm_crypto::chain_id_hex(&configured_id));
+            }
+            (None, Some(coordinated)) => {
+                let coordinated_id = pulsevm_crypto::parse_chain_id(coordinated)
+                    .map_err(|error| format!("coordinator platform chain id: {error}"))?;
+                platform = Some(pulsevm_crypto::chain_id_hex(&coordinated_id));
+            }
+            _ => {}
+        }
     }
     let checkpoint = checkpoint.ok_or_else(|| {
         "no checkpoint: set confirmation.checkpoint_sha256 or coordinator_url".to_string()
@@ -747,6 +840,19 @@ async fn submit_confirmation(
     let new_chain = new_chain.ok_or_else(|| {
         "no successor chain id: set confirmation.migration_genesis or coordinator_url".to_string()
     })?;
+    let platform = match platform {
+        Some(id) => {
+            let parsed = pulsevm_crypto::parse_chain_id(&id)
+                .map_err(|error| format!("configured platform chain id: {error}"))?;
+            Some(pulsevm_crypto::chain_id_hex(&parsed))
+        }
+        None => {
+            log_line!(
+                "WARNING: no platform chain id configured; the confirmation binds no signing id and the restore gate will refuse it (rehearsal-only mode)"
+            );
+            None
+        }
+    };
     let template = HaltConfirmation {
         version: HaltConfirmation::VERSION,
         declaration_digest: hex::encode(config.expected_digest),
@@ -754,11 +860,25 @@ async fn submit_confirmation(
         halt_block_id: local_block_id.clone(),
         checkpoint_sha256: checkpoint.clone(),
         new_chain_id: new_chain.clone(),
+        platform_chain_id: platform.clone(),
         signatures: Vec::new(),
     };
     let digest = template
         .digest()
         .map_err(|error| format!("confirmation digest: {error}"))?;
+    Ok((template, digest))
+}
+
+async fn submit_confirmation(
+    client: &reqwest::Client,
+    config: &LoadedConfig,
+) -> Result<String, String> {
+    let height = config.inner.height;
+    let (template, digest) = unsigned_confirmation(client, config).await?;
+    let local_block_id = template.halt_block_id.clone();
+    let checkpoint = template.checkpoint_sha256.clone();
+    let new_chain = template.new_chain_id.clone();
+    let platform = template.platform_chain_id.clone();
     let member_producer = config.inner.producer.clone();
     let signature = HaltSignature {
         producer: member_producer.clone(),
@@ -795,6 +915,7 @@ async fn submit_confirmation(
                 "halt_block_id": local_block_id,
                 "checkpoint_sha256": checkpoint,
                 "new_chain_id": new_chain,
+                "platform_chain_id": platform,
                 "declaration_digest": hex::encode(config.expected_digest),
                 "key": signature.key,
                 "signature": signature.signature,
@@ -819,13 +940,18 @@ async fn submit_confirmation(
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N]\n\
+        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N] [--print-digest]\n\
          \n\
          The config carries the node URL, contract, producer, coordinated\n\
          height and source chain, the roster file, the vote/payer key files\n\
          (owner-only permissions), and the confirmation delivery. See\n\
          tools/xpr-cutover-voter/config.example.json. Keys never appear on\n\
-         the command line and are never logged."
+         the command line and are never logged.\n\
+         \n\
+         --print-digest prints the currently actionable signing digest as\n\
+         JSON and exits without signing: an external agent (or remote\n\
+         signer) signs exactly those bytes and submits through its own\n\
+         path, so key custody never moves."
     );
     std::process::exit(2);
 }
@@ -842,24 +968,93 @@ fn now_stamp() -> String {
     format!("{secs}")
 }
 
-macro_rules! log_line {
-    ($($arg:tt)*) => {{
-        println!("[cutover-voter {}] {}", now_stamp(), format!($($arg)*));
-    }};
-}
-
-async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(), String> {
+fn build_client(config: &LoadedConfig) -> Result<reqwest::Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::HOST,
         reqwest::header::HeaderValue::from_str(&config.inner.host_header)
             .map_err(|error| format!("bad host_header: {error}"))?,
     );
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .default_headers(headers)
         .build()
-        .map_err(|error| format!("http client: {error}"))?;
+        .map_err(|error| format!("http client: {error}"))
+}
+
+/// Pure JSON shapes for `--print-digest`, unit-tested below: the digest an
+/// external signer signs must equal the voter's own signing digest.
+fn declaration_digest_json(config: &LoadedConfig) -> serde_json::Value {
+    serde_json::json!({
+        "role": "declaration",
+        "producer": config.inner.producer,
+        "height": config.inner.height,
+        "contract": config.inner.contract,
+        "digest": hex::encode(config.expected_digest),
+    })
+}
+
+fn confirmation_digest_json(
+    producer: &str,
+    template: &HaltConfirmation,
+    digest: &[u8; 32],
+) -> serde_json::Value {
+    serde_json::json!({
+        "role": "confirmation",
+        "producer": producer,
+        "height": template.halt_height,
+        "halt_block_id": template.halt_block_id,
+        "checkpoint_sha256": template.checkpoint_sha256,
+        "new_chain_id": template.new_chain_id,
+        "platform_chain_id": template.platform_chain_id,
+        "declaration_digest": template.declaration_digest,
+        "digest": hex::encode(digest),
+    })
+}
+
+/// Print the currently actionable digest without signing anything, for an
+/// agent that holds the key its own way: declaration while the vote is
+/// due, confirmation once H is final. Exits 0 after printing, 1 when
+/// nothing is actionable (same policy as the submit path, so the agent
+/// and the voter can never disagree on what to sign).
+async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
+    let client = build_client(config)?;
+    let view = read_view(&client, config).await?;
+    match decide(config, &view) {
+        Decision::Vote => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&declaration_digest_json(config))
+                    .map_err(|error| format!("serialize: {error}"))?
+            );
+            return Ok(());
+        }
+        Decision::Refuse(reason) => {
+            return Err(format!("nothing to sign: refusing ({reason})"));
+        }
+        Decision::Wait(_) | Decision::AlreadyVoted => {}
+    }
+    if view.lib_num < config.inner.height {
+        return Err(format!(
+            "nothing to sign: H={} is not final yet (LIB {})",
+            config.inner.height, view.lib_num
+        ));
+    }
+    let (template, digest) = unsigned_confirmation(&client, config).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&confirmation_digest_json(
+            &config.inner.producer,
+            &template,
+            &digest
+        ))
+        .map_err(|error| format!("serialize: {error}"))?
+    );
+    Ok(())
+}
+
+async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(), String> {
+    let client = build_client(config)?;
     let mut voted = false;
     let mut last_note = String::new();
     let mut polls = 0u64;
@@ -957,6 +1152,7 @@ async fn main() -> ExitCode {
     let mut config_path: Option<String> = None;
     let mut dry_run = false;
     let mut max_polls = 0u64;
+    let mut print_digest_only = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -969,6 +1165,7 @@ async fn main() -> ExitCode {
                     .parse()
                     .unwrap_or_else(|_| panic!("--max-polls needs a number, got {value}"));
             }
+            "--print-digest" => print_digest_only = true,
             _ => usage(),
         }
     }
@@ -982,6 +1179,15 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if print_digest_only {
+        return match print_digest(&config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("xpr_cutover_voter: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     if dry_run {
         log_line!("dry run: evaluating only, nothing will be signed or submitted");
     }
@@ -1044,6 +1250,7 @@ mod tests {
                     out_file: String::new(),
                     migration_genesis: None,
                     checkpoint_sha256: None,
+                    platform_chain_id: None,
                 },
             },
             vote_key: key,
@@ -1066,6 +1273,7 @@ mod tests {
             lib_num: head.saturating_sub(10),
             singleton,
             member,
+            schedule_blocked: false,
         }
     }
 
@@ -1173,6 +1381,76 @@ mod tests {
             }),
         );
         assert_eq!(decide(&config, &view), Decision::Vote);
+    }
+
+    #[test]
+    fn refuses_while_a_schedule_change_is_staged() {
+        let config = test_loaded_config(100);
+        let mut view = view_with(
+            90,
+            Some(live_singleton(&config)),
+            Some(live_member(&config, false)),
+        );
+        assert_eq!(decide(&config, &view), Decision::Vote);
+        view.schedule_blocked = true;
+        assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    #[test]
+    fn schedule_staging_reads_leap_shapes() {
+        // Empty slots (null or missing) are not a change.
+        assert!(!schedule_staged(&serde_json::json!({})));
+        assert!(!schedule_staged(
+            &serde_json::json!({"pending": null, "proposed": null})
+        ));
+        assert!(!schedule_staged(
+            &serde_json::json!({"pending": {"producers": []}, "proposed": null})
+        ));
+        // Any staged producers block the vote.
+        assert!(schedule_staged(
+            &serde_json::json!({"pending": {"producers": [{"producer_name": "eosio"}]}})
+        ));
+        assert!(schedule_staged(
+            &serde_json::json!({"proposed": {"producers": [{"producer_name": "eosio"}]}})
+        ));
+        // Unknown shapes fail closed: a schedule we cannot read may be mid-rotation.
+        assert!(schedule_staged(&serde_json::json!({"pending": {}})));
+        assert!(schedule_staged(
+            &serde_json::json!({"pending": {"version": 3}})
+        ));
+    }
+
+    #[test]
+    fn print_digest_shapes_carry_the_signing_digests() {
+        let config = test_loaded_config(100);
+        // The declaration shape carries exactly the digest the voter would
+        // sign: an external agent signing these bytes makes the same
+        // commitment as the voter.
+        let shape = declaration_digest_json(&config);
+        assert_eq!(shape["role"], "declaration");
+        assert_eq!(shape["producer"], "prod.a");
+        assert_eq!(shape["digest"], hex::encode(config.expected_digest));
+        // The confirmation shape carries the template digest, including
+        // the platform binding when configured.
+        let template = HaltConfirmation {
+            version: HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(config.expected_digest),
+            halt_height: 100,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: "10".repeat(32),
+            new_chain_id: "11".repeat(32),
+            platform_chain_id: Some("12".repeat(32)),
+            signatures: Vec::new(),
+        };
+        let digest = template.digest().unwrap();
+        let shape = confirmation_digest_json("prod.a", &template, &digest);
+        assert_eq!(shape["role"], "confirmation");
+        assert_eq!(shape["digest"], hex::encode(digest));
+        assert_eq!(shape["platform_chain_id"], "12".repeat(32));
+        assert_eq!(
+            shape["declaration_digest"],
+            hex::encode(config.expected_digest)
+        );
     }
 
     #[test]

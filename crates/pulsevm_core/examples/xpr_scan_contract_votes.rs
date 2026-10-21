@@ -455,6 +455,7 @@ async fn scan_once(
                     HaltContractVote {
                         producer,
                         block: block_num,
+                        schedule_version: version,
                         key: key.clone(),
                         signature: K1Signature::from_compact65(&compact).to_string(),
                     },

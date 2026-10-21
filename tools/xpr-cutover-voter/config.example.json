@@ -14,10 +14,11 @@
   "dry_run": false,
   "enabled": true,
   "confirmation": {
-    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly.",
+    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly. platform_chain_id is the MetalGo blockchain id wallets sign under, from the ceremony config; the restore gate refuses confirmations that do not bind it.",
     "coordinator_url": "https://cutover-coordinator.example.com",
     "out_file": "/var/lib/cutover/confirmation.json",
     "migration_genesis": "/etc/cutover/migration.genesis.json",
-    "checkpoint_sha256": null
+    "checkpoint_sha256": null,
+    "platform_chain_id": "<64 hex chars of the MetalGo blockchain id, published with the ceremony>"
   }
 }

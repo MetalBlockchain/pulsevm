@@ -81,25 +81,31 @@ equal it (forgery dies) → key must be in declared S, exact match
 - Threshold: `signed x 3 > total x 2`, integer math. Strictly greater —
   exactly-two-thirds fails. That's the +1 in 2/3+1.
 
-Weights are pinned to on-chain state at H by the schedule match below,
-so the quorum is graded against reality, not against the signers' claims.
-Weights are u128 truncated from `total_votes` — mainnet magnitudes
-(~1e20+) saturate u64, silently turning a stake quorum into a member
-count — and JSON carries them as decimal strings; the contract and the
-verifier use the identical conversion so tallies agree bit-for-bit.
+Weights are pinned to the **frozen on-chain tally** whenever contract
+evidence is attached: the singleton's totals must equal the declared
+total and the recomputed signer weight, so quorum math runs over frozen
+values no exporter can inflate. Pinning weights to H-state instead would
+make the ceremony uncompletable on mainnet — `total_votes` drifts every
+block, so a freeze at H-K would never match H-state weights; the memo
+path (no frozen singleton) keeps the exact H-state pin and therefore
+needs a quiet window. Weights are u128 truncated from `total_votes` —
+mainnet magnitudes (~1e20+) saturate u64, silently turning a stake quorum
+into a member count — and JSON carries them as decimal strings; the
+contract and the verifier use the identical conversion so tallies agree
+bit-for-bit.
 
 ## The light-client rule (trust anchor)
 
 The A-Chain replays XPR with full validation, so it independently knows
 the schedule, every block id, and the full state at every height. The
-declared set must **equal** the replayed schedule — names both ways,
-keys, weights. This single check closes the subset attack (a declaration
+declared set must **equal** the replayed schedule — same members both
+ways, same keys. (Weights are pinned by the frozen tally, not by H-state;
+see above.) This single check closes the subset attack (a declaration
 naming only its signer verifies against itself but cannot match the
-on-chain schedule it did not author) and the weight-inflation attack.
-Vote or schedule drift between H-K and H fails closed and restarts
-governance — same as a schedule change. One cutover means there is no
-retry path: a failed ceremony is a new governance decision, not an
-automatic round.
+on-chain schedule it did not author). Membership or key drift between
+H-K and H fails closed and restarts governance — same as a schedule
+change. One cutover means there is no retry path: a failed ceremony is a
+new governance decision, not an automatic round.
 
 ## Vehicles (transport, not proof)
 
@@ -143,16 +149,26 @@ operator once the frozen set matches the coordinated parameters:
 
 - Refuses anything but the exact freeze: wrong height, wrong source
   chain, a digest that does not recompute locally, keys outside the frozen
-  set, double votes, and votes at or after H. Every refusal is logged.
+  set, double votes, votes at or after H, and a staged producer schedule
+  change (pending/proposed): a freeze taken under a rotating set signs
+  nothing. Every refusal is logged.
 - Keys come from owner-only files, never the command line, and are never
   logged. `--dry-run` evaluates and logs every decision without signing.
+- `--print-digest` prints the currently actionable signing digest as JSON
+  and exits without signing: an external agent (or remote signer) signs
+  exactly those bytes with its own key management and submits through its
+  own path, so key custody never moves. The digest equals the voter's own
+  signing digest by construction (unit-tested, live-tested).
 - After H is final it signs the confirmation and delivers it to the
-  coordinator (whose block id and checkpoint are cross-checked against
-  the local node and config) or writes it to a file.
+  coordinator (whose block id, checkpoint, successor id, and platform id
+  are cross-checked against the local node and config) or writes it to a
+  file. The confirmation binds the platform chain id from the ceremony
+  config; without it the restore gate refuses.
 - The vote it submits is byte-identical to the manual `cvote` path, so
   automated and manual fleets verify together
-  (`contracts/cutover/test-voter.sh`: dry-run refusal, unattended live
-  vote, coordinator delivery, lying-coordinator refusal).
+  (`contracts/cutover/test-voter.sh`: dry-run refusal, print-digest
+  parity, unattended live vote, platform-bound coordinator delivery,
+  lying-coordinator and wrong-platform refusal).
 
 What automation cannot do is decide: H, the source chain, and the roster
 come from the coordinated config, and a failed ceremony restarts
@@ -165,15 +181,18 @@ With the contract vehicle the declaration signatures *are* the on-chain
 votes, so timing is provable per vote instead of per quorum. The exporter
 (`xpr_scan_contract_votes`) scans the window for `cutover::vote` actions,
 unpacking each action's `(producer, SIG_K1_)` and resolving the key from
-the frozen members table, and captures the `ceremony` singleton
-(`finalized`, digest, tally). The fragment lands in the manifest as
-`halt_contract_ceremony`, and the verifier replays it off-chain: singleton
-finalized on the verified declaration digest, every vote a rostered
-schedule key inside the declaration window, captured tally equal to the
+the frozen members table, recording each vote's block header schedule
+version, and captures the `ceremony` singleton (`finalized`, digest,
+tally). The fragment lands in the manifest as `halt_contract_ceremony`,
+and the verifier replays it off-chain: singleton finalized on the
+verified declaration digest, every vote a rostered schedule key inside
+the declaration window **and under H's schedule version** (a rotation
+anywhere in the window fails closed), captured tally equal to the
 recomputed signer weight, strict quorum on the recomputation. The
 confirmation still chains declaration → terminal block → checkpoint →
-successor chain id; the contract evidence replaces only the inclusion
-block, never the checks.
+successor chain id **plus the platform (MetalGo blockchain) id wallets
+sign under**; the contract evidence replaces only the inclusion block,
+never the checks.
 
 One deployment gotcha the fixture proved: Leap `setabi` carries the
 *packed binary* `abi_def`, not the JSON text (`cleos` packs client-side).

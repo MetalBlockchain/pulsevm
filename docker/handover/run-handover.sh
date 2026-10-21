@@ -1002,8 +1002,10 @@ cmd_checkpoint() {
         # Step two of the cutover: confirm H with the checkpoint and the
         # successor chain id, attach the pair, and verify offline before any
         # node boots. The migration genesis mirrors run-local.sh's recipe
-        # (base + checkpoint binding + fixture key) so the derived successor
-        # id matches the boot's exactly. On the memo path the fixture chain
+        # (base + checkpoint binding + fixture key); its derived successor
+        # id is what the confirmation chains (new_chain), while the
+        # platform id it binds is the launcher's id (see PLATFORM_CHAIN).
+        # On the memo path the fixture chain
         # carries no producers table, so the state cross-check logs its skip
         # exactly as designed for table-less fixtures; on the contract path
         # the seeded schedule row is exported with the checkpoint, so the
@@ -1028,7 +1030,18 @@ cmd_checkpoint() {
             --arg initial_key "$GENESIS_KEY" \
             '. + {migration_checkpoint_sha256: $checkpoint_sha256, initial_key: $initial_key}' \
             "$GENESIS_BASE" >"$WORK_DIR/migration.genesis.json" || fail "migration genesis build failed"
-        confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
+        # Platform id the boot will run under: the confirmation binds
+        # exactly this id (hex or the base58 log rendering), and the restore
+        # gate fails closed on any other. Set PULSEVM_PLATFORM_CHAIN_ID from
+        # the launcher when it is known in advance (production: the
+        # create-chain id, published by T-14). A local runner assigns the id
+        # at boot from the migration genesis, so the rehearsal learns it
+        # from a first boot's log and re-runs confirm with it: defaulting to
+        # the derived id only works when the boot is configured with the
+        # derived id, which the runner is not.
+        PLATFORM_CHAIN="${PULSEVM_PLATFORM_CHAIN_ID:-$("$CEREMONY_BIN" chain-id --genesis "$WORK_DIR/migration.genesis.json")}" \
+            || fail "platform chain id derivation failed"
+        confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$PLATFORM_CHAIN" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
             || fail "confirmation failed"
         echo "handover: $confirm_out"
         CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
@@ -1065,7 +1078,7 @@ cmd_checkpoint() {
             "${attach_args[@]}" \
             || fail "source block attach failed (H must be an empty block)"
         mv "$manifest.attached" "$manifest"
-        "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" \
+        "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$PLATFORM_CHAIN" \
             || fail "offline pair verification failed"
         # Explicit flip gate (not just phase ordering): the boot below
         # refuses to proceed unless this marker binds the exact manifest,
@@ -1144,7 +1157,11 @@ cmd_boot() {
     # Node ports are reassigned when taken, with dynamic allocation as the
     # backstop: the rehearsal shares the host with other live networks.
     export RUNNER_REASSIGN_PORTS_IF_USED=true
-    export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports --request-timeout 10m"
+    export PULSEVM_RUNNER_START_EXTRA_ARGS="--dynamic-ports --request-timeout ${PULSEVM_RUNNER_REQUEST_TIMEOUT:-30m}"
+    # 30m, not 10m: a loaded box (or a slow plugin exec) can push a
+    # five-node start past 10 minutes, and a request timeout mid-start
+    # tears the half-built network down with only "closed server" in the
+    # log. Override down, never below the time a healthy start needs.
     # The fixture checkpoint's system account is eosio, not pulse: the new
     # network must adopt the fixture identities, with the fixture dev key
     # (disposable rehearsal only, never used on mainnet).

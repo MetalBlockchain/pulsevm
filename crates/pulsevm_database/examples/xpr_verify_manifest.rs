@@ -29,7 +29,7 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_verify_manifest <manifest.json> <checkpoint> [--work-dir <dir>] [--genesis <migration-genesis.json>]"
+        "Usage: xpr_verify_manifest <manifest.json> <checkpoint> [--work-dir <dir>] [--genesis <migration-genesis.json>] [--platform-chain-id <hex>]"
     );
     eprintln!("       xpr_verify_manifest --emit-roster <checkpoint> [--work-dir <dir>]");
     eprintln!("  Verifies the manifest, halt proof, roster, and state binding,");
@@ -39,6 +39,12 @@ fn usage() {
     eprintln!("  --genesis (the migration genesis the new network boots from) is");
     eprintln!("  required when the manifest carries the two-step pair: the");
     eprintln!("  successor chain id is derived from it, never typed by hand.");
+    eprintln!("  --platform-chain-id (the MetalGo blockchain id wallets sign under, hex or");
+    eprintln!("  the base58 log rendering) independently confirms the confirmation's platform");
+    eprintln!("  binding, exactly as the restore gate does. Without it the binding's signatures");
+    eprintln!("  still verify but the id itself goes unchecked — the gate remains the");
+    eprintln!("  verify but the id itself is unchecked — the gate remains the");
+    eprintln!("  enforcer, since only boot config knows the real platform id.");
 }
 
 fn fail(message: String) -> ExitCode {
@@ -80,6 +86,7 @@ fn main() -> ExitCode {
     };
     let mut work_dir: Option<PathBuf> = None;
     let mut genesis: Option<String> = None;
+    let mut platform: Option<[u8; 32]> = None;
     while let Some(arg) = args.next() {
         if arg == "--work-dir" {
             let Some(dir) = args.next() else {
@@ -93,6 +100,19 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             genesis = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--platform-chain-id" {
+            let Some(hex) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let text = hex.to_string_lossy().into_owned();
+            match pulsevm_crypto::parse_chain_id(&text) {
+                Ok(id) => platform = Some(id),
+                Err(error) => {
+                    eprintln!("xpr_verify_manifest: --platform-chain-id: {error}");
+                    return ExitCode::from(2);
+                }
+            }
         } else {
             usage();
             return ExitCode::from(2);
@@ -104,6 +124,7 @@ fn main() -> ExitCode {
         Path::new(&checkpoint_path),
         work_dir.as_deref(),
         genesis.as_deref(),
+        platform.as_ref(),
     )
 }
 
@@ -112,6 +133,7 @@ fn run(
     checkpoint_path: &Path,
     work_dir: Option<&Path>,
     genesis_path: Option<&str>,
+    platform_chain_id: Option<&[u8; 32]>,
 ) -> ExitCode {
     let manifest: MigrationManifest = match fs::read(manifest_path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -212,12 +234,30 @@ fn run(
             return fail("migration genesis carries no migration checkpoint binding".into());
         }
         let new_chain_id = genesis.compute_chain_id();
+        let header_schedule_version = match manifest
+            .source_block
+            .as_deref()
+            .ok_or_else(|| "halt proof requires an attached source block".to_string())
+            .and_then(pulsevm_database::packed_source_block_schedule_version)
+        {
+            Ok(version) => version,
+            Err(error) => {
+                return fail(format!("source block schedule version unreadable: {error}"));
+            }
+        };
+        if platform_chain_id.is_none() {
+            println!(
+                "note: no --platform-chain-id given; the confirmation's platform binding is signature-checked but not independently confirmed"
+            );
+        }
         match verify_migration_halt_pair(
             &manifest,
             height,
             &block_id,
             &checkpoint_sha256,
             &new_chain_id,
+            header_schedule_version,
+            platform_chain_id,
         ) {
             Ok(roster) => {
                 println!(
@@ -372,7 +412,9 @@ fn verify_roster_against_checkpoint(
         return Ok(());
     }
     // The pair path enforces the light-client rule: the declared set must
-    // equal the on-chain schedule exactly.
+    // equal the on-chain schedule exactly (same members, same keys; weights
+    // pinned by the frozen tally when contract evidence is attached, by
+    // H-state on the memo path).
     match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)? {
         Some(matched) => {
             println!("roster schedule match: ok ({matched} producers)");
@@ -380,6 +422,10 @@ fn verify_roster_against_checkpoint(
         None => {
             println!("note: no producers table in checkpoint state; cross-check skipped");
         }
+    }
+    if manifest.halt_contract_ceremony.is_none() {
+        let matched = pulsevm_database::check_halt_roster_weights_match_state(roster, &state_keys)?;
+        println!("roster weight pin: ok ({matched} producers, memo path)");
     }
     Ok(())
 }
@@ -444,6 +490,10 @@ mod tests {
         checkpoint: std::path::PathBuf,
         genesis: std::path::PathBuf,
     }
+
+    /// Platform id the fixture confirmation binds (mirrors the ceremony
+    /// config the voter/agent would carry into production).
+    const FIXTURE_PLATFORM: [u8; 32] = [0x51; 32];
 
     fn migration_genesis_json(checkpoint_sha256: &str, initial_key: &str) -> serde_json::Value {
         serde_json::json!({
@@ -538,7 +588,11 @@ mod tests {
             7,
             ImportSummary::default(),
         );
-        manifest.source_block = Some("00".to_string());
+        // Minimal packed source-block prefix: zeros with schedule version 1
+        // at the version offset. The verifier only reads the prefix (the
+        // restore decodes the full block); the offset itself is pinned by a
+        // golden test against a decoded block in the controller tests.
+        manifest.source_block = Some(format!("{}01000000", "00".repeat(110)));
         let roster_key = if tamper_roster {
             other.public_key()
         } else {
@@ -592,6 +646,7 @@ mod tests {
             halt_block_id: "09".repeat(32),
             checkpoint_sha256: manifest.checkpoint_sha256.clone(),
             new_chain_id: hex::encode(genesis_id),
+            platform_chain_id: Some(hex::encode(FIXTURE_PLATFORM)),
             signatures: Vec::new(),
         };
         let conf_digest = template.digest().unwrap();
@@ -617,6 +672,7 @@ mod tests {
             votes: vec![pulsevm_database::HaltContractVote {
                 producer: "prod.a".to_string(),
                 block: 5,
+                schedule_version: 1,
                 key: signing.public_key().to_string(),
                 signature: vote_signature,
             }],
@@ -651,7 +707,8 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(genesis_str(&fixture))
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM)
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -667,7 +724,8 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(genesis_str(&fixture))
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM)
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -682,7 +740,8 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(genesis_str(&fixture))
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM)
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -709,7 +768,8 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(wrong.to_str().expect("genesis path is UTF-8"))
+                Some(wrong.to_str().expect("genesis path is UTF-8")),
+                Some(&FIXTURE_PLATFORM)
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -724,7 +784,25 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(genesis_str(&fixture))
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM)
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn rejects_pair_when_platform_diverges() {
+        let fixture = fixture(false);
+        let other = [0x52; 32];
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&other)
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -747,7 +825,8 @@ mod tests {
                 &fixture.manifest,
                 &fixture.checkpoint,
                 None,
-                Some(genesis_str(&fixture))
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM)
             ),
             std::process::ExitCode::SUCCESS
         );

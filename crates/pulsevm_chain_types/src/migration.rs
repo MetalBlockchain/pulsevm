@@ -526,6 +526,13 @@ pub struct HaltConfirmation {
     pub checkpoint_sha256: String,
     /// 64-hex successor (A-Chain) id the state continues on.
     pub new_chain_id: String,
+    /// 64-hex platform (MetalGo/Avago blockchain) id the successor runs
+    /// under — the id transaction signatures are verified against. Bound
+    /// into the digest when present so the ceremony cannot commit to one id
+    /// while wallets sign under another. Absent only in legacy evidence
+    /// (which restores refuse once a platform id is configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_chain_id: Option<String>,
     pub signatures: Vec<HaltSignature>,
 }
 
@@ -735,7 +742,10 @@ impl HaltConfirmation {
         message
     }
 
-    /// Signing digest for this confirmation.
+    /// Signing digest for this confirmation. The platform chain id binds
+    /// into the digest when present (appended after the v1 message), so a
+    /// confirmation that names a platform commits its signers to exactly
+    /// that id; confirmations without one keep the v1 digest bit-for-bit.
     pub fn digest(&self) -> Result<[u8; 32], ChainError> {
         let declaration_digest = decode_hex_32(&self.declaration_digest).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation declaration link invalid: {e}"))
@@ -749,20 +759,31 @@ impl HaltConfirmation {
         let new_chain_id = decode_hex_32(&self.new_chain_id).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation new chain id invalid: {e}"))
         })?;
-        Ok(*Digest::hash(Self::message_bytes(
+        let mut message = Self::message_bytes(
             &declaration_digest,
             self.halt_height,
             &halt_block_id,
             &checkpoint_sha256,
             &new_chain_id,
-        ))
-        .as_bytes())
+        );
+        if let Some(platform) = self.platform_chain_id.as_deref() {
+            let platform_id = decode_hex_32(platform).map_err(|e| {
+                ChainError::InternalError(format!(
+                    "halt confirmation platform chain id invalid: {e}"
+                ))
+            })?;
+            message.extend_from_slice(&platform_id);
+        }
+        Ok(*Digest::hash(&message).as_bytes())
     }
 
     /// Verify the confirmation: version, declaration link, height, terminal
-    /// block id, checkpoint, and successor chain id must all match the
-    /// expected cutover values, and the same declared set's quorum must have
-    /// signed the confirmation digest.
+    /// block id, checkpoint, successor chain id, and platform chain id must
+    /// all match the expected cutover values, and the same declared set's
+    /// quorum must have signed the confirmation digest. A confirmation with
+    /// no platform binding fails closed whenever the verifier configures
+    /// one: legacy evidence cannot silently skip the id wallets sign under.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
         declaration_digest: &[u8; 32],
@@ -771,6 +792,7 @@ impl HaltConfirmation {
         expected_block_id: &[u8; 32],
         expected_checkpoint: &[u8; 32],
         expected_new_chain_id: &[u8; 32],
+        expected_platform: Option<&[u8; 32]>,
     ) -> Result<(), ChainError> {
         if self.version != Self::VERSION {
             return Err(ChainError::InternalError(format!(
@@ -817,6 +839,30 @@ impl HaltConfirmation {
                 "halt confirmation successor chain id does not match this chain".into(),
             ));
         }
+        match (&self.platform_chain_id, expected_platform) {
+            (None, None) => {}
+            (Some(bound), Some(expected)) => {
+                let bound_id = decode_hex_32(bound).map_err(|e| {
+                    ChainError::InternalError(format!(
+                        "halt confirmation platform chain id invalid: {e}"
+                    ))
+                })?;
+                if bound_id != *expected {
+                    return Err(ChainError::InternalError(
+                        "halt confirmation platform chain id does not match this chain's configured id"
+                            .into(),
+                    ));
+                }
+            }
+            // A binding to an id nobody checks is committed but unenforced;
+            // the signatures still cover it, so it cannot be swapped later.
+            (Some(_), None) => {}
+            (None, Some(_)) => {
+                return Err(ChainError::InternalError(
+                    "halt confirmation carries no platform chain binding".into(),
+                ));
+            }
+        }
         let digest = self.digest()?;
         let signed =
             recover_rostered_signatures(&self.signatures, roster, &digest, "confirmation")?;
@@ -829,7 +875,9 @@ impl HaltConfirmation {
 /// from a source block. The vote signature runs over the step-one
 /// declaration digest, so each entry converts one-to-one into a
 /// [`HaltDeclaration`] signature; the block number is the on-chain
-/// timestamp the off-chain ceremony cannot prove.
+/// timestamp the off-chain ceremony cannot prove, and the schedule
+/// version pins which authority set the vote sat under so a mid-window
+/// rotation is detectable (every vote must share H's version).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaltContractVote {
     /// Producer named in the vote action. Informational for tallying (the
@@ -838,6 +886,9 @@ pub struct HaltContractVote {
     /// Source-chain block carrying the vote action. Must predate H: votes
     /// are the pre-commitment, and anything at or past H is not one.
     pub block: u32,
+    /// Schedule version of the block carrying the vote action, read from
+    /// the block header by the exporter. Must equal H's version.
+    pub schedule_version: u32,
     /// Frozen roster key the vote claims, `PUB_K1_` or legacy `EOS` form.
     pub key: String,
     /// `SIG_K1_` signature over the declaration digest.
@@ -881,14 +932,17 @@ impl HaltContractCeremony {
     /// Verify the on-chain ceremony against the declared set and the
     /// verified declaration digest: the singleton must be finalized on the
     /// same digest, every vote must be a rostered schedule key inside the
-    /// declaration window, the captured tally must match the recomputed
-    /// one, and the recomputed tally must clear the strict quorum.
+    /// declaration window and under `expected_schedule_version` (a rotation
+    /// anywhere in the window fails closed), the captured tally must match
+    /// the recomputed one, and the recomputed tally must clear the strict
+    /// quorum.
     pub fn verify(
         &self,
         expected_height: u32,
         max_declaration_lag: Option<u32>,
         roster: &[HaltRosterEntry],
         declaration_digest: &[u8; 32],
+        expected_schedule_version: u32,
     ) -> Result<(), ChainError> {
         if !self.finalized {
             return Err(ChainError::InternalError(
@@ -939,6 +993,12 @@ impl HaltContractCeremony {
                 return Err(ChainError::InternalError(format!(
                     "cutover contract vote from producer {} at block {} is older than the ceremony window (H={expected_height}, max lag {max_lag})",
                     vote.producer, vote.block
+                )));
+            }
+            if vote.schedule_version != expected_schedule_version {
+                return Err(ChainError::InternalError(format!(
+                    "cutover contract vote from producer {} sits under schedule version {} (expected {expected_schedule_version}); the schedule rotated mid-ceremony",
+                    vote.producer, vote.schedule_version
                 )));
             }
             let claimed = K1PublicKey::from_string(&vote.key).map_err(|e| {
@@ -1086,6 +1146,16 @@ mod tests {
     fn block_id_hex() -> String {
         "ab".repeat(32)
     }
+
+    fn platform() -> [u8; 32] {
+        [0x51; 32]
+    }
+
+    fn platform_hex() -> String {
+        "51".repeat(32)
+    }
+
+    const CEREMONY_VERSION: u32 = 7;
 
     fn key(seed: &str) -> K1PrivateKey {
         K1PrivateKey::from_seed_string(seed).expect("deterministic test key")
@@ -1441,6 +1511,7 @@ mod tests {
             halt_block_id: block_id_hex(),
             checkpoint_sha256: hex32(&checkpoint()),
             new_chain_id: new_chain_hex(),
+            platform_chain_id: Some(platform_hex()),
             signatures,
         }
     }
@@ -1605,6 +1676,7 @@ mod tests {
                 &block_id(),
                 &checkpoint(),
                 &NEW_CHAIN,
+                Some(&platform()),
             )
             .expect("confirmation must chain the declaration and the state");
     }
@@ -1631,6 +1703,7 @@ mod tests {
                 &id,
                 &checkpoint_bytes,
                 &NEW_CHAIN,
+                Some(&platform()),
             )
         };
         expect_ok(&good).expect("baseline confirmation must verify");
@@ -1649,7 +1722,8 @@ mod tests {
                     HEIGHT,
                     &id,
                     &checkpoint_bytes,
-                    &NEW_CHAIN
+                    &NEW_CHAIN,
+                    Some(&platform()),
                 )
                 .is_err()
         );
@@ -1680,6 +1754,80 @@ mod tests {
         assert!(expect_ok(&wrong_version).is_err());
     }
 
+    #[test]
+    fn confirmation_binds_the_platform_chain() {
+        let (keys, roster) = roster();
+        let names = ["prod.a", "prod.b", "prod.c"];
+        let unsigned = declared(Vec::new());
+        let decl_digest = declared_digest(&unsigned);
+        let id = block_id();
+        let checkpoint_bytes = checkpoint();
+        let verify_as = |confirmation: &HaltConfirmation, platform: Option<&[u8; 32]>| {
+            confirmation.verify(
+                &decl_digest,
+                &roster,
+                HEIGHT,
+                &id,
+                &checkpoint_bytes,
+                &NEW_CHAIN,
+                platform,
+            )
+        };
+        // Bound to the configured platform: verifies.
+        let template = confirmed(Vec::new(), &decl_digest);
+        let quorum = [0, 1]
+            .iter()
+            .map(|&i| sign_confirmation(&keys[i], names[i], &template))
+            .collect::<Vec<_>>();
+        let bound = confirmed(quorum, &decl_digest);
+        verify_as(&bound, Some(&platform())).expect("platform-bound confirmation must verify");
+        // Same signatures, another platform: the digest binds the
+        // platform, so the quorum does not carry over.
+        assert!(verify_as(&bound, Some(&[0x52; 32])).is_err());
+        // Fully legacy (never bound, nothing configured) still verifies:
+        // the v1 digest is bit-for-bit.
+        let mut legacy_template = confirmed(Vec::new(), &decl_digest);
+        legacy_template.platform_chain_id = None;
+        let legacy_quorum = [0, 1]
+            .iter()
+            .map(|&i| sign_confirmation(&keys[i], names[i], &legacy_template))
+            .collect::<Vec<_>>();
+        let mut legacy = confirmed(legacy_quorum, &decl_digest);
+        legacy.platform_chain_id = None;
+        verify_as(&legacy, None).expect("legacy confirmation verifies when nothing is configured");
+        // But legacy evidence against a configured platform fails closed:
+        // it cannot silently skip the id wallets sign under.
+        assert!(verify_as(&legacy, Some(&platform())).is_err());
+    }
+
+    #[test]
+    fn contract_ceremony_pins_every_vote_to_one_schedule_version() {
+        let (keys, roster, digest) = ceremony_inputs();
+        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        // Unanimous under H's version: verifies.
+        ceremony_template(&digest, votes.clone())
+            .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+            .expect("unanimous schedule version must verify");
+        // One vote from another version fails: the schedule rotated
+        // mid-ceremony and the freeze no longer names one set.
+        let mut rotated = votes.clone();
+        rotated[0].schedule_version = CEREMONY_VERSION + 1;
+        assert!(
+            ceremony_template(&digest, rotated)
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
+            "a vote from another schedule version must fail"
+        );
+        // Unanimous votes under a version that is not H's fail too: the
+        // attestation must pin H, not just agree with itself.
+        assert!(
+            ceremony_template(&digest, votes)
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION + 1)
+                .is_err(),
+            "votes under the wrong schedule version must fail"
+        );
+    }
+
     fn ceremony_votes(
         keys: &[K1PrivateKey],
         digest: &[u8; 32],
@@ -1692,6 +1840,7 @@ mod tests {
             .map(|((signing, producer), block)| HaltContractVote {
                 producer: producer.to_string(),
                 block: *block,
+                schedule_version: CEREMONY_VERSION,
                 key: signing.public_key().to_string(),
                 signature: signing.sign(digest).to_string(),
             })
@@ -1799,6 +1948,7 @@ mod tests {
         let votes = vec![HaltContractVote {
             producer: "prod.a".to_string(),
             block: HEIGHT - 2,
+            schedule_version: CEREMONY_VERSION,
             key: legacy.to_string(),
             signature: dev.sign(&digest).to_string(),
         }];
@@ -1830,6 +1980,7 @@ mod tests {
         let bad_votes = vec![HaltContractVote {
             producer: "mallory".to_string(),
             block: HEIGHT - 2,
+            schedule_version: CEREMONY_VERSION,
             key: outsider.public_key().to_string(),
             signature: outsider.sign(&digest).to_string(),
         }];
@@ -1850,6 +2001,7 @@ mod tests {
         let wrong_votes = vec![HaltContractVote {
             producer: "prod.a".to_string(),
             block: HEIGHT - 2,
+            schedule_version: CEREMONY_VERSION,
             key: keys[0].public_key().to_string(),
             signature: keys[0].sign(&other_digest).to_string(),
         }];
@@ -1869,7 +2021,7 @@ mod tests {
         let (keys, roster, digest) = ceremony_inputs();
         let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 30, HEIGHT - 2]);
         ceremony_template(&digest, votes)
-            .verify(HEIGHT, Some(30), &roster, &digest)
+            .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
             .expect("quorum votes in window must verify");
     }
 
@@ -1880,13 +2032,16 @@ mod tests {
         let mut open = ceremony_template(&digest, votes.clone());
         open.finalized = false;
         assert!(
-            open.verify(HEIGHT, None, &roster, &digest).is_err(),
+            open.verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "an open tally proves no quorum"
         );
         let mut wrong_link = ceremony_template(&digest, votes);
         wrong_link.declaration_digest = "44".repeat(32);
         assert!(
-            wrong_link.verify(HEIGHT, None, &roster, &digest).is_err(),
+            wrong_link
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "a digest link to another declaration must fail"
         );
     }
@@ -1900,7 +2055,7 @@ mod tests {
         votes[1].key = keys[2].public_key().to_string();
         assert!(
             ceremony_template(&digest, votes)
-                .verify(HEIGHT, None, &roster, &digest)
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "a vote under another member's key must fail"
         );
@@ -1910,12 +2065,13 @@ mod tests {
         votes.push(HaltContractVote {
             producer: "mallory".to_string(),
             block: HEIGHT - 2,
+            schedule_version: CEREMONY_VERSION,
             key: outsider.public_key().to_string(),
             signature: outsider.sign(&digest).to_string(),
         });
         assert!(
             ceremony_template(&digest, votes)
-                .verify(HEIGHT, None, &roster, &digest)
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "an outsider vote must fail"
         );
@@ -1927,7 +2083,9 @@ mod tests {
         let mut doubled = ceremony_template(&digest, vec![vote.clone(), doubled_vote]);
         doubled.voted_weight = HaltWeight(WEIGHTS[0].0 * 2);
         assert!(
-            doubled.verify(HEIGHT, None, &roster, &digest).is_err(),
+            doubled
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "a duplicated vote must fail"
         );
     }
@@ -1940,7 +2098,9 @@ mod tests {
         let mut short = ceremony_template(&digest, votes);
         short.voted_weight = HaltWeight(WEIGHTS[2].0);
         assert!(
-            short.verify(HEIGHT, None, &roster, &digest).is_err(),
+            short
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "a shortfall tally must fail"
         );
         // Captured tally disagreeing with the recomputed signer weight fails
@@ -1949,7 +2109,9 @@ mod tests {
         let mut inflated = ceremony_template(&digest, votes);
         inflated.voted_weight = HaltWeight(WEIGHTS[0].0 + WEIGHTS[1].0 + 1);
         assert!(
-            inflated.verify(HEIGHT, None, &roster, &digest).is_err(),
+            inflated
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "an inflated contract tally must fail"
         );
         let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
@@ -1957,7 +2119,9 @@ mod tests {
         wrong_total.total_weight =
             HaltWeight(WEIGHTS.iter().map(|weight| weight.0).sum::<u128>() + 1);
         assert!(
-            wrong_total.verify(HEIGHT, None, &roster, &digest).is_err(),
+            wrong_total
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "a total weight divorced from the declared set must fail"
         );
     }
@@ -1969,7 +2133,7 @@ mod tests {
         let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT]);
         assert!(
             ceremony_template(&digest, votes)
-                .verify(HEIGHT, None, &roster, &digest)
+                .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "a vote at H must fail"
         );
@@ -1978,7 +2142,8 @@ mod tests {
         let mut late = ceremony_template(&digest, votes);
         late.finalized_block = HEIGHT;
         assert!(
-            late.verify(HEIGHT, None, &roster, &digest).is_err(),
+            late.verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "finalization at H must fail"
         );
         // With a claimed freshness bound, stale votes and stale finality
@@ -1986,7 +2151,7 @@ mod tests {
         let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 31, HEIGHT - 2]);
         assert!(
             ceremony_template(&digest, votes)
-                .verify(HEIGHT, Some(30), &roster, &digest)
+                .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "a vote older than the ceremony window must fail"
         );
@@ -1994,7 +2159,9 @@ mod tests {
         let mut stale = ceremony_template(&digest, votes);
         stale.finalized_block = HEIGHT - 31;
         assert!(
-            stale.verify(HEIGHT, Some(30), &roster, &digest).is_err(),
+            stale
+                .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
+                .is_err(),
             "stale finalization must fail"
         );
     }

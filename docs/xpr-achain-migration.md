@@ -224,9 +224,13 @@ name an owner and block the cited phase gate until closed.
 Named contact plus written acknowledgement per venue; silence is not
 consent and blocks the announcement phase.
 
-- T-14 days: send every venue the new chain ID, the ticker plan, the
-  freeze/re-enable procedure below, and a staging endpoint. Require a
-  named contact and a test deposit on staging.
+- T-14 days: send every venue the MetalGo blockchain (platform) ID —
+  known as soon as the A-Chain is created, which must happen before the
+  freeze — plus the ticker plan, the freeze/re-enable procedure below,
+  and a staging endpoint. The ceremony binds this id (not the
+  checkpoint-derived successor id, which only exists after the H export);
+  venues must reject anything signed under any other id. Require a named
+  contact and a test deposit on staging.
 - T-7 days: confirm each venue's freeze implementation and replay the
   negative test: submit a known pre-H XPR transaction hash to the
   A-Chain and confirm rejection (wrong chain ID); submit an A-Chain

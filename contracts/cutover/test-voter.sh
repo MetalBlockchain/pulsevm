@@ -2,9 +2,11 @@
 # Live test for the cutover auto-voter on a throwaway single-node Leap chain:
 # deploys the ceremony contract, freezes a one-member schedule, then proves
 # the voter (1) refuses a foreign freeze in dry-run without signing anything,
-# (2) signs and submits a real vote unattended, and (3) delivers the
-# confirmation to a coordinator that serves live chain data -- while refusing
-# a coordinator that lies about the terminal block id.
+# (2) prints the exact signing digest for an external agent, (3) signs and
+# submits a real vote unattended, (4) delivers the confirmation binding the
+# configured platform id to a coordinator that serves live chain data --
+# while refusing a coordinator that lies about the terminal block id and one
+# that serves a different platform id.
 set -u
 cd "$(dirname "$0")/../.."
 REPO_ROOT="$PWD"
@@ -137,17 +139,21 @@ printf '%s' "$DEV_WIF" >"$WORK/payer.key"; chmod 600 "$WORK/payer.key"
 table_rows cutover cutover members \
     | python3 -c 'import json,sys; print(json.dumps([{"producer":r["producer"],"key":r["key"],"weight":r["weight"]} for r in json.load(sys.stdin)]))' \
     >"$WORK/roster.json"
-mk_config() { # $1=height $2=dry $3=coord-url-or-empty -> path
+PLATFORM="$(python3 -c 'print("ee" * 32)')"
+WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
+mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty -> path
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
     [[ -n "${3:-}" ]] && coord="\"$3\""
+    local plat="null"
+    [[ -n "${4:-}" ]] && plat="\"$4\""
     cat >"$out" <<EOF
 {"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"bpvoter",
  "source_chain_id":"$CHAIN_ID","height":$1,"roster_file":"$WORK/roster.json",
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
-  "migration_genesis":null,"checkpoint_sha256":null}}
+  "migration_genesis":null,"checkpoint_sha256":null,"platform_chain_id":$plat}}
 EOF
     printf '%s' "$out"
 }
@@ -164,11 +170,26 @@ VOTED="$(table_rows cutover cutover members | python3 -c 'import json,sys; print
 [[ "$VOTED" == "False" || "$VOTED" == "0" ]] || fail "dry-run submitted a vote (voted=$VOTED)"
 pass "foreign freeze refused, nothing signed"
 
+echo "cutover-voter-test: print-digest exposes the exact signing digest..."
+PRINT_CFG="$(mk_config "$H" true "" "$PLATFORM")"
+"$VOTER_BIN" --config "$PRINT_CFG" --print-digest >"$WORK/digest.json" 2>"$WORK/digest.err" \
+    || fail "print-digest failed: $(cat "$WORK/digest.err")"
+python3 - "$WORK/digest.json" "$FROZEN_DIGEST" <<'PYEOF'
+import json, sys
+shape = json.load(open(sys.argv[1]))
+want = sys.argv[2]
+assert shape["role"] == "declaration", shape
+assert shape["producer"] == "bpvoter", shape
+assert shape["digest"] == want, (shape["digest"], want)
+PYEOF
+pass "print-digest matches the frozen declaration digest"
+
 # Coordinator serving live chain data: block id is read from the node itself,
 # so it always matches; the voter must still verify every field.
 cat >"$WORK/coordinator.py" <<'PYEOF'
 import json, sys, urllib.request
 node, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
+plat = sys.argv[6]
 def rpc(path, body):
     req = urllib.request.Request(node + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Host": "0.0.0.0:8888"})
@@ -180,8 +201,9 @@ class H(BaseHTTPRequestHandler):
         info = rpc("/v1/chain/get_info", {})
         h = int(self.path.rsplit("=", 1)[-1]) if "=" in self.path else H_PLACEHOLDER
         blk = rpc("/v1/chain/get_block", {"block_num_or_id": str(h)})
-        body = {"halt_height": h, "halt_block_id": blk["id"] if mode == "good" else "00" * 32,
+        body = {"halt_height": h, "halt_block_id": blk["id"] if mode in ("good", "bad-platform") else "00" * 32,
                 "checkpoint_sha256": "ab" * 32, "new_chain_id": "cd" * 32,
+                "platform_chain_id": plat,
                 "source_chain_id": info["chain_id"]}
         data = json.dumps(body).encode()
         self.send_response(200)
@@ -207,7 +229,7 @@ with open(PORT_FILE, "w") as f:
 server.serve_forever()
 PYEOF
 echo "cutover-voter-test: live vote plus coordinator confirmation..."
-python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations.jsonl" "$H" "$WORK/coord.port" >>"$WORK/coordinator.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations.jsonl" "$H" "$WORK/coord.port" "$PLATFORM" >>"$WORK/coordinator.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord.port" ]] && break
@@ -215,7 +237,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 COORD_PORT="$(cat "$WORK/coord.port")"
-LIVE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PORT}")"
+LIVE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PORT}" "$PLATFORM")"
 # Portable timeout (no GNU timeout on macOS): background the voter, wait for
 # its log to show delivery, kill on expiry.
 "$VOTER_BIN" --config "$LIVE_CFG" >"$WORK/live.log" 2>&1 &
@@ -239,12 +261,16 @@ grep -q "vote submitted" "$WORK/live.log" || fail "no vote submitted: $(tail -5 
 VOTED="$(table_rows cutover cutover members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
 [[ "$VOTED" == "True" || "$VOTED" == "true" || "$VOTED" == "1" ]] || fail "vote did not land on-chain (voted=$VOTED)"
 grep -q "delivered to coordinator" "$WORK/live.log" || fail "no confirmation delivered"
-CONF_PRODUCER="$(python3 -c 'import json; print(json.load(open("'"$WORK/confirmations.jsonl"'"))["producer"])')"
-[[ "$CONF_PRODUCER" == "bpvoter" ]] || fail "coordinator got no well-formed confirmation"
-pass "vote landed and confirmation delivered unattended"
+python3 - "$WORK/confirmations.jsonl" "$PLATFORM" <<'PYEOF'
+import json, sys
+conf = json.load(open(sys.argv[1]))
+assert conf["producer"] == "bpvoter", conf
+assert conf["platform_chain_id"] == sys.argv[2], conf
+PYEOF
+pass "vote landed and platform-bound confirmation delivered unattended"
 
 echo "cutover-voter-test: lying coordinator is refused..."
-python3 "$WORK/coordinator.py" "$API" bad "$WORK/confirmations-bad.jsonl" "$H" "$WORK/coord-bad.port" >>"$WORK/coordinator-bad.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" bad "$WORK/confirmations-bad.jsonl" "$H" "$WORK/coord-bad.port" "$PLATFORM" >>"$WORK/coordinator-bad.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord-bad.port" ]] && break
@@ -268,5 +294,29 @@ wait "$COORD_PID" 2>/dev/null || true
 grep -q "does not match this node" "$WORK/bad.log" || fail "lying coordinator not refused: $(tail -5 "$WORK/bad.log")"
 [[ -s "$WORK/confirmations-bad.jsonl" ]] && fail "confirmation delivered to lying coordinator"
 pass "lying coordinator refused, nothing delivered"
+
+echo "cutover-voter-test: coordinator serving a different platform id is refused..."
+python3 "$WORK/coordinator.py" "$API" bad-platform "$WORK/confirmations-wrongplat.jsonl" "$H" "$WORK/coord-plat.port" "$WRONG_PLATFORM" >>"$WORK/coordinator-plat.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-plat.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "platform coordinator died on startup: $(cat "$WORK/coordinator-plat.log")"
+    sleep 1
+done
+COORD_PLAT_PORT="$(cat "$WORK/coord-plat.port")"
+PLAT_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PLAT_PORT}" "$PLATFORM")"
+"$VOTER_BIN" --config "$PLAT_CFG" --max-polls 4 >"$WORK/plat.log" 2>&1 &
+PLAT_PID=$!
+for _ in $(seq 1 15); do
+    kill -0 "$PLAT_PID" 2>/dev/null || break
+    sleep 2
+done
+kill "$PLAT_PID" 2>/dev/null || true
+wait "$PLAT_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "platform chain id does not match" "$WORK/plat.log" || fail "wrong platform not refused: $(tail -5 "$WORK/plat.log")"
+[[ -s "$WORK/confirmations-wrongplat.jsonl" ]] && fail "confirmation delivered to wrong-platform coordinator"
+pass "wrong platform refused, nothing delivered"
 
 echo "cutover-voter-test: PASS"

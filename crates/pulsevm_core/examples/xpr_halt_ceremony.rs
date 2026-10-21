@@ -35,10 +35,14 @@ fn usage() {
         "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json --key WIF [--key WIF...] --out declaration.json"
     );
     eprintln!(
-        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --block-id HEX --checkpoint HEX --genesis migration-genesis.json --key WIF [--key WIF...] --out confirmation.json"
+        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] --out confirmation.json"
     );
     eprintln!("  The successor chain id is derived from the migration genesis (the same");
     eprintln!("  bytes the new network boots from), never typed by hand.");
+    eprintln!("  --platform-chain-id (the MetalGo blockchain id wallets sign under) is bound");
+    eprintln!("  into the confirmation digest; the restore gate fails closed without it.");
+    eprintln!("       xpr_halt_ceremony chain-id --genesis migration-genesis.json");
+    eprintln!("  Prints the genesis-derived successor chain id (the rehearsal platform id).");
 }
 
 fn main() -> ExitCode {
@@ -54,6 +58,23 @@ fn main() -> ExitCode {
     } else if command == "confirm" {
         let request = ConfirmRequest::parse(args);
         request.and_then(|request| confirm(&request))
+    } else if command == "chain-id" {
+        let mut genesis = None;
+        while let Some(arg) = args.next() {
+            if arg == "--genesis" {
+                genesis = args
+                    .next()
+                    .map(|value| value.to_string_lossy().into_owned());
+            } else {
+                usage();
+                return ExitCode::from(2);
+            }
+        }
+        let Some(genesis) = genesis else {
+            usage();
+            return ExitCode::from(2);
+        };
+        successor_chain_id(&genesis)
     } else {
         usage();
         return ExitCode::from(2);
@@ -84,6 +105,7 @@ struct ConfirmRequest {
     block_id: String,
     checkpoint: String,
     genesis: String,
+    platform_chain_id: String,
     keys: Vec<String>,
     out: String,
 }
@@ -139,6 +161,7 @@ impl ConfirmRequest {
         let mut block_id = None;
         let mut checkpoint = None;
         let mut genesis = None;
+        let mut platform_chain_id = None;
         let mut keys = Vec::new();
         let mut out = None;
         while let Some(arg) = args.next() {
@@ -152,6 +175,8 @@ impl ConfirmRequest {
                 checkpoint = Some(take_value(&mut args, "--checkpoint")?);
             } else if arg == "--genesis" {
                 genesis = Some(take_value(&mut args, "--genesis")?);
+            } else if arg == "--platform-chain-id" {
+                platform_chain_id = Some(take_value(&mut args, "--platform-chain-id")?);
             } else if arg == "--key" {
                 keys.push(take_value(&mut args, "--key")?);
             } else if arg == "--out" {
@@ -166,6 +191,8 @@ impl ConfirmRequest {
             block_id: block_id.ok_or_else(|| "confirm needs --block-id".to_string())?,
             checkpoint: checkpoint.ok_or_else(|| "confirm needs --checkpoint".to_string())?,
             genesis: genesis.ok_or_else(|| "confirm needs --genesis".to_string())?,
+            platform_chain_id: platform_chain_id
+                .ok_or_else(|| "confirm needs --platform-chain-id".to_string())?,
             keys,
             out: out.ok_or_else(|| "confirm needs --out".to_string())?,
         })
@@ -300,6 +327,13 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
     // The successor id is derived from the migration genesis the new network
     // boots from, so the ceremony can never bind a hand-typed id.
     let new_chain_id = successor_chain_id(&request.genesis)?;
+    // The platform id is the one value the tool takes on trust: it must
+    // come from the ceremony config (the MetalGo blockchain id, hex or the
+    // base58 log rendering), and the restore gate fails closed if it does
+    // not match boot config. Stored as canonical hex either way.
+    let platform_id = pulsevm_crypto::parse_chain_id(&request.platform_chain_id)
+        .map_err(|error| format!("--platform-chain-id: {error}"))?;
+    let platform_hex = pulsevm_crypto::chain_id_hex(&platform_id);
     let template = HaltConfirmation {
         version: HaltConfirmation::VERSION,
         declaration_digest: hex::encode(declaration_digest),
@@ -307,6 +341,7 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
         halt_block_id: request.block_id.clone(),
         checkpoint_sha256: request.checkpoint.clone(),
         new_chain_id,
+        platform_chain_id: Some(platform_hex),
         signatures: Vec::new(),
     };
     let digest = template

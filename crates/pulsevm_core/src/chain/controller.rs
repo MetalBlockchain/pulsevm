@@ -1407,17 +1407,21 @@ impl Controller {
                 })?;
                 // The two-step cutover pair is mandatory: the declaration
                 // commits the source schedule to H before H exists, the
-                // confirmation chains H, the checkpoint, and this chain's
-                // id to that declaration, and pre-commitment timing must
-                // be provable (on-chain ceremony or recorded declaration
-                // inclusion). The declared set feeds the checkpoint-state
-                // cross-check below.
+                // confirmation chains H, the checkpoint, this chain's id,
+                // and the platform id wallets sign under to that
+                // declaration, and pre-commitment timing must be provable
+                // (on-chain ceremony or recorded declaration inclusion).
+                // Every ceremony vote must sit under H's schedule version.
+                // The declared set feeds the checkpoint-state cross-check
+                // below.
                 let roster = pulsevm_database::verify_migration_halt_pair(
                     &manifest,
                     source_block.block_num(),
                     &source_id.0.0,
                     &checkpoint_arr,
                     &migration_derived_chain_id.0.0,
+                    source_block.signed_block_header.header.schedule_version,
+                    Some(&chain_id.0.0),
                 )
                 .map_err(ChainError::GenesisError)?;
                 migration_roster = Some(roster);
@@ -1531,8 +1535,11 @@ impl Controller {
             // Bind the transported roster to checkpoint content now that the
             // state is restored. The declared set must MATCH the on-chain
             // schedule exactly (the light-client rule: same set both ways,
-            // same keys, same weights), so a declaration naming only its
-            // signer fails closed. Real XPR checkpoints always carry the
+            // same keys), so a declaration naming only its signer fails
+            // closed. Weights are pinned by the frozen on-chain tally when
+            // contract evidence is attached; the memo path without a
+            // ceremony keeps the exact weight pin (tight window by
+            // construction). Real XPR checkpoints always carry the
             // producers table; synthetic fixtures without one skip the
             // check (logged) instead of failing.
             if let Some(roster) = migration_roster.as_ref() {
@@ -1558,6 +1565,17 @@ impl Controller {
                         None => warn!(
                             "migration roster schedule match skipped: no producers table in checkpoint state"
                         ),
+                    }
+                    if manifest.halt_contract_ceremony.is_none() {
+                        pulsevm_database::check_halt_roster_weights_match_state(
+                            roster,
+                            &state_keys,
+                        )
+                        .map_err(|error| {
+                            ChainError::GenesisError(format!(
+                                "migration halt roster weights rejected by checkpoint schedule: {error}"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -10456,6 +10474,7 @@ mod tests {
             &["pulse"],
             &[1],
             &[0],
+            &chain_id.0.0,
         )?;
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
@@ -10519,6 +10538,25 @@ mod tests {
             error
                 .to_string()
                 .contains("input-transaction dedupe rows but manifest commits")
+        );
+
+        // The confirmation binds the configured platform id (fixed above),
+        // not the derived genesis id: booting the same manifest under a
+        // different platform id fails closed instead of verifying wallets
+        // under an id the ceremony never committed to.
+        let foreign_platform = Id::new([0x99; 32]);
+        let foreign_path = temp.path().join("foreign-platform-target");
+        let platform_error = Controller::new()
+            .initialize(
+                &foreign_platform,
+                &config_bytes,
+                &migration_genesis,
+                foreign_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            platform_error.to_string().contains("platform chain id"),
+            "unexpected error: {platform_error}"
         );
         Ok(())
     }
@@ -10618,7 +10656,14 @@ mod tests {
     // produces: members carry (producer, schedule key, weight) and only
     // `sign_subset` indices sign, so the declared set, the transport
     // roster, and the recomputed tally agree. Votes and finalization land
-    // in the block before H; no freshness window is claimed.
+    // in the block before H; no freshness window is claimed. The attested
+    // schedule version and every vote version come from H's actual packed
+    // header via the same prefix parser the offline verifier uses, so the
+    // controller tests pin the parser offset against the decoded block the
+    // restore gate reads. The platform binding commits the configured
+    // platform id, exactly as production does (the rehearsal configures
+    // the derived id as the platform; other tests pass a foreign id to
+    // prove the binding is checked, not assumed).
     #[allow(clippy::too_many_arguments)]
     fn attach_halt_pair(
         manifest_path: &str,
@@ -10630,6 +10675,7 @@ mod tests {
         producers: &[&str],
         weights: &[u64],
         sign_subset: &[usize],
+        platform_chain_id: &[u8; 32],
     ) -> Result<(), ChainError> {
         let manifest_bytes = fs::read(manifest_path)
             .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
@@ -10640,6 +10686,19 @@ mod tests {
             .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?;
         let new_chain_id =
             pulsevm_database::GenesisState::from_bytes(migration_genesis)?.compute_chain_id();
+        // H's real schedule version, read from the attached packed header
+        // with the same prefix parser the offline verifier uses: the
+        // attested version and every vote pin to exactly this, which also
+        // golden-tests the parser offset against the decoded block below.
+        let packed = manifest["source_block"].as_str().ok_or_else(|| {
+            ChainError::InternalError("manifest has no attached source block".into())
+        })?;
+        let header_schedule_version =
+            pulsevm_database::packed_source_block_schedule_version(packed).map_err(|error| {
+                ChainError::InternalError(format!(
+                    "manifest source block schedule version unreadable: {error}"
+                ))
+            })?;
         let mut members = Vec::with_capacity(producers.len());
         for ((producer, key), weight) in producers.iter().zip(keys.iter()).zip(weights.iter()) {
             members.push(pulsevm_database::HaltDeclarationMember {
@@ -10676,6 +10735,7 @@ mod tests {
             halt_block_id: hex::encode(source_block_id.as_bytes()),
             checkpoint_sha256: checkpoint_hex.to_string(),
             new_chain_id: hex::encode(new_chain_id),
+            platform_chain_id: Some(hex::encode(platform_chain_id)),
             signatures: Vec::new(),
         };
         let conf_digest = template.digest()?;
@@ -10698,6 +10758,7 @@ mod tests {
             votes.push(pulsevm_database::HaltContractVote {
                 producer: producers[index].to_string(),
                 block: prior,
+                schedule_version: header_schedule_version,
                 key: keys[index].public_key().to_string(),
                 signature: signatures[position].signature.clone(),
             });
@@ -10720,7 +10781,7 @@ mod tests {
         })?;
         manifest["halt_contract_ceremony"] = serde_json::to_value(&ceremony)
             .map_err(|e| ChainError::InternalError(format!("failed to encode ceremony: {e}")))?;
-        manifest["halt_schedule_version"] = json!(1);
+        manifest["halt_schedule_version"] = json!(header_schedule_version);
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
             .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
         Ok(())
@@ -10795,6 +10856,7 @@ mod tests {
             &["pulse"],
             &[1],
             &[0],
+            &chain_id.0.0,
         )?;
         let config_bytes = json!({
             "producer_name": "pulse",
@@ -10861,6 +10923,7 @@ mod tests {
             &["pulse"],
             &[1],
             &[0],
+            &chain_id.0.0,
         )?;
         let config_bytes = json!({
             "producer_name": "pulse",
@@ -10972,6 +11035,7 @@ mod tests {
             &["prod.a", "prod.b"],
             &[2, 1],
             &[0, 1],
+            &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
@@ -11132,6 +11196,7 @@ mod tests {
             &["prod.a", "prod.b"],
             &[2, 1],
             &[0, 1],
+            &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
@@ -11192,6 +11257,7 @@ mod tests {
             &["prod.a", "prod.b"],
             &[2, 1],
             &[0, 1],
+            &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
@@ -11256,6 +11322,7 @@ mod tests {
             &["prod.a", "prod.b"],
             &[2, 1],
             &[0, 1],
+            &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,

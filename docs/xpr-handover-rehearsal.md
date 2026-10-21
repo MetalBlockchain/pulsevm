@@ -114,6 +114,19 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   and ceremony/attach/verifier tools always rebuild (a stale skipped
   verifier binary once failed the offline check on an encoding the code
   already handled).
+- Record: five-node contract-path rehearsal PASS at H=170 (Oct 21, 2026)
+  with the platform-bound confirmation. Declaration digest `d0434c...`,
+  confirmation `d95376...` binding checkpoint `4f3407...`, source block H,
+  and platform chain `UJ4N...` (learn-then-bind: the runner assigns chain
+  ids non-deterministically, so the ceremony confirms the boot's actual
+  id). Offline verifier PASS with `--platform-chain-id`; gate opened
+  (member+key roster match, unanimous schedule version 0, frozen-tally
+  2/3 quorum); consensus started at lastAcceptedHeight=170; 5/5 head
+  agreement at H+1=171 with parent == H_ID; state equivalence 4/4;
+  boundary traffic 10/10 exactly-once. Mid-run the runner issued a second
+  chain id (`27L2...`); the gate refused it five times by design before
+  the confirmation was re-issued for the live chain — the fail-closed path
+  proven live, not just asserted.
 - Snapshot-while-running: the exact-H snapshot must be taken on the RUNNING
   producer, before the pause. A paused producer cannot serve
   `create_snapshot`; a data-dir copy races the paused commit (frozen head 207
