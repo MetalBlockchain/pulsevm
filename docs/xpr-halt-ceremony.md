@@ -169,6 +169,15 @@ operator once the frozen set matches the coordinated parameters:
   (`contracts/cutover/test-voter.sh`: dry-run refusal, print-digest
   parity, unattended live vote, platform-bound coordinator delivery,
   lying-coordinator and wrong-platform refusal).
+- Opt-in local halt: with `stop_producer.at_h` set plus the local
+  `producer_api_url`, the voter pauses its own producer right after
+  delivering the confirmation (Leap `producer/pause`, then proves
+  `paused`). A contract cannot stop block production, only the producer
+  can, so this is the half of the halt that lives in the binary. Off by
+  default; half-configured (armed without a URL) refuses to start; a
+  pause that will not verify fails loud (non-zero exit, supervisor
+  retries into the already-voted path) instead of degrading to a
+  warning.
 
 What automation cannot do is decide: H, the source chain, and the roster
 come from the coordinated config, and a failed ceremony restarts

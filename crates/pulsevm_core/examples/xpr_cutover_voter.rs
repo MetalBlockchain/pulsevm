@@ -87,6 +87,23 @@ struct Config {
     enabled: bool,
     #[serde(default)]
     confirmation: ConfirmationConfig,
+    /// Opt-in local producer stop. When `at_h` is set with a
+    /// `producer_api_url`, the voter pauses its own producer after the
+    /// confirmation for H is delivered (Leap `producer/pause`). A contract
+    /// cannot halt block production — only the producer can — so this is
+    /// the half of the halt that lives in the binary. Off by default: a
+    /// surprise pause is worse than a loud refusal to start.
+    #[serde(default)]
+    stop_producer: StopConfig,
+}
+
+/// Local producer stop at H. Both fields are required together: `at_h`
+/// without a URL fails fast at startup instead of silently never pausing.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StopConfig {
+    #[serde(default)]
+    at_h: bool,
+    producer_api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1053,7 +1070,58 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Fail fast when the stop is half-configured: `at_h` without a producer
+/// API URL would silently never pause, which is exactly the failure this
+/// option exists to prevent.
+fn validate_stop_config(stop: &StopConfig) -> Result<(), String> {
+    if stop.at_h && stop.producer_api_url.is_none() {
+        return Err(
+            "stop_producer.at_h is set but stop_producer.producer_api_url is missing: refusing to run a halt that cannot fire"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Pure pause predicate, unit-tested below. The pause fires only for the
+/// round whose confirmation this voter delivered: H reached on the local
+/// node, opt-in armed, and confirmation done. Pausing is reversible (the
+/// operator can always resume), so observed head — not irreversibility —
+/// is the right trigger; the votes were the careful part and they landed
+/// before H.
+fn should_pause_producer(
+    stop: &StopConfig,
+    head_num: u32,
+    height: u32,
+    confirmation_delivered: bool,
+) -> bool {
+    stop.at_h && stop.producer_api_url.is_some() && confirmation_delivered && head_num >= height
+}
+
+/// Pause the local producer via the Leap producer API, then prove it is
+/// paused instead of trusting the first call. Both endpoints are POSTs.
+async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), String> {
+    post_json(
+        client,
+        &format!("{api_url}/v1/producer/pause"),
+        &serde_json::json!({}),
+    )
+    .await?;
+    let state = post_json(
+        client,
+        &format!("{api_url}/v1/producer/paused"),
+        &serde_json::json!({}),
+    )
+    .await?;
+    if state.get("paused").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("producer pause unverified: {state}"))
+    }
+}
+
 async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(), String> {
+    validate_stop_config(&config.inner.stop_producer)?;
     let client = build_client(config)?;
     let mut voted = false;
     let mut last_note = String::new();
@@ -1121,12 +1189,68 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     "DRY RUN: would sign and deliver the confirmation for H={}",
                     config.inner.height
                 );
+                if should_pause_producer(
+                    &config.inner.stop_producer,
+                    view.head_num,
+                    config.inner.height,
+                    true,
+                ) {
+                    log_line!(
+                        "DRY RUN: would pause the local producer at H={} via {}",
+                        config.inner.height,
+                        config
+                            .inner
+                            .stop_producer
+                            .producer_api_url
+                            .as_deref()
+                            .unwrap_or("<missing>")
+                    );
+                }
                 return Ok(());
             }
             match submit_confirmation(&client, config).await {
                 Ok(line) => {
                     log_line!("{line}");
-                    return Ok(());
+                    if !should_pause_producer(
+                        &config.inner.stop_producer,
+                        view.head_num,
+                        config.inner.height,
+                        true,
+                    ) {
+                        return Ok(());
+                    }
+                    let api_url = config
+                        .inner
+                        .stop_producer
+                        .producer_api_url
+                        .clone()
+                        .unwrap_or_default();
+                    // The commitment is delivered; the producer must stop
+                    // before it builds H+1. Retry the pause, then fail loud:
+                    // a non-zero exit lets the supervisor restart us into
+                    // the AlreadyVoted path, which retries the pause. A
+                    // silently unpaused producer is the 25-blocks-past-stop
+                    // failure, so this never degrades to a warning.
+                    for attempt in 1..=3u32 {
+                        match pause_producer(&client, &api_url).await {
+                            Ok(()) => {
+                                log_line!(
+                                    "local producer paused at H={} (attempt {attempt})",
+                                    config.inner.height
+                                );
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                log_line!("producer pause failed (attempt {attempt}/3): {error}");
+                                tokio::time::sleep(Duration::from_secs(config.inner.poll_secs))
+                                    .await;
+                            }
+                        }
+                    }
+                    return Err(format!(
+                        "confirmation delivered for H={} but the local producer would not pause: refusing to exit clean on a running producer",
+                        config.inner.height
+                    ));
                 }
                 Err(error) => {
                     log_line!("confirmation failed, retrying: {error}");
@@ -1252,6 +1376,7 @@ mod tests {
                     checkpoint_sha256: None,
                     platform_chain_id: None,
                 },
+                stop_producer: StopConfig::default(),
             },
             vote_key: key,
             payer_key: PrivateKey::from_str(
@@ -1564,5 +1689,118 @@ mod tests {
         );
         assert!(load_loaded_config(&bad_height).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn armed_stop() -> StopConfig {
+        StopConfig {
+            at_h: true,
+            producer_api_url: Some("http://127.0.0.1:8888".to_string()),
+        }
+    }
+
+    #[test]
+    fn pause_fires_only_for_a_delivered_confirmation_at_h() {
+        // Off by default: an unconfigured voter never pauses, no matter
+        // what the chain does.
+        let off = StopConfig::default();
+        assert!(!should_pause_producer(&off, 100, 100, true));
+        assert!(!should_pause_producer(&off, 200, 100, true));
+        // Armed but head short of H: the producer still has blocks to
+        // build, pausing now would fork it off early.
+        let armed = armed_stop();
+        assert!(!should_pause_producer(&armed, 99, 100, true));
+        // Armed at H but the confirmation is not delivered: pausing on a
+        // superseded round's H would halt the wrong freeze.
+        assert!(!should_pause_producer(&armed, 100, 100, false));
+        // Delivered at H: stop before H+1.
+        assert!(should_pause_producer(&armed, 100, 100, true));
+        // Delivered past H (late confirmation): still stop — every block
+        // past H built by this producer is a straggler.
+        assert!(should_pause_producer(&armed, 103, 100, true));
+    }
+
+    /// Minimal Leap producer-API stub: answers pause/paused with canned
+    /// bodies over sequential connections. std-only; the test drives the
+    /// real `pause_producer` HTTP path against it.
+    fn stub_producer_api(paused_reports: bool) -> String {
+        use std::io::{
+            Read,
+            Write,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let head_text = String::from_utf8_lossy(&head);
+                let path = head_text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let content_len = head_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; content_len];
+                stream.read_exact(&mut body).ok();
+                let response_body = if path.ends_with("/v1/producer/paused") {
+                    format!("{{\"paused\":{paused_reports}}}")
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).ok();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn pause_producer_roundtrip_against_stub_api() {
+        let client = reqwest::Client::builder().build().unwrap();
+        let api = stub_producer_api(true);
+        assert!(pause_producer(&client, &api).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_producer_rejects_an_unverified_pause() {
+        // The pause call succeeds but the node reports still running:
+        // trust the verification, not the call.
+        let client = reqwest::Client::builder().build().unwrap();
+        let api = stub_producer_api(false);
+        assert!(pause_producer(&client, &api).await.is_err());
+    }
+
+    #[test]
+    fn half_configured_stop_fails_fast() {
+        // at_h without a URL would silently never pause: refuse to run.
+        let half = StopConfig {
+            at_h: true,
+            producer_api_url: None,
+        };
+        assert!(validate_stop_config(&half).is_err());
+        // Either fully armed or fully off validates.
+        assert!(validate_stop_config(&StopConfig::default()).is_ok());
+        assert!(validate_stop_config(&armed_stop()).is_ok());
     }
 }

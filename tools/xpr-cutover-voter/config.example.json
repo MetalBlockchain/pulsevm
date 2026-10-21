@@ -20,5 +20,10 @@
     "migration_genesis": "/etc/cutover/migration.genesis.json",
     "checkpoint_sha256": null,
     "platform_chain_id": "<64 hex chars of the MetalGo blockchain id, published with the ceremony>"
+  },
+  "stop_producer": {
+    "_comment": "Opt-in local halt. When at_h is true, the voter pauses its own producer (Leap producer/pause) after delivering the confirmation for H, then proves it is paused. A contract cannot stop block production, only the producer can. Omit or set at_h false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint.",
+    "at_h": false,
+    "producer_api_url": "http://127.0.0.1:8888"
   }
 }
