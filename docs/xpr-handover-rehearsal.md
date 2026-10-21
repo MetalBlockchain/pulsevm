@@ -1,6 +1,7 @@
 # XPR → A-Chain Handover Rehearsal: Proof Record
 
-Status: proven on EC2 (2026-10-16), twice — clean run and chaos run.
+Status: two-step cutover proven locally (2026-10-21); single-halt proven on
+EC2 (2026-10-16), twice — clean run and chaos run.
 Branch: `feat/handover-rehearsal`. Companion design doc:
 [xpr-achain-migration.md](xpr-achain-migration.md); validator
 commitment strategy: [halt ceremony](xpr-halt-ceremony.md).
@@ -13,7 +14,25 @@ restores the checkpoint, verifies the halt commitment, authors H+1, and
 stops the replay. From the customer's seat the network never stops — it
 swaps, with every boundary transaction landing exactly once.
 
-Latest proven run (EC2 `ubuntu@52.30.206.93`, `TERMINAL_HEIGHT=300`):
+Latest proven run (local Mac, `TERMINAL_HEIGHT=150`, two-step cutover):
+
+- XPR consensus (1 producer + 2 validators) → declared **H=187** at head 160
+  (K=27, within max lag 30); declaration `adfd985e…09bfcc501f` memo'd
+  on-chain in block 160, digest re-decoded from chain.
+- Halt confirmation `d6be7207…f480090` binds checkpoint + successor chain
+  `dcce9db3…`; offline verifier PASS (manifest v2, checkpoint binding ok,
+  declaration inclusion `[160,H-27]`, 1/1 roster quorum, strict schedule
+  equality); `verification-pass` marker gates the boot (flip gate).
+- Snapshot taken on the running producer at exactly H, bound by id; network
+  frozen at P=189 (H+2 stragglers by design, see lessons); block **188
+  builds on H** (parent link asserted on all nodes).
+- State equivalence **11/11** (`eosio,t1,t2,t3` + 7 memo accounts) via
+  payload-compared authorities.
+- Boundary audit **10/10 txs exactly-once** (5 pre-halt on old chain, 5
+  post-halt on new chain; none lost, none duplicated).
+
+Earlier proven run (EC2 `ubuntu@52.30.206.93`, `TERMINAL_HEIGHT=300`,
+single-halt):
 
 - XPR consensus (1 producer + 2 validators) → halt at **H=310**,
   id `00000136d50d237759274fb59b5822472e5cb5834e081ce82e3d64405982bf46`.
@@ -38,7 +57,17 @@ LEAP_HTTP_PORT=18880 SHADOW_RPC_PORT=19660 \
 ```
 
 Port remaps are required on hosts running live XPR infra (`:8888` relay,
-`:9660` follower). Resume a halted run from its checkpoint without replaying:
+`:9660` follower). On Apple-silicon Macs, and on any host sharing `:18080`:
+
+```sh
+XPR_PLATFORM=linux/arm64 XPR_NODEOS_IMAGE=pulsevm-xpr-handover:local \
+  XPR_SHADOW_NATIVE=1 TERMINAL_HEIGHT=150 \
+  PULSEVM_RUNNER_PORT=18180 PULSEVM_RUNNER_GATEWAY_PORT=18181 \
+  HANDOVER_WORK_DIR=/tmp/pulsevm-handover \
+  ./docker/handover/run-handover.sh start
+```
+
+Resume a halted run from its checkpoint without replaying:
 
 ```sh
 HANDOVER_WORK_DIR=<archived-workdir> ./docker/handover/run-handover.sh resume-boot
@@ -74,15 +103,52 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   H=328, five-node restore with tip 328 == H and head id equal to the
   committed halt block, H+1=329 parent-linked, state equivalence 4/4, boundary
   traffic 10/10 exactly-once.
+- Record: fresh-chain two-step rehearsal PASS at H=163 after the restore
+  gate was tightened (pair mandatory, roster-less commitments rejected,
+  declaration timing provable via ceremony or recorded inclusion).
+  Declaration at memo block 137 (K=26), confirmation binding checkpoint and
+  successor chain verified offline, H+1=164 parent-linked, state equivalence
+  11/11, boundary traffic 10/10 exactly-once. Two harness fixes made the
+  run possible: the SHiP log read path now flushes buffered appends before
+  opening the reader (follow-mode tail reads previously failed as Corrupt),
+  and ceremony/attach/verifier tools always rebuild (a stale skipped
+  verifier binary once failed the offline check on an encoding the code
+  already handled).
+- Snapshot-while-running: the exact-H snapshot must be taken on the RUNNING
+  producer, before the pause. A paused producer cannot serve
+  `create_snapshot`; a data-dir copy races the paused commit (frozen head 207
+  in memory, blocks.log still at 206); and this Leap build never completes
+  `create_snapshot` on non-producing nodes (2.1 MB `.pending-snapshot` file
+  written, HTTP response never sent — observed on two nodes). The pre-pause
+  snapshot + post-pause id bind (`SNAP_HID == H_ID`) sidesteps all three.
+- P vs H: `create_snapshot` costs ~0.36s of the 0.5s block interval, so the
+  pause always lands 1–2 blocks past H. The script records the actual frozen
+  head P from the validators (agreement + 2s stability, P-H ≤ 5) and proves
+  the snapshot binds H by id. Stragglers H+1..P are ignored by design, exactly
+  as post-H XPR blocks are ignored by the A-Chain. On mainnet the BPs halt
+  cleanly at H (P == H); the P≠H path is a harness artifact.
+- Mac rehearsal needs `XPR_SHADOW_NATIVE=1` (the host-built replay binary is
+  Mach-O and cannot exec in the Linux shadow container), `XPR_PLATFORM=linux/arm64`
+  (compose `platform`, export adapter, and snapshotter all default to amd64),
+  and non-default runner ports when the host is shared
+  (`PULSEVM_RUNNER_PORT/PULSEVM_RUNNER_GATEWAY_PORT`).
+- `[[ "$(wc -l <file)" == 7 ]]` is always false (`wc` pads with spaces) —
+  compare numerically. A dead shadow container spins the follow loop forever,
+  so the script now fails fast with the shadow's logs when the container dies
+  or its RPC never answers.
+- Teardown kills the supervisor's process group plus exactly our runner ports
+  (the runner can escape the group via reparenting); never `pkill` by bare
+  name on a shared host.
 
 ## What this does NOT prove (do not merge as migration-complete)
 
 - Promotion re-identifies the chain; same-ID in-process promotion is unmodeled.
-- The halt ceremony here is single-key. The restore gate now supports a
-  weighted 2/3 roster quorum and checkpoint-bound version 2 commitments
-  (see [halt ceremony](xpr-halt-ceremony.md)), but a live rehearsal with
-  distinct per-validator keys, a voted schedule, and a signed roster
-  distribution path is still unproven.
+- The two-step cutover ran with a 1-member fixture roster (single key). The
+  restore gate supports a weighted 2/3 roster quorum and checkpoint-bound
+  version 2 commitments (see [halt ceremony](xpr-halt-ceremony.md)), and
+  quorum math is unit-tested (`migration.rs`, `xpr_import.rs`), but a live
+  rehearsal with distinct per-validator keys, a voted schedule, and a signed
+  roster distribution path is still unproven.
 - CEX freeze/re-enable, gateway cutover, and Hyperion reindex runbooks live
   in the migration design doc, not in this rehearsal.
 - Resuming boot into the same workdir overwrites the plugin binary and kills

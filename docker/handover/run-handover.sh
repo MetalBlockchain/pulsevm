@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Rehearse the shadow-then-promote handover: a three-node Leap network runs
-# XPR under consensus, PulseVM shadows it, the whole XPR network halts at
-# TERMINAL_HEIGHT, and a five-node PulseVM network boots from the
-# checkpointed shadow state, takes its own first transaction, and continues
-# at H+1.
+# Rehearse the two-step cutover: a three-node Leap network runs XPR under
+# consensus, PulseVM shadows it block by block, the old schedule declares H
+# as its last block while H is still in the future (step one, recorded
+# on-chain K blocks early), the rehearsal freezes the producer exactly at H,
+# the quorum confirms H with the checkpoint and the successor chain id
+# (step two), and a five-node PulseVM network boots from the checkpoint and
+# continues at H+1.
 #
-# Phase 2 note: promotion currently re-identifies the chain (the migration
-# genesis commits to the checkpoint hash). Same-ID in-process promotion is
-# future work; this rehearsal validates follow, halt, checkpoint, boot,
+# The freeze stands in for the mainnet producer pact (BPs stop authoring at
+# the agreed H; the real XPR network keeps producing, and the A-Chain simply
+# ignores blocks past H). Promotion re-identifies the chain (the migration
+# genesis commits to the checkpoint hash). This rehearsal validates follow,
+# declaration, on-chain memo, exact freeze, confirmation, checkpoint, boot,
 # parent linkage, and liveness.
 set -euo pipefail
 
@@ -37,9 +41,19 @@ fail() {
     echo "handover: $*" >&2
     # Never leave a booted five-node network behind a failed run: take the
     # supervisor down with us (nodes stay up only after an explicit PASS).
+    # The supervisor is a setsid(2) group leader, so a negative PID kills
+    # exactly our tree. Never pkill by bare name: this box is shared with
+    # unrelated live networks.
     if [[ -f "${WORK_DIR:-/nonexistent}/five-node.pid" ]]; then
-        kill "$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
-        pkill -f 'metal-network-runne[r]' 2>/dev/null || true
+        kill -- "-$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
+        # The runner can escape the supervisor's process group (reparented to
+        # init on some paths): reclaim exactly our runner ports, nothing
+        # else. The boot gate refuses to start when our ports are held by
+        # anyone else, so a holder here is ours or our stale leftover.
+        for _port in "${PULSEVM_RUNNER_PORT:-18080}" "${PULSEVM_RUNNER_GATEWAY_PORT:-18081}"; do
+            _victims="$(lsof -ti "tcp:${_port}" -sTCP:LISTEN 2>/dev/null || true)"
+            [[ -n "$_victims" ]] && kill $_victims 2>/dev/null || true
+        done
     fi
     if [[ -f "${WORK_DIR:-/nonexistent}/shadow.pid" ]]; then
         kill "$(cat "$WORK_DIR/shadow.pid")" 2>/dev/null || true
@@ -132,6 +146,12 @@ cmd_start() {
     (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) || fail "probe tool build failed"
     PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
     [[ -x "$PROBE_BIN" ]] || fail "probe tool missing: $PROBE_BIN"
+    (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_halt_ceremony) || fail "ceremony tool build failed"
+    CEREMONY_BIN="$REPO_ROOT/target/release/examples/xpr_halt_ceremony"
+    [[ -x "$CEREMONY_BIN" ]] || fail "ceremony tool missing: $CEREMONY_BIN"
+    (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example xpr_scan_contract_votes) || fail "scanner build failed"
+    SCANNER_BIN="$REPO_ROOT/target/release/examples/xpr_scan_contract_votes"
+    [[ -x "$SCANNER_BIN" ]] || fail "scanner missing: $SCANNER_BIN"
     # A rehearsal proves a halt at H on a FRESH chain: drop the compose
     # volumes first. Without this, reruns resume the previous run's chain
     # from its named volume, so traffic/boundary account creation collides
@@ -215,7 +235,23 @@ json.dump(accts, open(out, "w"), indent=1)
     if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" ]]; then
         echo "handover: native shadow deferred until halt (static log replay)"
     else
-        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow)
+        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach shadow) \
+            || fail "shadow container failed to start"
+        # Fail fast when the shadow won't stay up (e.g. a host-built binary
+        # the container runtime cannot exec): otherwise the loop below spins
+        # forever on a dead shadow. The Mac rehearsal uses XPR_SHADOW_NATIVE=1
+        # instead; this guard protects Linux/EC2 runs.
+        for _ in $(seq 1 12); do
+            shadow_head >/dev/null 2>&1 && break
+            shadow_cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q shadow)"
+            if [[ -z "$shadow_cid" ]] || ! docker inspect -f '{{.State.Running}}' "$shadow_cid" 2>/dev/null | grep -q true; then
+                echo "handover: shadow container died at startup; last logs:" >&2
+                (cd "$SCRIPT_DIR" && docker compose -f compose.yaml logs --tail=30 shadow >&2 || true)
+                fail "shadow container is not running — cannot follow XPR (on Mac hosts use XPR_SHADOW_NATIVE=1)"
+            fi
+            sleep 5
+        done
+        shadow_head >/dev/null 2>&1 || fail "shadow RPC never answered :${SHADOW_RPC_PORT:-9660}"
     fi
     echo "handover: shadowing until height $TERMINAL_HEIGHT..."
     if [[ "${XPR_SHADOW_NATIVE:-0}" == "1" ]]; then
@@ -230,13 +266,497 @@ json.dump(accts, open(out, "w"), indent=1)
         done
     else
         while true; do
-            head="$(shadow_head 2>/dev/null || echo 0)"
+            if ! head="$(shadow_head 2>/dev/null)"; then
+                echo "handover: shadow RPC lost; last logs:" >&2
+                (cd "$SCRIPT_DIR" && docker compose -f compose.yaml logs --tail=30 shadow >&2 || true)
+                fail "shadow died mid-follow — cannot reach $TERMINAL_HEIGHT"
+            fi
             echo "handover: shadow head $head / $TERMINAL_HEIGHT"
             [[ "$head" -ge "$TERMINAL_HEIGHT" ]] && break
             sleep 5
         done
     fi
     cmd_halt
+}
+
+# Poll a Leap read until a python expression over the response JSON equals
+# the wanted value (prefix the want with ! to require inequality). Effect
+# waits: the chain must have advanced past our push AND included it — a bare
+# head advance can win the race while our transaction still sits in the
+# mempool, which would seal an empty tally or execute against missing code.
+leap_wait_effect() { # $1=desc $2=path $3=body $4=py-expr $5=want
+    local desc="$1" path="$2" body="$3" expr="$4" want="$5" got attempt negate=""
+    if [[ "$want" == "!"* ]]; then negate=1; want="${want#!}"; fi
+    for attempt in $(seq 1 60); do
+        got="$(leap_post "$LEAP_API" "$path" "$body" 2>/dev/null \
+            | python3 -c 'import json,sys; print('"$expr"')' 2>/dev/null || echo MISSING)"
+        if [[ -n "$negate" && "$got" != "$want" && "$got" != "MISSING" ]] || [[ -z "$negate" && "$got" == "$want" ]]; then
+            echo "handover: $desc ok ($got)"
+            return 0
+        fi
+        [[ "$attempt" == 60 ]] && fail "$desc never observed (last: $got)"
+        sleep 2
+    done
+}
+
+# Push one transaction with fresh tapos and wait until the chain advances
+# past the push head, so dependent pushes (account, then code, then init,
+# then vote) cannot reorder. Prints nothing; sets LEAP_TAPOS_CHAIN/HEAD.
+leap_tapos_push() { # $1=wif $2=mode rest=mode args
+    local wif="$1" mode="$2"
+    shift 2
+    local t_chain t_head t_head_id
+    read -r t_chain t_head t_head_id <<<"$(leap_chain_head "$LEAP_API")"
+    LEAP_TAPOS_CHAIN="$t_chain"
+    LEAP_TAPOS_HEAD="$t_head"
+    local t_prefix t_exp t_ref
+    t_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$t_head_id')[8:12], 'little'))")"
+    t_exp="$(($(date +%s) + 1800))"
+    t_ref="$((t_head & 0xffff))"
+    leap_send "$("$PROBE_BIN" "$mode" "$t_chain" "$wif" "$t_ref" "$t_prefix" "$t_exp" "$@")" \
+        || return 1
+    local now
+    for _ in $(seq 1 30); do
+        now="$(leap_head_lib "$LEAP_API" 2>/dev/null | cut -d' ' -f1)"
+        [[ "${now:-0}" -gt "$t_head" ]] && return 0
+        sleep 0.5
+    done
+    echo "handover: push $mode never landed (head stuck at $t_head)" >&2
+    return 1
+}
+
+# Fixture-only schedule seeder for the contract vehicle: the bare fixture
+# chain carries no system `producers` table, so the cutover contract's init
+# would freeze an empty schedule. This deploys the throwaway seeder as
+# code=eosio (the only writer allowed there) and plants the single-member
+# row mirroring the replayed genesis schedule (owner eosio, fixture dev
+# key, weight 1.0). NEVER on mainnet: there the live schedule is real.
+deploy_fixture_seeder() { # $1=dev wif
+    local wif="$1"
+    echo "handover: contract vehicle: planting the fixture schedule row..."
+    local seed_wasm="$REPO_ROOT/contracts/cutover/seed.wasm"
+    local seed_abi="$REPO_ROOT/contracts/cutover/seed.abi"
+    [[ -f "$seed_wasm" && -f "$seed_abi" ]] || fail "cutover contracts not built (contracts/cutover)"
+    local key33
+    key33="$("$PROBE_BIN" pubkey "$wif")" || fail "dev key to pubkey failed"
+    [[ "${#key33}" == 66 ]] || fail "dev pubkey is not 33 compressed bytes"
+    local code_hash
+    code_hash="$(leap_post "$LEAP_API" /v1/chain/get_code '{"account_name":"eosio"}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["code_hash"])')"
+    if [[ "$code_hash" == "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+        echo "handover: deploying fixture seeder as code=eosio..."
+        leap_tapos_push "$wif" setcode eosio "$seed_wasm" || fail "seeder setcode failed"
+        leap_tapos_push "$wif" setabi eosio "$seed_abi" || fail "seeder setabi failed"
+        leap_wait_effect "seeder code on eosio" /v1/chain/get_code '{"account_name":"eosio"}' \
+            'json.load(sys.stdin)["code_hash"]' '!0000000000000000000000000000000000000000000000000000000000000000'
+    fi
+    local rows
+    rows="$(leap_post "$LEAP_API" /v1/chain/get_table_rows \
+        '{"json":false,"code":"eosio","scope":"eosio","table":"producers","limit":1}' \
+        | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["rows"]))')"
+    if [[ "$rows" == 0 ]]; then
+        local votes_hex
+        votes_hex="$(python3 -c 'import struct; print(struct.pack("<d", 1.0).hex())')"
+        leap_tapos_push "$wif" cseed eosio eosio eosio "$votes_hex" "$key33" 1 \
+            || fail "schedule seed row failed"
+    fi
+    echo "handover: fixture schedule row present"
+}
+
+two_step_ceremony_and_freeze() {
+    # Step one of the cutover while H is still in the future: choose H,
+    # sign the declaration, record its digest on-chain, then freeze the
+    # producer exactly at H. Retries (new H, new memo names) on freeze
+    # overshoot; earlier rounds stay on-chain as superseded history.
+    # Leaves the producer paused, H/H_ID/block-H.json/snapshot staged.
+    local halt_key
+    halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
+    PROBE_BIN="${PROBE_BIN:-$REPO_ROOT/target/release/examples/make_probe_tx}"
+    CEREMONY_BIN="${CEREMONY_BIN:-$REPO_ROOT/target/release/examples/xpr_halt_ceremony}"
+    SCANNER_BIN="${SCANNER_BIN:-$REPO_ROOT/target/release/examples/xpr_scan_contract_votes}"
+    # Always rebuild (see the attach-stage note): stale ceremony tools
+    # would sign or scan against yesterday's logic.
+    (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) || fail "probe tool build failed"
+    (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_halt_ceremony) || fail "ceremony tool build failed"
+    (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example xpr_scan_contract_votes) || fail "scanner build failed"
+    # The fixture schedule is one member: eosio on the fixture genesis key.
+    local roster_key
+    roster_key="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
+    printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
+    if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
+        deploy_fixture_seeder "$halt_key"
+    fi
+    local producer_cid
+    producer_cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)"
+    [[ -n "$producer_cid" ]] || fail "xpr-producer container not found"
+    # H, DECL_DIGEST, MEMO_BLOCK, K stay global (like the legacy loop's H):
+    # the shared tail below and cmd_boot read them and their files.
+    local round
+    round=0
+    H=""
+    while [[ -z "$H" ]]; do
+        round="$((round + 1))"
+        [[ "$round" -le 3 ]] || fail "freeze missed the declared H three times; aborting"
+        local x_chain x_head
+        read -r x_chain x_head _ <<<"$(leap_chain_head "$LEAP_API")"
+        # The declare->memo->scan phase takes ~10-16 blocks; the lag must
+        # clear it with margin or every round overshoots before freezing.
+        H="$((x_head + ${CUTOVER_LAG:-30}))"
+        echo "handover: cutover round $round: declaring H=$H at head $x_head..."
+        if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
+            # Contract vehicle: the declaration digest comes from the frozen
+            # on-chain ceremony, not from a local signing. Deploy a fresh
+            # ceremony contract per round (a superseded round may have locked
+            # its freeze with votes, and the contract is intentionally
+            # one-shot), freeze the live schedule, cast the BP vote, and scan
+            # the window into the verifier evidence fragment plus the
+            # declaration the confirmation will chain.
+            CONTRACT_ACCT="cutover$round"
+            local cut_wasm="$REPO_ROOT/contracts/cutover/cutover.wasm"
+            local cut_abi="$REPO_ROOT/contracts/cutover/cutover.abi"
+            [[ -f "$cut_wasm" && -f "$cut_abi" ]] || fail "cutover contract not built (contracts/cutover)"
+            leap_tapos_push "$halt_key" newaccount "$CONTRACT_ACCT" || fail "contract account failed"
+            leap_wait_effect "contract account $CONTRACT_ACCT" /v1/chain/get_account \
+                '{"account_name":"'"$CONTRACT_ACCT"'"}' 'json.load(sys.stdin)["account_name"]' "$CONTRACT_ACCT"
+            leap_tapos_push "$halt_key" setcode "$CONTRACT_ACCT" "$cut_wasm" || fail "contract setcode failed"
+            leap_tapos_push "$halt_key" setabi "$CONTRACT_ACCT" "$cut_abi" || fail "contract setabi failed"
+            echo "handover: ceremony contract deployed at $CONTRACT_ACCT"
+            leap_wait_effect "contract code on $CONTRACT_ACCT" /v1/chain/get_code \
+                '{"account_name":"'"$CONTRACT_ACCT"'"}' 'json.load(sys.stdin)["code_hash"]' \
+                '!0000000000000000000000000000000000000000000000000000000000000000'
+            local init_hex
+            init_hex="$(python3 -c "import struct; print((struct.pack('<I', $H) + bytes.fromhex('$x_chain')).hex())")"
+            leap_tapos_push "$halt_key" raw "$CONTRACT_ACCT" init "$CONTRACT_ACCT" "$init_hex" || fail "contract init H=$H failed"
+            echo "handover: schedule frozen for H=$H"
+            leap_wait_effect "frozen ceremony H=$H" /v1/chain/get_table_rows \
+                '{"json":true,"code":"'"$CONTRACT_ACCT"'","scope":"'"$CONTRACT_ACCT"'","table":"ceremony","limit":1}' \
+                'json.load(sys.stdin)["rows"][0]["h"]' "$H"
+            printf '[{"producer":"eosio","key":"%s","weight":"1"}]' "$roster_key" >"$WORK_DIR/cvote-members.json"
+            leap_tapos_push "$halt_key" cvote "$CONTRACT_ACCT" "$CONTRACT_ACCT" eosio "$halt_key" "$H" "$x_chain" "$WORK_DIR/cvote-members.json" || fail "contract vote failed"
+            echo "handover: vote cast, scanning the window for contract evidence..."
+            leap_wait_effect "counted vote on $CONTRACT_ACCT" /v1/chain/get_table_rows \
+                '{"json":true,"code":"'"$CONTRACT_ACCT"'","scope":"'"$CONTRACT_ACCT"'","table":"ceremony","limit":1}' \
+                'json.load(sys.stdin)["rows"][0]["voted_weight"]' '!0'
+            local scan_to scan_log
+            scan_to="$(leap_chain_head "$LEAP_API" | cut -d' ' -f2)"
+            scan_log="$WORK_DIR/scan-round$round.log"
+            if ! "$SCANNER_BIN" --api "$LEAP_API" --contract "$CONTRACT_ACCT" --from "$x_head" --to "$scan_to" \
+                --singleton-block "$scan_to" --out "$WORK_DIR/fragment.json" \
+                --declare-out "$WORK_DIR/declaration.json" \
+                --host-header '0.0.0.0:8888' >"$scan_log" 2>&1; then
+                tail -5 "$scan_log"
+                fail "vote scan failed"
+            fi
+            cat "$scan_log"
+            DECL_DIGEST="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/fragment.json"'"))["declaration_digest"])')"
+            [[ "${#DECL_DIGEST}" == 64 ]] || fail "could not parse fragment digest"
+            local vote_version
+            vote_version="$(grep -o 'schedule_version=[0-9]*' "$scan_log" | cut -d= -f2)"
+            [[ -n "$vote_version" ]] || fail "scanner attested no schedule version"
+            echo "$vote_version" >"$WORK_DIR/schedule-version"
+            echo "$CONTRACT_ACCT" >"$WORK_DIR/contract-account"
+            # Quorum-completion block: the first block whose cumulative tally
+            # clears strict 2/3+1. This is the declaration inclusion.
+            local vote_code
+            vote_code=0
+            MEMO_BLOCK="$(python3 - "$WORK_DIR/fragment.json" "$WORK_DIR/declaration.json" <<'PYEOF'
+import json, sys
+frag = json.load(open(sys.argv[1]))
+decl = json.load(open(sys.argv[2]))
+weights = {m["producer"]: int(m["weight"]) for m in decl["validator_set"]}
+total = sum(weights.values())
+voted, completion = 0, None
+for v in sorted(frag["votes"], key=lambda v: v["block"]):
+    if v["producer"] not in weights:
+        sys.exit(f"vote from {v['producer']} names no frozen member")
+    voted += weights[v["producer"]]
+    if voted * 3 > total * 2:
+        completion = v["block"]
+        break
+if completion is None:
+    sys.exit("quorum never completed in the scanned votes")
+print(completion)
+PYEOF
+)" || vote_code=$?
+            [[ "$vote_code" == 0 && -n "$MEMO_BLOCK" ]] || fail "quorum completion not found"
+            K="$((H - MEMO_BLOCK))"
+            if [[ "$K" -lt 1 || "$K" -gt "${CUTOVER_LAG:-30}" ]]; then
+                echo "handover: round $round vote block $MEMO_BLOCK outside the window for H=$H (K=$K); superseded, retrying..."
+                H=""
+                continue
+            fi
+            echo "handover: round $round quorum completed in block $MEMO_BLOCK (K=$K); digest $DECL_DIGEST"
+        else
+        local decl_out
+        decl_out="$("$CEREMONY_BIN" declare --height "$H" --source-chain "$x_chain" --roster "$WORK_DIR/roster.json" --key "$halt_key" --out "$WORK_DIR/declaration.json")" \
+            || fail "declaration failed"
+        echo "handover: $decl_out"
+        DECL_DIGEST="$(printf '%s' "$decl_out" | awk '{print $2}')"
+        [[ "${#DECL_DIGEST}" == 64 ]] || fail "could not parse declaration digest"
+        # Memo: the declaration digest as newaccount names (hex nibbles to
+        # a-p, 10 per name, round letter disambiguates retries). Recomputing
+        # the digest from these on-chain accounts yields exactly DECL_DIGEST.
+        local memo_names
+        memo_names="$(python3 - "$DECL_DIGEST" "$round" <<'PYEOF'
+import sys
+alpha = "abcdefghijklmnop"
+letters = "".join(alpha[int(c, 16)] for c in sys.argv[1])
+letter = chr(ord("a") + int(sys.argv[2]) - 1)
+chunks = [letters[i:i + 10] for i in range(0, 64, 10)]
+print(" ".join("h" + letter + ch for ch in chunks))
+PYEOF
+)"
+        local m_chain m_head m_head_id m_prefix m_exp m_ref memo_submit_head
+        read -r m_chain m_head m_head_id <<<"$(leap_chain_head "$LEAP_API")"
+        memo_submit_head="$m_head"
+        m_prefix="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$m_head_id')[8:12], 'little'))")"
+        m_exp="$(($(date +%s) + 1800))"
+        m_ref="$((m_head & 0xffff))"
+        : >"$WORK_DIR/memo-txids"
+        local i mname
+        i=0
+        for mname in $memo_names; do
+            i="$((i + 1))"
+            (txid="$(leap_send "$("$PROBE_BIN" newaccount "$m_chain" "$halt_key" "$m_ref" "$m_prefix" "$m_exp" "$mname")")" \
+                && echo "$i $mname $txid" >>"$WORK_DIR/memo-txids") &
+        done
+        wait
+        # 64 hex nibbles at 10 per name: always exactly 7 memo accounts.
+        # NOTE: wc pads its count with spaces, so compare numerically.
+        [[ "$(wc -l <"$WORK_DIR/memo-txids" | tr -d ' ')" == 7 ]] || fail "memo submission lost transactions"
+        local scan_code
+        scan_code=0
+        MEMO_BLOCK="$(python3 - "$WORK_DIR/memo-txids" "$LEAP_API" "$memo_submit_head" "$H" "$DECL_DIGEST" <<'PYEOF'
+import json, sys, time, urllib.request
+txfile, api, lo, H, decl = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+pairs = [line.split() for line in open(txfile).read().splitlines() if line.split()]
+def post(path, body):
+    req = urllib.request.Request(api + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Host": "0.0.0.0:8888"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+want = {tx: (idx, name) for idx, name, tx in pairs}
+found = {}
+scanned = lo - 1
+for _ in range(30):
+    hi = post("/v1/chain/get_info", {})["head_block_num"]
+    for num in range(scanned + 1, hi + 1):
+        block = post("/v1/chain/get_block", {"block_num_or_id": str(num)})
+        for t in block.get("transactions", []):
+            trx = t.get("trx", t)
+            tid = trx.get("id") if isinstance(trx, dict) else trx
+            if tid in want and tid not in found:
+                found[tid] = num
+    scanned = max(scanned, hi)
+    if len(found) == len(want):
+        break
+    time.sleep(2)
+missing = sorted(set(want) - set(found))
+if missing:
+    print(f"memo txs missing: {missing}", file=sys.stderr)
+    sys.exit(1)
+blocks = sorted(set(found.values()))
+print(f"memo chunks landed in blocks {blocks}", file=sys.stderr)
+if max(blocks) >= H:
+    print(f"memo missed H={H}", file=sys.stderr)
+    sys.exit(2)
+alpha = "abcdefghijklmnop"
+ordered = sorted(pairs, key=lambda p: int(p[0]))
+letters = "".join(name[2:] for _, name, _ in ordered)
+if "".join(f"{alpha.index(c):x}" for c in letters) != decl:
+    print("memo names do not decode to the declaration digest", file=sys.stderr)
+    sys.exit(1)
+print(max(blocks))
+PYEOF
+)" || scan_code=$?
+        if [[ "$scan_code" == 2 ]]; then
+            echo "handover: round $round memo missed H=$H; superseded, retrying..."
+            H=""
+            continue
+        fi
+        [[ "$scan_code" == 0 && -n "$MEMO_BLOCK" ]] || fail "memo verification failed"
+        K="$((H - MEMO_BLOCK))"
+        echo "handover: round $round memo sealed in block $MEMO_BLOCK (K=$K); digest re-decodes from chain"
+        # Capture the memo accounts so the equivalence gate proves they
+        # migrated too.
+        python3 - "$LEAP_API" "$WORK_DIR/memo-accounts.json" $memo_names <<'PYEOF' || fail "memo account capture failed"
+import json, sys, time, urllib.request
+api, out, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+accts = {}
+for name in names:
+    for _ in range(30):
+        try:
+            req = urllib.request.Request(api + "/v1/chain/get_account",
+                                         data=json.dumps({"account_name": name}).encode(),
+                                         headers={"Content-Type": "application/json",
+                                                  "Host": "0.0.0.0:8888"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                accts[name] = json.load(r)
+            break
+        except Exception:
+            time.sleep(2)
+    else:
+        sys.exit(f"memo account {name} never appeared")
+json.dump(accts, open(out, "w"), indent=1)
+PYEOF
+        fi # end CUTOVER_VEHICLE branch (memo accounts only exist on the memo path)
+        # Snapshot while the producer still runs: create_snapshot is proven on
+        # the producing node (legacy path), while a paused producer cannot
+        # serve it, a data-dir copy races the paused commit, and this Leap
+        # build never completes snapshots on non-producing nodes (pending
+        # file written, HTTP response never sent). Poll to head==H, fire the
+        # snapshot, and require the snapshotted head to BE H — anything else
+        # means H+1 slipped in and the round is superseded (no pause yet, so
+        # retrying is just a new H; the old declaration stays on-chain as
+        # superseded history).
+        echo "handover: round $round snapshotting the running producer at H=$H..."
+        local snap_info snap_code
+        snap_code=0
+        snap_info="$(python3 - "$LEAP_API" "$H" <<'PYEOF'
+
+import json, sys, time, urllib.request
+api, H = sys.argv[1], int(sys.argv[2])
+def post(path, payload):
+    req = urllib.request.Request(api + path, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Host": "0.0.0.0:8888"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.load(r)
+deadline = time.time() + 120
+while True:
+    h = post("/v1/chain/get_info", {})["head_block_num"]
+    if h > H:
+        print(f"overshot H={H}: at {h}", file=sys.stderr)
+        sys.exit(2)
+    if h == H:
+        break
+    if time.time() > deadline:
+        print(f"head never reached H={H}", file=sys.stderr)
+        sys.exit(1)
+    time.sleep(0.01)
+snap = post("/v1/producer/create_snapshot", {})
+n, hid = snap.get("snapshot_name", ""), snap.get("head_block_id", "")
+if not n or not hid:
+    print(f"snapshot failed at H={H}: {snap}", file=sys.stderr)
+    sys.exit(1)
+print(f"{n} {hid}")
+PYEOF
+)" || snap_code=$?
+        if [[ "$snap_code" == 2 ]]; then
+            echo "handover: round $round snapshot missed H=$H; superseded, retrying..."
+            H=""
+            continue
+        fi
+        [[ "$snap_code" == 0 && -n "$snap_info" ]] || fail "producer snapshot failed"
+        SNAP_NAME="${snap_info%% *}"
+        SNAP_HID="${snap_info##* }"
+        [[ -n "$SNAP_NAME" && -n "$SNAP_HID" ]] || fail "producer snapshot returned no name/id"
+        echo "handover: snapshot $SNAP_NAME at $SNAP_HID"
+        # Live-flip irreversibility gate: before pausing, require both
+        # validators to report last_irreversible_block_num >= H. The cutoff
+        # (votes, empty H) must be BFT-final on the source network, not
+        # merely present at its tip — the producer is about to stop, so a
+        # lagging LIB could never catch up afterwards. Fails closed.
+        echo "handover: round $round waiting for validator LIB to cover H=$H..."
+        local lib1 lib2 attempt
+        for attempt in $(seq 1 60); do
+            lib1="$(leap_head_lib "$LEAP_V1_API" 2>/dev/null | cut -d' ' -f2)"
+            lib2="$(leap_head_lib "$LEAP_V2_API" 2>/dev/null | cut -d' ' -f2)"
+            if [[ -n "${lib1:-}" && -n "${lib2:-}" && "$lib1" -ge "$H" && "$lib2" -ge "$H" ]]; then
+                echo "handover: LIB covers H on both validators [$lib1 $lib2]"
+                break
+            fi
+            [[ "$attempt" == 60 ]] && fail "validator LIB never reached H=$H ([${lib1:-?} ${lib2:-?}])"
+            sleep 2
+        done
+        # Freeze: SIGSTOP-via-pause is instant. The exact-H anchor is the
+        # pre-pause snapshot above (create_snapshot costs ~0.36s of the 0.5s
+        # block interval, so the pause always lands a block or two past H).
+        # The pause just stops the network for the static tail: record the
+        # actual frozen head P, require P-H to be small (a large gap means
+        # the pause mechanism itself is broken), and require every validator
+        # to converge to P. All cutover proofs still reference H exactly.
+        echo "handover: round $round freezing the producer (snapshot holds H=$H)..."
+        local freeze_code
+        freeze_code=0
+        python3 - "$producer_cid" "$H" "$LEAP_API" <<'PYEOF' || freeze_code=$?
+import json, subprocess, sys, time, urllib.request
+cid, target, api = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def head():
+    req = urllib.request.Request(api + "/v1/chain/get_info", data=b"{}",
+                                 headers={"Content-Type": "application/json",
+                                          "Host": "0.0.0.0:8888"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)["head_block_num"]
+deadline = time.time() + 120
+h = head()
+while h < target:
+    if time.time() > deadline:
+        print(f"head never reached H={target}", file=sys.stderr)
+        sys.exit(1)
+    time.sleep(0.01)
+    h = head()
+r = subprocess.run(["docker", "pause", cid], capture_output=True, text=True)
+if r.returncode != 0:
+    print(f"docker pause failed: {r.stderr}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        [[ "$freeze_code" == 0 ]] || fail "producer freeze failed"
+        # The paused producer cannot report its own head, so P comes from
+        # the validators: wait until both agree, the head is stable across
+        # 2s, and it sits within a few blocks past H. A large gap means the
+        # pause path is broken, not merely racy.
+        local v1 v2 v1_head v2_head P
+        v1=""; v2=""; P=""
+        for _ in $(seq 1 30); do
+            v1="$(leap_head_lib "$LEAP_V1_API" 2>/dev/null || true)"
+            v2="$(leap_head_lib "$LEAP_V2_API" 2>/dev/null || true)"
+            v1_head="${v1%% *}"; v2_head="${v2%% *}"
+            if [[ -n "$v1_head" && "$v1_head" == "$v2_head" && "$v1_head" -ge "$H" ]]; then
+                sleep 2
+                v1="$(leap_head_lib "$LEAP_V1_API" 2>/dev/null || true)"
+                [[ "${v1%% *}" == "$v1_head" ]] && { P="$v1_head"; break; }
+            fi
+            sleep 1
+        done
+        if [[ -z "$P" || "$((P - H))" -gt 5 ]]; then
+            echo "handover: round $round validators converged to [$v1] [$v2], not within 5 past H=$H; unpausing, retrying..."
+            docker unpause "$producer_cid" >/dev/null 2>&1 || true
+            H=""
+            continue
+        fi
+        echo "handover: producer paused; network frozen at P=$P (snapshot holds exact H=$H)"
+        echo "$P" >"$WORK_DIR/P"
+        break
+    done
+    echo "$H" >"$WORK_DIR/H"
+    echo "$MEMO_BLOCK" >"$WORK_DIR/memo-block"
+    echo "$K" >"$WORK_DIR/cutover-K"
+    echo "$DECL_DIGEST" >"$WORK_DIR/decl-digest"
+    curl --fail --silent --max-time 15 -X POST "$LEAP_V1_API/v1/chain/get_block" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+        -d "{\"block_num_or_id\":\"$H\"}" >"$WORK_DIR/block-H.json" || fail "get_block H=$H failed"
+    H_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK_DIR/block-H.json")"
+    echo "$H_ID" >"$WORK_DIR/H_ID"
+    # The cutover block must be empty (no transactions, no schedule change):
+    # the memo landed strictly below H, so anything in H is foreign traffic.
+    python3 - "$WORK_DIR/block-H.json" <<'PYEOF' || fail "block H=$H is not an empty boundary"
+import json, sys
+b = json.load(open(sys.argv[1]))
+sys.exit(0 if (not b.get("transactions") and not b.get("new_producers")) else 1)
+PYEOF
+    echo "handover: network frozen at P=$(cat "$WORK_DIR/P"), cutover H=$H id=$H_ID; memo block $MEMO_BLOCK (K=$K)"
+    # The snapshot was taken pre-pause on the running producer: bind it to
+    # the cutover H (same id ⇒ same deterministic state) and stage it from
+    # the root-owned producer volume, the legacy pattern. Blocks H+1..P are
+    # rehearsal stragglers past the declared cutoff, ignored by design.
+    [[ "$SNAP_HID" == "$H_ID" ]] || fail "snapshot head $SNAP_HID != frozen H=$H $H_ID"
+    docker run --rm -v pulsevm-handover_leap-data:/d:ro -v "$WORK_DIR:/out" ubuntu:24.04 \
+        cp "/d/snapshots/$(basename "$SNAP_NAME")" /out/snapshot.bin \
+        || fail "snapshot stage failed"
+    echo "$WORK_DIR/snapshot.bin" >"$WORK_DIR/snapshot"
+    echo "handover: exact-H snapshot staged: $WORK_DIR/snapshot.bin"
 }
 
 cmd_halt() {
@@ -316,6 +836,23 @@ json.dump(rec, open(sys.argv[1], "w"), indent=1)
 print(f"  phase 1 confirmed in old chain blocks [{lo},{hi}]")
 PYEOF
     echo "handover: boundary phase 1 sealed at LIB (submit head $b_leap_head)"
+    if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then
+        # Two-step cutover: declare H in advance, memo it on-chain, snapshot
+        # the running producer at H, then freeze the network. (The snapshot
+        # must be taken while the producer runs: a paused producer cannot
+        # serve create_snapshot, and non-producing nodes never complete it.)
+        # The legacy snapshot loop below stays for TWO_STEP_CUTOVER=0
+        # comparison runs.
+        two_step_ceremony_and_freeze
+    fi
+    # TWO_STEP_CUTOVER=0 is retired: the restore gate requires the two-step
+    # pair (declaration + confirmation + on-chain ceremony), and a legacy
+    # single-step manifest no longer boots. Fail fast instead of running a
+    # ceremony the gate will reject.
+    if [[ "${TWO_STEP_CUTOVER:-1}" == "0" ]]; then
+        fail "TWO_STEP_CUTOVER=0 is retired: the restore gate requires the two-step cutover pair; run without it (default)"
+    # Legacy acquisition below is unreachable; kept for archaeology.
+    # (Kept at cmd_halt indent: this whole block is the legacy path.)
     # The migration anchor must be an empty block (no transactions, no
     # schedule change) for the id-exact attach. Snapshot heads usually are,
     # but a boundary transaction can land in one; retry until empty.
@@ -369,9 +906,14 @@ PYEOF
         cp "/d/snapshots/$(basename "$snap_host")" /out/snapshot.bin \
         || fail "snapshot stage failed"
     echo "$WORK_DIR/snapshot.bin" >"$WORK_DIR/snapshot"
+    fi # end legacy acquisition; the shared tail below runs in both modes
+    # Shared tail: stop the network, prove the freeze, let the shadow absorb
+    # H, checkpoint. H/H_ID/block-H.json/snapshot are staged above.
     # Full network halt: stop the producer and both validators. The XPR
     # chain must freeze: no new blocks may appear in the shared block log
-    # after the stop.
+    # after the stop. A two-step freeze leaves the producer paused: unpause
+    # first (the snapshot is staged, stragglers are ignored by design).
+    docker unpause "$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)" >/dev/null 2>&1 || true
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer xpr-validator-1 xpr-validator-2)
     # The block log lives in a root-owned Docker volume: read its size from
     # a throwaway container rather than stat(1) on the host mountpoint.
@@ -403,7 +945,18 @@ PYEOF
     done
     shadow_h="$(shadow_head)"
     [[ "$shadow_h" -ge "$H" ]] || fail "shadow never absorbed H=$H (stuck at $shadow_h)"
-    echo "handover: shadow absorbed H (shadow $shadow_h); checkpointing..."
+    # Id-exact absorption: height is not enough — the shadow must hold the
+    # same terminal block id the snapshot binds, or the replay diverged and
+    # the checkpoint would seal a foreign history.
+    shadow_resp="$(curl --fail --silent --max-time 15 -X POST "$SHADOW_RPC/" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getBlock","params":{"block_num_or_id":"'"$H"'"}}')" \
+        || fail "shadow block H=$H unreadable"
+    shadow_id="$(printf '%s' "$shadow_resp" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["id"])')" \
+        || fail "shadow getBlock H=$H failed: $shadow_resp"
+    [[ "$shadow_id" == "$H_ID" ]] || fail "shadow absorbed a different H=$H (id $shadow_id != $H_ID)"
+    echo "handover: shadow absorbed exact H=$H id=$H_ID (shadow $shadow_h); checkpointing..."
     # The replay's job ends here: it absorbed the terminal block, and the
     # checkpoint is sealed from static artifacts. Stop it explicitly — from
     # this point only the new network may write.
@@ -443,30 +996,114 @@ cmd_checkpoint() {
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
         || fail "attach tool build failed"
     manifest="$export_dir/migration.snapshot.manifest.json"
-    # The halt ceremony signs the freeze over H with the old schedule's key;
-    # the new network verifies this commitment before promoting.
     # Fixture dev key doubles as the old schedule key (rehearsal only).
     halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
-    # HALT_V2=1 exercises the checkpoint-bound commitment plus the weighted
-    # roster path with a self-contained single-member ceremony: roster
-    # {eosio, fixture key, 1} satisfies the 2/3 quorum on its own. The
-    # fixture chain carries no producers table, so the state cross-check
-    # logs its skip exactly as designed for table-less fixtures.
-    if [[ "${HALT_V2:-0}" == "1" ]]; then
+    if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then
+        # Step two of the cutover: confirm H with the checkpoint and the
+        # successor chain id, attach the pair, and verify offline before any
+        # node boots. The migration genesis mirrors run-local.sh's recipe
+        # (base + checkpoint binding + fixture key) so the derived successor
+        # id matches the boot's exactly. On the memo path the fixture chain
+        # carries no producers table, so the state cross-check logs its skip
+        # exactly as designed for table-less fixtures; on the contract path
+        # the seeded schedule row is exported with the checkpoint, so the
+        # light-client set-equality check runs and must pass.
+        CEREMONY_BIN="${CEREMONY_BIN:-$REPO_ROOT/target/release/examples/xpr_halt_ceremony}"
+        ATTACH_BIN="$REPO_ROOT/target/release/examples/xpr_attach_source_block"
+        VERIFY_BIN="$REPO_ROOT/target/release/examples/xpr_verify_manifest"
+        # Always rebuild: a skipped build silently runs yesterday's tools
+        # against today's manifest, and a rehearsal that verifies with a
+        # stale verifier proves nothing (this exact staleness once failed
+        # the offline check on a weight encoding the code already handled).
+        # Cargo no-ops in seconds when nothing changed.
+        (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_halt_ceremony) || fail "ceremony tool build failed"
+        (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) || fail "attach tool build failed"
+        (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_database --example xpr_verify_manifest) || fail "verifier build failed"
+        H="$(cat "$WORK_DIR/H")"
+        H_ID="$(cat "$WORK_DIR/H_ID")"
+        GENESIS_BASE="${PULSEVM_GENESIS_PATH:-$REPO_ROOT/genesis.json}"
+        GENESIS_KEY="${PULSEVM_GENESIS_INITIAL_KEY:-$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")}"
+        CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256' "$manifest")"
+        jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+            --arg initial_key "$GENESIS_KEY" \
+            '. + {migration_checkpoint_sha256: $checkpoint_sha256, initial_key: $initial_key}' \
+            "$GENESIS_BASE" >"$WORK_DIR/migration.genesis.json" || fail "migration genesis build failed"
+        confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
+            || fail "confirmation failed"
+        echo "handover: $confirm_out"
+        CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
+        NEW_CHAIN="$(printf '%s' "$confirm_out" | awk '{for (i=1;i<=NF;i++) if ($i=="new-chain") print $(i+1)}')"
+        [[ "${#CONF_DIGEST}" == 64 && "${#NEW_CHAIN}" == 64 ]] || fail "could not parse confirmation"
+        echo "$CONF_DIGEST" >"$WORK_DIR/conf-digest"
+        echo "$NEW_CHAIN" >"$WORK_DIR/new-chain"
+        # Vote-timing provenance: the memo block (or the quorum-completion
+        # vote block on the contract path) recorded at freeze time, the
+        # freshness bound K (same lag the declaration was built with), and
+        # the confirmation deadline J. The confirmation itself was signed
+        # off-chain (XPR froze at H), so no confirmation inclusion is
+        # recorded — the verifier notes timing as unprovable for that side.
+        # On the contract path the on-chain ceremony fragment and the
+        # unanimous schedule version ride along; the version must equal H's
+        # header version (rotation between the last vote and H restarts the
+        # ceremony — enforced here, before the manifest seals).
+        attach_args=(
+            --declaration "$WORK_DIR/declaration.json" --confirmation "$WORK_DIR/confirmation.json"
+            --declaration-inclusion "$(cat "$WORK_DIR/memo-block")"
+            --max-declaration-lag "${CUTOVER_LAG:-30}"
+            --max-confirmation-lag "${CONFIRM_LAG:-120}"
+        )
+        if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
+            h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')"
+            vote_version="$(cat "$WORK_DIR/schedule-version")"
+            [[ "$h_version" == "$vote_version" ]] \
+                || fail "schedule rotated between the last vote (version $vote_version) and H (version $h_version)"
+            echo "handover: schedule version $h_version unanimous across votes and H"
+            attach_args+=(--contract-ceremony "$WORK_DIR/fragment.json" --schedule-version "$h_version")
+        fi
+        "$ATTACH_BIN" \
+            "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+            "${attach_args[@]}" \
+            || fail "source block attach failed (H must be an empty block)"
+        mv "$manifest.attached" "$manifest"
+        "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" \
+            || fail "offline pair verification failed"
+        # Explicit flip gate (not just phase ordering): the boot below
+        # refuses to proceed unless this marker binds the exact manifest,
+        # checkpoint, confirmation, and successor chain it verified.
+        printf '%s %s %s %s\n' \
+            "$(sha256sum "$manifest" | awk '{print $1}')" \
+            "$CHECKPOINT_SHA256" \
+            "$CONF_DIGEST" \
+            "$NEW_CHAIN" >"$WORK_DIR/verification-pass" \
+            || fail "verification marker write failed"
+        echo "handover: two-step pair attached and verified: declaration $(cat "$WORK_DIR/decl-digest") -> confirmation $CONF_DIGEST on $NEW_CHAIN"
+    elif [[ "${HALT_V2:-0}" == "1" ]]; then
+        # Retired: the restore gate requires the two-step pair, so a
+        # single-step commitment manifest no longer boots.
+        fail "HALT_V2=1 is retired: the restore gate requires the two-step cutover pair"
+        (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
+            || fail "attach tool build failed"
         roster_key="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
         printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
         "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
             "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
             --halt-key-v2 "$halt_key" --halt-roster "$WORK_DIR/roster.json" \
             || fail "source block attach failed (H must be an empty block)"
+        mv "$manifest.attached" "$manifest"
+        echo "handover: halt commitment signed over H=$H"
     else
+        (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
+            || fail "attach tool build failed"
+        # Retired: a roster-less v1 commitment no longer boots. This else
+        # branch is unreachable; the two-step pair above is the only path.
+        fail "legacy v1 halt commitment is retired: the restore gate requires the two-step cutover pair"
         "$REPO_ROOT/target/release/examples/xpr_attach_source_block" \
             "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
             --halt-key "$halt_key" \
             || fail "source block attach failed (H must be an empty block)"
+        mv "$manifest.attached" "$manifest"
+        echo "handover: halt commitment signed over H=$H"
     fi
-    mv "$manifest.attached" "$manifest"
-    echo "handover: halt commitment signed over H=$H"
     echo "$export_dir/migration.snapshot" >"$WORK_DIR/checkpoint"
     echo "handover: checkpoint ready: $export_dir/migration.snapshot"
     cmd_boot "$export_dir/migration.snapshot"
@@ -476,6 +1113,24 @@ cmd_boot() {
     checkpoint="${1:?checkpoint required}"
     H="$(cat "$WORK_DIR/H")"
     H_ID="$(cat "$WORK_DIR/H_ID")"
+    if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then
+        # Explicit flip gate: tip == H AND the confirmation finalized AND the
+        # manifest still binds that tip — the boot refuses to proceed unless
+        # the offline verifier passed on this exact manifest, checkpoint,
+        # confirmation, and successor chain. The staged block is re-read
+        # here (not trusted from an earlier shell variable) so a swapped or
+        # truncated workdir fails instead of booting the wrong history.
+        marker="$WORK_DIR/verification-pass"
+        [[ -f "$marker" ]] || fail "refusing to boot: no verification-pass marker (confirmation not finalized)"
+        manifest="${checkpoint}.manifest.json"
+        expected="$(sha256sum "$manifest" | awk '{print $1}') $(jq -er '.checkpoint_sha256' "$manifest") $(cat "$WORK_DIR/conf-digest") $(cat "$WORK_DIR/new-chain")"
+        [[ "$(cat "$marker")" == "$expected" ]] || fail "refusing to boot: verification-pass marker does not match this checkpoint/manifest"
+        staged_id="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["id"])')"
+        [[ "$staged_id" == "$H_ID" ]] || fail "refusing to boot: staged block id $staged_id != frozen H=$H $H_ID"
+        manifest_tip="$(jq -er '.source_block_id' "$manifest")"
+        [[ "$manifest_tip" == "$H_ID" ]] || fail "refusing to boot: manifest tip $manifest_tip != frozen H=$H $H_ID"
+        echo "handover: flip gate open: tip H=$H id=$H_ID plus verified confirmation $(cat "$WORK_DIR/conf-digest")"
+    fi
     echo "handover: booting the five-node network from the H=$H checkpoint (background)..."
     # Dedicated plugin dir: the repo build/plugins file may be mapped by
     # another live network on a shared host (ETXTBSY on overwrite).
@@ -643,6 +1298,7 @@ print(s)")"
     # so compare decoded payloads, not strings.
     echo "handover: proving migrated state equals pre-halt XPR state..."
     python3 - "$WORK_DIR/pre-halt-accounts.json" "$rpc_url" <<'PYEOF' || fail "migrated state mismatch"
+import json, os, sys, urllib.request
 import json, sys, urllib.request
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 def b58decode(s):
@@ -678,6 +1334,11 @@ def get_account(rpc, name):
         return json.load(r)["result"]
 pre, rpc = sys.argv[1], sys.argv[2]
 old = json.load(open(pre))
+# The declaration memo accounts are pre-cutover state too: prove they
+# migrated alongside the pre-halt traffic (absent on legacy runs).
+memo_path = os.path.join(os.path.dirname(pre), "memo-accounts.json")
+if os.path.exists(memo_path):
+    old.update(json.load(open(memo_path)))
 bad = 0
 for name, old_acct in sorted(old.items()):
     try:
@@ -750,15 +1411,37 @@ if phase3 & old_ids:
 print(f"boundary: {len(phase1) + len(phase3) - bad}/{len(phase1) + len(phase3)} txs exactly-once")
 sys.exit(1 if bad else 0)
 PYEOF
-    echo "handover: PASS: block $((H + 1)) builds on committed halt block $H_ID with identical migrated state and exactly-once boundary traffic; shadow chain $old_chain -> new chain $new_chain"
+    if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then
+        MEMO_BLOCK="$(cat "$WORK_DIR/memo-block" 2>/dev/null || echo ?)"
+        CUTOVER_K="$(cat "$WORK_DIR/cutover-K" 2>/dev/null || echo ?)"
+        DECL_DIGEST="$(cat "$WORK_DIR/decl-digest" 2>/dev/null || echo ?)"
+        CONF_DIGEST="$(cat "$WORK_DIR/conf-digest" 2>/dev/null || echo ?)"
+        if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
+            CONTRACT_ACCT="$(cat "$WORK_DIR/contract-account" 2>/dev/null || echo ?)"
+            SCHED_VERSION="$(cat "$WORK_DIR/schedule-version" 2>/dev/null || echo ?)"
+            echo "handover: PASS: two-step contract cutover declared H=$H at vote block $MEMO_BLOCK (K=$CUTOVER_K, contract $CONTRACT_ACCT, schedule version $SCHED_VERSION, declaration $DECL_DIGEST), confirmed $CONF_DIGEST binding checkpoint and new chain; block $((H + 1)) builds on H=$H_ID with identical migrated state and exactly-once boundary traffic; shadow chain $old_chain -> new chain $new_chain"
+        else
+            echo "handover: PASS: two-step cutover declared H=$H at memo block $MEMO_BLOCK (K=$CUTOVER_K, declaration $DECL_DIGEST), confirmed $CONF_DIGEST binding checkpoint and new chain; block $((H + 1)) builds on H=$H_ID with identical migrated state and exactly-once boundary traffic; shadow chain $old_chain -> new chain $new_chain"
+        fi
+    else
+        echo "handover: PASS: block $((H + 1)) builds on committed halt block $H_ID with identical migrated state and exactly-once boundary traffic; shadow chain $old_chain -> new chain $new_chain"
+    fi
     echo "handover: new network RPC: $rpc_url (left running; run stop to tear down)"
 }
 
 cmd_stop() {
     if [[ -f "$WORK_DIR/five-node.pid" ]]; then
-        kill "$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
-        pkill -f metal-network-runner 2>/dev/null || true
+        # Setsid group kill: exactly our supervisor tree, never a foreign
+        # network sharing this host (see fail() above). The runner can
+        # escape the group (reparented to init), so also reclaim exactly
+        # our runner ports — the boot gate guarantees a holder is ours.
+        kill -- "-$(cat "$WORK_DIR/five-node.pid")" 2>/dev/null || true
+        for _port in "${PULSEVM_RUNNER_PORT:-18080}" "${PULSEVM_RUNNER_GATEWAY_PORT:-18081}"; do
+            _victims="$(lsof -ti "tcp:${_port}" -sTCP:LISTEN 2>/dev/null || true)"
+            [[ -n "$_victims" ]] && kill $_victims 2>/dev/null || true
+        done
     fi
+    docker rm -f pulsevm-handover-snapshotter 2>/dev/null || true
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml down --volumes 2>/dev/null) || true
     # Archive instead of deleting: the workdir holds the evidence trail
     # (H, checkpoint pointer, pre-halt state) for post-mortems and resumes.
@@ -782,6 +1465,12 @@ case "${1:-}" in
        echo "env: TERMINAL_HEIGHT (default 300, ~3 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
        echo "     LEAP_HTTP_PORT, LEAP_V1_HTTP_PORT, LEAP_V2_HTTP_PORT, SHADOW_RPC_PORT," >&2
+       echo "     TWO_STEP_CUTOVER must stay 1 (legacy 0 is retired: the restore" >&2
+       echo "       gate requires the two-step cutover pair)," >&2
+       echo "     CUTOVER_LAG (blocks between declaration and H; default 30)," >&2
+       echo "     CONFIRM_LAG (confirmation deadline past H in blocks; default 120)," >&2
+       echo "     CUTOVER_VEHICLE=contract (on-chain cutover contract instead of memo" >&2
+       echo "       accounts for the step-one declaration; default memo)," >&2
        echo "     CHAOS_KILL_NODE=1 (drop one validator before H+1; default off)" >&2
        exit 2 ;;
 esac

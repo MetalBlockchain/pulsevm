@@ -1,0 +1,27 @@
+[Unit]
+Description=XPR cutover auto-voter (signs the halt declaration and confirmation with the block-signing key)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cutover
+Group=cutover
+# The binary is built from the release: cargo build --locked --release -p pulsevm_core --example xpr_cutover_voter
+ExecStart=/usr/local/bin/xpr_cutover_voter --config /etc/cutover/voter.json
+# The config and both key files must be owner-only (the voter refuses otherwise).
+UMask=0077
+# Never restart blindly into a signing loop: a crash means the operator looks
+# before re-arming. The vote window is hours wide; missing it by restarting
+# into a bad state is worse than paging.
+Restart=no
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Logs go to the journal: every decision and its reason, never any key.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -151,7 +151,6 @@ use pulsevm_database::{
     PermissionLevelWeight,
     TimePoint,
     TransactionDependencies,
-    check_halt_roster_against_state,
     estimate_parallel_waves,
     migration_state_producer_keys,
     seconds,
@@ -1336,7 +1335,7 @@ impl Controller {
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
         let mut migration_source_block = None;
-        let mut migration_roster: Option<Vec<pulsevm_database::HaltRosterEntry>> = None;
+        let migration_roster: Option<Vec<pulsevm_database::HaltRosterEntry>>;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
@@ -1361,6 +1360,12 @@ impl Controller {
                         "migration genesis is missing migration_checkpoint_sha256".into(),
                     )
                 })?;
+            // The migration's successor identity is committed by the
+            // migration genesis itself (deterministic and known to the
+            // ceremony), not by the platform-assigned chain id, which the
+            // launcher may allocate. The two-step confirmation binds this
+            // derived id; platform divergence stays on the warning path.
+            let migration_derived_chain_id = Id::new(rust_genesis.compute_chain_id());
             if manifest.checkpoint_sha256 != hex::encode(expected_checkpoint_sha256) {
                 return Err(ChainError::GenesisError(format!(
                     "migration manifest checkpoint hash {} does not match migration genesis {}",
@@ -1372,20 +1377,24 @@ impl Controller {
             // The new network only promotes state the old network agreed to
             // freeze: when the manifest carries the producers' signed halt
             // commitment, verify it against the terminal block before the
-            // checkpoint is trusted. The shared dispatch covers version 1
-            // (single key) and version 2 (checkpoint-bound), with a weighted
-            // two-thirds quorum when the manifest carries a roster.
-            if manifest.halt_commitment.is_some() {
+            // checkpoint is trusted. The two-step pair is mandatory: a
+            // manifest without the declaration and its confirmation restores
+            // nothing, and a legacy commitment without a roster proves no
+            // schedule quorum. Both versions verify against the attached
+            // weighted roster under the strict two-thirds quorum.
+            {
+                if manifest.halt_declaration.is_none() {
+                    return Err(ChainError::GenesisError(
+                        "migration restore requires the two-step cutover pair: manifest carries no halt declaration"
+                            .into(),
+                    ));
+                }
                 let source_block = migration_source_block.as_ref().ok_or_else(|| {
                     ChainError::GenesisError(
-                        "migration halt commitment requires an attached source block".into(),
+                        "migration halt proof requires an attached source block".into(),
                     )
                 })?;
                 let source_id = source_block.id()?;
-                let roster = manifest.roster_entries().map_err(|error| {
-                    ChainError::GenesisError(format!("migration halt roster rejected: {error}"))
-                })?;
-                migration_roster = roster.clone();
                 let checkpoint_bytes = hex::decode(&manifest.checkpoint_sha256).map_err(|e| {
                     ChainError::GenesisError(format!(
                         "migration manifest checkpoint hash invalid: {e}"
@@ -1396,13 +1405,47 @@ impl Controller {
                         "migration manifest checkpoint hash has the wrong length".into(),
                     )
                 })?;
-                pulsevm_database::verify_migration_halt_commitment(
+                // The two-step cutover pair is mandatory: the declaration
+                // commits the source schedule to H before H exists, the
+                // confirmation chains H, the checkpoint, and this chain's
+                // id to that declaration, and pre-commitment timing must
+                // be provable (on-chain ceremony or recorded declaration
+                // inclusion). The declared set feeds the checkpoint-state
+                // cross-check below.
+                let roster = pulsevm_database::verify_migration_halt_pair(
                     &manifest,
                     source_block.block_num(),
                     &source_id.0.0,
                     &checkpoint_arr,
+                    &migration_derived_chain_id.0.0,
                 )
                 .map_err(ChainError::GenesisError)?;
+                migration_roster = Some(roster);
+                // Audit trail: what the old schedule committed to, in
+                // whose favor, over which terminal block — re-derivable
+                // by anyone holding the manifest.
+                if let Some(declaration) = manifest.halt_declaration.as_ref() {
+                    let digest = declaration.digest().map(hex::encode).unwrap_or_default();
+                    let successor = manifest
+                        .halt_confirmation
+                        .as_ref()
+                        .map(|confirmation| confirmation.new_chain_id.clone())
+                        .unwrap_or_default();
+                    info!(
+                        "migration cutover pair verified: declaration {digest} over height {} ({} members) confirms to {successor}",
+                        declaration.last_height,
+                        declaration.validator_set.len(),
+                    );
+                }
+                if manifest.halt_commitment.is_some() {
+                    pulsevm_database::verify_migration_halt_commitment(
+                        &manifest,
+                        source_block.block_num(),
+                        &source_id.0.0,
+                        &checkpoint_arr,
+                    )
+                    .map_err(ChainError::GenesisError)?;
+                }
             }
             if self.db.revision() <= 0 {
                 let header = self
@@ -1486,11 +1529,12 @@ impl Controller {
                 }
             }
             // Bind the transported roster to checkpoint content now that the
-            // state is restored: every rostered name must resolve to the
-            // same signing key in the checkpoint's own producers table, so
-            // the exporter cannot invent members. Real XPR checkpoints
-            // always carry that table; synthetic fixtures without one skip
-            // the check (logged) instead of failing.
+            // state is restored. The declared set must MATCH the on-chain
+            // schedule exactly (the light-client rule: same set both ways,
+            // same keys, same weights), so a declaration naming only its
+            // signer fails closed. Real XPR checkpoints always carry the
+            // producers table; synthetic fixtures without one skip the
+            // check (logged) instead of failing.
             if let Some(roster) = migration_roster.as_ref() {
                 let state_keys = migration_state_producer_keys(&self.db).map_err(|error| {
                     ChainError::GenesisError(format!(
@@ -1502,13 +1546,19 @@ impl Controller {
                         "migration roster state cross-check skipped: no producers table in checkpoint state"
                     );
                 } else {
-                    let bound =
-                        check_halt_roster_against_state(roster, &state_keys).map_err(|error| {
+                    match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)
+                        .map_err(|error| {
                             ChainError::GenesisError(format!(
-                                "migration halt roster rejected by checkpoint state: {error}"
+                                "migration halt roster rejected by checkpoint schedule: {error}"
                             ))
-                        })?;
-                    info!("migration halt roster bound to checkpoint state: {bound} producers");
+                        })? {
+                        Some(matched) => info!(
+                            "migration halt roster matches checkpoint schedule: {matched} producers"
+                        ),
+                        None => warn!(
+                            "migration roster schedule match skipped: no producers table in checkpoint state"
+                        ),
+                    }
                 }
             }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
@@ -10392,6 +10442,21 @@ mod tests {
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        // The restore requires the cutover pair even for synthetic
+        // fixtures: single-member roster signed by the genesis key.
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[1],
+            &[0],
+        )?;
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
         controller.initialize(
@@ -10428,8 +10493,14 @@ mod tests {
         assert_eq!(restarted.last_accepted_block().id()?, source_block_id);
         restarted.shutdown()?;
 
-        manifest.import_summary.input_transactions = 2;
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+        // Mutate the file in place so the attached pair survives: only the
+        // dedupe count diverges, and the restore must fail on that.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to re-read manifest: {e}")))?;
+        let mut mismatched: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        mismatched["import_summary"]["input_transactions"] = json!(2);
+        fs::write(&manifest_path, serde_json::to_vec(&mismatched).unwrap()).map_err(|e| {
             ChainError::InternalError(format!(
                 "failed to write mismatched migration manifest {}: {e}",
                 manifest_path.display()
@@ -10461,7 +10532,7 @@ mod tests {
     async fn migration_checkpoint_with_schedule_key(
         temp: &TempDir,
         schedule_key: &PrivateKey,
-    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64), ChainError> {
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
         // Build a real source chain so the checkpoint carries complete state
         // (accounts, permissions, resources, chain config): fresh genesis,
         // one accepted block, then a portable snapshot of that state.
@@ -10538,7 +10609,121 @@ mod tests {
             source_block_id,
             source_block.block_num(),
             source_revision,
+            source_chain_id.0.0,
         ))
+    }
+
+    // Attaches a valid two-step cutover pair plus the mandatory on-chain
+    // ceremony evidence, matching the roster shape the ceremony exporter
+    // produces: members carry (producer, schedule key, weight) and only
+    // `sign_subset` indices sign, so the declared set, the transport
+    // roster, and the recomputed tally agree. Votes and finalization land
+    // in the block before H; no freshness window is claimed.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_halt_pair(
+        manifest_path: &str,
+        migration_genesis: &[u8],
+        source_chain_id: &[u8; 32],
+        source_block_num: u32,
+        source_block_id: &Id,
+        keys: &[pulsevm_crypto::K1PrivateKey],
+        producers: &[&str],
+        weights: &[u64],
+        sign_subset: &[usize],
+    ) -> Result<(), ChainError> {
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let checkpoint_hex = manifest["checkpoint_sha256"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?;
+        let new_chain_id =
+            pulsevm_database::GenesisState::from_bytes(migration_genesis)?.compute_chain_id();
+        let mut members = Vec::with_capacity(producers.len());
+        for ((producer, key), weight) in producers.iter().zip(keys.iter()).zip(weights.iter()) {
+            members.push(pulsevm_database::HaltDeclarationMember {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(u128::from(*weight)),
+            });
+        }
+        pulsevm_database::HaltDeclaration::sort_members(&mut members);
+        let unsigned = pulsevm_database::HaltDeclaration {
+            version: pulsevm_database::HaltDeclaration::VERSION,
+            source_chain_id: hex::encode(source_chain_id),
+            last_height: source_block_num,
+            validator_set: members,
+            signatures: Vec::new(),
+        };
+        let decl_digest = unsigned.digest()?;
+        let mut signatures = Vec::with_capacity(sign_subset.len());
+        for &index in sign_subset {
+            signatures.push(pulsevm_database::HaltSignature {
+                producer: producers[index].to_string(),
+                key: keys[index].public_key().to_string(),
+                signature: keys[index].sign(&decl_digest).to_string(),
+            });
+        }
+        let declaration = pulsevm_database::HaltDeclaration {
+            signatures: signatures.clone(),
+            ..unsigned
+        };
+        let template = pulsevm_database::HaltConfirmation {
+            version: pulsevm_database::HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(declaration.digest()?),
+            halt_height: source_block_num,
+            halt_block_id: hex::encode(source_block_id.as_bytes()),
+            checkpoint_sha256: checkpoint_hex.to_string(),
+            new_chain_id: hex::encode(new_chain_id),
+            signatures: Vec::new(),
+        };
+        let conf_digest = template.digest()?;
+        let mut confirmations = Vec::with_capacity(sign_subset.len());
+        for &index in sign_subset {
+            confirmations.push(pulsevm_database::HaltSignature {
+                producer: producers[index].to_string(),
+                key: keys[index].public_key().to_string(),
+                signature: keys[index].sign(&conf_digest).to_string(),
+            });
+        }
+        let confirmation = pulsevm_database::HaltConfirmation {
+            signatures: confirmations,
+            ..template
+        };
+        let prior = source_block_num.saturating_sub(1);
+        let mut votes = Vec::with_capacity(sign_subset.len());
+        let mut voted_weight: u128 = 0;
+        for (position, &index) in sign_subset.iter().enumerate() {
+            votes.push(pulsevm_database::HaltContractVote {
+                producer: producers[index].to_string(),
+                block: prior,
+                key: keys[index].public_key().to_string(),
+                signature: signatures[position].signature.clone(),
+            });
+            voted_weight += u128::from(weights[index]);
+        }
+        let total_weight: u128 = weights.iter().map(|weight| u128::from(*weight)).sum();
+        let ceremony = pulsevm_database::HaltContractCeremony {
+            contract: "cutover".to_string(),
+            declaration_digest: hex::encode(decl_digest),
+            total_weight: pulsevm_chain_types::HaltWeight(total_weight),
+            voted_weight: pulsevm_chain_types::HaltWeight(voted_weight),
+            finalized: true,
+            finalized_block: prior,
+            votes,
+        };
+        manifest["halt_declaration"] = serde_json::to_value(&declaration)
+            .map_err(|e| ChainError::InternalError(format!("failed to encode declaration: {e}")))?;
+        manifest["halt_confirmation"] = serde_json::to_value(&confirmation).map_err(|e| {
+            ChainError::InternalError(format!("failed to encode confirmation: {e}"))
+        })?;
+        manifest["halt_contract_ceremony"] = serde_json::to_value(&ceremony)
+            .map_err(|e| ChainError::InternalError(format!("failed to encode ceremony: {e}")))?;
+        manifest["halt_schedule_version"] = json!(1);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
     }
 
     // Signs the old network's halt commitment over a migration source block
@@ -10594,7 +10779,23 @@ mod tests {
             source_block_id,
             source_block_num,
             source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[1],
+            &[0],
+        )?;
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
@@ -10641,10 +10842,26 @@ mod tests {
             manifest_path,
             migration_genesis,
             chain_id,
-            _source_block_id,
-            _source_block_num,
+            source_block_id,
+            source_block_num,
             source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[1],
+            &[0],
+        )?;
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": foreign_key.to_string(),
@@ -10678,10 +10895,10 @@ mod tests {
         Ok(())
     }
 
-    // The new network only promotes committed state: a manifest carrying
-    // a valid halt commitment restores and builds.
+    // The two-step pair is mandatory: a manifest carrying only a legacy
+    // halt commitment, and no declaration, refuses to restore.
     #[tokio::test]
-    async fn migration_restore_accepts_signed_halt_commitment() -> Result<(), ChainError> {
+    async fn migration_restore_rejects_manifest_without_halt_pair() -> Result<(), ChainError> {
         let schedule_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let temp = get_temp_dir();
@@ -10692,7 +10909,8 @@ mod tests {
             chain_id,
             source_block_id,
             source_block_num,
-            source_revision,
+            _source_revision,
+            _source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
         attach_halt_commitment(
             &manifest_path,
@@ -10711,28 +10929,23 @@ mod tests {
         .into_bytes();
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
-        controller.initialize(
-            &chain_id,
-            &config_bytes,
-            &migration_genesis,
-            target_path.to_str().unwrap(),
-        )?;
-        assert_eq!(controller.database().revision(), source_revision);
-        let now = TimePointSec::now().sec_since_epoch();
-        let mut mempool = Mempool::new();
-        mempool.add_transaction(create_account_with_expiration(
-            &schedule_key,
-            Name::from_str("carol")?,
-            chain_id,
-            TimePointSec::new(now + 1800),
-        )?);
-        let block = controller.build_block(&mut mempool).await?;
-        assert_eq!(block.block_num(), source_block_num + 1);
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("two-step cutover pair"),
+            "a manifest without the pair must fail closed, got: {error}"
+        );
         Ok(())
     }
 
-    // A corrupted halt commitment fails the restore closed: no signature,
-    // no promotion.
+    // A corrupted halt commitment fails the restore closed even when the
+    // pair verifies: no signature, no promotion.
     #[tokio::test]
     async fn migration_restore_rejects_tampered_halt_commitment() -> Result<(), ChainError> {
         let schedule_key =
@@ -10746,14 +10959,45 @@ mod tests {
             source_block_id,
             source_block_num,
             _source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
-        attach_halt_commitment(
+        let keys = halt_v2_keys()?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+        )?;
+        attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
             &source_block_id,
-            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
-            true,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+            false,
         )?;
+        // Corrupt one commitment signature in place; the rostered quorum no
+        // longer verifies.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let signature = manifest["halt_commitment"]["signatures"][0]["signature"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("commitment has no signature".into()))?;
+        let mut tampered = signature.to_string();
+        tampered.pop();
+        tampered.push('1');
+        manifest["halt_commitment"]["signatures"][0]["signature"] = json!(tampered);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
@@ -10875,8 +11119,20 @@ mod tests {
             source_block_id,
             source_block_num,
             source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
         let keys = halt_v2_keys()?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+        )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
@@ -10923,8 +11179,20 @@ mod tests {
             source_block_id,
             source_block_num,
             _source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
         let keys = halt_v2_keys()?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+        )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
@@ -10975,8 +11243,20 @@ mod tests {
             source_block_id,
             source_block_num,
             _source_revision,
+            source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
         let keys = halt_v2_keys()?;
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &keys,
+            &["prod.a", "prod.b"],
+            &[2, 1],
+            &[0, 1],
+        )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
@@ -11027,6 +11307,7 @@ mod tests {
             _source_block_id,
             _source_block_num,
             _source_revision,
+            _source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
         let manifest_bytes = fs::read(&manifest_path)
             .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;

@@ -1,0 +1,23 @@
+{
+  "_comment": "xpr_cutover_voter config. Copy, fill in, chmod 600. The voter refuses to start if either key file is readable by group or others.",
+  "nodeos_url": "http://127.0.0.1:8888",
+  "host_header": "0.0.0.0:8888",
+  "contract": "cutover",
+  "producer": "yourproducer",
+  "source_chain_id": "<64 hex chars of the XPR chain id, published with the ceremony>",
+  "height": 123456789,
+  "roster_file": "/etc/cutover/roster.json",
+  "vote_key_file": "/etc/cutover/vote.key",
+  "payer_account": "yourproducer",
+  "payer_key_file": "/etc/cutover/payer.key",
+  "poll_secs": 5,
+  "dry_run": false,
+  "enabled": true,
+  "confirmation": {
+    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly.",
+    "coordinator_url": "https://cutover-coordinator.example.com",
+    "out_file": "/var/lib/cutover/confirmation.json",
+    "migration_genesis": "/etc/cutover/migration.genesis.json",
+    "checkpoint_sha256": null
+  }
+}

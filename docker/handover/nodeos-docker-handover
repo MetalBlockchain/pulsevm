@@ -8,7 +8,9 @@
 set -euo pipefail
 
 readonly image="${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}"
-readonly platform="${XPR_NODEOS_PLATFORM:-linux/amd64}"
+# XPR_PLATFORM is the rehearsal-wide knob (compose services); XPR_NODEOS_PLATFORM
+# overrides for the export container only when set explicitly.
+readonly platform="${XPR_NODEOS_PLATFORM:-${XPR_PLATFORM:-linux/amd64}}"
 # The export container attaches to the localnet network; the standalone
 # localnet runner creates it, so ensure it here for rehearsal-only flows
 # (no-op when it already exists).

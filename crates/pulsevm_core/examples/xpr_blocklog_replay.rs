@@ -280,7 +280,16 @@ async fn replay_get_block(
             .map_err(|error| replay_rpc_error(500, error.to_string()))?
             .ok_or_else(|| replay_rpc_error(404, format!("block {identifier} not found")))?
     };
-    serde_json::to_value(block).map_err(|error| replay_rpc_error(500, error.to_string()))
+    // The terminal-cutover flip gate compares this id against the frozen
+    // source block id, so the response carries it explicitly (the block
+    // body itself has no top-level id field).
+    let id = block
+        .id()
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let mut value =
+        serde_json::to_value(block).map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    value["id"] = serde_json::Value::String(id.to_string());
+    Ok(value)
 }
 
 async fn replay_get_account(
