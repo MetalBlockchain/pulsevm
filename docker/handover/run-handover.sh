@@ -58,6 +58,7 @@ fail() {
     if [[ -f "${WORK_DIR:-/nonexistent}/shadow.pid" ]]; then
         kill "$(cat "$WORK_DIR/shadow.pid")" 2>/dev/null || true
     fi
+    kill_relaunched
     exit 1
 }
 
@@ -969,6 +970,133 @@ PYEOF
     cmd_checkpoint
 }
 
+# Confirm the frozen declaration against the terminal block, attach the
+# pair to the manifest, verify offline, and write the flip-gate marker.
+# Factored (not inline) because the rehearsal may run it twice: once with
+# the derived platform id, and again with the id learned from the first
+# boot when the runner assigns chain ids non-deterministically
+# (see learn_then_bind_retry below).
+confirm_attach_verify() { # $1=platform-chain-id
+    local platform_chain="$1"
+    local confirm_out CONF_DIGEST NEW_CHAIN h_version vote_version
+    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
+        || fail "confirmation failed"
+    echo "handover: $confirm_out"
+    CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
+    NEW_CHAIN="$(printf '%s' "$confirm_out" | awk '{for (i=1;i<=NF;i++) if ($i=="new-chain") print $(i+1)}')"
+    [[ "${#CONF_DIGEST}" == 64 && "${#NEW_CHAIN}" == 64 ]] || fail "could not parse confirmation"
+    echo "$CONF_DIGEST" >"$WORK_DIR/conf-digest"
+    echo "$NEW_CHAIN" >"$WORK_DIR/new-chain"
+    attach_args=(
+        --declaration "$WORK_DIR/declaration.json" --confirmation "$WORK_DIR/confirmation.json"
+        --declaration-inclusion "$(cat "$WORK_DIR/memo-block")"
+        --max-declaration-lag "${CUTOVER_LAG:-30}"
+        --max-confirmation-lag "${CONFIRM_LAG:-120}"
+    )
+    if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
+        h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')"
+        vote_version="$(cat "$WORK_DIR/schedule-version")"
+        [[ "$h_version" == "$vote_version" ]] \
+            || fail "schedule rotated between the last vote (version $vote_version) and H (version $h_version)"
+        echo "handover: schedule version $h_version unanimous across votes and H"
+        attach_args+=(--contract-ceremony "$WORK_DIR/fragment.json" --schedule-version "$h_version")
+    fi
+    "$ATTACH_BIN" \
+        "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
+        "${attach_args[@]}" \
+        || fail "source block attach failed (H must be an empty block)"
+    mv "$manifest.attached" "$manifest"
+    "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" \
+        || fail "offline pair verification failed"
+    printf '%s %s %s %s\n' \
+        "$(sha256sum "$manifest" | awk '{print $1}')" \
+        "$CHECKPOINT_SHA256" \
+        "$CONF_DIGEST" \
+        "$NEW_CHAIN" >"$WORK_DIR/verification-pass" \
+        || fail "verification marker write failed"
+    echo "handover: two-step pair attached and verified: declaration $(cat "$WORK_DIR/decl-digest") -> confirmation $CONF_DIGEST on $NEW_CHAIN"
+}
+
+# The runner assigns chain ids non-deterministically, but the confirmation
+# must bind the boot's actual id or the restore gate refuses (fail closed).
+# Production sets PULSEVM_PLATFORM_CHAIN_ID from the launcher (known at
+# T-14); the rehearsal learns it instead: scrape the id the first boot
+# refused, re-run the ceremony against it, and restart the five nodes in
+# place on the same network dir (the id is stable per network, so the
+# relaunched nodes pick up the corrected manifest). Exactly one retry;
+# a second refusal is a real failure, not a staler id.
+learn_then_bind_retry() {
+    [[ -z "${PULSEVM_PLATFORM_CHAIN_ID:-}" ]] \
+        || fail "explicit PULSEVM_PLATFORM_CHAIN_ID mismatches the boot id: fix the launcher id, no auto-retry on an operator-provided value"
+    # confirm_attach_verify runs in cmd_boot's scope, which lacks the
+    # confirm-time locals: rebuild exactly the same values here.
+    export_dir="$(dirname "${checkpoint}.manifest.json")"
+    CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256' "${checkpoint}.manifest.json")"
+    halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
+    CEREMONY_BIN="${CEREMONY_BIN:-$REPO_ROOT/target/release/examples/xpr_halt_ceremony}"
+    ATTACH_BIN="$REPO_ROOT/target/release/examples/xpr_attach_source_block"
+    VERIFY_BIN="${VERIFY_BIN:-$REPO_ROOT/target/release/examples/xpr_verify_manifest}"
+    manifest="${checkpoint}.manifest.json"
+    local netdir actual
+    netdir="$(find "${TMPDIR:-/tmp}" -maxdepth 5 -type d -name 'network_*' -newermt "@$boot_epoch" 2>/dev/null | sort | tail -1)"
+    [[ -n "$netdir" && -d "$netdir" ]] || fail "learn-then-bind: no five-node network dir found to learn the chain id from"
+    actual="$(grep -rhoE 'error creating chain \{"subnetID": "[A-Za-z0-9]+", "chainID": "[A-Za-z0-9]+"' "$netdir"/node*/logs/main.log 2>/dev/null | head -1 | grep -oE 'chainID": "[A-Za-z0-9]+"' | cut -d'"' -f3)"
+    [[ -n "$actual" ]] || fail "learn-then-bind: no refused chain id in the node logs"
+    grep -rq "halt confirmation platform chain id does not match" "$netdir"/node*/logs/main.log 2>/dev/null \
+        || fail "learn-then-bind: nodes refuse for another reason, see $netdir/node*/logs/main.log"
+    echo "handover: learn-then-bind: first boot runs as $actual; re-running the ceremony against it..."
+    confirm_attach_verify "$actual"
+    restart_five_nodes "$netdir"
+}
+
+# Restart the five nodes of one network dir in place (same configs, same
+# chain id) after the manifest was corrected. Records PIDs so stop/fail
+# cleanup reclaims exactly these processes too.
+restart_five_nodes() { # $1=network dir
+    local netdir="$1" n cfg pids pid cmdline
+    pids=""
+    for n in 1 2 3 4 5; do
+        cfg="$netdir/node$n/configs/config.json"
+        [[ -f "$cfg" ]] || fail "learn-then-bind: missing $cfg"
+    done
+    # Capture full command lines before killing: relaunch is byte-identical.
+    # Indexed arrays only (macOS ships bash 3.2: no associative arrays),
+    # and plain `&` children of this script (macOS ships no setsid
+    # binary): fail()/stop reclaim them via five-node.relaunched.
+    CMDS_1=""; CMDS_2=""; CMDS_3=""; CMDS_4=""; CMDS_5=""
+    for n in 1 2 3 4 5; do
+        cmdline="$(ps -eo pid,args | grep "[m]etalgo.*$netdir/node$n/configs" | head -1 | sed -E 's/^ *[0-9]+ //')"
+        [[ -n "$cmdline" ]] || fail "learn-then-bind: node$n process not found"
+        eval "CMDS_$n=\"\$cmdline\""
+        pids="$pids $(ps -eo pid,args | grep "[m]etalgo.*$netdir/node$n/configs" | head -1 | awk '{print $1}')"
+    done
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        # shellcheck disable=SC2086
+        kill -0 $pids 2>/dev/null || break
+        sleep 2
+    done
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+    : >"$WORK_DIR/five-node.relaunched"
+    for n in 1 2 3 4 5; do
+        eval "cmdline=\"\$CMDS_$n\""
+        bash -c "$cmdline" >>"$WORK_DIR/node-restart-$n.log" 2>&1 &
+        echo $! >>"$WORK_DIR/five-node.relaunched"
+    done
+    echo "handover: five nodes relaunched in place on the corrected manifest"
+}
+
+# Reclaim processes relaunched outside the supervisor group (see
+# restart_five_nodes). Called from fail() and cmd_stop().
+kill_relaunched() {
+    if [[ -f "${WORK_DIR:-/nonexistent}/five-node.relaunched" ]]; then
+        # shellcheck disable=SC2086
+        kill $(cat "$WORK_DIR/five-node.relaunched") 2>/dev/null || true
+    fi
+}
+
 cmd_checkpoint() {
     # No --xpr-core: preflight and the deferred sidecar are mainnet
     # provenance guards, and the fixture chain has no deferred activity.
@@ -1041,55 +1169,7 @@ cmd_checkpoint() {
         # derived id, which the runner is not.
         PLATFORM_CHAIN="${PULSEVM_PLATFORM_CHAIN_ID:-$("$CEREMONY_BIN" chain-id --genesis "$WORK_DIR/migration.genesis.json")}" \
             || fail "platform chain id derivation failed"
-        confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$PLATFORM_CHAIN" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
-            || fail "confirmation failed"
-        echo "handover: $confirm_out"
-        CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
-        NEW_CHAIN="$(printf '%s' "$confirm_out" | awk '{for (i=1;i<=NF;i++) if ($i=="new-chain") print $(i+1)}')"
-        [[ "${#CONF_DIGEST}" == 64 && "${#NEW_CHAIN}" == 64 ]] || fail "could not parse confirmation"
-        echo "$CONF_DIGEST" >"$WORK_DIR/conf-digest"
-        echo "$NEW_CHAIN" >"$WORK_DIR/new-chain"
-        # Vote-timing provenance: the memo block (or the quorum-completion
-        # vote block on the contract path) recorded at freeze time, the
-        # freshness bound K (same lag the declaration was built with), and
-        # the confirmation deadline J. The confirmation itself was signed
-        # off-chain (XPR froze at H), so no confirmation inclusion is
-        # recorded — the verifier notes timing as unprovable for that side.
-        # On the contract path the on-chain ceremony fragment and the
-        # unanimous schedule version ride along; the version must equal H's
-        # header version (rotation between the last vote and H restarts the
-        # ceremony — enforced here, before the manifest seals).
-        attach_args=(
-            --declaration "$WORK_DIR/declaration.json" --confirmation "$WORK_DIR/confirmation.json"
-            --declaration-inclusion "$(cat "$WORK_DIR/memo-block")"
-            --max-declaration-lag "${CUTOVER_LAG:-30}"
-            --max-confirmation-lag "${CONFIRM_LAG:-120}"
-        )
-        if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
-            h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')"
-            vote_version="$(cat "$WORK_DIR/schedule-version")"
-            [[ "$h_version" == "$vote_version" ]] \
-                || fail "schedule rotated between the last vote (version $vote_version) and H (version $h_version)"
-            echo "handover: schedule version $h_version unanimous across votes and H"
-            attach_args+=(--contract-ceremony "$WORK_DIR/fragment.json" --schedule-version "$h_version")
-        fi
-        "$ATTACH_BIN" \
-            "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
-            "${attach_args[@]}" \
-            || fail "source block attach failed (H must be an empty block)"
-        mv "$manifest.attached" "$manifest"
-        "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$PLATFORM_CHAIN" \
-            || fail "offline pair verification failed"
-        # Explicit flip gate (not just phase ordering): the boot below
-        # refuses to proceed unless this marker binds the exact manifest,
-        # checkpoint, confirmation, and successor chain it verified.
-        printf '%s %s %s %s\n' \
-            "$(sha256sum "$manifest" | awk '{print $1}')" \
-            "$CHECKPOINT_SHA256" \
-            "$CONF_DIGEST" \
-            "$NEW_CHAIN" >"$WORK_DIR/verification-pass" \
-            || fail "verification marker write failed"
-        echo "handover: two-step pair attached and verified: declaration $(cat "$WORK_DIR/decl-digest") -> confirmation $CONF_DIGEST on $NEW_CHAIN"
+        confirm_attach_verify "$PLATFORM_CHAIN"
     elif [[ "${HALT_V2:-0}" == "1" ]]; then
         # Retired: the restore gate requires the two-step pair, so a
         # single-step commitment manifest no longer boots.
@@ -1144,6 +1224,7 @@ cmd_boot() {
         [[ "$manifest_tip" == "$H_ID" ]] || fail "refusing to boot: manifest tip $manifest_tip != frozen H=$H $H_ID"
         echo "handover: flip gate open: tip H=$H id=$H_ID plus verified confirmation $(cat "$WORK_DIR/conf-digest")"
     fi
+    boot_epoch="$(date +%s)"
     echo "handover: booting the five-node network from the H=$H checkpoint (background)..."
     # Dedicated plugin dir: the repo build/plugins file may be mapped by
     # another live network on a shared host (ETXTBSY on overwrite).
@@ -1246,6 +1327,23 @@ EOF
         rpc_url=""
         sleep 5
     done
+    if [[ -z "$rpc_url" ]]; then
+        # First boot refused at the restore gate almost surely means the
+        # confirmation binds the wrong platform id: the runner assigns
+        # chain ids non-deterministically and the ceremony confirmed the
+        # derived one. Learn the boot's actual id, re-run the ceremony
+        # against it, and restart the nodes in place — exactly once.
+        # Anything else (or a second refusal) fails below as before.
+        learn_then_bind_retry
+        rpc_url=""
+        for _ in $(seq 1 60); do
+            rpc_url="$(chain_rpc_url || true)"
+            [[ -n "$rpc_url" ]] || { sleep 5; continue; }
+            rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' >/dev/null 2>&1 && break
+            rpc_url=""
+            sleep 5
+        done
+    fi
     [[ -n "$rpc_url" ]] || fail "new network RPC never came up (see $WORK_DIR/five-node.log)"
     read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
@@ -1458,6 +1556,10 @@ cmd_stop() {
             [[ -n "$_victims" ]] && kill $_victims 2>/dev/null || true
         done
     fi
+    # Nodes relaunched outside the supervisor group (learn-then-bind
+    # retry) are not covered by the group kill above: reclaim exactly
+    # those PIDs too.
+    kill_relaunched
     docker rm -f pulsevm-handover-snapshotter 2>/dev/null || true
     (cd "$SCRIPT_DIR" && docker compose -f compose.yaml down --volumes 2>/dev/null) || true
     # Archive instead of deleting: the workdir holds the evidence trail

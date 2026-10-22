@@ -1,6 +1,9 @@
 # U-1: genesis-settable successor chain id — assessment
 
-Status: design assessment. No consensus change is made by this note.
+Status: implemented in `GenesisState::chain_id_override`
+(`crates/pulsevm_chain_types/src/genesis.rs`), opt-in and bit-for-bit
+compatible when absent. The MetalGo launcher change (fixed chain
+registration) is still external.
 
 ## Problem
 

@@ -955,9 +955,205 @@ async fn submit_confirmation(
 // Main loop
 // ---------------------------------------------------------------------------
 
+/// Status: one JSON line for cron and monitoring. Reuses the loop's own
+/// `decide` and pause predicate, so the reported state is the state the
+/// loop would act on. Never signs, never submits, never pauses.
+async fn status(config: &LoadedConfig) -> ExitCode {
+    let client = match build_client(config) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("xpr_cutover_voter status: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let view = match read_view(&client, config).await {
+        Ok(view) => view,
+        Err(error) => {
+            eprintln!("xpr_cutover_voter status: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (vote_state, vote_detail) = match decide(config, &view) {
+        Decision::Vote => ("pending", String::new()),
+        Decision::AlreadyVoted => ("on-chain", String::new()),
+        Decision::Wait(reason) => ("waiting", reason),
+        Decision::Refuse(reason) => ("refused", reason),
+    };
+    let freeze_match = view
+        .singleton
+        .as_ref()
+        .map(|row| row.digest == hex::encode(config.expected_digest));
+    let confirmation_ready = matches!(decide(config, &view), Decision::AlreadyVoted)
+        || view.singleton.as_ref().is_some_and(|s| s.finalized);
+    let confirmation_state = if vote_state == "on-chain" || confirmation_ready {
+        if view.lib_num >= config.inner.height {
+            "actionable"
+        } else {
+            "waiting-lib"
+        }
+    } else {
+        "waiting-vote"
+    };
+    let pause_state = if !config.inner.stop_producer.at_h {
+        "off"
+    } else if should_pause_producer(
+        &config.inner.stop_producer,
+        view.head_num,
+        config.inner.height,
+        confirmation_state == "actionable",
+    ) {
+        "due"
+    } else {
+        "armed"
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "producer": config.inner.producer,
+            "height": config.inner.height,
+            "head": view.head_num,
+            "lib": view.lib_num,
+            "vote": vote_state,
+            "vote_detail": vote_detail,
+            "freeze_match": freeze_match,
+            "schedule_blocked": view.schedule_blocked,
+            "confirmation": confirmation_state,
+            "pause": pause_state,
+        })
+    );
+    ExitCode::SUCCESS
+}
+
+/// Preflight: the operator's go/no-go checklist before (and during) the
+/// window. Every check reuses the exact code the loop runs on — config and
+/// key loading, node reachability, the chain-id match, the frozen-table
+/// read, the recomputed digest, and (when armed) the producer API — so a
+/// GO means the loop would act, not that a different path was tested.
+/// Prints one line per check plus a verdict; exits 0 on GO, 1 otherwise.
+async fn preflight(config: &LoadedConfig) -> ExitCode {
+    let mut failures = 0u32;
+    macro_rules! check {
+        ($name:expr, $result:expr $(,)?) => {
+            match $result {
+                Ok(detail) => println!("PREFLIGHT ok: {}: {detail}", $name),
+                Err(error) => {
+                    failures += 1;
+                    println!("PREFLIGHT FAIL: {}: {error}", $name);
+                }
+            }
+        };
+    }
+    // Config, names, and both key files already loaded by the caller: the
+    // voter would have refused to start otherwise.
+    println!(
+        "PREFLIGHT ok: config and keys: producer {} contract {} height {}",
+        config.inner.producer, config.inner.contract, config.inner.height
+    );
+    check![
+        "stop config",
+        validate_stop_config(&config.inner.stop_producer)
+            .map(|()| "armed or off, never half".to_string()),
+    ];
+    let client = match build_client(config) {
+        Ok(client) => client,
+        Err(error) => {
+            println!("PREFLIGHT FAIL: http client: {error}");
+            println!("PREFLIGHT: NO-GO (1 check failed before the node was reached)");
+            return ExitCode::from(1);
+        }
+    };
+    let base = config.inner.nodeos_url.clone();
+    let info = get_info(&client, &base).await;
+    check![
+        "node reachable, source chain matches",
+        info.and_then(|(head, lib, chain_id)| {
+            if chain_id != config.inner.source_chain_id {
+                Err("node chain id does not match coordinated source chain".to_string())
+            } else {
+                Ok(format!("head {head} lib {lib}"))
+            }
+        }),
+    ];
+    match read_view(&client, config).await {
+        Ok(view) => {
+            match view.singleton {
+                Some(row) if row.digest == hex::encode(config.expected_digest) => println!(
+                    "PREFLIGHT ok: freeze on-chain: declaration {} matches the recomputed digest (finalized={})",
+                    row.digest, row.finalized
+                ),
+                Some(row) => {
+                    failures += 1;
+                    println!(
+                        "PREFLIGHT FAIL: freeze on-chain: frozen digest {} does not match the recomputed {}, refusing to sign",
+                        row.digest,
+                        hex::encode(config.expected_digest)
+                    );
+                }
+                None => println!(
+                    "PREFLIGHT WAIT: freeze on-chain: no ceremony row yet, re-run after init"
+                ),
+            }
+            match view.member {
+                Some(member) if !member.voted => println!(
+                    "PREFLIGHT ok: member row: {} present, vote not yet on-chain",
+                    config.inner.producer
+                ),
+                Some(_) => println!(
+                    "PREFLIGHT ok: member row: {} present, vote already on-chain",
+                    config.inner.producer
+                ),
+                None => println!(
+                    "PREFLIGHT WAIT: member row: {} not in the frozen set, no vote possible",
+                    config.inner.producer
+                ),
+            }
+            if view.schedule_blocked {
+                println!(
+                    "PREFLIGHT WAIT: schedule: a change is staged, votes refuse until the freeze is re-taken"
+                );
+            } else {
+                println!("PREFLIGHT ok: schedule: no staged change");
+            }
+            println!(
+                "PREFLIGHT ok: head vs H: head {} vs H {}",
+                view.head_num, config.inner.height
+            );
+        }
+        Err(error) => {
+            failures += 1;
+            println!("PREFLIGHT FAIL: ceremony tables: {error}");
+        }
+    }
+    if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
+        check![
+            "producer api reachable",
+            post_json(
+                &client,
+                &format!("{api_url}/v1/producer/paused"),
+                &serde_json::json!({})
+            )
+            .await
+            .map(|state| format!(
+                "paused={}",
+                state.get("paused").unwrap_or(&serde_json::Value::Null)
+            )),
+        ];
+    }
+    if failures == 0 {
+        println!("PREFLIGHT: GO");
+        ExitCode::SUCCESS
+    } else {
+        println!(
+            "PREFLIGHT: NO-GO ({failures} check{s} failed)",
+            s = if failures == 1 { "" } else { "s" }
+        );
+        ExitCode::from(1)
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
-        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N] [--print-digest]\n\
+        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N] [--print-digest] [--preflight]\n\
          \n\
          The config carries the node URL, contract, producer, coordinated\n\
          height and source chain, the roster file, the vote/payer key files\n\
@@ -968,7 +1164,13 @@ fn usage() -> ! {
          --print-digest prints the currently actionable signing digest as\n\
          JSON and exits without signing: an external agent (or remote\n\
          signer) signs exactly those bytes and submits through its own\n\
-         path, so key custody never moves."
+         path, so key custody never moves.\n\
+         \n\
+         --preflight runs the operator go/no-go checklist (config, keys,\
+         node, freeze, schedule, producer API) and exits 0 on GO.\n\
+         \n\
+         --status prints one JSON line for monitoring: head vs H, vote\
+         state, confirmation readiness, schedule and pause state."
     );
     std::process::exit(2);
 }
@@ -1303,6 +1505,8 @@ async fn main() -> ExitCode {
     let mut dry_run = false;
     let mut max_polls = 0u64;
     let mut print_digest_only = false;
+    let mut preflight_only = false;
+    let mut status_only = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -1316,6 +1520,8 @@ async fn main() -> ExitCode {
                     .unwrap_or_else(|_| panic!("--max-polls needs a number, got {value}"));
             }
             "--print-digest" => print_digest_only = true,
+            "--preflight" => preflight_only = true,
+            "--status" => status_only = true,
             _ => usage(),
         }
     }
@@ -1337,6 +1543,12 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         };
+    }
+    if preflight_only {
+        return preflight(&config).await;
+    }
+    if status_only {
+        return status(&config).await;
     }
     if dry_run {
         log_line!("dry run: evaluating only, nothing will be signed or submitted");

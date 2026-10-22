@@ -221,14 +221,18 @@ pdf.h2("4.3 Coordination checklist for BPs")
 pdf.grid(
     ["Step", "Owner", "Deadline"],
     [
-        ["Upgrade to the cutover release (plugin armed or dry-run).", "Each BP operator", "H-K-7 days"],
+        ["Upgrade to the cutover release; --preflight must print GO.", "Each BP operator", "H-K-7 days"],
         ["Confirm dry-run vote matches the published declaration digest.", "Each BP operator", "H-K-1 day"],
         ["Declaration window opens; auto (or manual) votes land.", "Voter / operator", "H-K .. H-1"],
         ["Keep producing through H; do not stop early.", "Each BP operator", "H"],
-        ["Confirmation auto-signed once H exists.", "Voter / operator", "H+1 .. H+J"],
+        ["Confirmation auto-signed once H exists; producer auto-pauses.", "Voter / operator", "H+1 .. H+J"],
         ["Repoint any BP-run gateways to A-Chain.", "Each BP operator", "H+1"],
     ],
     widths=[90, 40, 44],
+)
+
+pdf.body(
+    "Full operator procedure (T-14 publication list, ceremony runbook with the supersede path, post-H audit): docs/xpr-cutover-operations.md."
 )
 
 # ---------- 5. A-Chain verification + H+1 start ----------

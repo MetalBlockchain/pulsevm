@@ -17,9 +17,10 @@ UMask=0077
 # enforcing the producer pause (it never exits over a pause failure), so
 # no restart is needed for the halt path either.
 Restart=no
-# Page the operator on abnormal exit (e.g. half-configured stop, lost node):
-# ship a cutover-alert.service that pages, then uncomment.
-#OnFailure=cutover-alert.service
+# Page the operator on abnormal exit (half-configured stop, lost node,
+# crash): cutover-alert.service posts CUTOVER_WEBHOOK_URL from
+# /etc/cutover/alert.env.
+OnFailure=cutover-alert.service
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

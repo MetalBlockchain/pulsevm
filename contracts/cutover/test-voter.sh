@@ -196,6 +196,29 @@ assert shape["digest"] == want, (shape["digest"], want)
 PYEOF
 pass "print-digest matches the frozen declaration digest"
 
+echo "cutover-voter-test: preflight gives GO on a ready operator..."
+PREFLIGHT_CFG="$(mk_config "$H" true "" "$PLATFORM")"
+"$VOTER_BIN" --config "$PREFLIGHT_CFG" --preflight >"$WORK/preflight.log" 2>&1 \
+    || fail "preflight refused a ready setup: $(cat "$WORK/preflight.log")"
+grep -q "PREFLIGHT: GO" "$WORK/preflight.log" || fail "no preflight GO: $(cat "$WORK/preflight.log")"
+grep -q "freeze on-chain" "$WORK/preflight.log" || fail "preflight skipped the freeze check"
+pass "preflight GO before the window"
+
+echo "cutover-voter-test: status reports the loop state as JSON..."
+"$VOTER_BIN" --config "$PREFLIGHT_CFG" --status >"$WORK/status.json" 2>"$WORK/status.err" \
+    || fail "status failed: $(cat "$WORK/status.err")"
+python3 - "$WORK/status.json" "$H" <<'PYEOF'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st["producer"] == "bpvoter", st
+assert st["height"] == int(sys.argv[2]), st
+assert st["vote"] in ("pending", "on-chain"), st
+assert st["freeze_match"] is True, st
+assert st["schedule_blocked"] is False, st
+assert st["pause"] == "off", st
+PYEOF
+pass "status JSON matches the on-chain freeze"
+
 # Coordinator serving live chain data: block id is read from the node itself,
 # so it always matches; the voter must still verify every field.
 cat >"$WORK/coordinator.py" <<'PYEOF'
