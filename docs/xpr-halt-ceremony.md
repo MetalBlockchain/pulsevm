@@ -172,12 +172,16 @@ operator once the frozen set matches the coordinated parameters:
 - Opt-in local halt: with `stop_producer.at_h` set plus the local
   `producer_api_url`, the voter pauses its own producer right after
   delivering the confirmation (Leap `producer/pause`, then proves
-  `paused`). A contract cannot stop block production, only the producer
-  can, so this is the half of the halt that lives in the binary. Off by
-  default; half-configured (armed without a URL) refuses to start; a
-  pause that will not verify fails loud (non-zero exit, supervisor
-  retries into the already-voted path) instead of degrading to a
-  warning.
+  `paused`) and keeps enforcing it. A contract cannot stop block
+  production, only the producer can, so this is the half of the halt
+  that lives in the binary. Off by default; half-configured (armed
+  without a URL) refuses to start; a pause that will not verify is
+  retried in-loop and logged loudly instead of degrading to a warning.
+  A node restart clears Leap's in-memory pause, which is why the voter
+  re-asserts rather than pausing once and exiting. To resume production
+  deliberately, stop the voter first: a manual resume while it runs gets
+  re-paused on the next poll. Near H the loop polls every second so the
+  pause lands promptly, then drops back to the configured cadence.
 
 What automation cannot do is decide: H, the source chain, and the roster
 come from the coordinated config, and a failed ceremony restarts

@@ -210,7 +210,7 @@ pdf.bullets([
     "No new secrets: keys live in owner-only files the daemon refuses to start without -- never on the command line, never in logs; it only signs the two ceremony digests.",
     "Refuses closed on anything but the exact freeze: wrong H, chain, or digest; non-BP keys; double votes; votes at or after H; an unfinalized ceremony; a staged schedule change (rotation fails closed); coordinator data that disagrees with the local node. Dry-run mode rehearses without signing; print-digest mode emits the exact confirmation bytes for an external agent to sign, so the agent and the voter never disagree.",
     "Fallback intact: if a producer disables automation, the manual CLI path produces byte-identical votes; mixed fleets verify together.",
-    "Local halt included: with stop_producer armed, the voter pauses its own producer right after delivering the confirmation (Leap producer/pause, verified paused) -- a contract cannot stop block production, only the producer can. Off by default; a pause that will not verify fails loud instead of degrading to a warning.",
+    "Local halt included: with stop_producer armed, the voter pauses its own producer right after delivering the confirmation (Leap producer/pause, verified paused) and keeps enforcing it -- a node restart clears the in-memory pause, so one-shot pausing would reopen the gap. A contract cannot stop block production, only the producer can. Off by default; a pause that will not verify is retried in-loop and logged loudly, and the loop polls every second near H so it lands promptly.",
 ])
 pdf.body(
     "Why this passes governance: the automation cannot sign anything a manual vote could not -- "

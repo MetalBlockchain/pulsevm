@@ -1120,10 +1120,32 @@ async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), S
     }
 }
 
+/// Blocks of lookahead that switch the loop to 1s polling: discovering H
+/// a poll late is fine hours out, but near the halt every half-second
+/// block counts and the pause must land promptly.
+const FAST_POLL_LOOKAHEAD: u32 = 12;
+
+/// Seconds between polls once the halt is near. Slow polling far out
+/// keeps the loop quiet for weeks; fast polling near H catches the exact
+/// block. After the pause is holding, slow polling resumes: there is
+/// nothing left to discover, only the pause to re-assert.
+fn poll_interval_secs(poll_secs: u64, head_num: u32, height: u32, pause_holding: bool) -> u64 {
+    if pause_holding {
+        poll_secs
+    } else if head_num.saturating_add(FAST_POLL_LOOKAHEAD) >= height {
+        1
+    } else {
+        poll_secs
+    }
+}
+
 async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(), String> {
     validate_stop_config(&config.inner.stop_producer)?;
     let client = build_client(config)?;
     let mut voted = false;
+    let mut confirmation_delivered = false;
+    let mut pause_holding = false;
+    let mut pause_note = String::new();
     let mut last_note = String::new();
     let mut polls = 0u64;
     loop {
@@ -1211,53 +1233,57 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             match submit_confirmation(&client, config).await {
                 Ok(line) => {
                     log_line!("{line}");
-                    if !should_pause_producer(
-                        &config.inner.stop_producer,
-                        view.head_num,
-                        config.inner.height,
-                        true,
-                    ) {
-                        return Ok(());
-                    }
-                    let api_url = config
-                        .inner
-                        .stop_producer
-                        .producer_api_url
-                        .clone()
-                        .unwrap_or_default();
-                    // The commitment is delivered; the producer must stop
-                    // before it builds H+1. Retry the pause, then fail loud:
-                    // a non-zero exit lets the supervisor restart us into
-                    // the AlreadyVoted path, which retries the pause. A
-                    // silently unpaused producer is the 25-blocks-past-stop
-                    // failure, so this never degrades to a warning.
-                    for attempt in 1..=3u32 {
-                        match pause_producer(&client, &api_url).await {
-                            Ok(()) => {
-                                log_line!(
-                                    "local producer paused at H={} (attempt {attempt})",
-                                    config.inner.height
-                                );
-                                return Ok(());
-                            }
-                            Err(error) => {
-                                log_line!("producer pause failed (attempt {attempt}/3): {error}");
-                                tokio::time::sleep(Duration::from_secs(config.inner.poll_secs))
-                                    .await;
-                            }
-                        }
-                    }
-                    return Err(format!(
-                        "confirmation delivered for H={} but the local producer would not pause: refusing to exit clean on a running producer",
-                        config.inner.height
-                    ));
+                    confirmation_delivered = true;
                 }
                 Err(error) => {
                     log_line!("confirmation failed, retrying: {error}");
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+        // The halt half of the binary: once this voter's confirmation is
+        // delivered and H is observed, the local producer must stay paused.
+        // This never exits over a pause failure — the process stays alive
+        // retrying, because a node restart clears Leap's in-memory pause
+        // and only a live enforcer re-pauses it. To resume production
+        // deliberately, stop this voter first: a manual resume while it
+        // runs gets re-paused on the next poll.
+        if !dry_run
+            && should_pause_producer(
+                &config.inner.stop_producer,
+                view.head_num,
+                config.inner.height,
+                confirmation_delivered,
+            )
+        {
+            if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
+                match pause_producer(&client, &api_url).await {
+                    Ok(()) => {
+                        if !pause_holding {
+                            log_line!(
+                                "local producer paused at H={}, enforcing",
+                                config.inner.height
+                            );
+                        }
+                        pause_holding = true;
+                    }
+                    Err(error) => {
+                        pause_holding = false;
+                        note_throttled(
+                            &mut pause_note,
+                            &mut polls,
+                            &format!("producer pause failed, retrying: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(poll_interval_secs(
+            config.inner.poll_secs,
+            view.head_num,
+            config.inner.height,
+            pause_holding,
+        )))
+        .await;
     }
 }
 
@@ -1802,5 +1828,18 @@ mod tests {
         // Either fully armed or fully off validates.
         assert!(validate_stop_config(&StopConfig::default()).is_ok());
         assert!(validate_stop_config(&armed_stop()).is_ok());
+    }
+
+    #[test]
+    fn poll_interval_is_slow_far_out_fast_near_h_slow_while_holding() {
+        // Hours out: the configured cadence, quiet for weeks.
+        assert_eq!(poll_interval_secs(30, 100, 10_000, false), 30);
+        // Inside the lookahead: 1s polling so the pause lands promptly.
+        assert_eq!(poll_interval_secs(30, 9_989, 10_000, false), 1);
+        assert_eq!(poll_interval_secs(30, 10_000, 10_000, false), 1);
+        // Past H (stragglers): still fast until the pause is confirmed.
+        assert_eq!(poll_interval_secs(30, 10_005, 10_000, false), 1);
+        // Pause holding: nothing left to discover, slow cadence resumes.
+        assert_eq!(poll_interval_secs(30, 10_005, 10_000, true), 30);
     }
 }

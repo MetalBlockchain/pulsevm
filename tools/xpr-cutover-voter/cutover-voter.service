@@ -13,8 +13,13 @@ ExecStart=/usr/local/bin/xpr_cutover_voter --config /etc/cutover/voter.json
 UMask=0077
 # Never restart blindly into a signing loop: a crash means the operator looks
 # before re-arming. The vote window is hours wide; missing it by restarting
-# into a bad state is worse than paging.
+# into a bad state is worse than paging. The voter itself stays alive
+# enforcing the producer pause (it never exits over a pause failure), so
+# no restart is needed for the halt path either.
 Restart=no
+# Page the operator on abnormal exit (e.g. half-configured stop, lost node):
+# ship a cutover-alert.service that pages, then uncomment.
+#OnFailure=cutover-alert.service
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

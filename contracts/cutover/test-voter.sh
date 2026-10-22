@@ -130,6 +130,11 @@ FROZEN_DIGEST="$(table_rows cutover cutover ceremony | python3 -c 'import json,s
 [[ -n "$FROZEN_DIGEST" ]] || fail "no frozen ceremony"
 pass "ceremony frozen at H=$H"
 
+# (4) proves the opt-in producer stop: half-configured stop fails fast,
+# dry-run rehearses the pause, a live pause lands after confirmation and is
+# re-asserted on later polls (continuous enforcement), and an unverified
+# pause fails loud instead of going quiet.
+
 # Voter key files must be owner-only or the voter refuses to start.
 printf '%s' "$BP_WIF" >"$WORK/vote.key"; chmod 600 "$WORK/vote.key"
 printf '%s' "$DEV_WIF" >"$WORK/payer.key"; chmod 600 "$WORK/payer.key"
@@ -141,19 +146,26 @@ table_rows cutover cutover members \
     >"$WORK/roster.json"
 PLATFORM="$(python3 -c 'print("ee" * 32)')"
 WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
-mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty -> path
+mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty -> path
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
     [[ -n "${3:-}" ]] && coord="\"$3\""
     local plat="null"
     [[ -n "${4:-}" ]] && plat="\"$4\""
+    local stop='"stop_producer":{"at_h":false}'
+    if [[ "${5:-}" == "HALF" ]]; then
+        stop='"stop_producer":{"at_h":true}'
+    elif [[ -n "${5:-}" ]]; then
+        stop="\"stop_producer\":{\"at_h\":true,\"producer_api_url\":\"$5\"}"
+    fi
     cat >"$out" <<EOF
 {"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"bpvoter",
  "source_chain_id":"$CHAIN_ID","height":$1,"roster_file":"$WORK/roster.json",
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
-  "migration_genesis":null,"checkpoint_sha256":null,"platform_chain_id":$plat}}
+  "migration_genesis":null,"checkpoint_sha256":null,"platform_chain_id":$plat},
+ $stop}
 EOF
     printf '%s' "$out"
 }
@@ -318,5 +330,120 @@ wait "$COORD_PID" 2>/dev/null || true
 grep -q "platform chain id does not match" "$WORK/plat.log" || fail "wrong platform not refused: $(tail -5 "$WORK/plat.log")"
 [[ -s "$WORK/confirmations-wrongplat.jsonl" ]] && fail "confirmation delivered to wrong-platform coordinator"
 pass "wrong platform refused, nothing delivered"
+
+echo "cutover-voter-test: half-configured stop fails fast..."
+HALF_CFG="$(mk_config "$H" true "" "" HALF)"
+if "$VOTER_BIN" --config "$HALF_CFG" --max-polls 1 >"$WORK/half.log" 2>&1; then
+    fail "half-configured stop started: $(cat "$WORK/half.log")"
+fi
+grep -q "cannot fire" "$WORK/half.log" || fail "half-config refusal unexplained: $(cat "$WORK/half.log")"
+pass "half-configured stop fails fast"
+
+# Stub Leap producer API: pause always succeeds, paused reports the argv
+# value. Hits are recorded so the test proves calls happened, not just logs.
+cat >"$WORK/stub-producer.py" <<'PYEOF'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+paused_value = sys.argv[1]
+hits_path, port_path = sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(ln)
+        if self.path.endswith("/v1/producer/pause"):
+            open(hits_path, "a").write("pause\n")
+            data = b"{}"
+        elif self.path.endswith("/v1/producer/paused"):
+            data = ('{"paused":' + paused_value + "}").encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+server = HTTPServer(("127.0.0.1", 0), H)
+open(port_path, "w").write(str(server.server_address[1]))
+server.serve_forever()
+PYEOF
+start_stub() { # $1=true|false $2=hits-file $3=port-file -> pid in STUB_PID
+    python3 "$WORK/stub-producer.py" "$1" "$2" "$3" >>"$WORK/stub.log" 2>&1 &
+    STUB_PID=$!
+    for _ in $(seq 1 30); do
+        [[ -s "$3" ]] && break
+        kill -0 "$STUB_PID" 2>/dev/null || fail "producer stub died on startup: $(cat "$WORK/stub.log")"
+        sleep 1
+    done
+}
+
+echo "cutover-voter-test: dry-run rehearses the producer pause..."
+PAST_CFG="$(mk_config 5 true "" "" "http://127.0.0.1:9")"
+"$VOTER_BIN" --config "$PAST_CFG" --dry-run --max-polls 3 >"$WORK/pausedry.log" 2>&1 \
+    || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry.log")"
+grep -q "would pause the local producer at H=5" "$WORK/pausedry.log" \
+    || fail "no dry-run pause line: $(cat "$WORK/pausedry.log")"
+pass "dry-run rehearses the producer pause"
+
+echo "cutover-voter-test: live pause after confirmation, enforced continuously..."
+start_stub true "$WORK/pause-hits" "$WORK/stub.port"
+STUB_PORT="$(cat "$WORK/stub.port")"
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pause.jsonl" "$H" "$WORK/coord-pause.port" "$PLATFORM" >>"$WORK/coordinator-pause.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-pause.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "pause coordinator died on startup"
+    sleep 1
+done
+COORD_PAUSE_PORT="$(cat "$WORK/coord-pause.port")"
+PAUSE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PAUSE_PORT}" "$PLATFORM" "http://127.0.0.1:${STUB_PORT}")"
+"$VOTER_BIN" --config "$PAUSE_CFG" >"$WORK/pause.log" 2>&1 &
+PAUSE_PID=$!
+PAUSED=""
+for _ in $(seq 1 90); do
+    grep -q "local producer paused at H=" "$WORK/pause.log" 2>/dev/null && { PAUSED=1; break; }
+    kill -0 "$PAUSE_PID" 2>/dev/null || break
+    sleep 2
+done
+[[ -n "$PAUSED" ]] || { kill "$PAUSE_PID" 2>/dev/null || true; wait "$PAUSE_PID" 2>/dev/null || true; fail "producer never paused: $(tail -5 "$WORK/pause.log")"; }
+# Continuous enforcement: the voter must re-assert the pause on later polls,
+# not exit after the first one (a node restart clears Leap's in-memory pause).
+REENFORCED=""
+for _ in $(seq 1 15); do
+    [[ "$(wc -l <"$WORK/pause-hits" 2>/dev/null || echo 0)" -ge 2 ]] && { REENFORCED=1; break; }
+    sleep 2
+done
+kill "$PAUSE_PID" 2>/dev/null || true
+wait "$PAUSE_PID" 2>/dev/null || true
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+[[ -n "$REENFORCED" ]] || fail "pause asserted only once, not enforced: $(cat "$WORK/pause-hits" 2>/dev/null)"
+pass "producer paused after confirmation and re-asserted"
+
+echo "cutover-voter-test: unverified pause never goes quiet..."
+start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"
+STUB_BAD_PORT="$(cat "$WORK/stub-bad.port")"
+# The pause path sits behind a delivered confirmation, so this run needs a
+# good coordinator too: the point is the pause failing, not the delivery.
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pausebad.jsonl" "$H" "$WORK/coord-pausebad.port" "$PLATFORM" >>"$WORK/coordinator-pausebad.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-pausebad.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "pausebad coordinator died on startup"
+    sleep 1
+done
+COORD_BADGOOD_PORT="$(cat "$WORK/coord-pausebad.port")"
+PAUSEBAD_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_BADGOOD_PORT}" "$PLATFORM" "http://127.0.0.1:${STUB_BAD_PORT}")"
+"$VOTER_BIN" --config "$PAUSEBAD_CFG" --max-polls 8 >"$WORK/pausebad.log" 2>&1
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "producer pause failed" "$WORK/pausebad.log" || fail "pause failure went unlogged: $(tail -5 "$WORK/pausebad.log")"
+pass "unverified pause fails loud, never silent"
 
 echo "cutover-voter-test: PASS"
