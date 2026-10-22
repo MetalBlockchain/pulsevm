@@ -14,6 +14,9 @@
 # declaration, on-chain memo, exact freeze, confirmation, checkpoint, boot,
 # parent linkage, and liveness.
 set -euo pipefail
+# A set -e exit otherwise leaves no trace (no fail() line, no line
+# number): trap it so the next silent death names its line and command.
+trap 'echo "handover: FATAL: exiting on error at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -994,8 +997,10 @@ confirm_attach_verify() { # $1=platform-chain-id
         --max-confirmation-lag "${CONFIRM_LAG:-120}"
     )
     if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
-        h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')"
-        vote_version="$(cat "$WORK_DIR/schedule-version")"
+        h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')" \
+            || fail "could not read H schedule version from block-H.json"
+        vote_version="$(cat "$WORK_DIR/schedule-version")" \
+            || fail "could not read frozen schedule version"
         [[ "$h_version" == "$vote_version" ]] \
             || fail "schedule rotated between the last vote (version $vote_version) and H (version $h_version)"
         echo "handover: schedule version $h_version unanimous across votes and H"
@@ -1322,11 +1327,12 @@ EOF
     # needs a transaction. Submit the network's first transaction itself.
     echo "handover: waiting for the new network RPC..."
     rpc_url=""
-    for _ in $(seq 1 60); do
+    for _wait_iter in $(seq 1 60); do
         rpc_url="$(chain_rpc_url || true)"
         [[ -n "$rpc_url" ]] || { sleep 5; continue; }
         rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' >/dev/null 2>&1 && break
         rpc_url=""
+        [[ $((_wait_iter % 12)) == 0 ]] && echo "handover: still no new-network RPC ($_wait_iter/60)..."
         sleep 5
     done
     if [[ -z "$rpc_url" ]]; then
@@ -1338,11 +1344,12 @@ EOF
         # Anything else (or a second refusal) fails below as before.
         learn_then_bind_retry
         rpc_url=""
-        for _ in $(seq 1 60); do
+        for _wait_iter in $(seq 1 60); do
             rpc_url="$(chain_rpc_url || true)"
             [[ -n "$rpc_url" ]] || { sleep 5; continue; }
             rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' >/dev/null 2>&1 && break
             rpc_url=""
+            [[ $((_wait_iter % 12)) == 0 ]] && echo "handover: still no new-network RPC after rebind ($_wait_iter/60)..."
             sleep 5
         done
     fi
