@@ -1080,12 +1080,22 @@ restart_five_nodes() { # $1=network dir
     # Indexed arrays only (macOS ships bash 3.2: no associative arrays),
     # and plain `&` children of this script (macOS ships no setsid
     # binary): fail()/stop reclaim them via five-node.relaunched.
+    # Match on the network dir BASENAME: ps shows the path as invoked,
+    # which may differ by symlink prefix (/var vs /private/var).
+    NETBASE="$(basename "$netdir")"
     CMDS_1=""; CMDS_2=""; CMDS_3=""; CMDS_4=""; CMDS_5=""
     for n in 1 2 3 4 5; do
-        cmdline="$(ps -eo pid,args | grep "[m]etalgo.*$netdir/node$n/configs" | head -1 | sed -E 's/^ *[0-9]+ //')"
-        [[ -n "$cmdline" ]] || fail "learn-then-bind: node$n process not found"
+        # The supervisor may be restarting a failed node exactly as we
+        # look: retry the capture instead of dying on a restart gap.
+        cmdline=""
+        for _ in $(seq 1 6); do
+            cmdline="$(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$n/configs" | head -1 | sed -E 's/^ *[0-9]+ //' || true)"
+            [[ -n "$cmdline" ]] && break
+            sleep 5
+        done
+        [[ -n "$cmdline" ]] || fail "learn-then-bind: node$n process not found after retries"
         eval "CMDS_$n=\"\$cmdline\""
-        pids="$pids $(ps -eo pid,args | grep "[m]etalgo.*$netdir/node$n/configs" | head -1 | awk '{print $1}')"
+        pids="$pids $(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$n/configs" | head -1 | awk '{print $1}' || true)"
     done
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
