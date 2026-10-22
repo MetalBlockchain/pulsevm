@@ -1043,8 +1043,15 @@ learn_then_bind_retry() {
     VERIFY_BIN="${VERIFY_BIN:-$REPO_ROOT/target/release/examples/xpr_verify_manifest}"
     manifest="${checkpoint}.manifest.json"
     local netdir actual
-    netdir="$(find "${TMPDIR:-/tmp}" -maxdepth 5 -type d -name 'network_*' -newermt "@$boot_epoch" 2>/dev/null | sort | tail -1 || true)"
-    [[ -n "$netdir" && -d "$netdir" ]] || fail "learn-then-bind: no five-node network dir found to learn the chain id from"
+    # Newest network dir wins: the retry runs minutes after boot, so the
+    # current boot's dir is always the freshest. Portable across BSD/GNU
+    # (no find -newermt, no stat flavors): plain -nt comparison only.
+    netdir=""
+    for cand in "${TMPDIR:-/tmp}"/network-runner-root-data/network_* /tmp/network-runner-root-data/network_*; do
+        [[ -d "$cand" ]] || continue
+        if [[ -z "$netdir" || "$cand" -nt "$netdir" ]]; then netdir="$cand"; fi
+    done
+    [[ -n "$netdir" ]] || fail "learn-then-bind: no five-node network dir found to learn the chain id from"
     actual="$(grep -rhoE 'error creating chain \{"subnetID": "[A-Za-z0-9]+", "chainID": "[A-Za-z0-9]+"' "$netdir"/node*/logs/main.log 2>/dev/null | head -1 | grep -oE 'chainID": "[A-Za-z0-9]+"' | cut -d'"' -f3 || true)"
     [[ -n "$actual" ]] || fail "learn-then-bind: no refused chain id in the node logs"
     grep -rq "halt confirmation platform chain id does not match" "$netdir"/node*/logs/main.log 2>/dev/null \
@@ -1231,7 +1238,6 @@ cmd_boot() {
         [[ "$manifest_tip" == "$H_ID" ]] || fail "refusing to boot: manifest tip $manifest_tip != frozen H=$H $H_ID"
         echo "handover: flip gate open: tip H=$H id=$H_ID plus verified confirmation $(cat "$WORK_DIR/conf-digest")"
     fi
-    boot_epoch="$(date +%s)"
     echo "handover: booting the five-node network from the H=$H checkpoint (background)..."
     # Dedicated plugin dir: the repo build/plugins file may be mapped by
     # another live network on a shared host (ETXTBSY on overwrite).
