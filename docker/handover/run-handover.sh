@@ -128,6 +128,53 @@ shadow_head() {
         -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])'
 }
+# Newest runner network dir wins: retries run minutes after boot, so the
+# current boot's dir is always the freshest. Portable across BSD/GNU
+# (no find -newermt, no stat flavors): plain -nt comparison only.
+newest_netdir() {
+    local netdir="" cand
+    for cand in "${TMPDIR:-/tmp}"/network-runner-root-data/network_* /tmp/network-runner-root-data/network_*; do
+        [[ -d "$cand" ]] || continue
+        if [[ -z "$netdir" || "$cand" -nt "$netdir" ]]; then netdir="$cand"; fi
+    done
+    printf '%s' "$netdir"
+}
+# Direct chain-RPC discovery that does not depend on the runner server:
+# the runner's control API can wedge behind a pending `control start`
+# (a first boot refused at the restore gate never returns, so list-rpcs
+# times out on every poll), while the nodes themselves are healthy and
+# serving. Probe each node's platform API for its chains and return the
+# first URL answering pulsevm.getInfo with a real result. Short timeouts:
+# unresponsive endpoints must not stall a poll iteration.
+direct_chain_rpc_url() {
+    local netdir node cfg port chains id url body
+    netdir="$(newest_netdir)"
+    [[ -n "$netdir" ]] || return 1
+    for node in 1 2 3 4 5; do
+        cfg="$netdir/node$node/configs/config.json"
+        [[ -f "$cfg" ]] || continue
+        port="$(jq -er '.["http-port"]' "$cfg" 2>/dev/null || true)"
+        [[ -n "$port" ]] || continue
+        chains="$(curl --fail --silent --max-time 3 -X POST "http://127.0.0.1:$port/ext/P" \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"platform.getBlockchains"}' 2>/dev/null \
+            | jq -r '.result.blockchains[]?.id // empty' 2>/dev/null || true)"
+        [[ -n "$chains" ]] || continue
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            url="http://127.0.0.1:$port/ext/bc/$id/rpc"
+            body="$(curl --fail --silent --max-time 3 -X POST "$url" \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null || true)"
+            [[ -n "$body" ]] || continue
+            if printf '%s' "$body" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") else 1)' 2>/dev/null; then
+                printf '%s' "$url"
+                return 0
+            fi
+        done <<<"$chains"
+    done
+    return 1
+}
 chain_rpc_url() {
     # Bound the call: a dead endpoint otherwise stalls each poll iteration.
     # Uses the runner's own dial/request timeouts instead of GNU `timeout`,
@@ -136,10 +183,19 @@ chain_rpc_url() {
     # up" while the network underneath is healthy).
     # list-rpcs reports the full handler URL including the /rpc suffix: keep
     # it, since the bare /ext/bc/<id> base answers 404.
-    "$NETWORK_RUNNER" control list-rpcs --endpoint="$(runner_endpoint)" \
+    local url
+    url="$("$NETWORK_RUNNER" control list-rpcs --endpoint="$(runner_endpoint)" \
         --dial-timeout 5s --request-timeout 15s 2>/dev/null \
         | sed $'s/\033\[[0-9;]*m//g' \
-        | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+/rpc' | head -1
+        | grep -oE 'http://127\.0\.0\.1:[0-9]+/ext/bc/[A-Za-z0-9]+/rpc' | head -1 || true)"
+    if [[ -n "$url" ]]; then
+        printf '%s' "$url"
+        return 0
+    fi
+    # Fallback for the wedged-API case above: the runner server can stop
+    # answering while its nodes are healthy (pending start never returns),
+    # so discover their chain RPCs directly instead of failing the run.
+    direct_chain_rpc_url || true
 }
 rpc_call() {
     curl --fail --silent --max-time 15 -X POST "$1" \
@@ -1061,14 +1117,7 @@ learn_then_bind_retry() {
     VERIFY_BIN="${VERIFY_BIN:-$REPO_ROOT/target/release/examples/xpr_verify_manifest}"
     manifest="${checkpoint}.manifest.json"
     local netdir actual
-    # Newest network dir wins: the retry runs minutes after boot, so the
-    # current boot's dir is always the freshest. Portable across BSD/GNU
-    # (no find -newermt, no stat flavors): plain -nt comparison only.
-    netdir=""
-    for cand in "${TMPDIR:-/tmp}"/network-runner-root-data/network_* /tmp/network-runner-root-data/network_*; do
-        [[ -d "$cand" ]] || continue
-        if [[ -z "$netdir" || "$cand" -nt "$netdir" ]]; then netdir="$cand"; fi
-    done
+    netdir="$(newest_netdir)"
     [[ -n "$netdir" ]] || fail "learn-then-bind: no five-node network dir found to learn the chain id from"
     actual="$(grep -rhoE 'error creating chain \{"subnetID": "[A-Za-z0-9]+", "chainID": "[A-Za-z0-9]+"' "$netdir"/node*/logs/main.log 2>/dev/null | head -1 | grep -oE 'chainID": "[A-Za-z0-9]+"' | cut -d'"' -f3 || true)"
     [[ -n "$actual" ]] || fail "learn-then-bind: no refused chain id in the node logs"
