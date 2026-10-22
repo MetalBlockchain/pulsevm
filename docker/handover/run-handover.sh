@@ -446,16 +446,29 @@ two_step_ceremony_and_freeze() {
             leap_wait_effect "counted vote on $CONTRACT_ACCT" /v1/chain/get_table_rows \
                 '{"json":true,"code":"'"$CONTRACT_ACCT"'","scope":"'"$CONTRACT_ACCT"'","table":"ceremony","limit":1}' \
                 'json.load(sys.stdin)["rows"][0]["voted_weight"]' '!0'
-            local scan_to scan_log
-            scan_to="$(leap_chain_head "$LEAP_API" | cut -d' ' -f2)"
+            local scan_to scan_log scan_votes
             scan_log="$WORK_DIR/scan-round$round.log"
-            if ! "$SCANNER_BIN" --api "$LEAP_API" --contract "$CONTRACT_ACCT" --from "$x_head" --to "$scan_to" \
-                --singleton-block "$scan_to" --out "$WORK_DIR/fragment.json" \
-                --declare-out "$WORK_DIR/declaration.json" \
-                --host-header '0.0.0.0:8888' >"$scan_log" 2>&1; then
-                tail -5 "$scan_log"
-                fail "vote scan failed"
-            fi
+            # The counted-vote wait can observe the vote in pending
+            # (unconfirmed) state, freezing scan_to ahead of the vote's
+            # block. Re-scan to a fresh head until the vote is actually
+            # in a block instead of failing on the first empty window.
+            for _scan_attempt in $(seq 1 5); do
+                scan_to="$(leap_chain_head "$LEAP_API" | cut -d' ' -f2)"
+                if ! "$SCANNER_BIN" --api "$LEAP_API" --contract "$CONTRACT_ACCT" --from "$x_head" --to "$scan_to" \
+                    --singleton-block "$scan_to" --out "$WORK_DIR/fragment.json" \
+                    --declare-out "$WORK_DIR/declaration.json" \
+                    --host-header '0.0.0.0:8888' >"$scan_log" 2>&1; then
+                    tail -5 "$scan_log"
+                    fail "vote scan failed"
+                fi
+                scan_votes="$(python3 -c 'import json; print(len(json.load(open("'"$WORK_DIR/fragment.json"'"))["votes"]))' || echo -1)"
+                if [[ "$scan_votes" != "0" && "$scan_votes" != "-1" ]]; then
+                    break
+                fi
+                echo "handover: scanner saw no votes to $scan_to yet (attempt $_scan_attempt/5), re-scanning..."
+                sleep 5
+            done
+            [[ "$scan_votes" != "0" && "$scan_votes" != "-1" ]] || fail "vote scan found no votes after 5 attempts"
             cat "$scan_log"
             DECL_DIGEST="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/fragment.json"'"))["declaration_digest"])')"
             [[ "${#DECL_DIGEST}" == 64 ]] || fail "could not parse fragment digest"
