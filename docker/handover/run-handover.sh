@@ -16,6 +16,10 @@
 set -euo pipefail
 # A set -e exit otherwise leaves no trace (no fail() line, no line
 # number): trap it so the next silent death names its line and command.
+# -E (errtrace) extends the trap into shell functions; without it a
+# failure inside confirm_attach_verify/learn_then_bind_retry would still
+# die silently.
+set -E
 trap 'echo "handover: FATAL: exiting on error at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,6 +66,7 @@ fail() {
         kill "$(cat "$WORK_DIR/shadow.pid")" 2>/dev/null || true
     fi
     kill_relaunched
+    kill "${HEARTBEAT_PID:-}" 2>/dev/null || true
     exit 1
 }
 
@@ -1332,6 +1337,11 @@ EOF
     # The new network only builds on demand: empty blocks are gated, so H+1
     # needs a transaction. Submit the network's first transaction itself.
     echo "handover: waiting for the new network RPC..."
+    # Heartbeat: proves the harness itself is alive during the long silent
+    # waits. If the log stops advancing with no FATAL line, the shell was
+    # killed externally — note the last heartbeat when reporting.
+    ( while true; do sleep 60; echo "handover: heartbeat $(date +%H:%M:%S) (cmd_boot rpc wait)"; done & )
+    HEARTBEAT_PID=$!
     rpc_url=""
     for _wait_iter in $(seq 1 60); do
         rpc_url="$(chain_rpc_url || true)"
@@ -1360,6 +1370,7 @@ EOF
         done
     fi
     [[ -n "$rpc_url" ]] || fail "new network RPC never came up (see $WORK_DIR/five-node.log)"
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
     read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
     [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
