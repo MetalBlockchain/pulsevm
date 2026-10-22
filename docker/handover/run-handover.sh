@@ -1038,9 +1038,9 @@ learn_then_bind_retry() {
     VERIFY_BIN="${VERIFY_BIN:-$REPO_ROOT/target/release/examples/xpr_verify_manifest}"
     manifest="${checkpoint}.manifest.json"
     local netdir actual
-    netdir="$(find "${TMPDIR:-/tmp}" -maxdepth 5 -type d -name 'network_*' -newermt "@$boot_epoch" 2>/dev/null | sort | tail -1)"
+    netdir="$(find "${TMPDIR:-/tmp}" -maxdepth 5 -type d -name 'network_*' -newermt "@$boot_epoch" 2>/dev/null | sort | tail -1 || true)"
     [[ -n "$netdir" && -d "$netdir" ]] || fail "learn-then-bind: no five-node network dir found to learn the chain id from"
-    actual="$(grep -rhoE 'error creating chain \{"subnetID": "[A-Za-z0-9]+", "chainID": "[A-Za-z0-9]+"' "$netdir"/node*/logs/main.log 2>/dev/null | head -1 | grep -oE 'chainID": "[A-Za-z0-9]+"' | cut -d'"' -f3)"
+    actual="$(grep -rhoE 'error creating chain \{"subnetID": "[A-Za-z0-9]+", "chainID": "[A-Za-z0-9]+"' "$netdir"/node*/logs/main.log 2>/dev/null | head -1 | grep -oE 'chainID": "[A-Za-z0-9]+"' | cut -d'"' -f3 || true)"
     [[ -n "$actual" ]] || fail "learn-then-bind: no refused chain id in the node logs"
     grep -rq "halt confirmation platform chain id does not match" "$netdir"/node*/logs/main.log 2>/dev/null \
         || fail "learn-then-bind: nodes refuse for another reason, see $netdir/node*/logs/main.log"
@@ -1073,8 +1073,10 @@ restart_five_nodes() { # $1=network dir
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
     for _ in $(seq 1 30); do
+        alive=""
         # shellcheck disable=SC2086
-        kill -0 $pids 2>/dev/null || break
+        for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done
+        [[ -z "$alive" ]] && break
         sleep 2
     done
     # shellcheck disable=SC2086
