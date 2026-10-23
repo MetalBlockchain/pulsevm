@@ -35,6 +35,7 @@ pub use elastic_limit_parameters::{
 };
 pub use genesis::GenesisState;
 pub use migration::{
+    CEREMONY_VOTE_WINDOW_US,
     HALT_CONFIRMATION_DOMAIN,
     HALT_DECLARATION_DOMAIN,
     HALT_DOMAIN,
