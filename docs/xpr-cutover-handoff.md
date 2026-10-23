@@ -48,7 +48,18 @@ against independently replayed XPR state:
    recorded declaration inclusion (memo / msig execution block). A pair with
    neither fails closed — off-chain signatures alone say nothing about when
    they were made.
-5. **Bindings.** Confirmation ties H, block id, checkpoint, and successor
+5. **Freeze window, no bricking.** Votes land within seven days of the
+   freeze (`init_time`, XPR consensus time); afterwards the freeze expires:
+   votes are refused and anyone may re-init, votes or not. A wrong-H or
+   abandoned freeze can never lock the contract — expiry is the escape
+   hatch, and there is no admin to call instead. The voter refuses expired
+   freezes rather than submitting doomed votes.
+6. **Roster shape.** Every active producer must be plain 1-of-1 K1 with
+   its authority key equal to its schedule key; anything else (multisig,
+   non-K1, mismatched keys) fails init closed. Audit with
+   `contracts/cutover/check-schedule-readiness.py` at T-14 and at freeze
+   time — a single bad row dooms the ceremony before it starts.
+7. **Bindings.** Confirmation ties H, block id, checkpoint, and successor
    chain id to the declaration; the checkpoint hash is recomputed from the
    artifact, never trusted as a string. Replay across heights, exports, or
    chains cannot verify.
@@ -73,15 +84,24 @@ against independently replayed XPR state:
 
 - **Validator coordination.** BPs run the ceremony: freeze the contract (or
   record the memo) inside the window, sign the declaration before H, sign
-  the confirmation once H exists. One governance decision, one window, no
-  retry on the same H — a failed ceremony restarts governance, not the
-  script.
+  the confirmation once H exists. One governance decision, one window. A
+  failed freeze is re-taken, not escalated: re-init while voteless, or any
+  time after the 7-day window expires. Only a wrong coordinated H needs a
+  new governance decision.
 - **Schedule stability.** A schedule rotation between the freeze and H fails
   closed (roster no longer matches state) and restarts the ceremony. Freeze
   close to H.
 - **Gateways and RPC.** JSON-RPC/HTTPS endpoints, exchanges, and indexers
   cut over at H+1 to the A-Chain; XPR endpoints are abandoned at H with no
   coexistence period. Coordinate the switch per client, not per block.
+- **XPR is abandoned, not halted.** No protocol change stops XPR: upgraded
+  nodes pause their own block production after delivering the confirmation,
+  and everyone else follows the A-Chain. If a third or more of stake
+  upgrades, XPR stalls organically near H (the clean stop, for free). If
+  fewer upgrade, XPR keeps producing an unfollowed minority fork — visible
+  on explorers, meaningless for the cutover. Do not present this as a chain
+  halt to operators; present it as a coordinated move with a dead
+  origin chain.
 - **History.** The A-Chain serves blocks from H+1; pre-H history stays on
   XPR archive nodes and the exported SHiP logs. There is no transaction
   lookup index on the new chain until one is built — plan explorer coverage

@@ -5,7 +5,12 @@
 # wrong-height digest, double vote, boundary quorum (not-finalized then
 # finalized at strict 2/3+1), post-finalize and post-vote re-init rejection,
 # plus an independent Python reimplementation of the declaration digest and
-# the u128 tally that must match the contract bit-for-bit.
+# the u128 tally that must match the contract bit-for-bit. The freeze
+# window (init_time stamp, re-init re-stamp) is asserted as plumbing; the
+# 7-day expiry itself is not exercised here — no test chain can wait it
+# out, and time-travel would invalidate the fixture — so expiry is covered
+# by the voter predicate unit tests (same constant, same comparison) plus
+# the boundary that a live freeze always carries a sane init_time.
 #
 # Nothing here touches mainnet. The seeder contract is fixture-only.
 set -euo pipefail
@@ -183,11 +188,11 @@ H1=$(( $(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.l
 echo "cutover-fixture: init H=$H1..."
 mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
     "$(python3 -c "import struct; print((struct.pack('<I', $H1) + bytes.fromhex('$CHAIN_ID')).hex())")" >/dev/null
-read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST <<<"$(
+read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST INIT_US <<<"$(
     table_rows cutover cutover ceremony | python3 -c '
 import json,sys
 c = json.load(sys.stdin)[0]
-print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"])' )"
+print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"], c["init_time"])' )"
 # Frozen roster for the tool-built votes: weights as decimal strings keep
 # mainnet magnitudes exact through JSON (no float round-trip).
 table_rows cutover cutover members | python3 -c "
@@ -203,6 +208,13 @@ echo "cutover-fixture: frozen $COUNT members"
 [[ "$COUNT" == "4" ]] || fail "init must freeze exactly the 4 active producers"
 [[ "$VOTED" == "0" ]] || fail "fresh ceremony has votes"
 check "init froze 4 active members at H=$H1 (inactive skipped)"
+# Freeze instant bounds the vote window: it must be chain time (the fixture
+# produces in real time, so within an hour of wall clock either way).
+NOW_US="$(python3 -c 'import time; print(time.time_ns() // 1000)')"
+[[ "$INIT_US" -gt 0 ]] || fail "init did not stamp init_time"
+[[ "$INIT_US" -gt $((NOW_US - 3600 * 1000000)) ]] || fail "init_time is older than an hour: $INIT_US"
+[[ "$INIT_US" -lt $((NOW_US + 3600 * 1000000)) ]] || fail "init_time is in the future: $INIT_US"
+check "init stamped a sane freeze instant (window anchor present)"
 
 # Re-init before any vote lands must move the freeze (liveness-only
 # griefing vector); after the first vote the freeze locks. This runs here,
@@ -211,12 +223,13 @@ echo "cutover-fixture: re-init before votes is allowed..."
 H2=$((H1 + 7))
 mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
     "$(python3 -c "import struct; print((struct.pack('<I', $H2) + bytes.fromhex('$CHAIN_ID')).hex())")" >/dev/null
-read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST <<<"$(
+read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST INIT_US2 <<<"$(
     table_rows cutover cutover ceremony | python3 -c '
 import json,sys
 c = json.load(sys.stdin)[0]
-print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"])' )"
+print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"], c["init_time"])' )"
 [[ "$FROZEN_H" == "$H2" ]] || fail "re-init did not move the freeze"
+[[ "$INIT_US2" -ge "$INIT_US" ]] || fail "re-init did not re-stamp init_time"
 [[ "$FINALIZED" == "0" ]] || fail "voteless ceremony finalized"
 [[ "$VOTED" == "0" ]] || fail "voteless ceremony has votes"
 check "re-init moved the freeze to H=$H2"

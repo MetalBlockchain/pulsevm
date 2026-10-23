@@ -20,7 +20,13 @@ set -euo pipefail
 # failure inside confirm_attach_verify/learn_then_bind_retry would still
 # die silently.
 set -E
-trap 'echo "handover: FATAL: exiting on error at line $LINENO: $BASH_COMMAND" >&2' ERR
+# NOTE: with `set -E` this fires even for failures inside guarded contexts
+# (`||`, `if` conditions) where the shell intentionally continues — most
+# visibly a single failed getInfo poll. So this line alone never proves the
+# run died: a real abort always pairs it with the failing command's own
+# error or a `handover: ...` fail line. The orphan heartbeat (now
+# self-exiting) used to make this ambiguous; it no longer does.
+trap 'echo "handover: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -45,7 +51,10 @@ export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examp
 export PATH="$HOME/.cargo/bin:$PATH"
 
 fail() {
-    echo "handover: $*" >&2
+    # FATAL here means the run is aborting (exit 1 below). The ERR trap
+    # deliberately does not use the word: it also fires for guarded,
+    # non-fatal failures.
+    echo "handover: FATAL: $*" >&2
     # Never leave a booted five-node network behind a failed run: take the
     # supervisor down with us (nodes stay up only after an explicit PASS).
     # The supervisor is a setsid(2) group leader, so a negative PID kills

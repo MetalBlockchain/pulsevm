@@ -21,6 +21,7 @@ named owner; nothing ships "when ready".
 | Platform chain id | MetalGo team | Bound into every confirmation; the gate refuses without it |
 | Wallet/exchange test vectors (pre-H and post-H) | Wallet + exchange leads | Sign/verify fixtures on both chains before the window |
 | Voter config per producer (producer name, keys, producer API URL) | Each BP | `--preflight` must print GO before the freeze |
+| Schedule readiness: `check-schedule-readiness.py` PASS | Chain ops | Every active producer 1-of-1 K1, keys match schedule, no pending rotation; a single bad row dooms init |
 
 ## Ceremony runbook
 
@@ -29,7 +30,11 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
 1. **Freeze (H-K).** Chain ops runs `init` on the ceremony contract at H-K.
    Every BP runs `--preflight` until it prints GO: node reachable, source
    chain matches, freeze digest recomputed locally equals the on-chain
-   digest, member present, no staged schedule change.
+   digest, member present, no staged schedule change. Chain ops re-runs
+   `check-schedule-readiness.py` at freeze time: a rotation staged after
+   T-14 fails the freeze before BPs spend signatures on it. A freeze that
+   expires (7-day vote window) or carries the wrong H is re-taken with a
+   fresh `init` — re-init while voteless, or any time after expiry.
 2. **Vote window (H-J..H).** The voter signs and submits unattended, or the
    operator signs manually (byte-identical). Watch `--status`: `vote`
    should read `on-chain` for every rostered producer. Tally vs 2/3 is
