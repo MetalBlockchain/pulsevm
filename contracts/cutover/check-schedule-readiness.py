@@ -191,7 +191,7 @@ def main():
         print(f"readiness: note: schedule change staged ({detail}), allowed by flag")
     if failures:
         return 1
-    print("readiness: PASS: active set is 1-of-1 K1 throughout")
+    print("readiness: PASS: all active schedule keys are valid K1")
     return 0
 
 
