@@ -1413,9 +1413,13 @@ EOF
     # needs a transaction. Submit the network's first transaction itself.
     echo "handover: waiting for the new network RPC..."
     # Heartbeat: proves the harness itself is alive during the long silent
-    # waits. If the log stops advancing with no FATAL line, the shell was
-    # killed externally — note the last heartbeat when reporting.
-    ( while true; do sleep 60; echo "handover: heartbeat $(date +%H:%M:%S) (cmd_boot rpc wait)"; done & )
+    # waits. Background the loop directly (never `( ... & )`): a job
+    # backgrounded inside parens belongs to the subshell, so the parent's
+    # $! stays unset and `set -u` aborts the main shell with a bare
+    # "unbound variable" and no FATAL line. Direct `&` sets $! reliably.
+    # The loop also exits when the main shell goes away, so a dead run
+    # cannot keep ticking heartbeats into the log and look alive.
+    while true; do sleep 60; echo "handover: heartbeat $(date +%H:%M:%S) (cmd_boot rpc wait)"; kill -0 $PPID 2>/dev/null || exit 0; done &
     HEARTBEAT_PID=$!
     rpc_url=""
     for _wait_iter in $(seq 1 60); do
@@ -1445,7 +1449,7 @@ EOF
         done
     fi
     [[ -n "$rpc_url" ]] || fail "new network RPC never came up (see $WORK_DIR/five-node.log)"
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    kill "${HEARTBEAT_PID:-}" 2>/dev/null || true
     read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
     [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
