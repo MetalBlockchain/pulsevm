@@ -151,23 +151,24 @@ CONTRACT cutover : public eosio::contract {
         };
         std::vector<frozen> set;
         for (const auto &row : schedule) {
-            if (!row.head.is_active) {
+            if (!row.is_active) {
                 continue;
             }
-            const std::string producer_name = name_to_string(row.head.owner.value);
-            // Enforce the 1-of-1 single-key precondition explicitly from
-            // the raw tail bytes (PFR cannot reflect the variant).
-            const auto authority_key =
-                schedule_view::parse_authority_tail(row.tail, producer_name);
-            eosio::check(authority_key == compressed_key(row.head.producer_key),
-                         "cutover: producer authority key differs from schedule key");
+            // The roster key is the schedule key, gated to K1 here (a
+            // non-K1 schedule key would mint an entry nobody can sign for,
+            // and votes recover K1 only). XPR producers rows carry no
+            // authority — verified against live mainnet rows — and the
+            // schedule key is the only consensus-relevant key: producer
+            // multisig permissions, where they exist, live in account
+            // authorities that block production never consults.
+            schedule_view::compressed_key(row.producer_key);
             // NaN fails self-equality; infinities fail the upper bound.
             // (CDT 1.8 has no std::isfinite for contracts.)
-            eosio::check(row.head.total_votes == row.head.total_votes && row.head.total_votes >= 0.0 &&
-                             row.head.total_votes < 1.0e30,
+            eosio::check(row.total_votes == row.total_votes && row.total_votes >= 0.0 &&
+                             row.total_votes < 1.0e30,
                          "cutover: producer vote weight is not a usable float");
-            unsigned __int128 weight = static_cast<unsigned __int128>(row.head.total_votes);
-            set.push_back({name_to_string(row.head.owner.value), row.head.producer_key, weight});
+            unsigned __int128 weight = static_cast<unsigned __int128>(row.total_votes);
+            set.push_back({name_to_string(row.owner.value), row.producer_key, weight});
             total += weight;
             ++count;
         }

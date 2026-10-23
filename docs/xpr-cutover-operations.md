@@ -21,7 +21,7 @@ named owner; nothing ships "when ready".
 | Platform chain id | MetalGo team | Bound into every confirmation; the gate refuses without it |
 | Wallet/exchange test vectors (pre-H and post-H) | Wallet + exchange leads | Sign/verify fixtures on both chains before the window |
 | Voter config per producer (producer name, keys, producer API URL) | Each BP | `--preflight` must print GO before the freeze |
-| Schedule readiness: `check-schedule-readiness.py` PASS | Chain ops | Every active producer 1-of-1 K1, keys match schedule, no pending rotation; a single bad row dooms init |
+| Schedule readiness: `check-schedule-readiness.py` PASS | Chain ops | Every active producer carries a valid K1 schedule key, weights sane, no pending/proposed rotation; a single bad row dooms init |
 
 ## Ceremony runbook
 

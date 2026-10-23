@@ -3,9 +3,8 @@
 // The local fixture chain carries no system `producers` table, so the
 // cutover contract's init would find an empty schedule. This helper writes
 // synthetic rows under code `eosio` / scope `eosio` with the exact binary
-// layout the ceremony reads (shared schedule_view.hpp guarantees it).
-// Test rows are the only rows it can create: every row carries the
-// canonical 1-of-1 fixture authority tail.
+// layout the ceremony reads (shared schedule_view.hpp guarantees it):
+// the 8-field mainnet shape, no authority tail.
 
 #include <eosio/eosio.hpp>
 
@@ -25,8 +24,7 @@ CONTRACT seed : public eosio::contract {
         eosio::multi_index<"producers"_n, schedule_view::producer_row>;
 
     // Store one producers row: owner, float64 votes, 33-byte K1 key,
-    // active flag. The authority tail is always the canonical 1-of-1
-    // over the same key.
+    // active flag. Head-only, exactly the live mainnet shape.
     ACTION setprod(const eosio::name &owner, double votes,
                    const std::vector<char> &key, bool active) {
         require_auth(get_self());
@@ -40,26 +38,23 @@ CONTRACT seed : public eosio::contract {
         // Alternative 0 is K1; the two array alternatives are identical
         // types, so the index must be explicit.
         eosio::public_key producer_key(std::in_place_index<0>, key_bytes);
-        const auto tail = schedule_view::make_authority_tail(key_bytes);
         auto it = schedule.find(owner.value);
         if (it == schedule.end()) {
             schedule.emplace(get_self(), [&](auto &row) {
-                row.head.owner = owner;
-                row.head.total_votes = votes;
-                row.head.producer_key = producer_key;
-                row.head.is_active = active;
-                row.head.url = "";
-                row.head.unpaid_blocks = 0;
-                row.head.last_claim_time = 0;
-                row.head.location = 0;
-                row.tail = tail;
+                row.owner = owner;
+                row.total_votes = votes;
+                row.producer_key = producer_key;
+                row.is_active = active;
+                row.url = "";
+                row.unpaid_blocks = 0;
+                row.last_claim_time = 0;
+                row.location = 0;
             });
         } else {
             schedule.modify(it, eosio::same_payer, [&](auto &row) {
-                row.head.total_votes = votes;
-                row.head.producer_key = producer_key;
-                row.head.is_active = active;
-                row.tail = tail;
+                row.total_votes = votes;
+                row.producer_key = producer_key;
+                row.is_active = active;
             });
         }
     }

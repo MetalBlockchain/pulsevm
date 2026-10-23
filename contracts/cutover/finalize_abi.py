@@ -31,13 +31,10 @@ TABLES = [
         "key_types": ["name"],
         "type": "member",
     },
-    # Fixture-only: the seeder's synthetic `eosio.producers` row. The head
-    # mirrors the live system layout exactly (see schedule_view.hpp); the
-    # flattened authority tail is opaque bytes here because no standard ABI
-    # type consumes the exact 42 raw bytes. Row presence/count queries work;
-    # full JSON decoding of the tail is not supported by this ABI (the
-    # cutover contract parses the tail itself; the A-Chain verifier decodes
-    # checkpoint state with its own layout).
+    # Fixture-only: the seeder's synthetic `eosio.producers` row. The
+    # layout mirrors the live mainnet system layout exactly (see
+    # schedule_view.hpp): 8 fields, no authority tail. Leap 5 renders
+    # float64 total_votes as a decimal string and bool is_active as 0/1.
     {
         "name": "producers",
         "index_type": "i64",
@@ -76,14 +73,6 @@ STRUCTS = [
         "name": "producer_row",
         "base": "",
         "fields": [
-            {"name": "head", "type": "producer_head"},
-            {"name": "tail", "type": "bytes"},
-        ],
-    },
-    {
-        "name": "producer_head",
-        "base": "",
-        "fields": [
             {"name": "owner", "type": "name"},
             {"name": "total_votes", "type": "float64"},
             {"name": "producer_key", "type": "public_key"},
@@ -105,7 +94,6 @@ OWNERS = {
     "member": "cutover",
     "producers": "seed",
     "producer_row": "seed",
-    "producer_head": "seed",
 }
 owner = "cutover" if ABI_PATH.startswith("cutover") else "seed"
 

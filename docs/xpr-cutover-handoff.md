@@ -39,10 +39,10 @@ against independently replayed XPR state:
    in u128 integer math. Roster-less (single-key) commitments are rejected
    everywhere — one key cannot prove the schedule agreed.
 3. **Roster provenance.** The set is frozen on-chain from the live
-   `eosio.producers` table (never prover-supplied; multisig schedules fail
-   closed), and the gate cross-checks names, keys, *and* weights against the
-   checkpoint's own producers table — the light-client rule: same set both
-   ways.
+   `eosio.producers` table (never prover-supplied; a non-K1 schedule key
+   fails the freeze), and the gate cross-checks names, keys, *and* weights
+   against the checkpoint's own producers table — the light-client rule:
+   same set both ways.
 4. **Pre-commitment timing provable.** Declaration votes must land before H,
    proven one of two ways: on-chain ceremony votes (contract vehicle), or a
    recorded declaration inclusion (memo / msig execution block). A pair with
@@ -54,11 +54,17 @@ against independently replayed XPR state:
    abandoned freeze can never lock the contract — expiry is the escape
    hatch, and there is no admin to call instead. The voter refuses expired
    freezes rather than submitting doomed votes.
-6. **Roster shape.** Every active producer must be plain 1-of-1 K1 with
-   its authority key equal to its schedule key; anything else (multisig,
-   non-K1, mismatched keys) fails init closed. Audit with
-   `contracts/cutover/check-schedule-readiness.py` at T-14 and at freeze
-   time — a single bad row dooms the ceremony before it starts.
+6. **Roster shape.** The roster freezes the live schedule keys, each
+   gated to valid K1 at init; a non-K1 schedule key fails the freeze
+   instead of minting an entry nobody can sign for. XPR producers rows
+   carry no authority field (verified against live mainnet rows: 8
+   fields, 90 bytes), so there is nothing multisig to audit in the
+   roster path — DPoS schedules hold single keys by protocol, and votes
+   are K1 recoveries against the frozen schedule keys, never permission
+   checks. Audit with `contracts/cutover/check-schedule-readiness.py`
+   at T-14 and at freeze time: valid K1 schedule keys, sane weights, no
+   staged schedule rotation — a single bad row dooms the ceremony
+   before BPs spend signatures on it.
 7. **Bindings.** Confirmation ties H, block id, checkpoint, and successor
    chain id to the declaration; the checkpoint hash is recomputed from the
    artifact, never trusted as a string. Replay across heights, exports, or

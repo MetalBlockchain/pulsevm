@@ -12,11 +12,17 @@ Usage:
                                 [--allow-pending]
 
 Checks (hard failures, exit 1):
-  - each active producer authority is threshold 1, exactly one key of
-    weight 1, no accounts, no waits;
-  - that key is a valid K1 key (PUB_K1_ or legacy EOS with checksum) and
-    equals the row's schedule key (what the contract compares);
-  - total_votes is a finite number with 0 < v < 1e30 (contract bounds).
+  - each active producer's schedule key is a valid K1 key (PUB_K1_ or
+    legacy EOS with checksum) — the roster freezes the schedule key, and
+    a non-K1 key would mint an entry nobody can sign for;
+  - where the row carries an `authority` field (non-XPR chains), it must
+    be threshold 1, exactly one weight-1 key, no accounts, no waits, and
+    equal to the schedule key. XPR mainnet rows carry NO authority
+    (verified live: 8 fields, 90 bytes) — the schedule key is the only
+    consensus-relevant key, so absence is the expected shape, not a
+    failure;
+  - total_votes parses (Leap 5 renders float64 as a decimal string) to a
+    finite number with 0 < v < 1e30 (contract bounds).
 A staged pending/proposed schedule also fails unless --allow-pending: the
 frozen roster must name the set that will actually produce H.
 
@@ -106,33 +112,45 @@ def main():
     for row in active:
         name = row.get("owner", "?")
         problems = []
-        authority = row.get("authority") or {}
-        if authority.get("threshold") != 1:
-            problems.append(f"threshold={authority.get('threshold')}")
-        keys = authority.get("keys") or []
-        if len(keys) != 1 or keys[0].get("weight") != 1:
-            problems.append("not exactly one weight-1 key")
-        if authority.get("accounts"):
-            problems.append("has account approvals")
-        if authority.get("waits"):
-            problems.append("has waits")
-        try:
-            auth_key = parse_k1(keys[0]["key"]) if keys else None
-        except (ValueError, KeyError, IndexError) as error:
-            problems.append(f"bad authority key: {error}")
-            auth_key = None
         try:
             schedule_key = parse_k1(row.get("producer_key", ""))
         except ValueError as error:
             problems.append(f"bad schedule key: {error}")
             schedule_key = None
-        if auth_key is not None and schedule_key is not None and auth_key != schedule_key:
-            problems.append("authority key differs from schedule key")
-        votes = row.get("total_votes")
-        if not isinstance(votes, (int, float)) or not (0 < votes < 1e30) or votes != votes:
-            problems.append(f"total_votes out of bounds: {votes}")
+        if "authority" in row:
+            # Non-XPR chain shape: the on-chain authority must be plain
+            # 1-of-1 K1 and match the schedule key, exactly what the
+            # contract used to enforce before XPR dropped the field.
+            authority = row.get("authority") or {}
+            if authority.get("threshold") != 1:
+                problems.append(f"threshold={authority.get('threshold')}")
+            keys = authority.get("keys") or []
+            if len(keys) != 1 or keys[0].get("weight") != 1:
+                problems.append("not exactly one weight-1 key")
+            if authority.get("accounts"):
+                problems.append("has account approvals")
+            if authority.get("waits"):
+                problems.append("has waits")
+            try:
+                auth_key = parse_k1(keys[0]["key"]) if keys else None
+            except (ValueError, KeyError, IndexError) as error:
+                problems.append(f"bad authority key: {error}")
+                auth_key = None
+            if (
+                auth_key is not None
+                and schedule_key is not None
+                and auth_key != schedule_key
+            ):
+                problems.append("authority key differs from schedule key")
+        try:
+            # Leap 5 renders float64 as a decimal string; accept both.
+            votes = float(row.get("total_votes"))
+        except (TypeError, ValueError):
+            votes = float("nan")
+        if not (0 < votes < 1e30):
+            problems.append(f"total_votes out of bounds: {row.get('total_votes')}")
         else:
-            total_weight += float(votes)
+            total_weight += votes
         if problems:
             failures.append(f"{name}: {'; '.join(problems)}")
 
@@ -156,9 +174,13 @@ def main():
         print(f"readiness: FAIL: schedule change staged ({detail}); freeze after it activates")
         return 1
 
-    weights = sorted(
-        (float(row.get("total_votes", 0)) for row in active), reverse=True
-    )
+    def safe_votes(row):
+        try:
+            return float(row.get("total_votes", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    weights = sorted((safe_votes(row) for row in active), reverse=True)
     top21_share = sum(weights[:21]) / total_weight if total_weight else 0.0
     print(
         f"readiness: {len(active)} active producers checked, {len(failures)} failures; "
