@@ -51,12 +51,18 @@ using schedule_view::system_producers_table;
 static constexpr char declaration_domain[] = "PULSEVM-XPR-HALT-DECLARATION-v1";
 
 // Ceremony liveness bound: votes land within vote_window_us of the freeze
-// (publication_time() microseconds at init). Afterwards the freeze
-// expires: votes are refused and anyone may re-init, votes or not. A
-// wrong-H or abandoned freeze can never brick the contract. The window
-// must exceed the worst-case ceremony (hours) with wide margin while
-// staying short enough that a stale freeze cannot confuse coordination.
+// (init instant below). Afterwards the freeze expires: votes are refused
+// and re-init is allowed — even with votes on it, so a wrong-H or
+// abandoned freeze can never brick the contract. The window must exceed
+// the worst-case ceremony (hours) with wide margin while staying short
+// enough that a stale freeze cannot confuse coordination.
 static constexpr uint64_t vote_window_us = 7ULL * 24ULL * 60ULL * 60ULL * 1000000ULL;
+
+// publication_time() in plain microseconds since epoch: the init_time ABI
+// field and the off-chain microsecond clock speak the same unit.
+static uint64_t now_us() {
+    return static_cast<uint64_t>(eosio::publication_time().time_since_epoch().count());
+}
 
 // Frozen ceremony state (singleton). Table typedefs live inside the
 // contract class so abigen emits them into the ABI (get_table_rows needs
@@ -122,7 +128,7 @@ CONTRACT cutover : public eosio::contract {
         ceremony_singleton state(get_self(), get_self().value);
         if (state.exists()) {
             auto current = state.get();
-            bool expired = eosio::publication_time() > current.init_time + vote_window_us;
+            bool expired = now_us() > current.init_time + vote_window_us;
             eosio::check(current.voted_weight == 0 || expired,
                          "cutover already collecting votes; freeze is locked");
             state.remove();
@@ -192,7 +198,7 @@ CONTRACT cutover : public eosio::contract {
         eosio::checksum256 digest =
             eosio::sha256(message.data(), static_cast<uint32_t>(message.size()));
         state.set(
-            ceremony{0, h, source_chain_id, total, 0, false, digest, eosio::publication_time()},
+            ceremony{0, h, source_chain_id, total, 0, false, digest, now_us()},
             get_self());
     }
 
@@ -206,7 +212,7 @@ CONTRACT cutover : public eosio::contract {
         eosio::check(state.exists(), "cutover: no frozen ceremony; init first");
         auto frozen = state.get();
         eosio::check(!frozen.finalized, "cutover: tally already finalized");
-        eosio::check(eosio::publication_time() <= frozen.init_time + vote_window_us,
+        eosio::check(now_us() <= frozen.init_time + vote_window_us,
                      "cutover: ceremony window expired; re-init for a fresh freeze");
         member_table members(get_self(), get_self().value);
         auto it = members.find(producer.value);
