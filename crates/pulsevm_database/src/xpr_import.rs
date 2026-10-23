@@ -430,14 +430,15 @@ pub struct StateProducerKey {
 
 /// Decode one `producer_info` row in Leap 5.0.3 `fc::raw` layout: owner,
 /// `total_votes`, key type, 33-byte key, `is_active`, url, unpaid blocks,
-/// last claim time, location, then the `producer_authority` variant tail.
-/// The tail is enforced, not skipped: the ceremony can only tally
-/// single-key authorities, so a row whose authority is not exactly
-/// 1-of-1 over the schedule key fails closed here (and in the contract's
-/// `init`), visibly, instead of tallying the wrong keys. Vote weights are
-/// consumed but not returned: they drift every block between the roster
-/// reference and the checkpoint, so the cross-check binds names to keys
-/// and leaves weights to the quorum math over the transported roster.
+/// last claim time, location. XPR mainnet rows carry NO authority tail
+/// (verified live against mainnet: 8 fields, 90 bytes), so the schedule
+/// key is taken as the signing key after a K1 validity gate — the same
+/// rule the ceremony contract's `init` enforces. Vote weights are consumed
+/// but not returned: they drift every block between the roster reference
+/// and the checkpoint, so the cross-check binds names to keys and leaves
+/// weights to the quorum math over the transported roster. `finish`
+/// enforces exact consumption, so any future system-contract field
+/// addition fails this decoder loudly instead of silently changing shape.
 fn decode_producer_info_row(bytes: &[u8]) -> Result<(u64, StateProducerKey), XprImportError> {
     let mut row = RowCursor::new(bytes);
     let owner = row.u64()?;
@@ -451,35 +452,6 @@ fn decode_producer_info_row(bytes: &[u8]) -> Result<(u64, StateProducerKey), Xpr
     let _unpaid_blocks = row.u32()?;
     let _last_claim_time = row.i64()?;
     let _location = row.u16()?;
-    // `producer_authority$`: varuint variant index, then the alternative.
-    // Only index 0 (`block_signing_authority_v0`) exists on-chain today.
-    if row.varuint()? != 0 {
-        return Err(bad(
-            "XPR producer uses an unknown signing-authority version",
-        ));
-    }
-    if row.u32()? != 1 {
-        return Err(bad(
-            "XPR producer authority threshold is not 1-of-1; ceremony preconditions unmet",
-        ));
-    }
-    if row.varuint()? != 1 {
-        return Err(bad(
-            "XPR producer authority does not hold exactly one key; ceremony preconditions unmet",
-        ));
-    }
-    if row.varuint()? != 0 {
-        return Err(bad("XPR producer authority uses a non-K1 key"));
-    }
-    let authority_key = row.fixed::<33>()?;
-    if row.u16()? != 1 {
-        return Err(bad("XPR producer authority key weight is not 1"));
-    }
-    if authority_key != key {
-        return Err(bad(
-            "XPR producer authority key differs from the schedule key",
-        ));
-    }
     row.finish()?;
     Ok((
         owner,
@@ -4856,15 +4828,8 @@ mod tests {
         row.extend_from_slice(&0u32.to_le_bytes());
         row.extend_from_slice(&0i64.to_le_bytes());
         row.extend_from_slice(&0u16.to_le_bytes());
-        // Canonical 1-of-1 `producer_authority` tail over the schedule key,
-        // matching live mainnet rows: variant index 0, threshold 1, one K1
-        // key of weight 1. Authority-negative tests patch these bytes.
-        varuint(0, &mut row);
-        row.extend_from_slice(&1u32.to_le_bytes());
-        varuint(1, &mut row);
-        varuint(0, &mut row);
-        row.extend_from_slice(key_bytes);
-        row.extend_from_slice(&1u16.to_le_bytes());
+        // Head-only, exactly the live mainnet shape: XPR producers rows
+        // carry no authority tail, so nothing follows the location field.
         row
     }
 
@@ -4889,14 +4854,15 @@ mod tests {
     #[test]
     fn migration_state_producer_keys_rejects_bad_rows() {
         let key = test_key("state-roster-1");
-        let other = test_key("state-roster-2");
         let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
-        // Non-K1 key type.
+        // Non-K1 key type: nothing downstream can sign for this roster
+        // entry, so the freeze must refuse it.
         assert!(
             decode_producer_info_row(&pack_producer_info(owner, &key.compressed(), 1, true, 1.0))
                 .is_err()
         );
-        // Trailing bytes past the authority tail.
+        // Trailing bytes past the head: a future system-contract field
+        // addition must fail loudly, never silently decode.
         let mut trailed = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
         trailed.push(0);
         assert!(decode_producer_info_row(&trailed).is_err());
@@ -4904,24 +4870,6 @@ mod tests {
         let mut short = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
         short.truncate(short.len() - 2);
         assert!(decode_producer_info_row(&short).is_err());
-        // Authority tail is 42 bytes: index(1) threshold(4) nkeys(1)
-        // keytype(1) key(33) weight(2). Patch it for each negative case.
-        const TAIL: usize = 1 + 4 + 1 + 1 + 33 + 2;
-        // Unknown variant index.
-        let mut versioned = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
-        let at = versioned.len() - TAIL;
-        versioned[at] = 1;
-        assert!(decode_producer_info_row(&versioned).is_err());
-        // Threshold 2.
-        let mut thresholded = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
-        let at = thresholded.len() - TAIL + 1;
-        thresholded[at] = 2;
-        assert!(decode_producer_info_row(&thresholded).is_err());
-        // Authority key differs from the schedule key.
-        let mut swapped = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
-        let key_at = swapped.len() - TAIL + 1 + 4 + 1 + 1;
-        swapped[key_at..key_at + 33].copy_from_slice(&other.compressed());
-        assert!(decode_producer_info_row(&swapped).is_err());
     }
 
     fn state_key(key: &[u8; 33]) -> StateProducerKey {
