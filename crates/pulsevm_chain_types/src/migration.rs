@@ -29,6 +29,14 @@ pub const HALT_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-v1";
 /// checkpoint hash so a commitment cannot be replayed onto another export.
 pub const HALT_DOMAIN_V2: &[u8] = b"PULSEVM-XPR-HALT-v2";
 
+/// Cutover-ceremony vote window in microseconds: votes land within this of
+/// the freeze, afterwards the freeze expires and anyone may re-init (even
+/// with votes on it) so an abandoned freeze can never brick the contract.
+/// Must match `vote_window_us` in contracts/cutover/cutover.cpp exactly;
+/// the contract is authoritative (XPR consensus time) and off-chain code
+/// mirrors it for pre-submit refusal only.
+pub const CEREMONY_VOTE_WINDOW_US: u64 = 7 * 24 * 3600 * 1_000_000;
+
 /// One producer's signature over the halt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaltSignature {
@@ -924,6 +932,12 @@ pub struct HaltContractCeremony {
     /// Block where finalization was captured. Must predate H: the quorum
     /// completes before the cutover, never after it.
     pub finalized_block: u32,
+    /// Freeze instant (`publication_time()` microseconds at init) captured
+    /// from the singleton. Audit trail only: the liveness window it bounds
+    /// is enforced by the contract (XPR consensus time), not re-enforced
+    /// here against a second clock.
+    #[serde(default)]
+    pub init_time: u64,
     /// Every vote action the exporter found, in scan order.
     pub votes: Vec<HaltContractVote>,
 }
@@ -1855,6 +1869,7 @@ mod tests {
             voted_weight: HaltWeight(WEIGHTS[0].0 + WEIGHTS[1].0),
             finalized: true,
             finalized_block: HEIGHT - 1,
+            init_time: 0,
             votes,
         }
     }

@@ -25,12 +25,14 @@
 //   member (producer-len-be32 || producer-utf8 || key-compressed ||
 //   weight-be128), members in byte-lexicographic name order. One BP
 //   signature serves both the on-chain vote and the off-chain declaration.
-// - init is permissionless and re-runnable while no vote has landed. A
-//   wrong-H init cannot forge a quorum (votes bind the stored H; BPs only
-//   sign the coordinated digest), so griefing affects liveness only, never
-//   safety. Once the first vote lands the freeze is locked.
-// - One cutover: init runs once per freeze, votes close at finalized, and
-//   the contract holds no admin key. There is nothing to upgrade.
+// - init is permissionless and re-runnable while no vote has landed, or
+//   once the freeze expired (see vote_window_us). A wrong-H init cannot
+//   forge a quorum (votes bind the stored H; BPs only sign the coordinated
+//   digest), so griefing affects liveness only, never safety. An abandoned
+//   or wrong-H freeze with votes on it expires instead of bricking the
+//   contract: anyone may start over, no admin needed.
+// - One cutover: init runs once per live freeze, votes close at finalized,
+//   and the contract holds no admin key. There is nothing to upgrade.
 
 #include <eosio/crypto.hpp>
 #include <eosio/eosio.hpp>
@@ -48,6 +50,14 @@ using schedule_view::system_producers_table;
 // pulsevm_chain_types::migration.
 static constexpr char declaration_domain[] = "PULSEVM-XPR-HALT-DECLARATION-v1";
 
+// Ceremony liveness bound: votes land within vote_window_us of the freeze
+// (publication_time() microseconds at init). Afterwards the freeze
+// expires: votes are refused and anyone may re-init, votes or not. A
+// wrong-H or abandoned freeze can never brick the contract. The window
+// must exceed the worst-case ceremony (hours) with wide margin while
+// staying short enough that a stale freeze cannot confuse coordination.
+static constexpr uint64_t vote_window_us = 7ULL * 24ULL * 60ULL * 60ULL * 1000000ULL;
+
 // Frozen ceremony state (singleton). Table typedefs live inside the
 // contract class so abigen emits them into the ABI (get_table_rows needs
 // the table definitions to decode rows).
@@ -59,6 +69,12 @@ struct [[eosio::table]] ceremony {
     unsigned __int128 voted_weight = 0;
     bool finalized = false;
     eosio::checksum256 declaration_digest;
+    // publication_time() microseconds at freeze; votes are accepted only
+    // within vote_window_us of it. Appended last to keep the field order
+    // of the frozen rows stable for every JSON consumer. (Deployments are
+    // fresh accounts with empty tables — there is no same-account upgrade
+    // path whose old rows would need migration.)
+    uint64_t init_time = 0;
     uint64_t primary_key() const { return id; }
 };
 
@@ -98,12 +114,16 @@ CONTRACT cutover : public eosio::contract {
     using member_table = eosio::multi_index<"members"_n, member>;
 
     // Freeze the live schedule for cutover height H. Re-runnable while no
-    // vote has landed (voted_weight == 0); afterwards the freeze is locked.
+    // vote has landed (voted_weight == 0), or once the freeze expired —
+    // even with votes on it, so an abandoned freeze can never brick the
+    // contract. Expiry is publication_time() based, hence XPR consensus
+    // time, not wall clock.
     ACTION init(uint32_t h, const eosio::checksum256 &source_chain_id) {
         ceremony_singleton state(get_self(), get_self().value);
         if (state.exists()) {
             auto current = state.get();
-            eosio::check(current.voted_weight == 0,
+            bool expired = eosio::publication_time() > current.init_time + vote_window_us;
+            eosio::check(current.voted_weight == 0 || expired,
                          "cutover already collecting votes; freeze is locked");
             state.remove();
             // Fall through and re-freeze. Rows are re-created below; the
@@ -172,18 +192,22 @@ CONTRACT cutover : public eosio::contract {
         eosio::checksum256 digest =
             eosio::sha256(message.data(), static_cast<uint32_t>(message.size()));
         state.set(
-            ceremony{0, h, source_chain_id, total, 0, false, digest},
+            ceremony{0, h, source_chain_id, total, 0, false, digest, eosio::publication_time()},
             get_self());
     }
 
     // Record one producer's vote: signature over the frozen declaration
     // digest by the frozen schedule key. Permissionless: the signature is
-    // the authorization, so anyone may relay votes.
+    // the authorization, so anyone may relay votes. Votes land inside the
+    // freeze window only; afterwards the freeze is expired (re-init for a
+    // fresh one) so a stale freeze can never finalize late.
     ACTION vote(const eosio::name &producer, const eosio::signature &sig) {
         ceremony_singleton state(get_self(), get_self().value);
         eosio::check(state.exists(), "cutover: no frozen ceremony; init first");
         auto frozen = state.get();
         eosio::check(!frozen.finalized, "cutover: tally already finalized");
+        eosio::check(eosio::publication_time() <= frozen.init_time + vote_window_us,
+                     "cutover: ceremony window expired; re-init for a fresh freeze");
         member_table members(get_self(), get_self().value);
         auto it = members.find(producer.value);
         eosio::check(it != members.end(),

@@ -68,6 +68,32 @@ fn bool_from_int_or_bool<'de, D: serde::Deserializer<'de>>(input: D) -> Result<b
     input.deserialize_any(Flag)
 }
 
+/// Leap renders uint64 table fields as decimal strings; accept a JSON
+/// number too so fixture rows stay writable by hand. Missing stays 0 so
+/// rows frozen before the window existed still decode (the window only
+/// ever constrains live freezes).
+fn u64_from_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrNumber;
+    impl<'de> serde::de::Visitor<'de> for StringOrNumber {
+        type Value = u64;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a decimal uint64 string or a JSON number")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<u64, E> {
+            Ok(value)
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u64, E> {
+            value
+                .parse::<u64>()
+                .map_err(|_| E::custom(format!("not a uint64: {value}")))
+        }
+    }
+    deserializer.deserialize_any(StringOrNumber)
+}
+
 #[derive(Debug, Deserialize)]
 struct CeremonyRow {
     h: u32,
@@ -77,6 +103,8 @@ struct CeremonyRow {
     #[serde(deserialize_with = "bool_from_int_or_bool")]
     finalized: bool,
     declaration_digest: String,
+    #[serde(default, deserialize_with = "u64_from_string_or_number")]
+    init_time: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,6 +346,7 @@ async fn run(
         voted_weight: ceremony.voted_weight,
         finalized: ceremony.finalized,
         finalized_block: singleton_block,
+        init_time: ceremony.init_time,
         votes,
     };
     fs::write(

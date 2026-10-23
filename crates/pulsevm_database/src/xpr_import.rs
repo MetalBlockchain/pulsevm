@@ -5461,6 +5461,7 @@ mod tests {
             voted_weight: pulsevm_chain_types::HaltWeight(3),
             finalized: true,
             finalized_block: 6,
+            init_time: 0,
             votes: vec![
                 vote("prod.a", &key_a, &sig_a, 5),
                 vote("prod.b", &key_b, &sig_b, 6),

@@ -270,6 +270,10 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
 struct CeremonyView {
     head_num: u32,
     lib_num: u32,
+    /// Head block timestamp in microseconds: the expiry check runs on
+    /// chain time (the same clock the contract's `publication_time()`
+    /// window uses), never on the operator's wall clock.
+    head_time_us: u64,
     singleton: Option<CeremonyRow>,
     member: Option<MemberRow>,
     /// A schedule change is staged (pending or proposed): the frozen set
@@ -284,6 +288,9 @@ struct CeremonyRow {
     source_chain_id: String,
     finalized: bool,
     digest: String,
+    /// Freeze instant (`publication_time()` microseconds at init). Votes
+    /// are accepted by the contract only inside the vote window past it.
+    init_time_us: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +332,16 @@ fn decide(config: &LoadedConfig, view: &CeremonyView) -> Decision {
             "ceremony digest does not match the locally recomputed declaration: refusing to sign a foreign freeze"
                 .to_string(),
         );
+    }
+    // The contract stops accepting votes past the freeze window; submitting
+    // into an expired freeze burns payer CPU/NET on a doomed transaction,
+    // so refuse here and wait for a fresh freeze instead. Same clock as the
+    // contract (head timestamp vs init_time), same bound.
+    if view.head_time_us > singleton.init_time_us + pulsevm_chain_types::CEREMONY_VOTE_WINDOW_US {
+        return Decision::Refuse(format!(
+            "ceremony freeze expired (vote window is {} seconds)",
+            pulsevm_chain_types::CEREMONY_VOTE_WINDOW_US / 1_000_000
+        ));
     }
     if view.schedule_blocked {
         return Decision::Refuse(
@@ -502,6 +519,21 @@ fn parse_abi_bool(value: &serde_json::Value, field: &str) -> Result<bool, String
     Err(format!("row missing bool field {field}"))
 }
 
+/// Leap renders uint64 ABI fields as decimal strings; accept a JSON number
+/// too. Missing fails closed: without the freeze instant the vote window
+/// cannot be proven, so an old row must not be signed.
+fn parse_leap_uint64(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+    if let Some(number) = value.get(field).and_then(|v| v.as_u64()) {
+        return Ok(number);
+    }
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("row missing {field}"))?
+        .parse::<u64>()
+        .map_err(|_| format!("row field {field} is not a uint64"))
+}
+
 fn parse_ceremony_row(value: &serde_json::Value) -> Result<CeremonyRow, String> {
     Ok(CeremonyRow {
         h: value
@@ -519,6 +551,11 @@ fn parse_ceremony_row(value: &serde_json::Value) -> Result<CeremonyRow, String> 
             .and_then(|v| v.as_str())
             .ok_or_else(|| "ceremony row missing declaration_digest".to_string())?
             .to_string(),
+        init_time_us: parse_leap_uint64(value, "init_time").map_err(|error| {
+            format!(
+                "ceremony row missing freeze instant ({error}): refusing to sign an undated freeze"
+            )
+        })?,
     })
 }
 
@@ -563,9 +600,17 @@ async fn read_view(
         }
     }
     let schedule_blocked = read_schedule_blocked(client, base).await?;
+    // Head timestamp only matters once a freeze exists (it bounds the vote
+    // window); skip the extra block fetch while there is nothing to expire.
+    let head_time_us = if singleton.is_some() {
+        fetch_head_timestamp_us(client, base, head_num).await?
+    } else {
+        0
+    };
     Ok(CeremonyView {
         head_num,
         lib_num,
+        head_time_us,
         singleton,
         member,
         schedule_blocked,
@@ -734,6 +779,92 @@ async fn fetch_block_id(
         .and_then(|v| v.as_str())
         .map(|v| v.to_string())
         .ok_or_else(|| format!("get_block {height} missing id"))
+}
+
+/// Leap block timestamp (`2026-10-23T13:50:31.500`, always UTC) to
+/// microseconds since the Unix epoch. No chrono/time dependency: the
+/// days-from-civil count is exact for the Gregorian calendar, and the
+/// fractional part keeps millisecond precision (microsecond digits, if a
+/// node ever renders them, are truncated, never rounded up).
+fn parse_leap_timestamp_us(text: &str) -> Result<u64, String> {
+    let (date, time) = text
+        .split_once('T')
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let month: i64 = date_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let day: i64 = date_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let mut time_parts = time.split([':', '.']);
+    let hour: i64 = time_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let minute: i64 = time_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    let second: i64 = time_parts
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("bad Leap timestamp: {text}"))?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(format!("bad Leap timestamp: {text}"));
+    }
+    // Days from civil (Howard Hinnant's algorithm); valid for all
+    // non-negative years, which covers every chain timestamp.
+    let year_adj = if month <= 2 { year - 1 } else { year };
+    let era = year_adj.div_euclid(400);
+    let year_of_era = year_adj.rem_euclid(400);
+    let month_adj = month.rem_euclid(12);
+    let day_of_year = (153 * month_adj + 2).div_euclid(5) + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era.div_euclid(4) - year_of_era.div_euclid(100) + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    let fraction_us: u64 = time_parts
+        .next()
+        .map(|fraction| {
+            let digits = format!("{:0<6}", fraction.chars().take(6).collect::<String>());
+            digits.parse::<u64>().unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let micros = days as u64 * 86_400_1_000_000
+        + (hour as u64 * 3600 + minute as u64 * 60 + second as u64) * 1_000_000
+        + fraction_us;
+    Ok(micros)
+}
+
+/// Head block timestamp in microseconds: the expiry check's clock. Fetched
+/// per poll only while a freeze exists (no freeze, no deadline to check).
+async fn fetch_head_timestamp_us(
+    client: &reqwest::Client,
+    base: &str,
+    head_num: u32,
+) -> Result<u64, String> {
+    let block = post_json(
+        client,
+        &format!("{base}/v1/chain/get_block"),
+        &serde_json::json!({ "block_num_or_id": head_num.to_string() }),
+    )
+    .await?;
+    let timestamp = block
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("get_block {head_num} missing timestamp"))?;
+    parse_leap_timestamp_us(timestamp)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1628,12 +1759,14 @@ mod tests {
 
     fn view_with(
         head: u32,
+        head_time_us: u64,
         singleton: Option<CeremonyRow>,
         member: Option<MemberRow>,
     ) -> CeremonyView {
         CeremonyView {
             head_num: head,
             lib_num: head.saturating_sub(10),
+            head_time_us,
             singleton,
             member,
             schedule_blocked: false,
@@ -1646,6 +1779,7 @@ mod tests {
             source_chain_id: config.inner.source_chain_id.clone(),
             finalized: false,
             digest: hex::encode(config.expected_digest),
+            init_time_us: 0,
         }
     }
 
@@ -1659,7 +1793,7 @@ mod tests {
     #[test]
     fn waits_without_a_frozen_ceremony() {
         let config = test_loaded_config(100);
-        let view = view_with(90, None, None);
+        let view = view_with(90, 0, None, None);
         assert!(matches!(decide(&config, &view), Decision::Wait(_)));
     }
 
@@ -1669,17 +1803,17 @@ mod tests {
         // Wrong height.
         let mut bad = live_singleton(&config);
         bad.h = 101;
-        let view = view_with(90, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Wrong digest (a freeze we did not coordinate).
         let mut bad = live_singleton(&config);
         bad.digest = "00".repeat(32);
-        let view = view_with(90, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Wrong source chain.
         let mut bad = live_singleton(&config);
         bad.source_chain_id = "42".repeat(32);
-        let view = view_with(90, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
     }
 
@@ -1689,15 +1823,16 @@ mod tests {
         // Finalized without us.
         let mut done = live_singleton(&config);
         done.finalized = true;
-        let view = view_with(90, Some(done), Some(live_member(&config, false)));
+        let view = view_with(90, 0, Some(done), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Producer not frozen.
-        let view = view_with(90, Some(live_singleton(&config)), None);
+        let view = view_with(90, 0, Some(live_singleton(&config)), None);
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Frozen under a different key.
         let other = K1PrivateKey::from_seed_string("someone-else").unwrap();
         let view = view_with(
             90,
+            0,
             Some(live_singleton(&config)),
             Some(MemberRow {
                 key: other.public_key().to_string(),
@@ -1737,6 +1872,7 @@ mod tests {
         );
         let view = view_with(
             90,
+            0,
             Some(live_singleton(&config)),
             Some(MemberRow {
                 key: eos_form.to_string(),
@@ -1751,6 +1887,7 @@ mod tests {
         let config = test_loaded_config(100);
         let mut view = view_with(
             90,
+            0,
             Some(live_singleton(&config)),
             Some(live_member(&config, false)),
         );
@@ -1821,6 +1958,7 @@ mod tests {
         let config = test_loaded_config(100);
         let view = view_with(
             90,
+            0,
             Some(live_singleton(&config)),
             Some(live_member(&config, false)),
         );
@@ -1828,6 +1966,7 @@ mod tests {
         // Already on-chain: never sign twice.
         let view = view_with(
             90,
+            0,
             Some(live_singleton(&config)),
             Some(live_member(&config, true)),
         );
@@ -1835,10 +1974,75 @@ mod tests {
         // At or past H the contract must reject: refuse instead of spamming.
         let view = view_with(
             100,
+            0,
             Some(live_singleton(&config)),
             Some(live_member(&config, false)),
         );
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    #[test]
+    fn refuses_an_expired_freeze() {
+        use pulsevm_chain_types::CEREMONY_VOTE_WINDOW_US;
+        // The window constant is seven days in microseconds, matching the
+        // contract's vote_window_us (the contract is authoritative).
+        assert_eq!(CEREMONY_VOTE_WINDOW_US, 7 * 24 * 3600 * 1_000_000);
+        let config = test_loaded_config(100);
+        let mut frozen = live_singleton(&config);
+        frozen.init_time_us = 1_000_000_000_000_000;
+        // Inside the window (boundary inclusive): vote.
+        let view = view_with(
+            90,
+            frozen.init_time_us + CEREMONY_VOTE_WINDOW_US,
+            Some(frozen.clone()),
+            Some(live_member(&config, false)),
+        );
+        assert_eq!(decide(&config, &view), Decision::Vote);
+        // One microsecond past the window: refuse, do not spam a vote the
+        // contract must reject.
+        let view = view_with(
+            90,
+            frozen.init_time_us + CEREMONY_VOTE_WINDOW_US + 1,
+            Some(frozen),
+            Some(live_member(&config, false)),
+        );
+        assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    #[test]
+    fn leap_timestamps_parse_to_microseconds() {
+        // 2026-01-01T00:00:00Z is 1767225600 (2025 is not a leap year).
+        assert_eq!(
+            parse_leap_timestamp_us("2026-01-01T00:00:00.000").unwrap(),
+            1_767_225_600_000_000
+        );
+        assert_eq!(
+            parse_leap_timestamp_us("2026-10-23T13:50:31.500").unwrap()
+                - parse_leap_timestamp_us("2026-10-23T13:50:31.000").unwrap(),
+            500_000
+        );
+        assert!(parse_leap_timestamp_us("not-a-timestamp").is_err());
+        assert!(parse_leap_timestamp_us("2026-13-01T00:00:00.000").is_err());
+    }
+
+    #[test]
+    fn ceremony_row_requires_the_freeze_instant() {
+        let row = serde_json::json!({
+            "h": 100,
+            "source_chain_id": "41".repeat(32),
+            "finalized": false,
+            "declaration_digest": "00".repeat(32),
+            "init_time": "1700000000000000",
+        });
+        assert_eq!(
+            parse_ceremony_row(&row).unwrap().init_time_us,
+            1_700_000_000_000_000
+        );
+        // Undated freezes (rows frozen before the window existed) must not
+        // be signed: the vote window cannot be proven without init_time.
+        let mut undated = row.clone();
+        undated.as_object_mut().unwrap().remove("init_time");
+        assert!(parse_ceremony_row(&undated).is_err());
     }
 
     #[test]

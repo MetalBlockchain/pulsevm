@@ -10772,6 +10772,7 @@ mod tests {
             voted_weight: pulsevm_chain_types::HaltWeight(voted_weight),
             finalized: true,
             finalized_block: prior,
+            init_time: 0,
             votes,
         };
         manifest["halt_declaration"] = serde_json::to_value(&declaration)

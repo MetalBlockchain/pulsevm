@@ -669,6 +669,7 @@ mod tests {
             voted_weight: pulsevm_chain_types::HaltWeight(100),
             finalized: true,
             finalized_block: 6,
+            init_time: 0,
             votes: vec![pulsevm_database::HaltContractVote {
                 producer: "prod.a".to_string(),
                 block: 5,

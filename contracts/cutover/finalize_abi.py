@@ -59,6 +59,7 @@ STRUCTS = [
             {"name": "voted_weight", "type": "uint128"},
             {"name": "finalized", "type": "bool"},
             {"name": "declaration_digest", "type": "checksum256"},
+            {"name": "init_time", "type": "uint64"},
         ],
     },
     {
