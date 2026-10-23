@@ -134,6 +134,17 @@ pub struct ImportSummary {
     pub index_long_double_rows: u64,
 }
 
+/// One weighted-roster entry for halt-quorum verification, in the
+/// human-inspectable string-key form the manifest stores. Keys parse to
+/// [`pulsevm_chain_types::HaltRosterEntry`] via [`MigrationManifest::roster_entries`].
+/// Weights are decimal strings in JSON (see [`pulsevm_chain_types::HaltWeight`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationHaltRosterEntry {
+    pub producer: String,
+    pub key: String,
+    pub weight: pulsevm_chain_types::HaltWeight,
+}
+
 /// A durable, human-inspectable commitment to one XPR-to-Arena conversion.
 ///
 /// The arena checkpoint envelope protects its payload, while this manifest
@@ -157,16 +168,78 @@ pub struct MigrationManifest {
     pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
+    /// The old network's signed halt commitment. Optional for legacy
+    /// manifests; when present the restore verifies it against the source
+    /// block before trusting the checkpoint, so a node never promotes state
+    /// the source chain did not agree to freeze.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_commitment: Option<pulsevm_chain_types::HaltCommitment>,
+    /// Step one of the two-step cutover: the source schedule's signed
+    /// declaration that `last_height` is the last block it authors on the
+    /// source chain id. Made while H is still in the future and recorded
+    /// on the source chain before H arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_declaration: Option<pulsevm_chain_types::HaltDeclaration>,
+    /// Step two of the cutover: the same quorum's confirmation binding the
+    /// declaration to the terminal block id, the checkpoint, and the
+    /// successor chain id. Required whenever `halt_declaration` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_confirmation: Option<pulsevm_chain_types::HaltConfirmation>,
+    /// Block height carrying the declaration commitment (memo block or the
+    /// block by which the declaration quorum was complete on-chain).
+    /// Provenance for the vote-timing rule; absent when signatures were
+    /// collected off-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_declaration_inclusion: Option<u32>,
+    /// Block height carrying the confirmation quorum on-chain. Must postdate
+    /// H: a confirmation references H_ID, which cannot exist inside H
+    /// itself. Absent when the confirmation was signed off-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_confirmation_inclusion: Option<u32>,
+    /// Ceremony freshness bound K: a declaration inclusion older than H-K
+    /// is stale and fails closed. Unset means no freshness bound is
+    /// claimed; the structural bound (inclusion strictly before H) always
+    /// applies when an inclusion is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_max_declaration_lag: Option<u32>,
+    /// Ceremony liveness bound J: a confirmation inclusion past H+J misses
+    /// the deadline and fails closed. Unset means no deadline is claimed;
+    /// the structural bound (inclusion strictly after H) always applies
+    /// when an inclusion is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_max_confirmation_lag: Option<u32>,
     /// Commits the chainbase sidecar that supplies every field SHiP v0 omits,
     /// including replay-protection rows. The field keeps its original name for
     /// migration-manifest compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_transaction_sidecar_sha256: Option<String>,
+    /// Weighted producer roster for halt-quorum verification. Absent for
+    /// version 1 manifests, whose restore falls back to the single-key path.
+    /// Present implies version 2 (see [`MigrationManifest::with_halt_roster`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_roster: Option<Vec<MigrationHaltRosterEntry>>,
+    /// On-chain cutover-contract evidence for the step-one declaration: the
+    /// captured `ceremony` singleton plus every `vote` action the exporter
+    /// scanned. When present, the verifier replays the tally off-chain
+    /// (digest link, windows, membership, recomputed weights, strict
+    /// quorum) instead of trusting the recorded inclusion block alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_contract_ceremony: Option<pulsevm_chain_types::HaltContractCeremony>,
+    /// The producer-schedule version every vote — and the terminal block —
+    /// sat under, attested by the exporter. A rotation mid-ceremony changes
+    /// the schedule version, so unanimity here proves the frozen set was
+    /// the active schedule for the whole window; combined with the
+    /// set-equality check against checkpoint state, a divergent schedule
+    /// fails closed either as a stale version or a mismatched set.
+    /// Required whenever `halt_contract_ceremony` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_schedule_version: Option<u32>,
     pub import_summary: ImportSummary,
 }
 
 impl MigrationManifest {
     pub const VERSION: u16 = 1;
+    pub const VERSION_V2: u16 = 2;
 
     pub fn new(
         source_state_history: &[u8],
@@ -184,6 +257,16 @@ impl MigrationManifest {
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
             deferred_transaction_sidecar_sha256: None,
+            halt_commitment: None,
+            halt_declaration: None,
+            halt_confirmation: None,
+            halt_declaration_inclusion: None,
+            halt_confirmation_inclusion: None,
+            halt_max_declaration_lag: None,
+            halt_max_confirmation_lag: None,
+            halt_roster: None,
+            halt_contract_ceremony: None,
+            halt_schedule_version: None,
             import_summary,
         }
     }
@@ -203,17 +286,60 @@ impl MigrationManifest {
         self
     }
 
+    /// Attach the weighted producer roster for halt-quorum verification and
+    /// mark the manifest version 2. Version 1 manifests (no roster) keep the
+    /// single-key restore path.
+    pub fn with_halt_roster(mut self, roster: Vec<MigrationHaltRosterEntry>) -> Self {
+        self.version = Self::VERSION_V2;
+        self.halt_roster = Some(roster);
+        self
+    }
+
+    /// Parse the manifest roster into verifier entries. Returns `Ok(None)`
+    /// when the manifest carries no roster. Verification entry points must
+    /// treat `None` as a rejection: a roster-less commitment cannot prove a
+    /// schedule quorum, so the single-key path is not accepted anywhere.
+    pub fn roster_entries(
+        &self,
+    ) -> Result<Option<Vec<pulsevm_chain_types::HaltRosterEntry>>, String> {
+        let Some(roster) = self.halt_roster.as_ref() else {
+            return Ok(None);
+        };
+        roster
+            .iter()
+            .map(|entry| {
+                let key =
+                    pulsevm_crypto::k1::K1PublicKey::from_string(&entry.key).map_err(|e| {
+                        format!("halt roster key for {} invalid: {e:?}", entry.producer)
+                    })?;
+                Ok(pulsevm_chain_types::HaltRosterEntry {
+                    producer: entry.producer.clone(),
+                    key,
+                    weight: entry.weight,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some)
+    }
+
+    /// Supported manifest versions: 1 (single-key halt) and 2 (roster +
+    /// checkpoint-bound halt). Anything else fails closed.
+    fn check_version(&self) -> Result<(), String> {
+        if self.version != Self::VERSION && self.version != Self::VERSION_V2 {
+            return Err(format!(
+                "unsupported migration manifest version {} (expected {} or {})",
+                self.version,
+                Self::VERSION,
+                Self::VERSION_V2
+            ));
+        }
+        Ok(())
+    }
     /// Verify that `checkpoint` is precisely the artifact this manifest
     /// describes. The checkpoint envelope itself is checked by restore; this
     /// method establishes its migration provenance before restore begins.
     pub fn verify_checkpoint(&self, checkpoint: &[u8]) -> Result<(), String> {
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let actual = hex::encode(Digest::hash(checkpoint).as_bytes());
         if actual != self.checkpoint_sha256 {
             return Err(format!(
@@ -236,13 +362,7 @@ impl MigrationManifest {
     /// multi-gigabyte envelope in the controller process.
     pub fn verify_checkpoint_path(&self, checkpoint: impl AsRef<Path>) -> Result<(), String> {
         let path = checkpoint.as_ref();
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let mut file = File::open(path)
             .map_err(|error| format!("cannot read checkpoint {}: {error}", path.display()))?;
         let length = file
@@ -292,6 +412,483 @@ impl MigrationManifest {
         }
         Ok(())
     }
+}
+
+/// One `eosio` `producers`-table row as restored from checkpoint state:
+/// the block-signing key bound to a producer name. (`eosio.system` holds no
+/// such table on XPR mainnet — the account does not exist there; the live
+/// schedule table is code `eosio`, scope `eosio`.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StateProducerKey {
+    pub key: [u8; 33],
+    pub is_active: bool,
+    /// Vote weight as recorded on-chain. Quorum math runs over the
+    /// transported roster's integer weights, not this float; it is exposed
+    /// so roster builders start from the same source of truth.
+    pub total_votes: f64,
+}
+
+/// Decode one `producer_info` row in Leap 5.0.3 `fc::raw` layout: owner,
+/// `total_votes`, key type, 33-byte key, `is_active`, url, unpaid blocks,
+/// last claim time, location. XPR mainnet rows carry NO authority tail
+/// (verified live against mainnet: 8 fields, 90 bytes), so the schedule
+/// key is taken as the signing key after a K1 validity gate — the same
+/// rule the ceremony contract's `init` enforces. Vote weights are consumed
+/// but not returned: they drift every block between the roster reference
+/// and the checkpoint, so the cross-check binds names to keys and leaves
+/// weights to the quorum math over the transported roster. `finish`
+/// enforces exact consumption, so any future system-contract field
+/// addition fails this decoder loudly instead of silently changing shape.
+fn decode_producer_info_row(bytes: &[u8]) -> Result<(u64, StateProducerKey), XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    let owner = row.u64()?;
+    let total_votes = f64::from_le_bytes(row.fixed::<8>()?);
+    if row.varuint()? != 0 {
+        return Err(bad("XPR producer uses a non-K1 signing key"));
+    }
+    let key = row.fixed::<33>()?;
+    let is_active = row.bool()?;
+    let _url = row.bytes()?;
+    let _unpaid_blocks = row.u32()?;
+    let _last_claim_time = row.i64()?;
+    let _location = row.u16()?;
+    row.finish()?;
+    Ok((
+        owner,
+        StateProducerKey {
+            key,
+            is_active,
+            total_votes,
+        },
+    ))
+}
+
+/// Derive the producer-name to signing-key map from restored checkpoint
+/// state (code `eosio`, scope `eosio`, table `producers` — the live XPR
+/// schedule table, verified against mainnet). Returns an empty map when the
+/// table is absent, which only happens for synthetic fixtures: real XPR
+/// checkpoints always carry the schedule table.
+pub fn migration_state_producer_keys(
+    db: &Database,
+) -> Result<BTreeMap<u64, StateProducerKey>, String> {
+    use std::str::FromStr;
+    let system = pulsevm_name::Name::from_str("eosio")
+        .map_err(|e| format!("invalid system account name: {e}"))?
+        .as_u64();
+    let producers = pulsevm_name::Name::from_str("producers")
+        .map_err(|e| format!("invalid producers table name: {e}"))?
+        .as_u64();
+    let mut map = BTreeMap::new();
+    for (primary, value) in db.arena_table_range(system, system, producers) {
+        let (owner, entry) = decode_producer_info_row(&value)
+            .map_err(|e| format!("producers row {primary} undecodable: {e}"))?;
+        if owner != primary {
+            return Err(format!(
+                "producers row {primary} carries a mismatched owner {owner}"
+            ));
+        }
+        if map.insert(owner, entry).is_some() {
+            return Err(format!("duplicate producers row for owner {owner}"));
+        }
+    }
+    Ok(map)
+}
+
+/// Emit a starting-point halt roster from checkpoint state: active
+/// producers with weights truncated from on-chain `total_votes` as
+/// [`pulsevm_chain_types::HaltWeight`] (`u128`: mainnet magnitudes saturate
+/// `u64`). The operator — or the on-chain ceremony — pins the final
+/// roster; weights drift every block, so a template built earlier is stale
+/// and the roster must be rebuilt at H.
+pub fn migration_halt_roster_template(
+    db: &Database,
+) -> Result<Vec<MigrationHaltRosterEntry>, String> {
+    let mut roster = Vec::new();
+    for (owner, entry) in migration_state_producer_keys(db)? {
+        if !entry.is_active {
+            continue;
+        }
+        let key = pulsevm_crypto::k1::K1PublicKey::from_compressed(&entry.key)
+            .map_err(|e| format!("producers row {owner} holds an invalid key: {e:?}"))?;
+        let weight = pulsevm_chain_types::HaltWeight::from_votes(entry.total_votes)
+            .map_err(|e| format!("producers row {owner} holds an unusable weight: {e}"))?;
+        roster.push(MigrationHaltRosterEntry {
+            producer: pulsevm_name::Name::new(owner).to_string(),
+            key: key.to_string(),
+            weight,
+        });
+    }
+    Ok(roster)
+}
+
+/// Bind a transported halt roster to checkpoint content: every rostered
+/// producer name must resolve to exactly the same signing key in the
+/// restored state. Returns the number of bound entries. Weights are
+/// deliberately not compared: they move every block, so a weight pinned
+/// at the roster reference legitimately differs from checkpoint state.
+/// `is_active` is likewise not enforced here (a producer may retire
+/// between the reference and the checkpoint); activity enforcement
+/// belongs to the on-chain ceremony that pins the roster.
+///
+/// This lenient form guards the legacy single-step commitments. The
+/// two-step cutover uses [`check_halt_roster_matches_state`], which
+/// additionally requires set equality: a declaration naming only its
+/// signer would verify against itself, so the declared set must match
+/// the on-chain schedule exactly.
+pub fn check_halt_roster_against_state(
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    state: &BTreeMap<u64, StateProducerKey>,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let mut matched = 0;
+    for entry in roster {
+        let name = pulsevm_name::Name::from_str(&entry.producer)
+            .map_err(|e| format!("halt roster producer name invalid: {e}"))?
+            .as_u64();
+        let state_key = state.get(&name).ok_or_else(|| {
+            format!(
+                "halt roster producer {} is not present in checkpoint state",
+                entry.producer
+            )
+        })?;
+        if state_key.key != entry.key.compressed() {
+            return Err(format!(
+                "halt roster key for {} does not match checkpoint state",
+                entry.producer
+            ));
+        }
+        matched += 1;
+    }
+    Ok(matched)
+}
+
+/// Strict schedule match for the two-step cutover (the light-client rule):
+/// the declared validator set must EQUAL the active schedule in checkpoint
+/// state — same producers both ways, same keys. Weights are deliberately
+/// NOT compared here: `total_votes` drifts every block, so a declaration
+/// frozen at H-K would never match H-state weights on a live chain. The
+/// weights are pinned instead to the frozen on-chain tally whenever
+/// contract evidence is attached (the singleton totals must equal the
+/// declared total and the recomputed signer weight, so quorum math runs
+/// over frozen values no exporter can inflate); the memo path without
+/// contract evidence keeps the exact weight pin via
+/// [`check_halt_roster_weights_match_state`]. Membership or key drift
+/// between the H-K declaration and the H checkpoint fails closed and
+/// restarts the ceremony, exactly like a schedule change does. An absent
+/// producers table (synthetic fixtures only) yields `Ok(None)` so
+/// table-less exports keep the historical skip-with-warning behavior;
+/// real XPR checkpoints always carry the table and are enforced.
+pub fn check_halt_roster_matches_state(
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    state: &BTreeMap<u64, StateProducerKey>,
+) -> Result<Option<usize>, String> {
+    use std::str::FromStr;
+    if state.is_empty() {
+        return Ok(None);
+    }
+    let active: BTreeMap<u64, &StateProducerKey> = state
+        .iter()
+        .filter(|(_, entry)| entry.is_active)
+        .map(|(owner, entry)| (*owner, entry))
+        .collect();
+    if active.len() != roster.len() {
+        return Err(format!(
+            "declared validator set has {} members but checkpoint schedule has {} active producers",
+            roster.len(),
+            active.len()
+        ));
+    }
+    for entry in roster {
+        let name = pulsevm_name::Name::from_str(&entry.producer)
+            .map_err(|e| format!("halt declaration producer name invalid: {e}"))?
+            .as_u64();
+        let state_entry = active.get(&name).ok_or_else(|| {
+            format!(
+                "halt declaration producer {} is not in the checkpoint schedule",
+                entry.producer
+            )
+        })?;
+        if state_entry.key != entry.key.compressed() {
+            return Err(format!(
+                "halt declaration key for {} does not match checkpoint state",
+                entry.producer
+            ));
+        }
+    }
+    Ok(Some(roster.len()))
+}
+
+/// Exact weight pin for the memo path (two-step pair without on-chain
+/// ceremony evidence). With no frozen singleton to bind the tally, the
+/// H-state weights are the only trustworthy anchor: every declared weight
+/// must equal the checkpoint's `total_votes` truncation exactly. This is a
+/// tight-window rule by construction — any vote churn between the freeze
+/// and H fails the restore and restarts the ceremony — which is why the
+/// contract path is the production path and the memo path is the manual
+/// fallback for a quiet window.
+pub fn check_halt_roster_weights_match_state(
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    state: &BTreeMap<u64, StateProducerKey>,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let mut matched = 0;
+    for entry in roster {
+        let name = pulsevm_name::Name::from_str(&entry.producer)
+            .map_err(|e| format!("halt declaration producer name invalid: {e}"))?
+            .as_u64();
+        let state_entry = state.get(&name).ok_or_else(|| {
+            format!(
+                "halt declaration producer {} is not present in checkpoint state",
+                entry.producer
+            )
+        })?;
+        let state_weight = pulsevm_chain_types::HaltWeight::from_votes(state_entry.total_votes)
+            .map_err(|e| {
+                format!(
+                    "halt declaration weight for {} is unusable in checkpoint state: {e}",
+                    entry.producer
+                )
+            })?;
+        if state_weight != entry.weight {
+            return Err(format!(
+                "halt declaration weight for {} does not match checkpoint state",
+                entry.producer
+            ));
+        }
+        matched += 1;
+    }
+    Ok(matched)
+}
+
+/// Verify a manifest's halt commitment against the terminal block it names.
+/// Both versions verify against the attached weighted roster under the
+/// strict two-thirds quorum (version 2 additionally binds the migration
+/// checkpoint). A manifest without a roster fails closed: the legacy
+/// single-key path cannot prove the schedule agreed, so it promotes
+/// nothing. This is the same check the restore gate runs; the offline
+/// verifier reuses it so a manifest can be validated without booting a
+/// node.
+pub fn verify_migration_halt_commitment(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    checkpoint_sha256: &[u8; 32],
+) -> Result<(), String> {
+    use pulsevm_chain_types::HaltCommitment;
+    let commitment = manifest
+        .halt_commitment
+        .as_ref()
+        .ok_or_else(|| "migration manifest carries no halt commitment".to_string())?;
+    let roster = manifest.roster_entries()?.ok_or_else(|| {
+        "migration halt commitment carries no roster: single-key commitments prove nothing about the schedule"
+            .to_string()
+    })?;
+    match commitment.version {
+        HaltCommitment::VERSION => commitment
+            .verify_weighted_quorum(height, block_id, &roster)
+            .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        HaltCommitment::VERSION_V2 => commitment
+            .verify_weighted_quorum_v2(height, block_id, checkpoint_sha256, &roster)
+            .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        other => Err(format!("unsupported halt commitment version {other}")),
+    }
+}
+
+/// Vote-timing rule for the two-step cutover: a commitment is only valid
+/// inside its window. Votes are XPR transactions, so their inclusion height
+/// is XPR consensus — unlike off-chain signature timestamps, which are
+/// merely asserted. Declaration votes must land strictly before H (H stays
+/// empty and the commitment is a genuine pre-commitment); confirmation
+/// votes must land strictly after H (a confirmation references H_ID, which
+/// cannot exist inside H itself). The freshness bound K and the deadline J
+/// apply when the ceremony claims them. Sides without a recorded inclusion
+/// are skipped: off-chain signatures carry no trustworthy timestamp.
+pub fn check_halt_inclusion_window(
+    height: u32,
+    declaration_inclusion: Option<u32>,
+    max_declaration_lag: Option<u32>,
+    confirmation_inclusion: Option<u32>,
+    max_confirmation_lag: Option<u32>,
+) -> Result<(), String> {
+    if let Some(inclusion) = declaration_inclusion {
+        if inclusion >= height {
+            return Err(format!(
+                "declaration commitment at block {inclusion} does not predate cutover height {height}"
+            ));
+        }
+        if let Some(max_lag) = max_declaration_lag
+            && inclusion.saturating_add(max_lag) < height
+        {
+            return Err(format!(
+                "declaration commitment at block {inclusion} is older than the ceremony window (H={height}, max lag {max_lag})"
+            ));
+        }
+    }
+    if let Some(inclusion) = confirmation_inclusion {
+        if inclusion <= height {
+            return Err(format!(
+                "confirmation commitment at block {inclusion} does not postdate cutover height {height}"
+            ));
+        }
+        if let Some(max_lag) = max_confirmation_lag
+            && inclusion > height.saturating_add(max_lag)
+        {
+            return Err(format!(
+                "confirmation commitment at block {inclusion} misses the ceremony deadline (H={height}, max lag {max_lag})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify on-chain cutover-contract evidence for the step-one declaration:
+/// the captured singleton must be finalized on the verified declaration
+/// digest, every scanned vote must be a rostered schedule key inside the
+/// declaration window and under `expected_schedule_version`, and the
+/// captured tally must match the recomputed signer weight under the strict
+/// quorum. The attested schedule version must equal the expected (H's)
+/// version: presence alone proves nothing, so a version the exporter merely
+/// asserts without matching H fails closed, as does any vote from another
+/// version. A manifest without contract evidence verifies nothing here:
+/// the pair then requires a recorded declaration inclusion instead, so one
+/// of the two always proves the quorum committed before H.
+pub fn verify_migration_contract_evidence(
+    manifest: &MigrationManifest,
+    height: u32,
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    declaration_digest: &[u8; 32],
+    expected_schedule_version: u32,
+) -> Result<(), String> {
+    let Some(ceremony) = manifest.halt_contract_ceremony.as_ref() else {
+        return Ok(());
+    };
+    if manifest.halt_schedule_version != Some(expected_schedule_version) {
+        return Err(format!(
+            "migration cutover contract evidence attests schedule version {:?} (expected H's version {expected_schedule_version})",
+            manifest.halt_schedule_version
+        ));
+    }
+    ceremony
+        .verify(
+            height,
+            manifest.halt_max_declaration_lag,
+            roster,
+            declaration_digest,
+            expected_schedule_version,
+        )
+        .map_err(|e| format!("migration cutover contract evidence rejected: {e}"))
+}
+
+/// Verify the two-step cutover pair: the declaration must carry a quorum
+/// of the declared set over the cutover height, the confirmation must chain
+/// that exact declaration to the terminal block, the checkpoint, this
+/// chain's id, and the configured platform id, and an attached transport
+/// roster — when present — must match the declared set entry-wise so the
+/// two encodings cannot diverge. Recorded inclusion heights are
+/// window-checked via [`check_halt_inclusion_window`]; attached contract
+/// evidence is replayed via [`verify_migration_contract_evidence`] with
+/// every vote pinned to `header_schedule_version` (H's version).
+/// Pre-commitment timing must be provable one of two ways: the on-chain
+/// ceremony (per-vote timing), or a recorded declaration inclusion (the
+/// digest on-chain before H, as the memo and msig vehicles record). A pair
+/// with neither fails closed — off-chain signatures alone say nothing
+/// about when they were made.
+/// Returns the declared set for the checkpoint-state cross-check. This is
+/// the same check the restore gate runs; the offline verifier reuses it so
+/// a manifest can be validated without booting a node. The restore gate
+/// always configures a platform id (`Some`); `None` is the legacy and
+/// offline-tolerant path (a confirmation that binds a platform still has
+/// its signatures checked, but the id itself goes unconfirmed — the gate
+/// remains the enforcer, since only boot config knows the real id).
+pub fn verify_migration_halt_pair(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    checkpoint_sha256: &[u8; 32],
+    new_chain_id: &[u8; 32],
+    header_schedule_version: u32,
+    platform_chain_id: Option<&[u8; 32]>,
+) -> Result<Vec<pulsevm_chain_types::HaltRosterEntry>, String> {
+    let declaration = manifest.halt_declaration.as_ref().ok_or_else(|| {
+        "two-step cutover requires a halt declaration in the migration manifest".to_string()
+    })?;
+    let declaration_digest = declaration
+        .verify(height)
+        .map_err(|e| format!("migration halt declaration rejected: {e}"))?;
+    let roster = declaration
+        .roster()
+        .map_err(|e| format!("migration halt declaration set invalid: {e}"))?;
+    // The transport roster is inspectability sugar over the same set: when
+    // the exporter attaches both, they must agree exactly.
+    if let Some(transport) = manifest.roster_entries()?
+        && transport != roster
+    {
+        return Err("migration halt roster does not match the declared validator set".to_string());
+    }
+    let confirmation = manifest.halt_confirmation.as_ref().ok_or_else(|| {
+        "two-step cutover requires a halt confirmation chaining the declaration".to_string()
+    })?;
+    confirmation
+        .verify(
+            &declaration_digest,
+            &roster,
+            height,
+            block_id,
+            checkpoint_sha256,
+            new_chain_id,
+            platform_chain_id,
+        )
+        .map_err(|e| format!("migration halt confirmation rejected: {e}"))?;
+    check_halt_inclusion_window(
+        height,
+        manifest.halt_declaration_inclusion,
+        manifest.halt_max_declaration_lag,
+        manifest.halt_confirmation_inclusion,
+        manifest.halt_max_confirmation_lag,
+    )?;
+    verify_migration_contract_evidence(
+        manifest,
+        height,
+        &roster,
+        &declaration_digest,
+        header_schedule_version,
+    )?;
+    // Pre-commitment timing must be provable: either the on-chain ceremony
+    // replays the quorum's votes before H, or the declaration digest was
+    // recorded on-chain (memo / msig execution) before H. Off-chain
+    // signatures alone say nothing about when they were made.
+    if manifest.halt_contract_ceremony.is_none() && manifest.halt_declaration_inclusion.is_none() {
+        return Err("migration halt declaration has no pre-commitment timing evidence: attach the on-chain cutover ceremony or record the declaration inclusion block".to_string());
+    }
+    Ok(roster)
+}
+
+/// Schedule-version offset in a packed `signed_block` prefix, in this
+/// codebase's pack order (which the id check proves reproduces the wire
+/// layout bit-for-bit): timestamp[4] | producer[8] | confirmed[u16] |
+/// previous[32] | transaction_mroot[32] | action_mroot[32] |
+/// schedule_version[u32 LE] — the version starts at byte 110.
+///
+/// The restore gate reads H's version from the decoded source block; the
+/// offline verifier reuses this prefix parse because it cannot decode full
+/// blocks. A wrong offset fails closed (the version will not match H), so
+/// this helper can only refuse, never admit — and a golden test pins the
+/// offset against a decoded block in the controller migration tests.
+pub fn packed_source_block_schedule_version(packed_hex: &str) -> Result<u32, String> {
+    const OFFSET: usize = 4 + 8 + 2 + 32 + 32 + 32;
+    const PREFIX: usize = OFFSET + 4;
+    let bytes =
+        hex::decode(packed_hex).map_err(|e| format!("source block is not hexadecimal: {e}"))?;
+    if bytes.len() < PREFIX {
+        return Err(format!(
+            "source block prefix is {} bytes, need at least {PREFIX} for the schedule version",
+            bytes.len()
+        ));
+    }
+    let raw: [u8; 4] = bytes[OFFSET..PREFIX]
+        .try_into()
+        .map_err(|_| "source block schedule version slice is not 4 bytes".to_string())?;
+    Ok(u32::from_le_bytes(raw))
 }
 
 /// A malformed or unsupported XPR state-history input.
@@ -4156,6 +4753,1115 @@ mod tests {
         assert_eq!(manifest.import_summary.accounts, 3);
         assert_eq!(manifest.import_summary.deferred_transactions, 0);
         assert_eq!(manifest.import_summary.input_transactions, 0);
+    }
+
+    #[test]
+    fn migration_manifest_v2_roster_roundtrips_and_parses() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq".to_string(),
+            weight: pulsevm_chain_types::HaltWeight(50),
+        }]);
+        assert_eq!(manifest.version, MigrationManifest::VERSION_V2);
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: MigrationManifest = serde_json::from_str(&json).unwrap();
+        let roster = parsed
+            .roster_entries()
+            .expect("roster must parse")
+            .expect("v2 manifest must carry a roster");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].producer, "prod.a");
+        assert_eq!(roster[0].weight, pulsevm_chain_types::HaltWeight(50));
+        assert!(parsed.verify_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn migration_manifest_rejects_unsupported_version() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let mut manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        manifest.version = 99;
+        assert!(manifest.verify_checkpoint(&checkpoint).is_err());
+    }
+
+    use std::str::FromStr as _;
+
+    fn pack_producer_info(
+        owner: u64,
+        key_bytes: &[u8; 33],
+        key_type: u64,
+        is_active: bool,
+        votes: f64,
+    ) -> Vec<u8> {
+        fn varuint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        let mut row = Vec::new();
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&votes.to_le_bytes());
+        varuint(key_type, &mut row);
+        row.extend_from_slice(key_bytes);
+        row.push(u8::from(is_active));
+        varuint(3, &mut row);
+        row.extend_from_slice(b"url");
+        row.extend_from_slice(&0u32.to_le_bytes());
+        row.extend_from_slice(&0i64.to_le_bytes());
+        row.extend_from_slice(&0u16.to_le_bytes());
+        // Head-only, exactly the live mainnet shape: XPR producers rows
+        // carry no authority tail, so nothing follows the location field.
+        row
+    }
+
+    fn test_key(seed: &str) -> pulsevm_crypto::k1::K1PublicKey {
+        pulsevm_crypto::k1::K1PrivateKey::from_seed_string(seed)
+            .expect("deterministic test key")
+            .public_key()
+    }
+
+    #[test]
+    fn migration_state_producer_keys_decodes_producer_info_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let row = pack_producer_info(owner, &key.compressed(), 0, true, 12345.0);
+        let (decoded_owner, decoded) =
+            decode_producer_info_row(&row).expect("valid row must decode");
+        assert_eq!(decoded_owner, owner);
+        assert_eq!(decoded.key, key.compressed());
+        assert!(decoded.is_active);
+    }
+
+    #[test]
+    fn migration_state_producer_keys_rejects_bad_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        // Non-K1 key type: nothing downstream can sign for this roster
+        // entry, so the freeze must refuse it.
+        assert!(
+            decode_producer_info_row(&pack_producer_info(owner, &key.compressed(), 1, true, 1.0))
+                .is_err()
+        );
+        // Trailing bytes past the head: a future system-contract field
+        // addition must fail loudly, never silently decode.
+        let mut trailed = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
+        trailed.push(0);
+        assert!(decode_producer_info_row(&trailed).is_err());
+        // Truncated row.
+        let mut short = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
+        short.truncate(short.len() - 2);
+        assert!(decode_producer_info_row(&short).is_err());
+    }
+
+    fn state_key(key: &[u8; 33]) -> StateProducerKey {
+        StateProducerKey {
+            key: *key,
+            is_active: true,
+            total_votes: 0.0,
+        }
+    }
+
+    #[test]
+    fn halt_roster_cross_check_binds_keys_to_checkpoint_state() {
+        let key_a = test_key("state-roster-1");
+        let key_b = test_key("state-roster-2");
+        let owner_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let owner_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        let mut state = BTreeMap::new();
+        state.insert(owner_a, state_key(&key_a.compressed()));
+        state.insert(owner_b, state_key(&key_b.compressed()));
+        let roster = vec![
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: key_a,
+                weight: pulsevm_chain_types::HaltWeight(2),
+            },
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: key_b,
+                weight: pulsevm_chain_types::HaltWeight(1),
+            },
+        ];
+        assert_eq!(check_halt_roster_against_state(&roster, &state).unwrap(), 2);
+        // Swapped key must fail: the roster no longer matches checkpoint state.
+        let forged = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: key_b,
+            weight: pulsevm_chain_types::HaltWeight(2),
+        }];
+        assert!(check_halt_roster_against_state(&forged, &state).is_err());
+        // Unknown producer must fail.
+        let unknown = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: key_b,
+            weight: pulsevm_chain_types::HaltWeight(1),
+        }];
+        assert!(check_halt_roster_against_state(&unknown, &state).is_err());
+    }
+
+    fn strict_state(
+        entries: &[(&str, &pulsevm_crypto::k1::K1PublicKey, f64, bool)],
+    ) -> BTreeMap<u64, StateProducerKey> {
+        let mut state = BTreeMap::new();
+        for (name, key, votes, active) in entries {
+            let owner = pulsevm_name::Name::from_str(name).unwrap().as_u64();
+            state.insert(
+                owner,
+                StateProducerKey {
+                    key: key.compressed(),
+                    is_active: *active,
+                    total_votes: *votes,
+                },
+            );
+        }
+        state
+    }
+
+    fn strict_roster(
+        entries: &[(&str, &pulsevm_crypto::k1::K1PublicKey, u128)],
+    ) -> Vec<pulsevm_chain_types::HaltRosterEntry> {
+        entries
+            .iter()
+            .map(|(name, key, weight)| pulsevm_chain_types::HaltRosterEntry {
+                producer: name.to_string(),
+                key: **key,
+                weight: pulsevm_chain_types::HaltWeight(*weight),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_schedule_match_accepts_exact_set_and_rejects_subset() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        let state = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 1.0, true)]);
+        // Exact set and keys: the light-client rule holds (weights are
+        // pinned by the frozen tally, not by H-state).
+        let roster = strict_roster(&[("prod.a", &key_a, 2), ("prod.b", &key_b, 1)]);
+        assert_eq!(
+            check_halt_roster_matches_state(&roster, &state).unwrap(),
+            Some(2)
+        );
+        // A declaration naming only its signer verifies against itself but
+        // must fail the schedule match: the subset attack is closed.
+        let subset = strict_roster(&[("prod.a", &key_a, 2)]);
+        assert!(check_halt_roster_matches_state(&subset, &state).is_err());
+        // An extra member fails the same way: set equality runs both ways.
+        let mut superset = roster.clone();
+        superset.push(pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: key_b,
+            weight: pulsevm_chain_types::HaltWeight(1),
+        });
+        assert!(check_halt_roster_matches_state(&superset, &state).is_err());
+    }
+
+    #[test]
+    fn strict_schedule_match_tolerates_weight_drift_rejects_key_and_activity_drift() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        let state = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 1.0, true)]);
+        // Swapped key fails.
+        let forged = strict_roster(&[("prod.a", &key_b, 2), ("prod.b", &key_b, 1)]);
+        assert!(check_halt_roster_matches_state(&forged, &state).is_err());
+        // Vote churn between freeze and H changes weights without changing
+        // the set: the ceremony stays completable because weights are
+        // pinned by the frozen on-chain tally, not by H-state. A mainnet
+        // window with any stake movement at all used to fail closed here
+        // on every attempt.
+        let drifted = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 8.0, true)]);
+        let roster = strict_roster(&[("prod.a", &key_a, 2), ("prod.b", &key_b, 1)]);
+        assert_eq!(
+            check_halt_roster_matches_state(&roster, &drifted).unwrap(),
+            Some(2)
+        );
+        // A producer that deactivates between declaration and checkpoint
+        // restarts the ceremony instead of sliding through.
+        let retired = strict_state(&[
+            ("prod.a", &key_a, 2.0, true),
+            ("prod.b", &key_b, 1.0, false),
+        ]);
+        assert!(check_halt_roster_matches_state(&roster, &retired).is_err());
+        // Inactive rows never count toward the schedule.
+        let with_inactive = strict_state(&[
+            ("prod.a", &key_a, 2.0, true),
+            ("prod.b", &key_b, 1.0, true),
+            ("prod.zz", &key_b, 9.0, false),
+        ]);
+        assert_eq!(
+            check_halt_roster_matches_state(&roster, &with_inactive).unwrap(),
+            Some(2)
+        );
+        // Table-less exports keep the historical skip.
+        assert_eq!(
+            check_halt_roster_matches_state(&roster, &BTreeMap::new()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn memo_path_weight_pin_rejects_drift() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        // Exact weights pass: the freeze sat inside a quiet window.
+        let state = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 1.0, true)]);
+        let roster = strict_roster(&[("prod.a", &key_a, 2), ("prod.b", &key_b, 1)]);
+        assert_eq!(
+            check_halt_roster_weights_match_state(&roster, &state),
+            Ok(2)
+        );
+        // Any churn fails the memo path: without a frozen singleton there
+        // is no other trustworthy weight anchor.
+        let drifted = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 8.0, true)]);
+        assert!(check_halt_roster_weights_match_state(&roster, &drifted).is_err());
+        // An unknown producer fails, not silently skipped.
+        let unknown = strict_state(&[("prod.a", &key_a, 2.0, true)]);
+        assert!(check_halt_roster_weights_match_state(&roster, &unknown).is_err());
+    }
+
+    #[test]
+    fn weight_drift_simulation_freeze_window_survives_churn_h_state_pin_does_not() {
+        let key_a = test_key("drift-1");
+        let key_b = test_key("drift-2");
+        // Freeze-time anchor: members, keys, and weights as declared, with
+        // weights pinned by the frozen on-chain tally (contract path).
+        let roster = strict_roster(&[("prod.a", &key_a, 2), ("prod.b", &key_b, 1)]);
+        // Simulate 32 consecutive post-freeze blocks, each carrying one
+        // stake update on alternating producers: the shape of mainnet
+        // vote churn between declaration and H.
+        let mut exact_pin_survivors = 0u32;
+        for block in 0..32u32 {
+            let (a_votes, b_votes) = if block % 2 == 0 {
+                (2.0 + 0.5 * f64::from(block), 1.0)
+            } else {
+                (2.0, 1.0 + 0.25 * f64::from(block))
+            };
+            let state = strict_state(&[
+                ("prod.a", &key_a, a_votes, true),
+                ("prod.b", &key_b, b_votes, true),
+            ]);
+            // Members and keys never change: the contract-path schedule
+            // match holds on every block of the window, so the ceremony
+            // stays completable under arbitrary vote churn.
+            assert_eq!(
+                check_halt_roster_matches_state(&roster, &state).unwrap(),
+                Some(2)
+            );
+            // The exact H-state weight pin (memo path) truncates floats
+            // (`votes as u128`), so it survives only drift that stays
+            // inside one integer: block 0 quiet plus the two blocks whose
+            // drift is still sub-1.0. Anything crossing an integer
+            // boundary fails it, which is why the memo path is a
+            // tight-window fallback, not the primary vehicle.
+            if check_halt_roster_weights_match_state(&roster, &state).is_ok() {
+                exact_pin_survivors += 1;
+            }
+        }
+        // 3 of 32 simulated blocks keep the exact pin (block 0 plus two
+        // sub-1.0 drift blocks). On mainnet, vote totals in the millions
+        // cross integers constantly, so the effective window is zero
+        // blocks: the contract path (frozen tally) is the completable one.
+        assert_eq!(exact_pin_survivors, 3);
+    }
+
+    #[test]
+    fn migration_state_producer_keys_derive_from_hydrated_state() {
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut kv_row = secondary_prefix(system, system, producers, owner, payer);
+        bytes(
+            &mut kv_row,
+            &pack_producer_info(owner, &key.compressed(), 0, true, 12345.0),
+        );
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("contract_table", table_row),
+                delta("contract_row", kv_row),
+            ],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state(&mut db, &entry).unwrap();
+        let map = migration_state_producer_keys(&db).expect("derivation must succeed");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&owner].key, key.compressed());
+        // The template carries the same key with the on-chain vote weight.
+        let template = migration_halt_roster_template(&db).unwrap();
+        assert_eq!(template.len(), 1);
+        assert_eq!(template[0].producer, "prod.a");
+        assert_eq!(template[0].weight, pulsevm_chain_types::HaltWeight(12345));
+        let parsed = pulsevm_chain_types::HaltRosterEntry {
+            producer: template[0].producer.clone(),
+            key: pulsevm_crypto::k1::K1PublicKey::from_string(&template[0].key).unwrap(),
+            weight: template[0].weight,
+        };
+        assert_eq!(parsed.key.compressed(), key.compressed());
+        let roster = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key,
+            weight: pulsevm_chain_types::HaltWeight(2),
+        }];
+        assert_eq!(check_halt_roster_against_state(&roster, &map).unwrap(), 1);
+    }
+
+    #[test]
+    fn halt_roster_template_keeps_mainnet_magnitudes() {
+        // Live XPR `total_votes` reach 1e22 (top producer ~5.25e21). The old
+        // `as u64` template saturated every large producer at u64::MAX, so a
+        // 37-member schedule tallied as 37 equal votes. u128 truncation must
+        // preserve the magnitudes and their order.
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let big = test_key("magnitude-big");
+        let small = test_key("magnitude-small");
+        let owner_big = pulsevm_name::Name::from_str("prod.big").unwrap().as_u64();
+        let owner_small = pulsevm_name::Name::from_str("prod.small").unwrap().as_u64();
+        let votes_big = 5.251494364735212e21_f64;
+        let votes_small = 1.5792002538645e20_f64;
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut kv_big = secondary_prefix(system, system, producers, owner_big, payer);
+        bytes(
+            &mut kv_big,
+            &pack_producer_info(owner_big, &big.compressed(), 0, true, votes_big),
+        );
+        let mut kv_small = secondary_prefix(system, system, producers, owner_small, payer);
+        bytes(
+            &mut kv_small,
+            &pack_producer_info(owner_small, &small.compressed(), 0, true, votes_small),
+        );
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("contract_table", table_row),
+                delta("contract_row", kv_big),
+                delta("contract_row", kv_small),
+            ],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state(&mut db, &entry).unwrap();
+        let template = migration_halt_roster_template(&db).unwrap();
+        assert_eq!(template.len(), 2);
+        let big_weight = template
+            .iter()
+            .find(|entry| entry.producer == "prod.big")
+            .expect("big producer templated")
+            .weight;
+        let small_weight = template
+            .iter()
+            .find(|entry| entry.producer == "prod.small")
+            .expect("small producer templated")
+            .weight;
+        assert_eq!(
+            big_weight,
+            pulsevm_chain_types::HaltWeight(votes_big as u128)
+        );
+        assert_eq!(
+            small_weight,
+            pulsevm_chain_types::HaltWeight(votes_small as u128)
+        );
+        assert!(big_weight.0 > u64::MAX as u128);
+        assert!(big_weight.0 > small_weight.0 * 30);
+    }
+
+    fn halt_test_manifest() -> (MigrationManifest, [u8; 32], [u8; 32]) {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        let hash: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        (manifest, [9; 32], hash)
+    }
+
+    fn halt_v1_commitment(
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        producer: &str,
+        height: u32,
+        id: &[u8; 32],
+    ) -> pulsevm_chain_types::HaltCommitment {
+        let digest = pulsevm_chain_types::HaltCommitment::digest(height, id);
+        pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION,
+            halt_height: height,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: None,
+            producer_keys: vec![signing.public_key().to_string()],
+            signatures: vec![pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: signing.public_key().to_string(),
+                signature: signing.sign(&digest).to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_migration_halt_rejects_rosterless_single_key() {
+        // One valid signature with no roster proves nothing about the
+        // schedule: the legacy single-key path is rejected even though the
+        // signature itself verifies.
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        manifest.halt_commitment = Some(halt_v1_commitment(&signing, "prod.a", 7, &id));
+        let error = verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).unwrap_err();
+        assert!(
+            error.contains("no roster"),
+            "roster-less commitments must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_accepts_v2_roster_quorum_and_rejects_shortfall() {
+        let (manifest, id, checkpoint) = halt_test_manifest();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-2").unwrap();
+        let roster = vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(2),
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(1),
+            },
+        ];
+        let sign = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            let digest = pulsevm_chain_types::HaltCommitment::digest_v2(7, &id, &checkpoint);
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&digest).to_string(),
+            }
+        };
+        let mut full = manifest.clone().with_halt_roster(roster);
+        let checkpoint_hex = full.checkpoint_sha256.clone();
+        full.halt_commitment = Some(pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION_V2,
+            halt_height: 7,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: Some(checkpoint_hex),
+            producer_keys: vec![],
+            signatures: vec![sign(&k1, "prod.a"), sign(&k2, "prod.b")],
+        });
+        verify_migration_halt_commitment(&full, 7, &id, &checkpoint).unwrap();
+        // Only prod.b (weight 1 of 3) signs: below the two-thirds quorum.
+        let mut short = full.clone();
+        short.halt_commitment.as_mut().unwrap().signatures = vec![sign(&k2, "prod.b")];
+        assert!(verify_migration_halt_commitment(&short, 7, &id, &checkpoint).is_err());
+    }
+
+    #[test]
+    fn verify_migration_halt_rejects_bad_version_and_bad_checkpoint() {
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = 7;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).is_err());
+        let (mut manifest, id, _) = halt_test_manifest();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = pulsevm_chain_types::HaltCommitment::VERSION_V2;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &[8; 32]).is_err());
+    }
+
+    /// H's schedule version in the pair fixture: every vote and the
+    /// attested version pin to exactly this.
+    const TEST_SCHEDULE_VERSION: u32 = 42;
+    /// The platform (MetalGo blockchain) id the pair-fixture confirmation
+    /// binds: the restore always configures one, so fixtures carry one.
+    const TEST_PLATFORM_ID: [u8; 32] = [0x51; 32];
+
+    fn halt_test_pair() -> (MigrationManifest, [u8; 32], [u8; 32], [u8; 32]) {
+        let (manifest, id, checkpoint) = halt_test_manifest();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let mut members = vec![
+            pulsevm_chain_types::HaltDeclarationMember {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(2),
+            },
+            pulsevm_chain_types::HaltDeclarationMember {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(1),
+            },
+        ];
+        pulsevm_chain_types::HaltDeclaration::sort_members(&mut members);
+        let unsigned = pulsevm_chain_types::HaltDeclaration {
+            version: pulsevm_chain_types::HaltDeclaration::VERSION,
+            source_chain_id: "41".repeat(32),
+            last_height: 7,
+            validator_set: members,
+            signatures: Vec::new(),
+        };
+        let decl_digest = unsigned.digest().unwrap();
+        let sign_decl = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&decl_digest).to_string(),
+            }
+        };
+        let declaration = pulsevm_chain_types::HaltDeclaration {
+            signatures: vec![sign_decl(&k1, "prod.a"), sign_decl(&k2, "prod.b")],
+            ..unsigned
+        };
+        let new_chain = [0x31; 32];
+        let template = pulsevm_chain_types::HaltConfirmation {
+            version: pulsevm_chain_types::HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(declaration.digest().unwrap()),
+            halt_height: 7,
+            halt_block_id: "09".repeat(32),
+            checkpoint_sha256: hex::encode(checkpoint),
+            new_chain_id: hex::encode(new_chain),
+            platform_chain_id: Some(hex::encode(TEST_PLATFORM_ID)),
+            signatures: Vec::new(),
+        };
+        let conf_digest = template.digest().unwrap();
+        let sign_conf = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&conf_digest).to_string(),
+            }
+        };
+        let mut manifest = manifest.with_halt_roster(vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(2),
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight(1),
+            },
+        ]);
+        manifest.halt_declaration = Some(declaration.clone());
+        manifest.halt_confirmation = Some(pulsevm_chain_types::HaltConfirmation {
+            signatures: vec![sign_conf(&k1, "prod.a"), sign_conf(&k2, "prod.b")],
+            ..template
+        });
+        // The pair always carries the on-chain ceremony: both votes land
+        // before H (blocks 5 and 6), the singleton is finalized at 6, and
+        // the captured tally equals the recomputed signer weight (2 + 1).
+        // Weights are 2 and 1: both votes clear the strict quorum at 3 of 3.
+        let vote = |producer: &str, key: &str, signature: &str, block: u32| {
+            pulsevm_chain_types::HaltContractVote {
+                producer: producer.to_string(),
+                block,
+                schedule_version: TEST_SCHEDULE_VERSION,
+                key: key.to_string(),
+                signature: signature.to_string(),
+            }
+        };
+        let key_a = declaration.validator_set[0].key.clone();
+        let key_b = declaration.validator_set[1].key.clone();
+        let sig_a = declaration.signatures[0].signature.clone();
+        let sig_b = declaration.signatures[1].signature.clone();
+        manifest.halt_contract_ceremony = Some(pulsevm_chain_types::HaltContractCeremony {
+            contract: "cutover".to_string(),
+            declaration_digest: hex::encode(decl_digest),
+            total_weight: pulsevm_chain_types::HaltWeight(3),
+            voted_weight: pulsevm_chain_types::HaltWeight(3),
+            finalized: true,
+            finalized_block: 6,
+            init_time: 0,
+            votes: vec![
+                vote("prod.a", &key_a, &sig_a, 5),
+                vote("prod.b", &key_b, &sig_b, 6),
+            ],
+        });
+        manifest.halt_schedule_version = Some(TEST_SCHEDULE_VERSION);
+        (manifest, id, checkpoint, new_chain)
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_accepts_and_binds_every_link() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let roster = verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("cutover pair must verify");
+        assert_eq!(roster.len(), 2);
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_replays_contract_evidence() {
+        // The pair fixture already carries the on-chain ceremony (both
+        // votes before H, finalized singleton, matching tally).
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("pair with contract evidence must verify");
+        // A pair stripped of its ceremony and with no recorded inclusion
+        // proves no pre-commitment timing: off-chain signatures alone say
+        // nothing about when they were made.
+        let mut bare = manifest.clone();
+        bare.halt_contract_ceremony = None;
+        assert!(
+            verify_migration_halt_pair(
+                &bare,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // The memo vehicle records the digest on-chain instead: a recorded
+        // in-window inclusion with no ceremony still verifies.
+        let mut memo = manifest.clone();
+        memo.halt_contract_ceremony = None;
+        memo.halt_schedule_version = None;
+        memo.halt_declaration_inclusion = Some(5);
+        verify_migration_halt_pair(
+            &memo,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("recorded declaration inclusion proves pre-commitment timing");
+        // Contract evidence without the attested schedule version fails:
+        // unanimity across the window must be on the record.
+        let mut unversioned = manifest.clone();
+        unversioned.halt_schedule_version = None;
+        assert!(
+            verify_migration_halt_pair(
+                &unversioned,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A vote landing at H is not a pre-commitment: the evidence fails.
+        let mut late = manifest.clone();
+        late.halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .votes[1]
+            .block = 7;
+        assert!(
+            verify_migration_halt_pair(
+                &late,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A captured tally divorced from the recomputed signer weight fails.
+        let mut inflated = manifest.clone();
+        inflated
+            .halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .voted_weight = pulsevm_chain_types::HaltWeight(4);
+        assert!(
+            verify_migration_halt_pair(
+                &inflated,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_enforces_version_and_platform_pins() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("pair fixture must verify");
+        // A vote from another schedule version fails: the schedule rotated
+        // mid-ceremony and the freeze no longer names one set.
+        let mut rotated = manifest.clone();
+        rotated
+            .halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .votes[0]
+            .schedule_version = TEST_SCHEDULE_VERSION + 1;
+        assert!(
+            verify_migration_halt_pair(
+                &rotated,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // The attested version must equal H's version, not merely exist: a
+        // version the exporter asserts without matching H fails closed.
+        let mut misattested = manifest.clone();
+        misattested.halt_schedule_version = Some(TEST_SCHEDULE_VERSION + 1);
+        assert!(
+            verify_migration_halt_pair(
+                &misattested,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // H under another version fails even with unanimous votes.
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION + 1,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A confirmation bound to another platform fails: wallets would
+        // sign under a different id than the ceremony committed to.
+        let other_platform = [0x52; 32];
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&other_platform)
+            )
+            .is_err()
+        );
+        // A confirmation stripped of its platform binding fails closed
+        // once the verifier configures a platform: legacy evidence cannot
+        // silently skip the id wallets sign under.
+        let mut unbound = manifest.clone();
+        unbound
+            .halt_confirmation
+            .as_mut()
+            .expect("confirmation attached")
+            .platform_chain_id = None;
+        assert!(
+            verify_migration_halt_pair(
+                &unbound,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_signer_weight_inflation() {
+        // Move weight onto a signer in the declaration only: the frozen
+        // singleton still pins the old tally and the quorum signatures bind
+        // the old digest, so the inflated declaration verifies against
+        // nothing. Either layer fails the pair closed.
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest
+            .halt_declaration
+            .as_mut()
+            .expect("declaration attached")
+            .validator_set[0]
+            .weight = pulsevm_chain_types::HaltWeight(3);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_missing_steps() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_confirmation = None;
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_declaration = None;
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_enforces_vote_windows() {
+        // Declaration committed two blocks before H, inside a lag-10
+        // window; confirmation quorum recorded two blocks after H inside a
+        // 10-block deadline: the timing is provable and valid.
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_declaration_inclusion = Some(5);
+        manifest.halt_max_declaration_lag = Some(10);
+        manifest.halt_confirmation_inclusion = Some(9);
+        manifest.halt_max_confirmation_lag = Some(10);
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("in-window inclusions must verify");
+        // A declaration at H itself is not a pre-commitment: H must stay
+        // empty and the commitment must predate it.
+        manifest.halt_declaration_inclusion = Some(7);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A stale declaration (older than H-K) fails the freshness bound.
+        manifest.halt_declaration_inclusion = Some(5);
+        manifest.halt_max_declaration_lag = Some(1);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        manifest.halt_max_declaration_lag = Some(10);
+        // A confirmation at H itself is circular: it references H_ID,
+        // which cannot exist inside H.
+        manifest.halt_confirmation_inclusion = Some(7);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A confirmation past its deadline fails closed.
+        manifest.halt_confirmation_inclusion = Some(9);
+        manifest.halt_max_confirmation_lag = Some(1);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn halt_inclusion_window_handles_boundaries() {
+        // No inclusions recorded: off-chain path, skipped.
+        assert!(check_halt_inclusion_window(7, None, None, None, None).is_ok());
+        // Structural bounds without claimed K/J.
+        assert!(check_halt_inclusion_window(7, Some(6), None, None, None).is_ok());
+        assert!(check_halt_inclusion_window(7, Some(7), None, None, None).is_err());
+        assert!(check_halt_inclusion_window(7, None, None, Some(8), None).is_ok());
+        assert!(check_halt_inclusion_window(7, None, None, Some(7), None).is_err());
+        // Zero height: nothing can predate it.
+        assert!(check_halt_inclusion_window(0, Some(0), None, None, None).is_err());
+        // Saturating arithmetic near u32::MAX: no panic, bounds enforced.
+        assert!(
+            check_halt_inclusion_window(u32::MAX, Some(u32::MAX - 1), Some(10), None, None).is_ok()
+        );
+        assert!(
+            check_halt_inclusion_window(u32::MAX, None, None, Some(u32::MAX), Some(0)).is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_divergent_roster_and_chain() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_roster.as_mut().unwrap()[0].weight = pulsevm_chain_types::HaltWeight(9);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (manifest, id, checkpoint, _) = halt_test_pair();
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &[0x99; 32],
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                8,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_manifest_roster_rejects_invalid_key() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: "not-a-key".to_string(),
+            weight: pulsevm_chain_types::HaltWeight(10),
+        }]);
+        assert!(manifest.roster_entries().is_err());
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

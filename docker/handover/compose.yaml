@@ -1,0 +1,124 @@
+# Handover rehearsal: XPR producer chain to PulseVM validator network.
+#
+# Models the shadow-then-promote migration: a three-node Leap chain (one
+# producer, two validating peers: "normal XPR") produces blocks under
+# consensus, a PulseVM shadow replays them in real time, and at
+# TERMINAL_HEIGHT the whole XPR network halts, the shadow state is
+# checkpointed, and a five-node PulseVM network boots from it, takes its own
+# first transaction, and continues numbering at H+1.
+#
+# Phase 2 note: promotion currently re-identifies the chain (the migration
+# genesis commits to the checkpoint hash, so the chain ID changes). Same-ID
+# in-process promotion needs block production inside the replay binary and
+# is not modeled here. The rehearsal still validates follow, halt,
+# checkpoint, boot, parent linkage, and liveness.
+
+name: pulsevm-handover
+
+services:
+  xpr-producer:
+    # Pinned Leap 5.0.3 image (v5.0.3-d133c64), prebuilt on the host. To
+    # rebuild from source instead, replace `image` with a build of
+    # ../../tools/xpr-chainbase-export/localnet.
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/producer-config.ini
+        target: /config/config.ini
+        read_only: true
+      - leap-data:/data
+    ports:
+      - "127.0.0.1:${LEAP_HTTP_PORT:-8888}:8888"
+    # No healthcheck: the Leap image ships no HTTP client, and the
+    # orchestrator polls get_info (with a matching Host header) and
+    # starts the shadow only once the producer answers.
+
+  # Two non-producing validators: they follow the fixture chain over P2P,
+  # independently validating every block, so the XPR side is a three-node
+  # consensus network rather than a lone producer. Both use the same
+  # validator config; each keeps its own data volume and host HTTP port.
+  xpr-validator-1:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ./config/validator.ini
+        target: /config/config.ini
+        read_only: true
+      - validator1-data:/data
+    ports:
+      - "127.0.0.1:${LEAP_V1_HTTP_PORT:-18881}:8888"
+
+  xpr-validator-2:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ./config/validator.ini
+        target: /config/config.ini
+        read_only: true
+      - validator2-data:/data
+    ports:
+      - "127.0.0.1:${LEAP_V2_HTTP_PORT:-18882}:8888"
+
+  shadow:
+    # Runs the host-built replay binary (built by run-handover.sh before
+    # compose starts) in a slim runtime matching the host glibc.
+    image: ubuntu:24.04
+    depends_on:
+      - xpr-producer
+    environment:
+      XPR_REPLAY_FOLLOW: "1"
+      XPR_REPLAY_RPC_BIND: "0.0.0.0:9660"
+      XPR_REPLAY_GENESIS_FILE: /config/genesis.json
+    volumes:
+      - type: bind
+        source: ${PULSEVM_REPLAY_BIN:?run-handover.sh builds this first}
+        target: /usr/local/bin/xpr_blocklog_replay
+        read_only: true
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config/genesis.json
+        read_only: true
+      - leap-data:/leap-data:ro
+      - shadow-arena:/arena
+    ports:
+      - "127.0.0.1:${SHADOW_RPC_PORT:-9660}:9660"
+    entrypoint: ["/usr/local/bin/xpr_blocklog_replay", "/leap-data/blocks", "/arena"]
+
+volumes:
+  leap-data:
+  validator1-data:
+  validator2-data:
+  shadow-arena:

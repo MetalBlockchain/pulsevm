@@ -4,6 +4,10 @@
 //! boundaries with transactions or schedule changes are deliberately rejected;
 //! choose an empty boundary block so the migration anchor can be independently
 //! reconstructed and checked without trusting pruned transaction JSON.
+//!
+//! With `--halt-key <wif>` the tool additionally signs the old network's halt
+//! commitment over the boundary block and embeds it in the manifest, so the
+//! new network verifies the producers agreed to freeze before promoting.
 
 use std::{
     collections::VecDeque,
@@ -25,9 +29,17 @@ use pulsevm_core::{
     id::Id,
     name::Name,
 };
-use pulsevm_crypto::Digest;
+use pulsevm_crypto::{
+    Digest,
+    K1PrivateKey,
+};
 use pulsevm_database::{
     BlockTimestamp,
+    HaltCommitment,
+    HaltConfirmation,
+    HaltDeclaration,
+    HaltSignature,
+    MigrationHaltRosterEntry,
     MigrationManifest,
 };
 use pulsevm_serialization::Write;
@@ -35,8 +47,32 @@ use serde_json::Value;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json>"
+        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>] [--declaration <declaration.json> --confirmation <confirmation.json> [--declaration-inclusion <height>] [--confirmation-inclusion <height>] [--max-declaration-lag <K>] [--max-confirmation-lag <J>] [--contract-ceremony <fragment.json> --schedule-version <n>]]"
     );
+    eprintln!(
+        "  --halt-key-v2 signs a version 2 checkpoint-bound commitment; --halt-roster attaches a"
+    );
+    eprintln!(
+        "  weighted roster JSON array ([{{\"producer\", \"key\", \"weight\"}}]) for quorum verification."
+    );
+    eprintln!(
+        "  --declaration/--confirmation embed the two-step cutover pair; the transport roster is"
+    );
+    eprintln!("  then taken from the declared set (an explicit --halt-roster must agree with it).");
+    eprintln!(
+        "  --contract-ceremony attaches the on-chain ceremony fragment (its digest must equal"
+    );
+    eprintln!(
+        "  the declaration digest); --schedule-version records the unanimous schedule version"
+    );
+    eprintln!("  across votes and H (required with contract evidence; export-enforced).");
+    eprintln!("  --declaration-inclusion records the block carrying the declaration votes (must");
+    eprintln!("  predate H); --confirmation-inclusion records the block carrying the confirmation");
+    eprintln!(
+        "  quorum (must postdate H). --max-declaration-lag/--max-confirmation-lag record the"
+    );
+    eprintln!("  ceremony freshness bound K and deadline J. The vote-timing rule is enforced here");
+    eprintln!("  at record time and re-verified at restore.");
 }
 
 fn main() -> ExitCode {
@@ -47,11 +83,125 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
-    if args.next().is_some() {
-        usage();
+    let mut halt_key: Option<String> = None;
+    let mut halt_key_v2: Option<String> = None;
+    let mut halt_roster: Option<String> = None;
+    let mut declaration: Option<String> = None;
+    let mut confirmation: Option<String> = None;
+    let mut timing = PairTiming::default();
+    while let Some(arg) = args.next() {
+        if arg == "--halt-key" {
+            let Some(wif) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_key = Some(wif.to_string_lossy().into_owned());
+        } else if arg == "--halt-key-v2" {
+            let Some(wif) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_key_v2 = Some(wif.to_string_lossy().into_owned());
+        } else if arg == "--halt-roster" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_roster = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--declaration" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            declaration = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--confirmation" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            confirmation = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--declaration-inclusion" {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Ok(height) = value.to_string_lossy().parse::<u32>() else {
+                eprintln!("--declaration-inclusion needs a block height");
+                return ExitCode::from(2);
+            };
+            timing.declaration_inclusion = Some(height);
+        } else if arg == "--confirmation-inclusion" {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Ok(height) = value.to_string_lossy().parse::<u32>() else {
+                eprintln!("--confirmation-inclusion needs a block height");
+                return ExitCode::from(2);
+            };
+            timing.confirmation_inclusion = Some(height);
+        } else if arg == "--max-declaration-lag" {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Ok(lag) = value.to_string_lossy().parse::<u32>() else {
+                eprintln!("--max-declaration-lag needs a block count");
+                return ExitCode::from(2);
+            };
+            timing.max_declaration_lag = Some(lag);
+        } else if arg == "--max-confirmation-lag" {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Ok(lag) = value.to_string_lossy().parse::<u32>() else {
+                eprintln!("--max-confirmation-lag needs a block count");
+                return ExitCode::from(2);
+            };
+            timing.max_confirmation_lag = Some(lag);
+        } else if arg == "--contract-ceremony" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            timing.contract_ceremony = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--schedule-version" {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            let Ok(version) = value.to_string_lossy().parse::<u32>() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            timing.schedule_version = Some(version);
+        } else {
+            usage();
+            return ExitCode::from(2);
+        }
+    }
+    if halt_key.is_some() && halt_key_v2.is_some() {
+        eprintln!("cannot attach migration source block: --halt-key and --halt-key-v2 conflict");
         return ExitCode::from(2);
     }
-    match attach(Path::new(&manifest), Path::new(&block), Path::new(&output)) {
+    if declaration.is_some() != confirmation.is_some() {
+        eprintln!(
+            "cannot attach migration source block: --declaration and --confirmation go together"
+        );
+        return ExitCode::from(2);
+    }
+    match attach(
+        Path::new(&manifest),
+        Path::new(&block),
+        Path::new(&output),
+        halt_key.as_deref(),
+        halt_key_v2.as_deref(),
+        halt_roster.as_deref(),
+        declaration.as_deref(),
+        confirmation.as_deref(),
+        timing,
+    ) {
         Ok((height, id)) => {
             println!("attached migration source block {height} {id}");
             ExitCode::SUCCESS
@@ -63,10 +213,29 @@ fn main() -> ExitCode {
     }
 }
 
+/// Vote-timing provenance recorded into the manifest: where each
+/// commitment landed and which freshness/deadline bounds the ceremony
+/// claims. The restore gate re-verifies all of it.
+#[derive(Default)]
+struct PairTiming {
+    declaration_inclusion: Option<u32>,
+    confirmation_inclusion: Option<u32>,
+    max_declaration_lag: Option<u32>,
+    max_confirmation_lag: Option<u32>,
+    contract_ceremony: Option<String>,
+    schedule_version: Option<u32>,
+}
+
 fn attach(
     manifest_path: &Path,
     block_path: &Path,
     output_path: &Path,
+    halt_key: Option<&str>,
+    halt_key_v2: Option<&str>,
+    halt_roster: Option<&str>,
+    declaration_path: Option<&str>,
+    confirmation_path: Option<&str>,
+    timing: PairTiming,
 ) -> Result<(u32, Id), String> {
     let mut manifest: MigrationManifest = serde_json::from_slice(
         &fs::read(manifest_path).map_err(|error| format!("read manifest: {error}"))?,
@@ -151,6 +320,152 @@ fn attach(
             .pack()
             .map_err(|error| format!("pack source block: {error}"))?,
     ));
+    // The halt ceremony signs the freeze over the boundary block: the new
+    // network verifies this commitment against the old schedule before it
+    // promotes the checkpoint.
+    if let Some(wif) = halt_key {
+        let signing = K1PrivateKey::from_string(wif)
+            .map_err(|error| format!("halt key invalid: {error:?}"))?;
+        let producer_key = signing.public_key().to_string();
+        let digest = HaltCommitment::digest(height, &id.0.0);
+        manifest.halt_commitment = Some(HaltCommitment {
+            version: HaltCommitment::VERSION,
+            halt_height: height,
+            halt_block_id: hex::encode(id.as_bytes()),
+            checkpoint_sha256: None,
+            producer_keys: vec![producer_key.clone()],
+            signatures: vec![HaltSignature {
+                producer: block.signed_block_header.header.producer.to_string(),
+                key: producer_key,
+                signature: signing.sign(&digest).to_string(),
+            }],
+        });
+    }
+    // Version 2 binds the checkpoint hash into the signed digest so the
+    // commitment cannot be replayed onto another export of the same block.
+    if let Some(wif) = halt_key_v2 {
+        let signing = K1PrivateKey::from_string(wif)
+            .map_err(|error| format!("halt key invalid: {error:?}"))?;
+        let producer_key = signing.public_key().to_string();
+        let checkpoint: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+            .map_err(|error| format!("manifest checkpoint hash invalid: {error}"))?
+            .try_into()
+            .map_err(|_| "manifest checkpoint hash has the wrong length".to_string())?;
+        let digest = HaltCommitment::digest_v2(height, &id.0.0, &checkpoint);
+        manifest.halt_commitment = Some(HaltCommitment {
+            version: HaltCommitment::VERSION_V2,
+            halt_height: height,
+            halt_block_id: hex::encode(id.as_bytes()),
+            checkpoint_sha256: Some(manifest.checkpoint_sha256.clone()),
+            producer_keys: vec![producer_key.clone()],
+            signatures: vec![HaltSignature {
+                producer: block.signed_block_header.header.producer.to_string(),
+                key: producer_key,
+                signature: signing.sign(&digest).to_string(),
+            }],
+        });
+    }
+    // The two-step cutover pair: the declaration commits the source
+    // schedule to this exact terminal block before it exists, the
+    // confirmation chains the checkpoint and the successor chain id to it.
+    // The transport roster mirrors the declared set; an explicit
+    // --halt-roster must agree with it instead of replacing it.
+    if let (Some(declaration_path), Some(confirmation_path)) = (declaration_path, confirmation_path)
+    {
+        let declaration: HaltDeclaration = serde_json::from_slice(
+            &fs::read(declaration_path)
+                .map_err(|error| format!("read declaration {declaration_path}: {error}"))?,
+        )
+        .map_err(|error| format!("parse declaration {declaration_path}: {error}"))?;
+        let confirmation: HaltConfirmation = serde_json::from_slice(
+            &fs::read(confirmation_path)
+                .map_err(|error| format!("read confirmation {confirmation_path}: {error}"))?,
+        )
+        .map_err(|error| format!("parse confirmation {confirmation_path}: {error}"))?;
+        let declaration_digest = declaration
+            .digest()
+            .map_err(|error| format!("declaration digest: {error}"))?;
+        if confirmation.declaration_digest != hex::encode(declaration_digest) {
+            return Err("confirmation does not chain the attached declaration".into());
+        }
+        if declaration.last_height != height || confirmation.halt_height != height {
+            return Err(format!(
+                "cutover pair height does not match source block height {height}"
+            ));
+        }
+        if confirmation.halt_block_id != id.to_string() {
+            return Err("confirmation block id does not match the source block".into());
+        }
+        if confirmation.checkpoint_sha256 != manifest.checkpoint_sha256 {
+            return Err("confirmation checkpoint does not match the manifest checkpoint".into());
+        }
+        let declared_roster: Vec<MigrationHaltRosterEntry> = declaration
+            .validator_set
+            .iter()
+            .map(|member| MigrationHaltRosterEntry {
+                producer: member.producer.clone(),
+                key: member.key.clone(),
+                weight: member.weight,
+            })
+            .collect();
+        if let Some(roster_path) = halt_roster {
+            let bytes = fs::read(roster_path)
+                .map_err(|error| format!("read roster {roster_path}: {error}"))?;
+            let roster: Vec<MigrationHaltRosterEntry> = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("parse roster {roster_path}: {error}"))?;
+            if roster != declared_roster {
+                return Err(format!(
+                    "roster {roster_path} does not match the declared validator set"
+                ));
+            }
+            manifest = manifest.with_halt_roster(roster);
+        } else {
+            manifest = manifest.with_halt_roster(declared_roster);
+        }
+        manifest.halt_declaration = Some(declaration);
+        manifest.halt_confirmation = Some(confirmation);
+        manifest.halt_declaration_inclusion = timing.declaration_inclusion;
+        manifest.halt_confirmation_inclusion = timing.confirmation_inclusion;
+        manifest.halt_max_declaration_lag = timing.max_declaration_lag;
+        manifest.halt_max_confirmation_lag = timing.max_confirmation_lag;
+        if let Some(fragment_path) = timing.contract_ceremony {
+            let bytes = fs::read(&fragment_path)
+                .map_err(|error| format!("read contract ceremony {fragment_path}: {error}"))?;
+            let ceremony: pulsevm_database::HaltContractCeremony =
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("parse contract ceremony {fragment_path}: {error}"))?;
+            let ceremony_digest = hex::decode(&ceremony.declaration_digest)
+                .map_err(|error| format!("contract ceremony digest invalid: {error}"))?;
+            if ceremony_digest.as_slice() != declaration_digest {
+                return Err(
+                    "contract ceremony digest does not match the attached declaration".into(),
+                );
+            }
+            manifest.halt_contract_ceremony = Some(ceremony);
+        }
+        manifest.halt_schedule_version = timing.schedule_version;
+        // Fail fast at record time with provenance errors; the restore gate
+        // re-verifies the same rule from the manifest.
+        pulsevm_database::check_halt_inclusion_window(
+            height,
+            manifest.halt_declaration_inclusion,
+            manifest.halt_max_declaration_lag,
+            manifest.halt_confirmation_inclusion,
+            manifest.halt_max_confirmation_lag,
+        )
+        .map_err(|error| format!("cutover vote timing rejected: {error}"))?;
+    } else if let Some(roster_path) = halt_roster {
+        // A weighted roster moves the restore from the single-key path to the
+        // two-thirds quorum path (version 1 and 2 commitments alike).
+        let bytes =
+            fs::read(roster_path).map_err(|error| format!("read roster {roster_path}: {error}"))?;
+        let roster: Vec<MigrationHaltRosterEntry> = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse roster {roster_path}: {error}"))?;
+        if roster.is_empty() {
+            return Err(format!("roster {roster_path} carries no entries"));
+        }
+        manifest = manifest.with_halt_roster(roster);
+    }
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("serialize manifest: {error}"))?;
     let temporary = output_path.with_extension(format!("tmp-{}", std::process::id()));

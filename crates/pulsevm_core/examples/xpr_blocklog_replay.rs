@@ -280,7 +280,16 @@ async fn replay_get_block(
             .map_err(|error| replay_rpc_error(500, error.to_string()))?
             .ok_or_else(|| replay_rpc_error(404, format!("block {identifier} not found")))?
     };
-    serde_json::to_value(block).map_err(|error| replay_rpc_error(500, error.to_string()))
+    // The terminal-cutover flip gate compares this id against the frozen
+    // source block id, so the response carries it explicitly (the block
+    // body itself has no top-level id field).
+    let id = block
+        .id()
+        .map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    let mut value =
+        serde_json::to_value(block).map_err(|error| replay_rpc_error(500, error.to_string()))?;
+    value["id"] = serde_json::Value::String(id.to_string());
+    Ok(value)
 }
 
 async fn replay_get_account(
@@ -1529,7 +1538,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let chain_id = Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid");
+    // Rehearsal escape hatch for the docker handover model: point the replay
+    // at a non-mainnet fixture chain instead of XPR Mainnet. Absent, every
+    // mainnet pin below stays exactly as-is.
+    let custom_genesis_path = env::var_os("XPR_REPLAY_GENESIS_FILE");
+    let genesis = match &custom_genesis_path {
+        Some(path) => {
+            eprintln!(
+                "[replay] custom genesis mode: mainnet pins disabled, log must match the given genesis"
+            );
+            fs::read(path).with_context(|| {
+                format!("read XPR_REPLAY_GENESIS_FILE {}", Path::new(path).display())
+            })?
+        }
+        None => {
+            include_bytes!("../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json").to_vec()
+        }
+    };
+    let chain_id = match &custom_genesis_path {
+        Some(_) => {
+            let genesis_state = pulsevm_database::GenesisState::from_bytes(&genesis)
+                .context("parse XPR_REPLAY_GENESIS_FILE as genesis JSON")?;
+            Id::new(genesis_state.compute_chain_id())
+        }
+        None => Id::from_str(XPR_CHAIN_ID).expect("constant XPR chain id is valid"),
+    };
     let producer_key = replay_producer_key(env::var("XPR_REPLAY_PRODUCER_KEY").ok());
     let config = serde_json::to_vec(&json!({
         "system_account": "eosio",
@@ -1546,8 +1579,6 @@ async fn main() -> Result<()> {
         "db_size": 48_u64 * 1024 * 1024 * 1024,
         "max_transaction_time_ms": 300_000
     }))?;
-    let genesis =
-        include_bytes!("../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json").to_vec();
     let initialized_fresh = !arena_dir.join("arena_state.bin").exists();
     fs::create_dir_all(&arena_dir)?;
 
@@ -1566,20 +1597,35 @@ async fn main() -> Result<()> {
     }
     let local_tip = controller.last_accepted_block();
     verify_replay_checkpoint_semantics(&arena_dir, local_tip.block_num(), initialized_fresh)?;
-    if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
-        bail!(
-            "authored genesis id {} is not canonical XPR block 1",
-            local_tip.id()?
-        );
-    }
+    // The source log must open with the same genesis this node authored.
+    // That is the canonical mainnet block 1 by default; in custom genesis
+    // mode it is the given fixture genesis, and resuming a non-fresh arena
+    // is refused so a mismatched log can never replay.
+    let expected_genesis_id = match &custom_genesis_path {
+        Some(_) => {
+            if !initialized_fresh {
+                bail!("XPR_REPLAY_GENESIS_FILE requires a fresh arena directory");
+            }
+            local_tip.id()?.to_string()
+        }
+        None => {
+            if local_tip.block_num() == 1 && local_tip.id()?.to_string() != XPR_BLOCK_ONE_ID {
+                bail!(
+                    "authored genesis id {} is not canonical XPR block 1",
+                    local_tip.id()?
+                );
+            }
+            XPR_BLOCK_ONE_ID.to_string()
+        }
+    };
 
     let source_genesis_bytes = source.packed_block(1)?;
     let source_genesis = controller
         .parse_block(&source_genesis_bytes)
         .map_err(|error| anyhow::anyhow!("decode source block 1: {error}"))?;
-    if source_genesis.id()?.to_string() != XPR_BLOCK_ONE_ID {
+    if source_genesis.id()?.to_string() != expected_genesis_id {
         bail!(
-            "source block 1 id {} differs from canonical genesis {XPR_BLOCK_ONE_ID}",
+            "source block 1 id {} does not match the local genesis {expected_genesis_id}",
             source_genesis.id()?
         );
     }

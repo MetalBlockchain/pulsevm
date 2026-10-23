@@ -795,11 +795,18 @@ impl StateHistoryLog {
         // file out from under the offset we just looked up. Once we
         // hold an fd, the old inode stays valid for the read.
         let (pos, mut f) = {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let pos = inner
                 .index
                 .get(block_num)
                 .ok_or(ShLogError::NotFound(block_num))?;
+            // Flush buffered appends so the reader observes everything the
+            // in-memory index references. Bulk replay batches appends
+            // without syncing; without this, reads of unflushed tail
+            // records fail as Corrupt against the short on-disk file.
+            // This is a userspace flush, not a durability barrier.
+            inner.log.flush()?;
+            inner.idx.flush()?;
             let f = OpenOptions::new().read(true).open(&self.log_path)?;
             (pos, f)
         };
@@ -857,7 +864,7 @@ impl StateHistoryLog {
             )));
         }
         let (first, last, start_offset, f) = {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let (first, last) = inner.index.range().ok_or(ShLogError::NotFound(start))?;
             if start < first || end > last {
                 return Err(ShLogError::NotFound(if start < first {
@@ -867,6 +874,10 @@ impl StateHistoryLog {
                 }));
             }
             let start_offset = inner.index.get(start).ok_or(ShLogError::NotFound(start))?;
+            // Same flush as read_block: the range reader validates against
+            // the on-disk file, so buffered appends must be visible first.
+            inner.log.flush()?;
+            inner.idx.flush()?;
             let f = OpenOptions::new().read(true).open(&self.log_path)?;
             (first, last, start_offset, f)
         };
@@ -1568,6 +1579,42 @@ mod tests {
         assert_eq!(reopened.range().unwrap().1, last + 2);
         assert_eq!(reopened.read_block(last + 1).unwrap(), b"first");
         assert_eq!(reopened.read_block(last + 2).unwrap(), b"second");
+    }
+
+    #[test]
+    fn reads_observe_unflushed_deferred_appends() {
+        // Bulk replay batches appends without syncing while serving reads
+        // off the same log (follow mode). A read must observe every
+        // logically committed append: before the read-path flush, tail
+        // reads failed as Corrupt against the short on-disk file.
+        let (dir, magic) = setup("deferred-read");
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        let last = log.range().unwrap().1;
+        let syncs_before = log.data_sync_count();
+
+        // Enough payload to overflow the userspace buffers several times
+        // over, with a length that is not a multiple of the buffer
+        // capacity, so the tail is guaranteed partially unflushed, not
+        // merely unsynced.
+        let big = vec![0x5Au8; 100_003];
+        for offset in 1..=4u32 {
+            log.append_deferred_sync(make_id(last + offset, 0xB0 + offset as u8), &big)
+                .unwrap();
+        }
+        // No durability barrier ran: everything is still userspace-buffered.
+        assert_eq!(log.data_sync_count(), syncs_before);
+        // Yet every committed append reads back, including the tail.
+        for offset in 1..=4u32 {
+            assert_eq!(log.read_block(last + offset).unwrap(), big);
+        }
+        let mut seen = Vec::new();
+        log.read_range(last + 1, last + 4, |block, payload| {
+            seen.push((block, payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen.iter().all(|(_, payload)| *payload == big));
     }
 
     #[test]

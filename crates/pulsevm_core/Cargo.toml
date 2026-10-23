@@ -60,6 +60,8 @@ arena-shadow = []
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 wat = "1"
+pulsevm_chain_types = { path = "../pulsevm_chain_types" }
+pulsevm_crypto = { path = "../pulsevm_crypto" }
 # Signing the same digest twice with different nonce data, to build a
 # transaction whose signatures are distinct but recover the same key.
 secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
