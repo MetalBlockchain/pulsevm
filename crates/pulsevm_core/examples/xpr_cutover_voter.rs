@@ -842,7 +842,7 @@ fn parse_leap_timestamp_us(text: &str) -> Result<u64, String> {
             digits.parse::<u64>().unwrap_or(0)
         })
         .unwrap_or(0);
-    let micros = days as u64 * 86_400_1_000_000
+    let micros = days as u64 * 86_400_000_000
         + (hour as u64 * 3600 + minute as u64 * 60 + second as u64) * 1_000_000
         + fraction_us;
     Ok(micros)
