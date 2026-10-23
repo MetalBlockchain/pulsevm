@@ -100,8 +100,11 @@ leap_send() {
     body="$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
         || { echo "handover: leap_send: refusing to submit an unparseable issueTx body" >&2; return 1; }
     for attempt in 1 2 3; do
-        send_out="$(curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
-            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$body" 2>&1)" && break
+        # Pipe the body via stdin (@-), never argv: a setcode packed_trx
+        # with inlined WASM exceeds Linux MAX_ARG_STRLEN (128 KiB per
+        # string) and exec fails with "Argument list too long".
+        send_out="$(printf '%s' "$body" | curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d @- 2>&1)" && break
         echo "handover: leap_send attempt $attempt failed: $send_out" >&2
         sleep 3
     done
