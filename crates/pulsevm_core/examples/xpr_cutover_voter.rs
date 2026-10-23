@@ -829,7 +829,8 @@ fn parse_leap_timestamp_us(text: &str) -> Result<u64, String> {
     let year_adj = if month <= 2 { year - 1 } else { year };
     let era = year_adj.div_euclid(400);
     let year_of_era = year_adj.rem_euclid(400);
-    let month_adj = month.rem_euclid(12);
+    // March-based month index in [0, 11] (Hinnant days-from-civil).
+    let month_adj = (month + 9).rem_euclid(12);
     let day_of_year = (153 * month_adj + 2).div_euclid(5) + day - 1;
     let day_of_era =
         year_of_era * 365 + year_of_era.div_euclid(4) - year_of_era.div_euclid(100) + day_of_year;
@@ -2020,6 +2021,13 @@ mod tests {
             parse_leap_timestamp_us("2026-10-23T13:50:31.500").unwrap()
                 - parse_leap_timestamp_us("2026-10-23T13:50:31.000").unwrap(),
             500_000
+        );
+        // A second absolute vector in the March-based half of the year, so
+        // the month remap is pinned on both sides of February.
+        // 2026-03-01T00:00:00Z is 1772323200 (Jan 31 + Feb 28 past New Year).
+        assert_eq!(
+            parse_leap_timestamp_us("2026-03-01T00:00:00.000").unwrap(),
+            1_772_323_200_000_000
         );
         assert!(parse_leap_timestamp_us("not-a-timestamp").is_err());
         assert!(parse_leap_timestamp_us("2026-13-01T00:00:00.000").is_err());
