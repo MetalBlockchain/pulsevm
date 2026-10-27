@@ -197,11 +197,11 @@ impl HaltCommitment {
     /// Verify this commitment against a weighted producer roster (the
     /// on-chain ceremony): version, height, and id must match, every
     /// signature must recover to a rostered key over the halt digest, and the
-    /// signers' combined weight must reach two thirds of the roster weight.
+    /// signers' combined weight must clear two thirds of the roster weight.
     /// Each producer's weight counts once no matter how often it signed.
-    /// Integer cross-multiplication (`signed * 3 >= total * 2`, in u128) sets
-    /// the threshold with no float rounding; an empty or all-zero roster
-    /// fails closed.
+    /// Integer cross-multiplication (`signed * 3 > total * 2`, in u128) sets
+    /// the strict threshold with no float rounding — exactly-two-thirds
+    /// fails closed; an empty or all-zero roster fails closed.
     pub fn verify_weighted_quorum(
         &self,
         expected_height: u32,
@@ -246,7 +246,7 @@ impl HaltCommitment {
             .filter(|entry| signed.contains(&entry.key))
             .map(|entry| entry.weight.0)
             .sum();
-        if signed_weight * 3 < total * 2 {
+        if signed_weight * 3 <= total * 2 {
             return Err(ChainError::InternalError(format!(
                 "halt commitment weight {signed_weight} below two-thirds quorum of {total}"
             )));
@@ -403,7 +403,7 @@ impl HaltCommitment {
             .filter(|entry| signed.contains(&entry.key))
             .map(|entry| entry.weight.0)
             .sum();
-        if signed_weight * 3 < total * 2 {
+        if signed_weight * 3 <= total * 2 {
             return Err(ChainError::InternalError(format!(
                 "halt commitment weight {signed_weight} below two-thirds quorum of {total}"
             )));
@@ -412,29 +412,22 @@ impl HaltCommitment {
     }
 }
 
-/// Integer vote weights: XPR `total_votes` is a float64 whose mainnet
-/// magnitudes (1e20+) saturate `u64`, silently turning a stake quorum into a
-/// member count. Weights are `u128` converted once from the source float by
-/// truncation (`as u128`, finite non-negative inputs only, checked where the
-/// roster is built); both the contract and the verifier must use this exact
-/// conversion so their tallies agree bit-for-bit. JSON encodes the weight as
-/// a decimal string: `serde_json` without `arbitrary_precision` cannot
-/// round-trip `u128` magnitudes as numbers.
+/// Schedule-member weights: every member of the frozen active schedule
+/// weighs exactly 1, so the quorum is a count quorum (`signed * 3 >
+/// total * 2` over a roster of ones is 15-of-21) that matches Leap
+/// irreversibility exactly. Vote-weight (`total_votes`) tracking is
+/// deliberately gone: it drifted every block, let a handful of large
+/// producers clear quorum alone, and let standby churn brick the freeze.
+/// The weight field stays on the wire so digests and JSON keep their shape;
+/// verification rejects any member whose weight is not 1. JSON encodes the
+/// weight as a decimal string: `serde_json` without `arbitrary_precision`
+/// cannot round-trip `u128` magnitudes as numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HaltWeight(pub u128);
 
 impl HaltWeight {
-    /// Truncate a source float to an integer weight, failing closed on
-    /// non-finite or negative inputs (NaN and infinities must never become
-    /// silent zeros or saturating maxima in quorum math).
-    pub fn from_votes(votes: f64) -> Result<Self, ChainError> {
-        if !votes.is_finite() || votes < 0.0 {
-            return Err(ChainError::InternalError(format!(
-                "halt weight source is not a finite non-negative float: {votes}"
-            )));
-        }
-        Ok(HaltWeight(votes as u128))
-    }
+    /// The only valid schedule-member weight.
+    pub const MEMBER: HaltWeight = HaltWeight(1);
 }
 
 impl Serialize for HaltWeight {
@@ -481,8 +474,12 @@ pub struct HaltRosterEntry {
 pub const HALT_DECLARATION_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-DECLARATION-v1";
 /// Domain separator for a step-two halt confirmation: the quorum's signed
 /// statement, made once block H exists, binding the declaration to the
-/// terminal block id, the migration checkpoint, and the successor chain id.
-pub const HALT_CONFIRMATION_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-CONFIRMATION-v1";
+/// terminal block id, the migration checkpoint, the successor chain id, and
+/// the platform (MetalGo blockchain) id wallets sign under. Version 2 makes
+/// the platform binding positional and mandatory: a confirmation that names
+/// no platform cannot commit its signers to the id wallets sign under, so
+/// version 1 confirmations are rejected outright.
+pub const HALT_CONFIRMATION_DOMAIN_V2: &[u8] = b"PULSEVM-XPR-HALT-CONFIRMATION-v2";
 
 /// One validator-set member as carried inside a halt declaration. The shape
 /// mirrors the transport roster entry; parsing it yields a
@@ -518,9 +515,13 @@ pub struct HaltDeclaration {
 
 /// Step two of the cutover: once block H exists, the same quorum confirms
 /// the handoff — declaration digest, terminal block id, migration
-/// checkpoint, and successor chain id — in one digest. Either step alone is
-/// insufficient: the declaration commits to the future before the state
-/// exists, the confirmation commits to the state once it does.
+/// checkpoint, successor chain id, and the highest pause head the quorum
+/// observed — in one digest. Either step alone is insufficient: the
+/// declaration commits to the future before the state exists, the
+/// confirmation commits to the state once it does. The pause head binds
+/// the post-H emptiness proof's coverage: the restore gate requires staged
+/// headers H+1 through exactly this head, so a proof that stops short of
+/// the quorum's own observation fails closed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaltConfirmation {
     pub version: u16,
@@ -528,6 +529,15 @@ pub struct HaltConfirmation {
     pub declaration_digest: String,
     /// H: must equal the declaration's `last_height`.
     pub halt_height: u32,
+    /// P: the highest pause head attested by the confirming quorum — the
+    /// greatest source height any confirmer observed frozen. Every confirmer
+    /// signs the same unanimous value (a frozen network observes one head,
+    /// so disagreement means the network is not frozen and refuses). The
+    /// post-H emptiness proof must cover exactly H+1 through this head;
+    /// covering it subsumes the irreversibility block, because confirmation
+    /// only happens after LIB passes H. Required: confirmations minted
+    /// before this field existed fail closed at parse time.
+    pub pause_height: u32,
     /// 64-hex id of the terminal block H.
     pub halt_block_id: String,
     /// 64-hex SHA-256 of the migration checkpoint exported at H.
@@ -536,11 +546,10 @@ pub struct HaltConfirmation {
     pub new_chain_id: String,
     /// 64-hex platform (MetalGo/Avago blockchain) id the successor runs
     /// under — the id transaction signatures are verified against. Bound
-    /// into the digest when present so the ceremony cannot commit to one id
-    /// while wallets sign under another. Absent only in legacy evidence
-    /// (which restores refuse once a platform id is configured).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub platform_chain_id: Option<String>,
+    /// positionally into the v2 digest so the ceremony cannot commit to one
+    /// id while wallets sign under another. Required: a confirmation that
+    /// names no platform fails closed at digest time.
+    pub platform_chain_id: String,
     pub signatures: Vec<HaltSignature>,
 }
 
@@ -643,6 +652,14 @@ impl HaltDeclaration {
         votes: &[HaltContractVote],
     ) -> Result<Self, ChainError> {
         let mut validator_set = members;
+        for member in &validator_set {
+            if member.weight != HaltWeight::MEMBER {
+                return Err(ChainError::InternalError(format!(
+                    "halt declaration member {} weight {} is not the schedule weight 1",
+                    member.producer, member.weight.0
+                )));
+            }
+        }
         Self::sort_members(&mut validator_set);
         let source_bytes = decode_hex_32(source_chain_id).map_err(|e| {
             ChainError::InternalError(format!("halt declaration source chain id invalid: {e}"))
@@ -702,10 +719,11 @@ impl HaltDeclaration {
     }
 
     /// Verify the declaration against the expected cutover height: version
-    /// and height must match, the set must carry weight, and the signers'
-    /// combined weight must reach two thirds of the declared set over the
-    /// declaration digest. Returns the digest so the caller can chain the
-    /// step-two confirmation to exactly this declaration.
+    /// and height must match, every member must weigh exactly 1 (the frozen
+    /// active schedule, not a vote-weight tally), and the signers must clear
+    /// the strict two-thirds count quorum over the declaration digest.
+    /// Returns the digest so the caller can chain the step-two confirmation
+    /// to exactly this declaration.
     pub fn verify(&self, expected_height: u32) -> Result<[u8; 32], ChainError> {
         if self.version != Self::VERSION {
             return Err(ChainError::InternalError(format!(
@@ -719,7 +737,43 @@ impl HaltDeclaration {
                 self.last_height, expected_height
             )));
         }
+        for member in &self.validator_set {
+            if member.weight != HaltWeight::MEMBER {
+                return Err(ChainError::InternalError(format!(
+                    "halt declaration member {} weight {} is not the schedule weight 1",
+                    member.producer, member.weight.0
+                )));
+            }
+        }
+        // Duplicate producers would count twice in the tally and let an
+        // exporter move the denominator: the schedule names each member
+        // once. (Duplicate keys across different string forms are caught
+        // below on the parsed roster.)
+        {
+            use std::collections::HashSet;
+            let mut producers = HashSet::new();
+            for member in &self.validator_set {
+                if !producers.insert(member.producer.clone()) {
+                    return Err(ChainError::InternalError(format!(
+                        "halt declaration member {} appears twice",
+                        member.producer
+                    )));
+                }
+            }
+        }
         let roster = self.roster()?;
+        {
+            use std::collections::HashSet;
+            let mut keys = HashSet::new();
+            for entry in &roster {
+                if !keys.insert(entry.key) {
+                    return Err(ChainError::InternalError(format!(
+                        "halt declaration key for {} appears twice",
+                        entry.producer
+                    )));
+                }
+            }
+        }
         let digest = self.digest()?;
         let signed =
             recover_rostered_signatures(&self.signatures, &roster, &digest, "declaration")?;
@@ -729,31 +783,70 @@ impl HaltDeclaration {
 }
 
 impl HaltConfirmation {
-    pub const VERSION: u16 = 1;
+    pub const VERSION: u16 = 2;
 
-    /// Canonical confirmation message: domain || declaration-digest ||
-    /// height-be32 || block-id || checkpoint || new-chain-id.
+    /// Canonical confirmation message: v2 domain || declaration-digest ||
+    /// height-be32 || pause-height-be32 || block-id || checkpoint ||
+    /// new-chain-id || platform-id. The pause head and platform id are
+    /// positional, not appended conditionally, so the domain tag pins the
+    /// full binding set: a confirmation minted before the pause head
+    /// existed signs a different digest and fails closed.
     pub fn message_bytes(
         declaration_digest: &[u8; 32],
         halt_height: u32,
+        pause_height: u32,
         halt_block_id: &[u8; 32],
         checkpoint_sha256: &[u8; 32],
         new_chain_id: &[u8; 32],
+        platform_chain_id: &[u8; 32],
     ) -> Vec<u8> {
-        let mut message = Vec::with_capacity(HALT_CONFIRMATION_DOMAIN.len() + 32 * 4 + 4);
-        message.extend_from_slice(HALT_CONFIRMATION_DOMAIN);
+        let mut message = Vec::with_capacity(HALT_CONFIRMATION_DOMAIN_V2.len() + 32 * 5 + 8);
+        message.extend_from_slice(HALT_CONFIRMATION_DOMAIN_V2);
         message.extend_from_slice(declaration_digest);
         message.extend_from_slice(&halt_height.to_be_bytes());
+        message.extend_from_slice(&pause_height.to_be_bytes());
         message.extend_from_slice(halt_block_id);
         message.extend_from_slice(checkpoint_sha256);
         message.extend_from_slice(new_chain_id);
+        message.extend_from_slice(platform_chain_id);
         message
     }
 
-    /// Signing digest for this confirmation. The platform chain id binds
-    /// into the digest when present (appended after the v1 message), so a
-    /// confirmation that names a platform commits its signers to exactly
-    /// that id; confirmations without one keep the v1 digest bit-for-bit.
+    /// Build the unsigned confirmation template over already cross-checked
+    /// values plus its signing digest, without signing or delivering
+    /// anything. Every ceremony agent (voter, coordinator tooling, offline
+    /// signers) builds the same template from the same fields, so one BP
+    /// signature serves every tally and no agent shells out to another
+    /// binary for the digest.
+    pub fn unsigned(
+        declaration_digest_hex: &str,
+        halt_height: u32,
+        pause_height: u32,
+        halt_block_id_hex: &str,
+        checkpoint_sha256_hex: &str,
+        new_chain_id_hex: &str,
+        platform_chain_id_hex: &str,
+    ) -> Result<(Self, [u8; 32]), ChainError> {
+        let template = Self {
+            version: Self::VERSION,
+            declaration_digest: declaration_digest_hex.to_string(),
+            halt_height,
+            pause_height,
+            halt_block_id: halt_block_id_hex.to_string(),
+            checkpoint_sha256: checkpoint_sha256_hex.to_string(),
+            new_chain_id: new_chain_id_hex.to_string(),
+            platform_chain_id: platform_chain_id_hex.to_string(),
+            signatures: Vec::new(),
+        };
+        let digest = template.digest()?;
+        Ok((template, digest))
+    }
+
+    /// Signing digest for this confirmation. Only version 2 exists: the
+    /// platform chain id binds positionally into the digest, so a
+    /// confirmation commits its signers to exactly the id wallets sign
+    /// under. Anything else fails closed at digest time, before any
+    /// signature is checked.
     pub fn digest(&self) -> Result<[u8; 32], ChainError> {
         let declaration_digest = decode_hex_32(&self.declaration_digest).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation declaration link invalid: {e}"))
@@ -767,30 +860,38 @@ impl HaltConfirmation {
         let new_chain_id = decode_hex_32(&self.new_chain_id).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation new chain id invalid: {e}"))
         })?;
-        let mut message = Self::message_bytes(
+        let platform_chain_id = decode_hex_32(&self.platform_chain_id).map_err(|e| {
+            ChainError::InternalError(format!("halt confirmation platform chain id invalid: {e}"))
+        })?;
+        if self.version != Self::VERSION {
+            return Err(ChainError::InternalError(format!(
+                "unsupported halt confirmation version {} (expected {})",
+                self.version,
+                Self::VERSION
+            )));
+        }
+        let message = Self::message_bytes(
             &declaration_digest,
             self.halt_height,
+            self.pause_height,
             &halt_block_id,
             &checkpoint_sha256,
             &new_chain_id,
+            &platform_chain_id,
         );
-        if let Some(platform) = self.platform_chain_id.as_deref() {
-            let platform_id = decode_hex_32(platform).map_err(|e| {
-                ChainError::InternalError(format!(
-                    "halt confirmation platform chain id invalid: {e}"
-                ))
-            })?;
-            message.extend_from_slice(&platform_id);
-        }
         Ok(*Digest::hash(&message).as_bytes())
     }
 
-    /// Verify the confirmation: version, declaration link, height, terminal
-    /// block id, checkpoint, successor chain id, and platform chain id must
-    /// all match the expected cutover values, and the same declared set's
-    /// quorum must have signed the confirmation digest. A confirmation with
-    /// no platform binding fails closed whenever the verifier configures
-    /// one: legacy evidence cannot silently skip the id wallets sign under.
+    /// Verify the confirmation: version 2, declaration link, height,
+    /// terminal block id, checkpoint, successor chain id, and platform chain
+    /// id must all match the expected cutover values, the pause head must
+    /// not predate H, and the same declared set's quorum must have signed
+    /// the confirmation digest (which binds the pause head positionally).
+    /// The platform binding is mandatory: version 1 confirmations are
+    /// rejected outright, so no evidence can silently skip the id wallets
+    /// sign under. The post-H coverage itself is enforced by
+    /// `verify_migration_post_chain`, which requires staged headers H+1
+    /// through exactly this pause head.
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
@@ -822,6 +923,15 @@ impl HaltConfirmation {
                 self.halt_height, expected_height
             )));
         }
+        // The pause head is the highest frozen height the quorum observed:
+        // it cannot predate the terminal block, and the restore gate
+        // requires the post-H proof to cover exactly H+1 through it.
+        if self.pause_height < expected_height {
+            return Err(ChainError::InternalError(format!(
+                "halt confirmation pause head {} predates cutover height {}",
+                self.pause_height, expected_height
+            )));
+        }
         let committed_id = decode_hex_32(&self.halt_block_id).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation block id invalid: {e}"))
         })?;
@@ -847,29 +957,16 @@ impl HaltConfirmation {
                 "halt confirmation successor chain id does not match this chain".into(),
             ));
         }
-        match (&self.platform_chain_id, expected_platform) {
-            (None, None) => {}
-            (Some(bound), Some(expected)) => {
-                let bound_id = decode_hex_32(bound).map_err(|e| {
-                    ChainError::InternalError(format!(
-                        "halt confirmation platform chain id invalid: {e}"
-                    ))
-                })?;
-                if bound_id != *expected {
-                    return Err(ChainError::InternalError(
-                        "halt confirmation platform chain id does not match this chain's configured id"
-                            .into(),
-                    ));
-                }
-            }
-            // A binding to an id nobody checks is committed but unenforced;
-            // the signatures still cover it, so it cannot be swapped later.
-            (Some(_), None) => {}
-            (None, Some(_)) => {
-                return Err(ChainError::InternalError(
-                    "halt confirmation carries no platform chain binding".into(),
-                ));
-            }
+        let bound_id = decode_hex_32(&self.platform_chain_id).map_err(|e| {
+            ChainError::InternalError(format!("halt confirmation platform chain id invalid: {e}"))
+        })?;
+        if let Some(expected) = expected_platform
+            && bound_id != *expected
+        {
+            return Err(ChainError::InternalError(
+                "halt confirmation platform chain id does not match this chain's configured id"
+                    .into(),
+            ));
         }
         let digest = self.digest()?;
         let signed =
@@ -1149,6 +1246,7 @@ fn hex_nibble(byte: u8) -> u8 {
 mod tests {
     use super::*;
     use pulsevm_crypto::k1::K1PrivateKey;
+    use std::str::FromStr;
 
     const HEIGHT: u32 = 310;
     const WEIGHTS: [HaltWeight; 3] = [HaltWeight(50), HaltWeight(30), HaltWeight(20)];
@@ -1226,7 +1324,9 @@ mod tests {
     }
 
     #[test]
-    fn quorum_accepts_exact_two_thirds() {
+    fn quorum_rejects_exact_two_thirds() {
+        // Strict 2/3+1: signed * 3 > total * 2, so exactly-two-thirds
+        // fails closed everywhere, including the legacy commitment path.
         let a = key("halt-test-1");
         let b = key("halt-test-2");
         let roster = vec![
@@ -1242,9 +1342,11 @@ mod tests {
             },
         ];
         let id = block_id();
-        commitment(vec![sign(&a, "prod.a", HEIGHT, &id)])
-            .verify_weighted_quorum(HEIGHT, &id, &roster)
-            .expect("exact two-thirds must verify");
+        assert!(
+            commitment(vec![sign(&a, "prod.a", HEIGHT, &id)])
+                .verify_weighted_quorum(HEIGHT, &id, &roster)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1472,15 +1574,29 @@ mod tests {
         "22".repeat(32)
     }
 
+    /// The frozen active schedule as declarations carry it: one member, one
+    /// vote. Declaration and confirmation tests run over this count quorum
+    /// (strict 2/3 of 3 needs all three signatures).
+    fn unit_roster(keys: &[K1PrivateKey]) -> Vec<HaltRosterEntry> {
+        let names = ["prod.a", "prod.b", "prod.c"];
+        keys.iter()
+            .zip(names)
+            .map(|(signing, producer)| HaltRosterEntry {
+                producer: producer.to_string(),
+                key: signing.public_key(),
+                weight: HaltWeight::MEMBER,
+            })
+            .collect()
+    }
+
     fn declaration_members(keys: &[K1PrivateKey]) -> Vec<HaltDeclarationMember> {
         let names = ["prod.a", "prod.b", "prod.c"];
         keys.iter()
             .zip(names)
-            .zip(WEIGHTS)
-            .map(|((signing, producer), weight)| HaltDeclarationMember {
+            .map(|(signing, producer)| HaltDeclarationMember {
                 producer: producer.to_string(),
                 key: signing.public_key().to_string(),
-                weight,
+                weight: HaltWeight::MEMBER,
             })
             .collect()
     }
@@ -1514,18 +1630,31 @@ mod tests {
         declaration.digest().expect("declaration digest must parse")
     }
 
+    /// Pause head the confirmation tests attest: three blocks past H, so
+    /// the post-H window H+1..P is non-trivial wherever coverage matters.
+    const PAUSE: u32 = HEIGHT + 3;
+
     fn confirmed(
         signatures: Vec<HaltSignature>,
         declaration_digest: &[u8; 32],
+    ) -> HaltConfirmation {
+        confirmed_at(signatures, declaration_digest, PAUSE)
+    }
+
+    fn confirmed_at(
+        signatures: Vec<HaltSignature>,
+        declaration_digest: &[u8; 32],
+        pause_height: u32,
     ) -> HaltConfirmation {
         HaltConfirmation {
             version: HaltConfirmation::VERSION,
             declaration_digest: hex32(declaration_digest),
             halt_height: HEIGHT,
+            pause_height,
             halt_block_id: block_id_hex(),
             checkpoint_sha256: hex32(&checkpoint()),
             new_chain_id: new_chain_hex(),
-            platform_chain_id: Some(platform_hex()),
+            platform_chain_id: platform_hex(),
             signatures,
         }
     }
@@ -1547,20 +1676,23 @@ mod tests {
 
     #[test]
     fn declaration_quorum_accepts_and_rejects_shortfall() {
+        // Count quorum over the frozen schedule: strict 2/3 of 3 needs all
+        // three signatures; two of three (exactly two-thirds) fails closed.
         let (keys, _) = roster();
         let unsigned = declared(Vec::new());
         let digest = declared_digest(&unsigned);
-        let quorum = [0, 1]
+        let names = ["prod.a", "prod.b", "prod.c"];
+        let quorum = [0, 1, 2]
             .iter()
-            .map(|&i| {
-                let names = ["prod.a", "prod.b", "prod.c"];
-                sign_declaration(&keys[i], names[i], &digest)
-            })
+            .map(|&i| sign_declaration(&keys[i], names[i], &digest))
             .collect();
         let digest = declared(quorum)
             .verify(HEIGHT)
-            .expect("declaration quorum weight must verify");
-        let shortfall = vec![sign_declaration(&keys[2], "prod.c", &digest)];
+            .expect("declaration quorum must verify");
+        let shortfall = [1, 2]
+            .iter()
+            .map(|&i| sign_declaration(&keys[i], names[i], &digest))
+            .collect();
         assert!(declared(shortfall).verify(HEIGHT).is_err());
     }
 
@@ -1583,12 +1715,10 @@ mod tests {
         let (keys, _) = roster();
         let unsigned = declared(Vec::new());
         let digest = declared_digest(&unsigned);
-        let quorum = [0, 1]
+        let names = ["prod.a", "prod.b", "prod.c"];
+        let quorum = [0, 1, 2]
             .iter()
-            .map(|&i| {
-                let names = ["prod.a", "prod.b", "prod.c"];
-                sign_declaration(&keys[i], names[i], &digest)
-            })
+            .map(|&i| sign_declaration(&keys[i], names[i], &digest))
             .collect::<Vec<_>>();
         let declaration = declared(quorum.clone());
         assert!(declaration.verify(HEIGHT + 1).is_err());
@@ -1612,36 +1742,43 @@ mod tests {
     }
 
     #[test]
-    fn weight_keeps_mainnet_magnitudes_and_string_encoding() {
-        // Live XPR `total_votes` reach 1e20+: `as u64` would saturate every
-        // large producer at u64::MAX, turning a stake quorum into a member
-        // count. u128 truncation preserves the magnitudes.
-        let votes = 5.251494364735212e21_f64;
-        let weight = HaltWeight::from_votes(votes).expect("finite votes convert");
-        assert_eq!(weight.0, votes as u128);
-        assert!(weight.0 > u64::MAX as u128);
-        // JSON encodes as a decimal string (no arbitrary_precision); plain
-        // numbers still parse for back-compat with small fixture weights.
-        let encoded = serde_json::to_string(&weight).expect("weight serializes");
-        assert_eq!(encoded, format!("\"{}\"", weight.0));
+    fn schedule_weights_are_pinned_to_one() {
+        // The frozen schedule is a count quorum: every member weighs 1.
+        // JSON still encodes the weight as a decimal string (no
+        // arbitrary_precision); plain numbers parse for rehearsal fixtures.
+        let encoded = serde_json::to_string(&HaltWeight::MEMBER).expect("weight serializes");
+        assert_eq!(encoded, "\"1\"");
         let decoded: HaltWeight = serde_json::from_str(&encoded).expect("string parses");
-        assert_eq!(decoded, weight);
-        let legacy: HaltWeight = serde_json::from_str("20").expect("number parses");
-        assert_eq!(legacy, HaltWeight(20));
-        // Non-finite and negative sources fail closed, never silent 0/MAX.
-        assert!(HaltWeight::from_votes(f64::NAN).is_err());
-        assert!(HaltWeight::from_votes(f64::INFINITY).is_err());
-        assert!(HaltWeight::from_votes(-1.0).is_err());
-        // A declaration member round-trips through JSON with string weights.
+        assert_eq!(decoded, HaltWeight::MEMBER);
+        let plain: HaltWeight = serde_json::from_str("1").expect("number parses");
+        assert_eq!(plain, HaltWeight::MEMBER);
+        // A declaration member round-trips through JSON with the unit weight.
         let member = HaltDeclarationMember {
             producer: "prod.a".to_string(),
             key: key("halt-test-1").public_key().to_string(),
-            weight,
+            weight: HaltWeight::MEMBER,
         };
         let json = serde_json::to_string(&member).expect("member serializes");
-        assert!(json.contains(&format!("\"weight\":\"{}\"", weight.0)));
+        assert!(json.contains("\"weight\":\"1\""));
         let back: HaltDeclarationMember = serde_json::from_str(&json).expect("member parses");
         assert_eq!(back, member);
+        // A vote-weight member is not the schedule: verification fails
+        // closed even with a full quorum over it, as does a duplicated
+        // producer (which would count twice and move the denominator).
+        let (keys, _) = roster();
+        let mut duplicated = declared(Vec::new());
+        duplicated.validator_set[1].producer = duplicated.validator_set[0].producer.clone();
+        assert!(duplicated.verify(HEIGHT).is_err());
+        let mut weighted = declared(Vec::new());
+        weighted.validator_set[0].weight = HaltWeight(50);
+        let digest = weighted.digest().expect("weighted digest parses");
+        let names = ["prod.a", "prod.b", "prod.c"];
+        let quorum = [0, 1, 2]
+            .iter()
+            .map(|&i| sign_declaration(&keys[i], names[i], &digest))
+            .collect();
+        weighted.signatures = quorum;
+        assert!(weighted.verify(HEIGHT).is_err());
     }
 
     #[test]
@@ -1663,11 +1800,12 @@ mod tests {
 
     #[test]
     fn confirmation_chains_declaration_and_state() {
-        let (keys, roster) = roster();
+        let (keys, _) = roster();
+        let roster = unit_roster(&keys);
         let names = ["prod.a", "prod.b", "prod.c"];
         let unsigned = declared(Vec::new());
         let decl_digest = declared_digest(&unsigned);
-        let decl_sigs = [0, 1]
+        let decl_sigs = [0, 1, 2]
             .iter()
             .map(|&i| sign_declaration(&keys[i], names[i], &decl_digest))
             .collect();
@@ -1677,7 +1815,7 @@ mod tests {
         assert_eq!(parsed, roster);
 
         let template = confirmed(Vec::new(), &verified);
-        let conf_sigs = [0, 1]
+        let conf_sigs = [0, 1, 2]
             .iter()
             .map(|&i| sign_confirmation(&keys[i], names[i], &template))
             .collect();
@@ -1697,12 +1835,13 @@ mod tests {
 
     #[test]
     fn confirmation_rejects_any_broken_link() {
-        let (keys, roster) = roster();
+        let (keys, _) = roster();
+        let roster = unit_roster(&keys);
         let names = ["prod.a", "prod.b", "prod.c"];
         let unsigned = declared(Vec::new());
         let decl_digest = declared_digest(&unsigned);
         let template = confirmed(Vec::new(), &decl_digest);
-        let quorum = [0, 1]
+        let quorum = [0, 1, 2]
             .iter()
             .map(|&i| sign_confirmation(&keys[i], names[i], &template))
             .collect::<Vec<_>>();
@@ -1770,7 +1909,8 @@ mod tests {
 
     #[test]
     fn confirmation_binds_the_platform_chain() {
-        let (keys, roster) = roster();
+        let (keys, _) = roster();
+        let roster = unit_roster(&keys);
         let names = ["prod.a", "prod.b", "prod.c"];
         let unsigned = declared(Vec::new());
         let decl_digest = declared_digest(&unsigned);
@@ -1789,7 +1929,7 @@ mod tests {
         };
         // Bound to the configured platform: verifies.
         let template = confirmed(Vec::new(), &decl_digest);
-        let quorum = [0, 1]
+        let quorum = [0, 1, 2]
             .iter()
             .map(|&i| sign_confirmation(&keys[i], names[i], &template))
             .collect::<Vec<_>>();
@@ -1798,26 +1938,31 @@ mod tests {
         // Same signatures, another platform: the digest binds the
         // platform, so the quorum does not carry over.
         assert!(verify_as(&bound, Some(&[0x52; 32])).is_err());
-        // Fully legacy (never bound, nothing configured) still verifies:
-        // the v1 digest is bit-for-bit.
-        let mut legacy_template = confirmed(Vec::new(), &decl_digest);
-        legacy_template.platform_chain_id = None;
-        let legacy_quorum = [0, 1]
-            .iter()
-            .map(|&i| sign_confirmation(&keys[i], names[i], &legacy_template))
-            .collect::<Vec<_>>();
-        let mut legacy = confirmed(legacy_quorum, &decl_digest);
-        legacy.platform_chain_id = None;
-        verify_as(&legacy, None).expect("legacy confirmation verifies when nothing is configured");
-        // But legacy evidence against a configured platform fails closed:
-        // it cannot silently skip the id wallets sign under.
+        // A version 1 confirmation is rejected outright, even with a full
+        // quorum: no evidence can silently skip the platform binding.
+        let mut legacy = bound.clone();
+        legacy.version = 1;
         assert!(verify_as(&legacy, Some(&platform())).is_err());
+        assert!(verify_as(&legacy, None).is_err());
+        // The shared template constructor fails closed on a bad platform id.
+        assert!(
+            HaltConfirmation::unsigned(
+                &hex32(&decl_digest),
+                HEIGHT,
+                PAUSE,
+                &block_id_hex(),
+                &hex32(&checkpoint()),
+                &new_chain_hex(),
+                "not-hex",
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn contract_ceremony_pins_every_vote_to_one_schedule_version() {
         let (keys, roster, digest) = ceremony_inputs();
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         // Unanimous under H's version: verifies.
         ceremony_template(&digest, votes.clone())
             .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
@@ -1865,8 +2010,10 @@ mod tests {
         HaltContractCeremony {
             contract: "cutover".to_string(),
             declaration_digest: hex32(digest),
-            total_weight: HaltWeight(WEIGHTS.iter().map(|weight| weight.0).sum()),
-            voted_weight: HaltWeight(WEIGHTS[0].0 + WEIGHTS[1].0),
+            // The frozen schedule is three unit members; the captured tally
+            // is the vote count until a test mutates it.
+            total_weight: HaltWeight(3),
+            voted_weight: HaltWeight(votes.len() as u128),
             finalized: true,
             finalized_block: HEIGHT - 1,
             init_time: 0,
@@ -1875,7 +2022,8 @@ mod tests {
     }
 
     fn ceremony_inputs() -> (Vec<K1PrivateKey>, Vec<HaltRosterEntry>, [u8; 32]) {
-        let (keys, roster) = roster();
+        let (keys, _) = roster();
+        let roster = unit_roster(&keys);
         let unsigned = declared(Vec::new());
         let digest = declared_digest(&unsigned);
         (keys, roster, digest)
@@ -1890,11 +2038,10 @@ mod tests {
         let members: Vec<HaltDeclarationMember> = keys
             .iter()
             .zip(names)
-            .zip(WEIGHTS)
-            .map(|((signing, producer), weight)| HaltDeclarationMember {
+            .map(|(signing, producer)| HaltDeclarationMember {
                 producer: producer.to_string(),
                 key: signing.public_key().to_string(),
-                weight,
+                weight: HaltWeight::MEMBER,
             })
             .collect();
         let votes = ceremony_votes(keys, digest, blocks);
@@ -1906,16 +2053,15 @@ mod tests {
     fn from_contract_votes_builds_verifiable_declaration() {
         let (keys, _, _) = ceremony_inputs();
         // The digest must run over the same two members the declaration is
-        // built from (prod.a/prod.b with WEIGHTS[0]/WEIGHTS[1]).
+        // built from (prod.a/prod.b, one vote each).
         let names = ["prod.a", "prod.b"];
         let members: Vec<HaltDeclarationMember> = keys[..2]
             .iter()
             .zip(names)
-            .zip([WEIGHTS[0], WEIGHTS[1]])
-            .map(|((signing, producer), weight)| HaltDeclarationMember {
+            .map(|(signing, producer)| HaltDeclarationMember {
                 producer: producer.to_string(),
                 key: signing.public_key().to_string(),
-                weight,
+                weight: HaltWeight::MEMBER,
             })
             .collect();
         let mut unsigned = HaltDeclaration {
@@ -1985,11 +2131,10 @@ mod tests {
         let members: Vec<HaltDeclarationMember> = keys[..1]
             .iter()
             .zip(["prod.a"])
-            .zip([WEIGHTS[0]])
-            .map(|((signing, producer), weight)| HaltDeclarationMember {
+            .map(|(signing, producer)| HaltDeclarationMember {
                 producer: producer.to_string(),
                 key: signing.public_key().to_string(),
-                weight,
+                weight: HaltWeight::MEMBER,
             })
             .collect();
         let bad_votes = vec![HaltContractVote {
@@ -2034,7 +2179,7 @@ mod tests {
     #[test]
     fn contract_ceremony_accepts_quorum_votes_in_window() {
         let (keys, roster, digest) = ceremony_inputs();
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 30, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 30, HEIGHT - 3, HEIGHT - 2]);
         ceremony_template(&digest, votes)
             .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
             .expect("quorum votes in window must verify");
@@ -2043,7 +2188,7 @@ mod tests {
     #[test]
     fn contract_ceremony_rejects_open_tally_and_digest_link() {
         let (keys, roster, digest) = ceremony_inputs();
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         let mut open = ceremony_template(&digest, votes.clone());
         open.finalized = false;
         assert!(
@@ -2064,7 +2209,7 @@ mod tests {
     #[test]
     fn contract_ceremony_rejects_outsider_wrong_key_and_double_vote() {
         let (keys, roster, digest) = ceremony_inputs();
-        let mut votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let mut votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         // A vote naming a rostered producer but signed by another key: the
         // name/key binding must hold, not just roster membership.
         votes[1].key = keys[2].public_key().to_string();
@@ -2096,7 +2241,7 @@ mod tests {
         let mut doubled_vote = vote.clone();
         doubled_vote.block = HEIGHT - 2;
         let mut doubled = ceremony_template(&digest, vec![vote.clone(), doubled_vote]);
-        doubled.voted_weight = HaltWeight(WEIGHTS[0].0 * 2);
+        doubled.voted_weight = HaltWeight(2);
         assert!(
             doubled
                 .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
@@ -2108,31 +2253,29 @@ mod tests {
     #[test]
     fn contract_ceremony_rejects_shortfall_and_tally_mismatch() {
         let (keys, roster, digest) = ceremony_inputs();
-        // prod.c alone (20 of 100) cannot finalize: exact-boundary shortfall.
+        // prod.c alone (1 of 3) cannot finalize: count shortfall.
         let votes = ceremony_votes(&keys[2..3], &digest, &[HEIGHT - 2]);
-        let mut short = ceremony_template(&digest, votes);
-        short.voted_weight = HaltWeight(WEIGHTS[2].0);
+        let short = ceremony_template(&digest, votes);
         assert!(
             short
                 .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "a shortfall tally must fail"
         );
-        // Captured tally disagreeing with the recomputed signer weight fails
+        // Captured tally disagreeing with the recomputed signer count fails
         // even though the signatures themselves clear the quorum.
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         let mut inflated = ceremony_template(&digest, votes);
-        inflated.voted_weight = HaltWeight(WEIGHTS[0].0 + WEIGHTS[1].0 + 1);
+        inflated.voted_weight = HaltWeight(4);
         assert!(
             inflated
                 .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "an inflated contract tally must fail"
         );
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         let mut wrong_total = ceremony_template(&digest, votes);
-        wrong_total.total_weight =
-            HaltWeight(WEIGHTS.iter().map(|weight| weight.0).sum::<u128>() + 1);
+        wrong_total.total_weight = HaltWeight(4);
         assert!(
             wrong_total
                 .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
@@ -2142,10 +2285,104 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_binds_the_pause_head() {
+        let (keys, _) = roster();
+        let roster = unit_roster(&keys);
+        let names = ["prod.a", "prod.b", "prod.c"];
+        let unsigned = declared(Vec::new());
+        let decl_digest = declared_digest(&unsigned);
+        let id = block_id();
+        let checkpoint_bytes = checkpoint();
+        let verify_as = |confirmation: &HaltConfirmation| {
+            confirmation.verify(
+                &decl_digest,
+                &roster,
+                HEIGHT,
+                &id,
+                &checkpoint_bytes,
+                &NEW_CHAIN,
+                Some(&platform()),
+            )
+        };
+        // Unanimous over the attested pause head: verifies.
+        let template = confirmed(Vec::new(), &decl_digest);
+        assert_eq!(template.pause_height, PAUSE);
+        let quorum = [0, 1, 2]
+            .iter()
+            .map(|&i| sign_confirmation(&keys[i], names[i], &template))
+            .collect::<Vec<_>>();
+        let good = confirmed(quorum, &decl_digest);
+        verify_as(&good).expect("pause-bound confirmation must verify");
+        // The digest binds the pause head: the same quorum's signatures do
+        // not carry over to a confirmation attesting another head.
+        let moved = confirmed_at(Vec::new(), &decl_digest, PAUSE + 1);
+        assert_ne!(
+            template.digest().unwrap(),
+            moved.digest().unwrap(),
+            "the pause head must enter the confirmation digest"
+        );
+        let replayed = HaltConfirmation {
+            signatures: good.signatures.clone(),
+            ..moved
+        };
+        assert!(
+            verify_as(&replayed).is_err(),
+            "signatures over one pause head must not verify another"
+        );
+        // A pause head predating H fails closed, even with a full quorum
+        // over it: nothing after the freeze can be covered.
+        let early_template = confirmed_at(Vec::new(), &decl_digest, HEIGHT - 1);
+        let early_quorum = [0, 1, 2]
+            .iter()
+            .map(|&i| sign_confirmation(&keys[i], names[i], &early_template))
+            .collect::<Vec<_>>();
+        let early = confirmed_at(early_quorum, &decl_digest, HEIGHT - 1);
+        assert!(
+            verify_as(&early).is_err(),
+            "a pause head before H must fail"
+        );
+        // The shared template constructor carries the pause head through to
+        // the digest, so every agent builds the same bytes.
+        let (rebuilt, digest) = HaltConfirmation::unsigned(
+            &hex32(&decl_digest),
+            HEIGHT,
+            PAUSE,
+            &block_id_hex(),
+            &hex32(&checkpoint()),
+            &new_chain_hex(),
+            &platform_hex(),
+        )
+        .expect("template with a pause head must build");
+        assert_eq!(rebuilt.pause_height, PAUSE);
+        assert_eq!(digest, template.digest().unwrap());
+    }
+
+    #[test]
+    fn confirmation_rejects_a_legacy_confirmation_without_pause_height() {
+        // Confirmations minted before the pause head existed carry no
+        // `pause_height` field: parsing them fails closed instead of
+        // defaulting the coverage bound to zero (or to H).
+        let legacy = serde_json::json!({
+            "version": HaltConfirmation::VERSION,
+            "declaration_digest": "44".repeat(32),
+            "halt_height": HEIGHT,
+            "halt_block_id": block_id_hex(),
+            "checkpoint_sha256": hex32(&checkpoint()),
+            "new_chain_id": new_chain_hex(),
+            "platform_chain_id": platform_hex(),
+            "signatures": [],
+        });
+        assert!(
+            serde_json::from_value::<HaltConfirmation>(legacy).is_err(),
+            "a confirmation without a pause head must not parse"
+        );
+    }
+
+    #[test]
     fn contract_ceremony_enforces_vote_and_finality_windows() {
         let (keys, roster, digest) = ceremony_inputs();
         // A vote at or past H is not a pre-commitment.
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT]);
         assert!(
             ceremony_template(&digest, votes)
                 .verify(HEIGHT, None, &roster, &digest, CEREMONY_VERSION)
@@ -2153,7 +2390,7 @@ mod tests {
             "a vote at H must fail"
         );
         // Finalization at or past H likewise misses the pre-commitment.
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         let mut late = ceremony_template(&digest, votes);
         late.finalized_block = HEIGHT;
         assert!(
@@ -2163,14 +2400,14 @@ mod tests {
         );
         // With a claimed freshness bound, stale votes and stale finality
         // fail even though both predate H.
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 31, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 31, HEIGHT - 3, HEIGHT - 2]);
         assert!(
             ceremony_template(&digest, votes)
                 .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "a vote older than the ceremony window must fail"
         );
-        let votes = ceremony_votes(&keys[..2], &digest, &[HEIGHT - 3, HEIGHT - 2]);
+        let votes = ceremony_votes(&keys, &digest, &[HEIGHT - 4, HEIGHT - 3, HEIGHT - 2]);
         let mut stale = ceremony_template(&digest, votes);
         stale.finalized_block = HEIGHT - 31;
         assert!(

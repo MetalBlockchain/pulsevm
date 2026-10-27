@@ -75,6 +75,12 @@ struct Config {
     producer: String,
     source_chain_id: String,
     height: u32,
+    /// Coordinated active schedule version the freeze must name: the
+    /// voter refuses unless the contract init params (H, chain id,
+    /// schedule version, schedule) equal the live `get_producer_schedule`
+    /// exactly. Missing (not zero) fails closed at startup so an old
+    /// config cannot sign under an unpinned schedule.
+    schedule_version: u32,
     roster_file: String,
     vote_key_file: String,
     payer_account: String,
@@ -192,6 +198,17 @@ fn read_roster(path: &str) -> Result<Vec<HaltDeclarationMember>, String> {
     if roster.is_empty() {
         return Err(format!("roster {path} carries no entries"));
     }
+    // The ceremony roster is the frozen active schedule: one member, one
+    // vote. A vote-weight entry is not the schedule and must never be
+    // signed, so it fails here instead of minting a foreign digest.
+    for entry in &roster {
+        if entry.weight != pulsevm_database::HaltWeight::MEMBER {
+            return Err(format!(
+                "roster {path} entry {} weight {} is not the schedule weight 1: refusing a non-schedule roster",
+                entry.producer, entry.weight.0
+            ));
+        }
+    }
     let mut members: Vec<HaltDeclarationMember> = roster
         .into_iter()
         .map(|entry| HaltDeclarationMember {
@@ -274,18 +291,31 @@ struct CeremonyView {
     /// chain time (the same clock the contract's `publication_time()`
     /// window uses), never on the operator's wall clock.
     head_time_us: u64,
+    /// Live active schedule version from `get_producer_schedule`: the
+    /// vote refuses unless this equals both the frozen ceremony version
+    /// and the coordinated config version.
+    live_version: u32,
     singleton: Option<CeremonyRow>,
     member: Option<MemberRow>,
     /// A schedule change is staged (pending or proposed): the frozen set
     /// may no longer name the active set, so the vote refuses until the
     /// freeze is re-taken on the new set.
     schedule_blocked: bool,
+    /// The frozen ceremony set no longer matches the live active schedule
+    /// (member or schedule-key drift since the freeze): the freeze is stale
+    /// and the vote refuses until it is re-taken.
+    schedule_mismatch: bool,
 }
 
 #[derive(Debug, Clone)]
 struct CeremonyRow {
     h: u32,
     source_chain_id: String,
+    /// Frozen schedule version from the contract `init`: the vote refuses
+    /// unless this equals the coordinated config version and the live
+    /// active version, so a freeze taken under a rotated schedule signs
+    /// nothing even when the member set still matches.
+    schedule_version: u32,
     finalized: bool,
     digest: String,
     /// Freeze instant (`publication_time()` microseconds at init). Votes
@@ -333,6 +363,23 @@ fn decide(config: &LoadedConfig, view: &CeremonyView) -> Decision {
                 .to_string(),
         );
     }
+    // The contract init params (H, chain id, schedule version, schedule)
+    // must equal the live schedule exactly: names and keys are pinned by
+    // the digest plus the freeze-vs-schedule comparison below, and the
+    // version is pinned here on all three sides (frozen, coordinated,
+    // live). A rotation anywhere in the triangle refuses.
+    if singleton.schedule_version != config.inner.schedule_version {
+        return Decision::Refuse(format!(
+            "ceremony schedule version {} does not match coordinated version {}: refusing to sign a freeze taken under the wrong schedule",
+            singleton.schedule_version, config.inner.schedule_version
+        ));
+    }
+    if view.live_version != config.inner.schedule_version {
+        return Decision::Refuse(format!(
+            "live schedule version {} does not match coordinated version {}: the schedule rotated, refusing to sign until the freeze is re-taken",
+            view.live_version, config.inner.schedule_version
+        ));
+    }
     // The contract stops accepting votes past the freeze window; submitting
     // into an expired freeze burns payer CPU/NET on a doomed transaction,
     // so refuse here and wait for a fresh freeze instead. Same clock as the
@@ -346,6 +393,12 @@ fn decide(config: &LoadedConfig, view: &CeremonyView) -> Decision {
     if view.schedule_blocked {
         return Decision::Refuse(
             "a producer schedule change is staged (pending or proposed): refusing to sign until the freeze names the active set"
+                .to_string(),
+        );
+    }
+    if view.schedule_mismatch {
+        return Decision::Refuse(
+            "the frozen ceremony set does not match the live active schedule (member or schedule-key drift): refusing to sign a stale freeze"
                 .to_string(),
         );
     }
@@ -488,7 +541,76 @@ fn schedule_staged(value: &serde_json::Value) -> bool {
     false
 }
 
-async fn read_schedule_blocked(client: &reqwest::Client, base: &str) -> Result<bool, String> {
+/// The live producer schedule as the voter needs it: whether a change is
+/// staged, the active version, plus the active set to compare the frozen
+/// set against. A freeze taken under a rotating set signs nothing, and a
+/// freeze whose members no longer match the live active schedule is stale
+/// — both refuse.
+struct LiveSchedule {
+    blocked: bool,
+    version: u32,
+    active: Vec<(String, pulsevm_crypto::k1::K1PublicKey)>,
+}
+
+/// Parse one `get_producer_schedule` active producer: name plus its schedule
+/// (block-signing) key. Leap 4+ carries the key inside the producer
+/// authority (`authority: [1, {threshold, keys}]`), not a flat
+/// `block_signing_key`: only a single-key, threshold-1 authority maps to
+/// one signing key, anything else fails closed. A schedule the voter
+/// cannot read is one it must not sign under.
+fn parse_active_producer(
+    value: &serde_json::Value,
+) -> Result<(String, pulsevm_crypto::k1::K1PublicKey), String> {
+    let name = value
+        .get("producer_name")
+        .and_then(|name| name.as_str())
+        .ok_or_else(|| "active schedule producer missing producer_name".to_string())?
+        .to_string();
+    let authority = value
+        .get("authority")
+        .and_then(|authority| authority.as_array())
+        .ok_or_else(|| format!("active schedule producer {name} has no authority"))?;
+    let [tag, versioned] = authority.as_slice() else {
+        return Err(format!(
+            "active schedule producer {name} authority is not a versioned pair"
+        ));
+    };
+    // Leap 4 serves the v0 authority at tag 0, Leap 5 at tag 1; both carry
+    // the threshold-and-keys object. Anything else is a shape the voter
+    // must not guess at.
+    if !tag.as_u64().is_some_and(|tag| tag <= 1) {
+        return Err(format!(
+            "active schedule producer {name} authority has unknown variant tag {tag}"
+        ));
+    }
+    let threshold = versioned
+        .get("threshold")
+        .and_then(|threshold| threshold.as_u64())
+        .ok_or_else(|| format!("active schedule producer {name} authority has no threshold"))?;
+    if threshold != 1 {
+        return Err(format!(
+            "active schedule producer {name} authority threshold is {threshold}, not 1"
+        ));
+    }
+    let keys = versioned
+        .get("keys")
+        .and_then(|keys| keys.as_array())
+        .ok_or_else(|| format!("active schedule producer {name} authority has no keys"))?;
+    let [entry] = keys.as_slice() else {
+        return Err(format!(
+            "active schedule producer {name} authority does not name exactly one block-signing key"
+        ));
+    };
+    let key = entry
+        .get("key")
+        .and_then(|key| key.as_str())
+        .ok_or_else(|| format!("active schedule producer {name} authority key has no key"))?;
+    let parsed = pulsevm_crypto::k1::K1PublicKey::from_string(key)
+        .map_err(|error| format!("active schedule producer {name} key invalid: {error:?}"))?;
+    Ok((name, parsed))
+}
+
+async fn read_live_schedule(client: &reqwest::Client, base: &str) -> Result<LiveSchedule, String> {
     let schedule = post_json(
         client,
         &format!("{base}/v1/chain/get_producer_schedule"),
@@ -496,7 +618,119 @@ async fn read_schedule_blocked(client: &reqwest::Client, base: &str) -> Result<b
     )
     .await
     .map_err(|error| format!("producer schedule unreadable: {error}"))?;
-    Ok(schedule_staged(&schedule))
+    let blocked = schedule_staged(&schedule);
+    let mut active = Vec::new();
+    let version: Option<u32>;
+    match schedule.get("active") {
+        None => {
+            return Err(
+                "producer schedule carries no active slot: cannot prove the freeze names the live set"
+                    .to_string(),
+            );
+        }
+        Some(slot) if slot.is_null() => {
+            return Err(
+                "producer schedule active slot is null: cannot prove the freeze names the live set"
+                    .to_string(),
+            );
+        }
+        Some(slot) => {
+            version = slot
+                .get("version")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok());
+            let producers = slot
+                .get("producers")
+                .and_then(|p| p.as_array())
+                .ok_or_else(|| "producer schedule active slot carries no producers".to_string())?;
+            for producer in producers {
+                active.push(parse_active_producer(producer)?);
+            }
+        }
+    }
+    if active.is_empty() {
+        return Err("producer schedule active set is empty: refusing to sign".to_string());
+    }
+    let version = version.ok_or_else(|| {
+        "producer schedule active slot carries no version: cannot prove the freeze names the coordinated schedule"
+            .to_string()
+    })?;
+    Ok(LiveSchedule {
+        blocked,
+        version,
+        active,
+    })
+}
+
+/// Confirmation-time schedule gate: the voter refuses to sign a
+/// confirmation unless the coordinated init params still equal the live
+/// `get_producer_schedule` exactly — same version, same member names, same
+/// schedule keys — and no change is staged. The declaration-time `decide`
+/// covers the vote; this covers the confirmation, so a schedule that
+/// rotates (or stages a proposed replacement) between the vote and H+1
+/// refuses at confirmation time instead of attesting a superseded freeze.
+/// Pending *and* proposed slots both block: a proposed schedule is a
+/// staged change the freeze never named.
+fn verify_confirmation_schedule(
+    expected_version: u32,
+    expected_members: &[HaltDeclarationMember],
+    live: &LiveSchedule,
+) -> Result<(), String> {
+    if live.blocked {
+        return Err(
+            "a producer schedule change is staged (pending or proposed): refusing to confirm until the freeze is re-taken on the active set"
+                .to_string(),
+        );
+    }
+    if live.version != expected_version {
+        return Err(format!(
+            "live schedule version {} does not match coordinated version {expected_version}: refusing to confirm a superseded freeze",
+            live.version
+        ));
+    }
+    let mut expected: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> =
+        Vec::with_capacity(expected_members.len());
+    for member in expected_members {
+        let key = pulsevm_crypto::k1::K1PublicKey::from_string(&member.key).map_err(|error| {
+            format!(
+                "coordinated roster key for {} invalid: {error:?}",
+                member.producer
+            )
+        })?;
+        expected.push((member.producer.clone(), key));
+    }
+    if !schedule_matches_freeze(&expected, &live.active) {
+        return Err(
+            "coordinated roster does not match the live active schedule (member or schedule-key drift): refusing to confirm a superseded freeze"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether the frozen ceremony set still names the live active schedule:
+/// same members both ways, same schedule keys. This closes the gap where
+/// `producers.producer_key` can differ from the schedule key — the voter
+/// compares the frozen ceremony keys against the schedule keys directly,
+/// never against the producers table. Key forms may differ (legacy EOS vs
+/// PUB_K1_); the comparison runs on parsed keys, never strings.
+fn schedule_matches_freeze(
+    frozen: &[(String, pulsevm_crypto::k1::K1PublicKey)],
+    active: &[(String, pulsevm_crypto::k1::K1PublicKey)],
+) -> bool {
+    if frozen.len() != active.len() {
+        return false;
+    }
+    let mut frozen_sorted: Vec<&(String, pulsevm_crypto::k1::K1PublicKey)> =
+        frozen.iter().collect();
+    let mut active_sorted: Vec<&(String, pulsevm_crypto::k1::K1PublicKey)> =
+        active.iter().collect();
+    frozen_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    active_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    frozen_sorted
+        .iter()
+        .zip(active_sorted.iter())
+        .all(|(left, right)| left.0 == right.0 && left.1 == right.1)
 }
 
 /// Leap renders contract bools inconsistently across versions (JSON bool
@@ -545,6 +779,14 @@ fn parse_ceremony_row(value: &serde_json::Value) -> Result<CeremonyRow, String> 
             .and_then(|v| v.as_str())
             .ok_or_else(|| "ceremony row missing source_chain_id".to_string())?
             .to_string(),
+        schedule_version: value
+            .get("schedule_version")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                "ceremony row missing schedule_version: cannot prove the freeze names the coordinated schedule"
+                    .to_string()
+            })?,
         finalized: parse_abi_bool(value, "finalized")?,
         digest: value
             .get("declaration_digest")
@@ -592,14 +834,27 @@ async fn read_view(
     let singleton = ceremony.first().map(parse_ceremony_row).transpose()?;
     let members = get_table_rows(client, base, &config.inner.contract, "members").await?;
     let mut member = None;
+    let mut frozen: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = Vec::new();
+    let mut frozen_unreadable = false;
     for row in &members {
         let (producer, parsed) = parse_member_row(row)?;
+        match pulsevm_crypto::k1::K1PublicKey::from_string(&parsed.key) {
+            Ok(key) => frozen.push((producer.clone(), key)),
+            Err(_) => frozen_unreadable = true,
+        }
+        // No early break: the freeze-vs-schedule comparison below needs the
+        // full frozen set, not just this operator's row.
         if producer == config.inner.producer {
             member = Some(parsed);
-            break;
         }
     }
-    let schedule_blocked = read_schedule_blocked(client, base).await?;
+    let live = read_live_schedule(client, base).await?;
+    // The frozen ceremony must still name the live active schedule: same
+    // members both ways, same schedule keys. An unreadable frozen key or a
+    // set that drifted since the freeze refuses (stale freeze), while an
+    // absent freeze has nothing to compare yet.
+    let schedule_mismatch = singleton.is_some()
+        && (frozen_unreadable || !schedule_matches_freeze(&frozen, &live.active));
     // Head timestamp only matters once a freeze exists (it bounds the vote
     // window); skip the extra block fetch while there is nothing to expire.
     let head_time_us = if singleton.is_some() {
@@ -611,9 +866,11 @@ async fn read_view(
         head_num,
         lib_num,
         head_time_us,
+        live_version: live.version,
         singleton,
         member,
-        schedule_blocked,
+        schedule_blocked: live.blocked,
+        schedule_mismatch,
     })
 }
 
@@ -916,6 +1173,17 @@ async fn unsigned_confirmation(
 ) -> Result<(HaltConfirmation, [u8; 32]), String> {
     let height = config.inner.height;
     let local_block_id = fetch_block_id(client, &config.inner.nodeos_url, height).await?;
+    // The voter's own observed pause head: the local head at confirmation
+    // time. The confirmation quorum attests the highest such head, and the
+    // restore gate requires the post-H proof to cover exactly it — so the
+    // template carries what this node actually sees frozen, never a
+    // coordinator-typed number.
+    let (observed_head, _, _) = get_info(client, &config.inner.nodeos_url).await?;
+    if observed_head < height {
+        return Err(format!(
+            "local head {observed_head} has not reached H={height}: nothing to confirm yet"
+        ));
+    }
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
     // what the local node reports for H.
@@ -989,33 +1257,38 @@ async fn unsigned_confirmation(
     let new_chain = new_chain.ok_or_else(|| {
         "no successor chain id: set confirmation.migration_genesis or coordinator_url".to_string()
     })?;
-    let platform = match platform {
-        Some(id) => {
-            let parsed = pulsevm_crypto::parse_chain_id(&id)
-                .map_err(|error| format!("configured platform chain id: {error}"))?;
-            Some(pulsevm_crypto::chain_id_hex(&parsed))
-        }
-        None => {
-            log_line!(
-                "WARNING: no platform chain id configured; the confirmation binds no signing id and the restore gate will refuse it (rehearsal-only mode)"
-            );
-            None
-        }
-    };
-    let template = HaltConfirmation {
-        version: HaltConfirmation::VERSION,
-        declaration_digest: hex::encode(config.expected_digest),
-        halt_height: height,
-        halt_block_id: local_block_id.clone(),
-        checkpoint_sha256: checkpoint.clone(),
-        new_chain_id: new_chain.clone(),
-        platform_chain_id: platform.clone(),
-        signatures: Vec::new(),
-    };
-    let digest = template
-        .digest()
-        .map_err(|error| format!("confirmation digest: {error}"))?;
-    Ok((template, digest))
+    // The platform id is mandatory: a confirmation that does not bind the
+    // id wallets sign under is refused by the restore gate, so shipping one
+    // is never useful. Fail here, loudly, instead of signing evidence the
+    // gate must reject.
+    let platform = platform.ok_or_else(|| {
+        "no platform chain id configured: set confirmation.platform_chain_id or coordinator_url"
+            .to_string()
+    })?;
+    let parsed = pulsevm_crypto::parse_chain_id(&platform)
+        .map_err(|error| format!("configured platform chain id: {error}"))?;
+    let platform = pulsevm_crypto::chain_id_hex(&parsed);
+    // Confirmation-time schedule gate: the coordinated init params must
+    // still equal the live schedule exactly (version, names, keys), and no
+    // pending or proposed change may be staged. A rotation between the
+    // vote and the confirmation refuses here — same policy as the
+    // declaration-time vote refusal, re-checked because the chain moved.
+    let live = read_live_schedule(client, &config.inner.nodeos_url).await?;
+    let expected_members = read_roster(&config.inner.roster_file)?;
+    verify_confirmation_schedule(config.inner.schedule_version, &expected_members, &live)?;
+    // One shared library constructor builds every agent's template, so an
+    // external signer over --print-digest bytes and a locally signed vote
+    // are the same commitment by construction.
+    HaltConfirmation::unsigned(
+        &hex::encode(config.expected_digest),
+        height,
+        observed_head,
+        &local_block_id,
+        &checkpoint,
+        &new_chain,
+        &platform,
+    )
+    .map_err(|error| format!("confirmation template: {error}"))
 }
 
 async fn submit_confirmation(
@@ -1061,6 +1334,7 @@ async fn submit_confirmation(
             &serde_json::json!({
                 "producer": member_producer,
                 "halt_height": height,
+                "pause_height": template.pause_height,
                 "halt_block_id": local_block_id,
                 "checkpoint_sha256": checkpoint,
                 "new_chain_id": new_chain,
@@ -1243,8 +1517,12 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
                 println!(
                     "PREFLIGHT WAIT: schedule: a change is staged, votes refuse until the freeze is re-taken"
                 );
+            } else if view.schedule_mismatch {
+                println!(
+                    "PREFLIGHT WAIT: schedule: frozen set does not match the live active schedule, votes refuse until the freeze is re-taken"
+                );
             } else {
-                println!("PREFLIGHT ok: schedule: no staged change");
+                println!("PREFLIGHT ok: schedule: frozen set matches the live active schedule");
             }
             println!(
                 "PREFLIGHT ok: head vs H: head {} vs H {}",
@@ -1354,6 +1632,7 @@ fn confirmation_digest_json(
         "role": "confirmation",
         "producer": producer,
         "height": template.halt_height,
+        "pause_height": template.pause_height,
         "halt_block_id": template.halt_block_id,
         "checkpoint_sha256": template.checkpoint_sha256,
         "new_chain_id": template.new_chain_id,
@@ -1708,6 +1987,9 @@ mod tests {
         K1PrivateKey::from_seed_string("cutover-voter-test").unwrap()
     }
 
+    /// Coordinated schedule version the test freeze names.
+    const TEST_SCHEDULE_VERSION: u32 = 7;
+
     fn test_loaded_config(height: u32) -> LoadedConfig {
         let key = super::tests::test_key();
         let member = HaltDeclarationMember {
@@ -1732,6 +2014,7 @@ mod tests {
                 producer: "prod.a".to_string(),
                 source_chain_id: "41".repeat(32),
                 height,
+                schedule_version: TEST_SCHEDULE_VERSION,
                 roster_file: String::new(),
                 vote_key_file: String::new(),
                 payer_account: "prod.a".to_string(),
@@ -1759,6 +2042,7 @@ mod tests {
     }
 
     fn view_with(
+        config: &LoadedConfig,
         head: u32,
         head_time_us: u64,
         singleton: Option<CeremonyRow>,
@@ -1768,9 +2052,11 @@ mod tests {
             head_num: head,
             lib_num: head.saturating_sub(10),
             head_time_us,
+            live_version: config.inner.schedule_version,
             singleton,
             member,
             schedule_blocked: false,
+            schedule_mismatch: false,
         }
     }
 
@@ -1778,6 +2064,7 @@ mod tests {
         CeremonyRow {
             h: config.inner.height,
             source_chain_id: config.inner.source_chain_id.clone(),
+            schedule_version: config.inner.schedule_version,
             finalized: false,
             digest: hex::encode(config.expected_digest),
             init_time_us: 0,
@@ -1794,7 +2081,7 @@ mod tests {
     #[test]
     fn waits_without_a_frozen_ceremony() {
         let config = test_loaded_config(100);
-        let view = view_with(90, 0, None, None);
+        let view = view_with(&config, 90, 0, None, None);
         assert!(matches!(decide(&config, &view), Decision::Wait(_)));
     }
 
@@ -1804,17 +2091,17 @@ mod tests {
         // Wrong height.
         let mut bad = live_singleton(&config);
         bad.h = 101;
-        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(&config, 90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Wrong digest (a freeze we did not coordinate).
         let mut bad = live_singleton(&config);
         bad.digest = "00".repeat(32);
-        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(&config, 90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Wrong source chain.
         let mut bad = live_singleton(&config);
         bad.source_chain_id = "42".repeat(32);
-        let view = view_with(90, 0, Some(bad), Some(live_member(&config, false)));
+        let view = view_with(&config, 90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
     }
 
@@ -1824,14 +2111,21 @@ mod tests {
         // Finalized without us.
         let mut done = live_singleton(&config);
         done.finalized = true;
-        let view = view_with(90, 0, Some(done), Some(live_member(&config, false)));
+        let view = view_with(
+            &config,
+            90,
+            0,
+            Some(done),
+            Some(live_member(&config, false)),
+        );
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Producer not frozen.
-        let view = view_with(90, 0, Some(live_singleton(&config)), None);
+        let view = view_with(&config, 90, 0, Some(live_singleton(&config)), None);
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
         // Frozen under a different key.
         let other = K1PrivateKey::from_seed_string("someone-else").unwrap();
         let view = view_with(
+            &config,
             90,
             0,
             Some(live_singleton(&config)),
@@ -1872,6 +2166,7 @@ mod tests {
             config.vote_key.public_key()
         );
         let view = view_with(
+            &config,
             90,
             0,
             Some(live_singleton(&config)),
@@ -1887,6 +2182,7 @@ mod tests {
     fn refuses_while_a_schedule_change_is_staged() {
         let config = test_loaded_config(100);
         let mut view = view_with(
+            &config,
             90,
             0,
             Some(live_singleton(&config)),
@@ -1895,6 +2191,240 @@ mod tests {
         assert_eq!(decide(&config, &view), Decision::Vote);
         view.schedule_blocked = true;
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    #[test]
+    fn refuses_a_freeze_that_drifted_from_the_active_schedule() {
+        let config = test_loaded_config(100);
+        let mut view = view_with(
+            &config,
+            90,
+            0,
+            Some(live_singleton(&config)),
+            Some(live_member(&config, false)),
+        );
+        assert_eq!(decide(&config, &view), Decision::Vote);
+        view.schedule_mismatch = true;
+        assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    #[test]
+    fn refuses_a_freeze_under_the_wrong_schedule_version() {
+        let config = test_loaded_config(100);
+        // The frozen ceremony names another version than coordinated: even
+        // with matching members, the freeze is not the coordinated one.
+        let mut wrong_frozen = live_singleton(&config);
+        wrong_frozen.schedule_version = TEST_SCHEDULE_VERSION + 1;
+        let view = view_with(
+            &config,
+            90,
+            0,
+            Some(wrong_frozen),
+            Some(live_member(&config, false)),
+        );
+        assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+        // The live schedule rotated past the coordinated version after the
+        // freeze: the vote must wait for a re-taken freeze.
+        let mut rotated = view_with(
+            &config,
+            90,
+            0,
+            Some(live_singleton(&config)),
+            Some(live_member(&config, false)),
+        );
+        rotated.live_version = TEST_SCHEDULE_VERSION + 1;
+        assert!(matches!(decide(&config, &rotated), Decision::Refuse(_)));
+        // All three sides agree (frozen, coordinated, live): votes.
+        let view = view_with(
+            &config,
+            90,
+            0,
+            Some(live_singleton(&config)),
+            Some(live_member(&config, false)),
+        );
+        assert_eq!(decide(&config, &view), Decision::Vote);
+    }
+
+    #[test]
+    fn confirmation_refuses_any_schedule_drift_or_staging() {
+        let config = test_loaded_config(100);
+        let key = config.vote_key.public_key();
+        let members = vec![HaltDeclarationMember {
+            producer: "prod.a".to_string(),
+            key: key.to_string(),
+            weight: pulsevm_chain_types::HaltWeight(1),
+        }];
+        let live = |blocked: bool, version: u32, active: Vec<(String, _)>| LiveSchedule {
+            blocked,
+            version,
+            active,
+        };
+        let matching = vec![("prod.a".to_string(), key.clone())];
+        // Exact match on version, names, and keys: confirms.
+        verify_confirmation_schedule(
+            TEST_SCHEDULE_VERSION,
+            &members,
+            &live(false, TEST_SCHEDULE_VERSION, matching.clone()),
+        )
+        .expect("exact init params must confirm");
+        // A staged schedule — pending or proposed — blocks the
+        // confirmation exactly like it blocks the vote.
+        for staged in [
+            serde_json::json!({"pending": {"producers": [{"producer_name": "prod.a"}]}}),
+            serde_json::json!({"proposed": {"producers": [{"producer_name": "prod.a"}]}}),
+        ] {
+            let blocked = LiveSchedule {
+                blocked: schedule_staged(&staged),
+                version: TEST_SCHEDULE_VERSION,
+                active: matching.clone(),
+            };
+            assert!(
+                verify_confirmation_schedule(TEST_SCHEDULE_VERSION, &members, &blocked).is_err(),
+                "a staged schedule must refuse the confirmation"
+            );
+        }
+        // A live version past the coordinated one: the freeze is
+        // superseded, even with matching members.
+        assert!(
+            verify_confirmation_schedule(
+                TEST_SCHEDULE_VERSION,
+                &members,
+                &live(false, TEST_SCHEDULE_VERSION + 1, matching.clone()),
+            )
+            .is_err(),
+            "a rotated live version must refuse the confirmation"
+        );
+        // A schedule-key rotation under the same version: stale freeze.
+        let other = K1PrivateKey::from_seed_string("someone-else")
+            .unwrap()
+            .public_key();
+        assert!(
+            verify_confirmation_schedule(
+                TEST_SCHEDULE_VERSION,
+                &members,
+                &live(
+                    false,
+                    TEST_SCHEDULE_VERSION,
+                    vec![("prod.a".to_string(), other)]
+                ),
+            )
+            .is_err(),
+            "a rotated schedule key must refuse the confirmation"
+        );
+        // A standby joining changes the set: stale freeze.
+        let mut grown = matching.clone();
+        grown.push(("prod.b".to_string(), key));
+        assert!(
+            verify_confirmation_schedule(
+                TEST_SCHEDULE_VERSION,
+                &members,
+                &live(false, TEST_SCHEDULE_VERSION, grown),
+            )
+            .is_err(),
+            "a grown schedule must refuse the confirmation"
+        );
+    }
+
+    #[test]
+    fn freeze_matches_live_schedule_on_names_and_keys() {
+        use pulsevm_crypto::k1::K1PrivateKey;
+        let first = K1PrivateKey::from_seed_string("schedule-a")
+            .unwrap()
+            .public_key();
+        let second = K1PrivateKey::from_seed_string("schedule-b")
+            .unwrap()
+            .public_key();
+        let frozen = vec![
+            ("prod.a".to_string(), first.clone()),
+            ("prod.b".to_string(), second.clone()),
+        ];
+        // Same set, any order: matches.
+        let active = vec![
+            ("prod.b".to_string(), second.clone()),
+            ("prod.a".to_string(), first.clone()),
+        ];
+        assert!(schedule_matches_freeze(&frozen, &active));
+        // A schedule-key rotation on one member: stale freeze.
+        let other = K1PrivateKey::from_seed_string("schedule-c")
+            .unwrap()
+            .public_key();
+        let rotated = vec![
+            ("prod.a".to_string(), first.clone()),
+            ("prod.b".to_string(), other),
+        ];
+        assert!(!schedule_matches_freeze(&frozen, &rotated));
+        // A standby joining (or a member leaving) changes the count: stale.
+        let grown = vec![
+            ("prod.a".to_string(), first.clone()),
+            ("prod.b".to_string(), second.clone()),
+            ("prod.c".to_string(), second.clone()),
+        ];
+        assert!(!schedule_matches_freeze(&frozen, &grown));
+        assert!(!schedule_matches_freeze(&grown, &frozen));
+    }
+
+    #[test]
+    fn active_producer_parses_leap_authority_shapes() {
+        use pulsevm_crypto::k1::K1PrivateKey;
+        let key = K1PrivateKey::from_seed_string("schedule-a")
+            .unwrap()
+            .public_key()
+            .to_string();
+        let authority = |tag: u64, threshold: u64, keys: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "producer_name": "prod.a",
+                "authority": [tag, {"threshold": threshold, "keys": keys}],
+            })
+        };
+        let one = || vec![serde_json::json!({"key": key.clone(), "weight": 1})];
+        // Leap 4 (tag 0) and Leap 5 (tag 1) authority forms with a single
+        // threshold-1 key: both parse — the rehearsal serves tag 0.
+        for tag in [0, 1] {
+            let (name, parsed) =
+                parse_active_producer(&authority(tag, 1, one())).expect("authority parses");
+            assert_eq!(name, "prod.a");
+            assert_eq!(parsed.to_string(), key);
+        }
+        // The legacy flat key form is gone: refuse, do not sign under a
+        // schedule we misread.
+        assert!(
+            parse_active_producer(&serde_json::json!({
+                "producer_name": "prod.a",
+                "block_signing_key": key,
+            }))
+            .is_err(),
+            "flat block_signing_key must refuse"
+        );
+        // Threshold 2 and multi-key authorities name no single key: refuse.
+        // An unknown variant tag is a shape the voter must not guess at.
+        assert!(
+            parse_active_producer(&authority(
+                1,
+                2,
+                vec![
+                    serde_json::json!({"key": key, "weight": 1}),
+                    serde_json::json!({"key": key, "weight": 1}),
+                ]
+            ))
+            .is_err(),
+            "threshold-2 authority must refuse"
+        );
+        assert!(
+            parse_active_producer(&authority(
+                1,
+                1,
+                vec![
+                    serde_json::json!({"key": key, "weight": 1}),
+                    serde_json::json!({"key": key, "weight": 1}),
+                ]
+            ))
+            .is_err(),
+            "multi-key authority must refuse"
+        );
+        assert!(
+            parse_active_producer(&authority(7, 1, one())).is_err(),
+            "unknown variant tag must refuse"
+        );
     }
 
     #[test]
@@ -1937,15 +2467,17 @@ mod tests {
             version: HaltConfirmation::VERSION,
             declaration_digest: hex::encode(config.expected_digest),
             halt_height: 100,
+            pause_height: 103,
             halt_block_id: "09".repeat(32),
             checkpoint_sha256: "10".repeat(32),
             new_chain_id: "11".repeat(32),
-            platform_chain_id: Some("12".repeat(32)),
+            platform_chain_id: "12".repeat(32),
             signatures: Vec::new(),
         };
         let digest = template.digest().unwrap();
         let shape = confirmation_digest_json("prod.a", &template, &digest);
         assert_eq!(shape["role"], "confirmation");
+        assert_eq!(shape["pause_height"], 103);
         assert_eq!(shape["digest"], hex::encode(digest));
         assert_eq!(shape["platform_chain_id"], "12".repeat(32));
         assert_eq!(
@@ -1958,6 +2490,7 @@ mod tests {
     fn votes_once_inside_the_window_then_stops() {
         let config = test_loaded_config(100);
         let view = view_with(
+            &config,
             90,
             0,
             Some(live_singleton(&config)),
@@ -1966,6 +2499,7 @@ mod tests {
         assert_eq!(decide(&config, &view), Decision::Vote);
         // Already on-chain: never sign twice.
         let view = view_with(
+            &config,
             90,
             0,
             Some(live_singleton(&config)),
@@ -1974,6 +2508,7 @@ mod tests {
         assert_eq!(decide(&config, &view), Decision::AlreadyVoted);
         // At or past H the contract must reject: refuse instead of spamming.
         let view = view_with(
+            &config,
             100,
             0,
             Some(live_singleton(&config)),
@@ -1993,6 +2528,7 @@ mod tests {
         frozen.init_time_us = 1_000_000_000_000_000;
         // Inside the window (boundary inclusive): vote.
         let view = view_with(
+            &config,
             90,
             frozen.init_time_us + CEREMONY_VOTE_WINDOW_US,
             Some(frozen.clone()),
@@ -2002,6 +2538,7 @@ mod tests {
         // One microsecond past the window: refuse, do not spam a vote the
         // contract must reject.
         let view = view_with(
+            &config,
             90,
             frozen.init_time_us + CEREMONY_VOTE_WINDOW_US + 1,
             Some(frozen),
@@ -2038,14 +2575,22 @@ mod tests {
         let row = serde_json::json!({
             "h": 100,
             "source_chain_id": "41".repeat(32),
+            "schedule_version": 7,
             "finalized": false,
             "declaration_digest": "00".repeat(32),
             "init_time": "1700000000000000",
         });
-        assert_eq!(
-            parse_ceremony_row(&row).unwrap().init_time_us,
-            1_700_000_000_000_000
-        );
+        let parsed = parse_ceremony_row(&row).unwrap();
+        assert_eq!(parsed.init_time_us, 1_700_000_000_000_000);
+        assert_eq!(parsed.schedule_version, 7);
+        // A row without the frozen version cannot pin the init params to
+        // the live schedule: it must not parse.
+        let mut unversioned = row.clone();
+        unversioned
+            .as_object_mut()
+            .unwrap()
+            .remove("schedule_version");
+        assert!(parse_ceremony_row(&unversioned).is_err());
         // Undated freezes (rows frozen before the window existed) must not
         // be signed: the vote window cannot be proven without init_time.
         let mut undated = row.clone();

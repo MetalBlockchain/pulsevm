@@ -1540,8 +1540,9 @@ impl Controller {
             // contract evidence is attached; the memo path without a
             // ceremony keeps the exact weight pin (tight window by
             // construction). Real XPR checkpoints always carry the
-            // producers table; synthetic fixtures without one skip the
-            // check (logged) instead of failing.
+            // producers table; a checkpoint without one cannot prove the
+            // declared set is the on-chain schedule, so it fails closed
+            // instead of skipping the check.
             if let Some(roster) = migration_roster.as_ref() {
                 let state_keys = migration_state_producer_keys(&self.db).map_err(|error| {
                     ChainError::GenesisError(format!(
@@ -1549,10 +1550,15 @@ impl Controller {
                     ))
                 })?;
                 if state_keys.is_empty() {
-                    warn!(
-                        "migration roster state cross-check skipped: no producers table in checkpoint state"
-                    );
+                    return Err(ChainError::GenesisError(
+                        "migration roster state cross-check refused: no producers table in checkpoint state"
+                            .into(),
+                    ));
                 } else {
+                    // Key-anchored schedule check: every declared member must be
+                    // active in checkpoint state with the same schedule key.
+                    // Weights are 1 by construction, so there is no H-state
+                    // weight pin to re-check here.
                     match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)
                         .map_err(|error| {
                             ChainError::GenesisError(format!(
@@ -1562,20 +1568,16 @@ impl Controller {
                         Some(matched) => info!(
                             "migration halt roster matches checkpoint schedule: {matched} producers"
                         ),
-                        None => warn!(
-                            "migration roster schedule match skipped: no producers table in checkpoint state"
-                        ),
-                    }
-                    if manifest.halt_contract_ceremony.is_none() {
-                        pulsevm_database::check_halt_roster_weights_match_state(
-                            roster,
-                            &state_keys,
-                        )
-                        .map_err(|error| {
-                            ChainError::GenesisError(format!(
-                                "migration halt roster weights rejected by checkpoint schedule: {error}"
-                            ))
-                        })?;
+                        // Unreachable when the table is present (the check
+                        // only returns `None` for an empty table, which
+                        // fails closed above): fail closed defensively
+                        // rather than silently skipping the binding.
+                        None => {
+                            return Err(ChainError::GenesisError(
+                                "migration roster state cross-check refused: no producers table in checkpoint state"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
             }
@@ -10400,6 +10402,12 @@ mod tests {
                 .unwrap();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        // The restore requires the cutover pair even for synthetic
+        // fixtures: single-member roster signed by the genesis key. Built
+        // early so the checkpoint can stage the producers table row the
+        // roster cross-check binds against.
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
         let temp = get_temp_dir();
         let checkpoint_dir = temp.path().join("checkpoint-source");
         let checkpoint_path = temp.path().join("migration.snapshot");
@@ -10410,6 +10418,10 @@ mod tests {
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
         checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // Real XPR checkpoints always carry the producers table; the
+        // restore fails closed without it, so the fixture stages the row
+        // for the pair's single member.
+        seed_producers_table(&mut checkpoint_db, &[("pulse", &pair_key)])?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10460,10 +10472,8 @@ mod tests {
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
-        // The restore requires the cutover pair even for synthetic
-        // fixtures: single-member roster signed by the genesis key.
-        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
-            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        // The pair key was built up front so the checkpoint could stage
+        // the producers table row it binds against.
         attach_halt_pair(
             manifest_path.to_str().unwrap(),
             &migration_genesis,
@@ -10472,7 +10482,6 @@ mod tests {
             &source_block_id,
             &[pair_key],
             &["pulse"],
-            &[1],
             &[0],
             &chain_id.0.0,
         )?;
@@ -10561,15 +10570,217 @@ mod tests {
         Ok(())
     }
 
+    // A checkpoint without the XPR producers table cannot prove the
+    // declared set is the on-chain schedule: the restore fails closed
+    // instead of promoting state the schedule never endorsed. The pair
+    // itself verifies — the refusal names the missing table, not the
+    // cryptography.
+    #[tokio::test]
+    async fn migration_restore_refuses_checkpoint_without_producers_table() -> Result<(), ChainError>
+    {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let temp = get_temp_dir();
+        let checkpoint_dir = temp.path().join("table-less-source");
+        let checkpoint_path = temp.path().join("table-less.snapshot");
+        let mut checkpoint_db = Database::new(checkpoint_dir.to_str().unwrap(), 1024 * 1024)
+            .map_err(ChainError::InternalError)?;
+        checkpoint_db.add_indices()?;
+        checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
+        checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // Deliberately no producers table: the fixture stages nothing the
+        // roster cross-check could bind against.
+        checkpoint_db.set_revision(42)?;
+        let checkpoint = checkpoint_db.snapshot_bytes()?;
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("table-less.manifest.json");
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        let mut manifest = MigrationManifest::new(
+            b"controller table-less migration test",
+            source_block_id.0.0,
+            &checkpoint,
+            42,
+            pulsevm_database::ImportSummary {
+                input_transactions: 1,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "migration_checkpoint": checkpoint_path,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        let target_path = temp.path().join("table-less-target");
+        let error = Controller::new()
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no producers table"),
+            "a table-less checkpoint must fail closed on the missing table, got: {error}"
+        );
+        Ok(())
+    }
+
     // A migration restore starts a new producer schedule seeded from the
     // migration genesis initial key (the source schedule is deliberately not
     // carried over). The producing node must hold that key: with a foreign
     // key every build fails closed at the signing gate instead of emitting
     // an unverifiable block. These tests pin both sides with a
     // self-contained checkpoint.
+    /// Seed the XPR `eosio/producers` schedule table into a fixture
+    /// database so the restore's roster↔state cross-check has checkpoint
+    /// state to bind against: every member is written active with exactly
+    /// the schedule key the declaration will name. Real XPR checkpoints
+    /// always carry this table; synthetic fixtures must stage it
+    /// explicitly — a checkpoint without it fails closed at restore, by
+    /// design, instead of skipping the check.
+    fn seed_producers_table(
+        db: &mut Database,
+        members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+    ) -> Result<(), ChainError> {
+        use pulsevm_database::{
+            StateHistoryEntry,
+            TableDelta,
+            TableDeltaRow,
+        };
+        fn varuint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+        // Head-only mainnet shape: owner, total_votes (ignored by the
+        // gate), K1 key-type varuint, 33-byte compressed schedule key,
+        // is_active, url, unpaid_blocks, last_claim_time, location.
+        fn producer_row(owner: u64, key: &[u8; 33]) -> Vec<u8> {
+            let mut row = Vec::new();
+            row.extend_from_slice(&owner.to_le_bytes());
+            row.extend_from_slice(&1.0f64.to_le_bytes());
+            varuint(0, &mut row);
+            row.extend_from_slice(key);
+            row.push(1);
+            varuint(3, &mut row);
+            row.extend_from_slice(b"url");
+            row.extend_from_slice(&0u32.to_le_bytes());
+            row.extend_from_slice(&0i64.to_le_bytes());
+            row.extend_from_slice(&0u16.to_le_bytes());
+            row
+        }
+        let system = Name::from_str("eosio")
+            .map_err(|e| ChainError::InternalError(format!("bad system name: {e}")))?
+            .as_u64();
+        let producers = Name::from_str("producers")
+            .map_err(|e| ChainError::InternalError(format!("bad table name: {e}")))?
+            .as_u64();
+        let payer = 55u64;
+        let mut table_row = vec![0u8];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut deltas = vec![TableDelta {
+            name: "contract_table".into(),
+            rows: vec![TableDeltaRow {
+                present: true,
+                data: table_row,
+            }],
+        }];
+        for (producer, key) in members {
+            let owner = Name::from_str(producer)
+                .map_err(|e| ChainError::InternalError(format!("bad producer name: {e}")))?
+                .as_u64();
+            let mut kv_row = vec![0u8];
+            for value in [system, system, producers, owner, payer] {
+                kv_row.extend_from_slice(&value.to_le_bytes());
+            }
+            let value = producer_row(owner, &key.public_key().compressed());
+            assert!(value.len() < 128);
+            kv_row.push(value.len() as u8);
+            kv_row.extend_from_slice(&value);
+            deltas.push(TableDelta {
+                name: "contract_row".into(),
+                rows: vec![TableDeltaRow {
+                    present: true,
+                    data: kv_row,
+                }],
+            });
+        }
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas,
+        };
+        pulsevm_database::hydrate_full_state(db, &entry)
+            .map_err(|e| ChainError::InternalError(format!("seed producers table: {e}")))?;
+        Ok(())
+    }
+
+    // Build a real source chain so the checkpoint carries complete state
+    // (accounts, permissions, resources, chain config): fresh genesis,
+    // one accepted block, then a portable snapshot of that state.
+    // `extra_producers` stages additional XPR schedule-table rows next to
+    // the genesis producer so multi-member declarations bind against
+    // checkpoint state.
     async fn migration_checkpoint_with_schedule_key(
         temp: &TempDir,
         schedule_key: &PrivateKey,
+        extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
     ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
         // Build a real source chain so the checkpoint carries complete state
         // (accounts, permissions, resources, chain config): fresh genesis,
@@ -10605,7 +10816,19 @@ mod tests {
         let source_block_id = source_block.id()?;
         let source_revision = source.database().revision();
         let imported_transactions = source.database().arena_transaction_count() as u64;
-        let checkpoint = source.database().snapshot_bytes()?;
+        // Stage the XPR schedule table the restore binds the transported
+        // roster against: the genesis producer plus any extra pair members
+        // the caller stages. A checkpoint without this table fails closed
+        // at restore, so fixtures carry it like real XPR state does.
+        let schedule_k1 = pulsevm_crypto::k1::K1PrivateKey::from_string(&schedule_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let mut members: Vec<(&str, &pulsevm_crypto::k1::K1PrivateKey)> =
+            Vec::with_capacity(extra_producers.len() + 1);
+        members.push(("pulse", &schedule_k1));
+        members.extend_from_slice(extra_producers);
+        let mut seed_db = source.database();
+        seed_producers_table(&mut seed_db, &members)?;
+        let checkpoint = seed_db.snapshot_bytes()?;
         source.shutdown()?;
         drop(source);
         let checkpoint_path = temp.path().join("migration.snapshot");
@@ -10664,6 +10887,58 @@ mod tests {
     // platform id, exactly as production does (the rehearsal configures
     // the derived id as the platform; other tests pass a foreign id to
     // prove the binding is checked, not assumed).
+    /// Pack one synthetic post-H empty block: `pulsevm_core::block` wire
+    /// layout, signed by the schedule key over the header digest. Mirrors
+    /// the handover's real post-H headers; the restore gate walks it.
+    fn pack_post_block(
+        previous: &[u8; 32],
+        producer: u64,
+        signing: &pulsevm_crypto::K1PrivateKey,
+        schedule_version: u32,
+        root: [u8; 32],
+        schedule_hash: [u8; 32],
+    ) -> Result<(String, [u8; 32]), ChainError> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&producer.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(previous);
+        header.extend_from_slice(&[0u8; 32]);
+        header.extend_from_slice(&[0u8; 32]);
+        header.extend_from_slice(&schedule_version.to_le_bytes());
+        header.push(0); // no schedule change
+        header.push(0); // no header extensions
+        let header_digest = pulsevm_crypto::Digest::hash(&header).0;
+        // Leap's producer signature digest over the recorded root and
+        // schedule hash, exactly as the restore gate recomputes it.
+        let mut digest_and_root = Vec::with_capacity(64);
+        digest_and_root.extend_from_slice(&header_digest);
+        digest_and_root.extend_from_slice(&root);
+        let bound = pulsevm_crypto::Digest::hash(&digest_and_root).0;
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&bound);
+        bound_and_schedule.extend_from_slice(&schedule_hash);
+        let digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let mut packed = Vec::with_capacity(64 + header.len() + 99);
+        packed.extend_from_slice(&root);
+        packed.extend_from_slice(&schedule_hash);
+        packed.extend_from_slice(&header);
+        packed.push(0); // K1 tag
+        packed.extend_from_slice(&signing.sign(&digest).compact65());
+        packed.push(0); // no transactions
+        packed.push(0); // no block extensions
+        let num =
+            u32::from_be_bytes(previous[0..4].try_into().map_err(|_| {
+                ChainError::InternalError("fixture post-H parent id malformed".into())
+            })?) + 1;
+        let mut id = header_digest;
+        id[0..4].copy_from_slice(&num.to_be_bytes());
+        // The entry carries the block's id verbatim: the gate chains it,
+        // never recomputing Leap's id formula.
+        packed.extend_from_slice(&id);
+        Ok((hex::encode(&packed), id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attach_halt_pair(
         manifest_path: &str,
@@ -10673,7 +10948,6 @@ mod tests {
         source_block_id: &Id,
         keys: &[pulsevm_crypto::K1PrivateKey],
         producers: &[&str],
-        weights: &[u64],
         sign_subset: &[usize],
         platform_chain_id: &[u8; 32],
     ) -> Result<(), ChainError> {
@@ -10699,12 +10973,13 @@ mod tests {
                     "manifest source block schedule version unreadable: {error}"
                 ))
             })?;
+        // The ceremony roster is the frozen schedule: one member, one vote.
         let mut members = Vec::with_capacity(producers.len());
-        for ((producer, key), weight) in producers.iter().zip(keys.iter()).zip(weights.iter()) {
+        for (producer, key) in producers.iter().zip(keys.iter()) {
             members.push(pulsevm_database::HaltDeclarationMember {
                 producer: producer.to_string(),
                 key: key.public_key().to_string(),
-                weight: pulsevm_chain_types::HaltWeight(u128::from(*weight)),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
             });
         }
         pulsevm_database::HaltDeclaration::sort_members(&mut members);
@@ -10732,10 +11007,15 @@ mod tests {
             version: pulsevm_database::HaltConfirmation::VERSION,
             declaration_digest: hex::encode(declaration.digest()?),
             halt_height: source_block_num,
+            // The pair stages two post-H headers below (H+1, H+2), so the
+            // attested pause head is exactly H+2.
+            pause_height: source_block_num
+                .checked_add(2)
+                .ok_or_else(|| ChainError::InternalError("fixture pause head overflows".into()))?,
             halt_block_id: hex::encode(source_block_id.as_bytes()),
             checkpoint_sha256: checkpoint_hex.to_string(),
             new_chain_id: hex::encode(new_chain_id),
-            platform_chain_id: Some(hex::encode(platform_chain_id)),
+            platform_chain_id: hex::encode(platform_chain_id),
             signatures: Vec::new(),
         };
         let conf_digest = template.digest()?;
@@ -10753,7 +11033,6 @@ mod tests {
         };
         let prior = source_block_num.saturating_sub(1);
         let mut votes = Vec::with_capacity(sign_subset.len());
-        let mut voted_weight: u128 = 0;
         for (position, &index) in sign_subset.iter().enumerate() {
             votes.push(pulsevm_database::HaltContractVote {
                 producer: producers[index].to_string(),
@@ -10762,14 +11041,14 @@ mod tests {
                 key: keys[index].public_key().to_string(),
                 signature: signatures[position].signature.clone(),
             });
-            voted_weight += u128::from(weights[index]);
         }
-        let total_weight: u128 = weights.iter().map(|weight| u128::from(*weight)).sum();
+        // Count quorum over the frozen schedule: each member weighs 1, so
+        // the totals are member counts, not vote weights.
         let ceremony = pulsevm_database::HaltContractCeremony {
             contract: "cutover".to_string(),
             declaration_digest: hex::encode(decl_digest),
-            total_weight: pulsevm_chain_types::HaltWeight(total_weight),
-            voted_weight: pulsevm_chain_types::HaltWeight(voted_weight),
+            total_weight: pulsevm_chain_types::HaltWeight(producers.len() as u128),
+            voted_weight: pulsevm_chain_types::HaltWeight(sign_subset.len() as u128),
             finalized: true,
             finalized_block: prior,
             init_time: 0,
@@ -10783,6 +11062,54 @@ mod tests {
         manifest["halt_contract_ceremony"] = serde_json::to_value(&ceremony)
             .map_err(|e| ChainError::InternalError(format!("failed to encode ceremony: {e}")))?;
         manifest["halt_schedule_version"] = json!(header_schedule_version);
+        // The fixture checkpoint carries no proposed schedule (synthetic
+        // state never stages one): attest the absence the gate requires.
+        manifest["halt_proposed_schedule"] = json!(false);
+        // The recorded schedule is the declared set, unit weights.
+        manifest["halt_schedule"] = json!(
+            producers
+                .iter()
+                .zip(keys.iter())
+                .map(|(producer, key)| {
+                    json!({
+                        "producer": producer,
+                        "key": key.public_key().to_string(),
+                        "weight": "1",
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        // Post-H emptiness window: two signed empty blocks hash-linked from
+        // H (pause head P = H + 2 in the fixture), proving nothing landed
+        // after the freeze. Producers sign in fixture order.
+        let post_producer = |index: usize| {
+            crate::chain::name::Name::from_str(producers[index])
+                .map(|name| name.as_u64())
+                .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))
+        };
+        // The staged headers name the roster-derived schedule hash the
+        // The staged headers name a fixed schedule hash: the gate binds
+        // the exact (root, hash) pair through the producer signature, so
+        // any consistent value exercises the real check.
+        const FIXTURE_SCHED_HASH: [u8; 32] = [0x5E; 32];
+        let (post_next, next_id) = pack_post_block(
+            &source_block_id.0.0,
+            post_producer(0)?,
+            &keys[0],
+            header_schedule_version,
+            [0xA1; 32],
+            FIXTURE_SCHED_HASH,
+        )?;
+        let second = (1 % producers.len().max(1)) as usize;
+        let (post_last, _) = pack_post_block(
+            &next_id,
+            post_producer(second)?,
+            &keys[second],
+            header_schedule_version,
+            [0xB2; 32],
+            FIXTURE_SCHED_HASH,
+        )?;
+        manifest["halt_post_blocks"] = json!([post_next, post_last]);
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
             .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
         Ok(())
@@ -10842,7 +11169,7 @@ mod tests {
             source_block_num,
             source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
             "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
         )
@@ -10855,7 +11182,6 @@ mod tests {
             &source_block_id,
             &[pair_key],
             &["pulse"],
-            &[1],
             &[0],
             &chain_id.0.0,
         )?;
@@ -10909,7 +11235,7 @@ mod tests {
             source_block_num,
             source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
             "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
         )
@@ -10922,7 +11248,6 @@ mod tests {
             &source_block_id,
             &[pair_key],
             &["pulse"],
-            &[1],
             &[0],
             &chain_id.0.0,
         )?;
@@ -10975,7 +11300,7 @@ mod tests {
             source_block_num,
             _source_revision,
             _source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         attach_halt_commitment(
             &manifest_path,
             source_block_num,
@@ -11024,7 +11349,7 @@ mod tests {
             source_block_num,
             _source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let keys = halt_v2_keys()?;
         attach_halt_pair(
             &manifest_path,
@@ -11034,7 +11359,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             &chain_id.0.0,
         )?;
@@ -11044,7 +11368,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             false,
         )?;
@@ -11099,7 +11422,6 @@ mod tests {
         source_block_id: &Id,
         keys: &[pulsevm_crypto::K1PrivateKey],
         producers: &[&str],
-        weights: &[u64],
         sign_subset: &[usize],
         tamper_checkpoint: bool,
     ) -> Result<(), ChainError> {
@@ -11132,15 +11454,16 @@ mod tests {
                 "signature": keys[index].sign(&digest).to_string(),
             }));
         }
+        // Unit schedule weights: the legacy commitment vehicle tallies the
+        // same count quorum as the pair.
         let roster: Vec<serde_json::Value> = keys
             .iter()
             .zip(producers.iter())
-            .zip(weights.iter())
-            .map(|((key, producer), weight)| {
+            .map(|(key, producer)| {
                 json!({
                     "producer": producer,
                     "key": key.public_key().to_string(),
-                    "weight": weight,
+                    "weight": "1",
                 })
             })
             .collect();
@@ -11176,6 +11499,7 @@ mod tests {
         let schedule_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
         let (
             checkpoint,
             manifest_path,
@@ -11185,8 +11509,12 @@ mod tests {
             source_block_num,
             source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
-        let keys = halt_v2_keys()?;
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+        )
+        .await?;
         attach_halt_pair(
             &manifest_path,
             &migration_genesis,
@@ -11195,7 +11523,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             &chain_id.0.0,
         )?;
@@ -11205,7 +11532,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             false,
         )?;
@@ -11246,7 +11572,7 @@ mod tests {
             source_block_num,
             _source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let keys = halt_v2_keys()?;
         attach_halt_pair(
             &manifest_path,
@@ -11256,7 +11582,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             &chain_id.0.0,
         )?;
@@ -11266,7 +11591,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[1],
             false,
         )?;
@@ -11311,7 +11635,7 @@ mod tests {
             source_block_num,
             _source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let keys = halt_v2_keys()?;
         attach_halt_pair(
             &manifest_path,
@@ -11321,7 +11645,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             &chain_id.0.0,
         )?;
@@ -11331,7 +11654,6 @@ mod tests {
             &source_block_id,
             &keys,
             &["prod.a", "prod.b"],
-            &[2, 1],
             &[0, 1],
             true,
         )?;
@@ -11376,7 +11698,7 @@ mod tests {
             _source_block_num,
             _source_revision,
             _source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key).await?;
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
         let manifest_bytes = fs::read(&manifest_path)
             .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
         let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)

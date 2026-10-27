@@ -18,10 +18,11 @@ at H the pre-commit window is gone. One signature cannot do both jobs.
 
 - Step one, signable at H-K: `M_decl = sha256("DECL" || C || H || S)` —
   source chain id, terminal height, full ordered validator set (names,
-  block-signing keys, weights).
-- Step two, signable only at H: `M_conf = sha256("CONF" || decl_digest ||
-  H || H_ID || S_H || N)` — chains the declaration to the terminal block
-  id, the checkpoint hash, and the successor chain id.
+  block-signing keys, unit weights).
+- Step two, signable only at H: `M_conf = sha256("CONF-v2" || decl_digest ||
+  H || H_ID || S_H || N || P)` — chains the declaration to the terminal
+  block id, the checkpoint hash, the successor chain id, and the mandatory
+  platform id wallets sign under.
 
 Signers are the block producers with their block-signing keys. No ceremony
 keys, no new distribution. Each BP recomputes the digests from the fields
@@ -36,13 +37,17 @@ against independently replayed XPR state:
    with neither fails closed at the gate.
 2. **Schedule quorum, strict 2/3+1.** Every signature is K1-recovered and
    must equal a rostered key; each key counts once; `signed x 3 > total x 2`
-   in u128 integer math. Roster-less (single-key) commitments are rejected
-   everywhere — one key cannot prove the schedule agreed.
-3. **Roster provenance.** The set is frozen on-chain from the live
-   `eosio.producers` table (never prover-supplied; a non-K1 schedule key
-   fails the freeze), and the gate cross-checks names, keys, *and* weights
-   against the checkpoint's own producers table — the light-client rule:
-   same set both ways.
+   in u128 integer math — a count quorum over unit members (15 of 21 on
+   mainnet), never a vote-weight fraction. Roster-less (single-key)
+   commitments are rejected everywhere — one key cannot prove the schedule
+   agreed. Exactly-two-thirds fails everywhere, including the legacy
+   commitment path.
+3. **Roster provenance.** The set is the frozen **active schedule** (names,
+   schedule keys, version): one member, one vote. The contract freeze takes
+   the schedule explicitly and gates every key to K1; the gate anchors each
+   member to checkpoint state (active, same key) and pins the attested
+   version to H's header version. Vote weight is gone — no denominator to
+   drift, no standby can brick the freeze.
 4. **Pre-commitment timing provable.** Declaration votes must land before H,
    proven one of two ways: on-chain ceremony votes (contract vehicle), or a
    recorded declaration inclusion (memo / msig execution block). A pair with
@@ -62,29 +67,67 @@ against independently replayed XPR state:
    roster path — DPoS schedules hold single keys by protocol, and votes
    are K1 recoveries against the frozen schedule keys, never permission
    checks. Audit with `contracts/cutover/check-schedule-readiness.py`
-   at T-14 and at freeze time: valid K1 schedule keys, sane weights, no
-   staged schedule rotation — a single bad row dooms the ceremony
-   before BPs spend signatures on it.
-7. **Bindings.** Confirmation ties H, block id, checkpoint, and successor
-   chain id to the declaration; the checkpoint hash is recomputed from the
-   artifact, never trusted as a string. Replay across heights, exports, or
-   chains cannot verify.
+   at T-14 and at freeze time: valid K1 schedule keys, producers-table
+   keys equal to the schedule signing keys, no staged schedule rotation —
+   a single bad row dooms the ceremony before BPs spend signatures on
+   it. The restore additionally requires the export-time attestation that
+   the checkpoint carries no proposed schedule (hydration keeps only the
+   parsed chain config, so absence cannot be re-derived later).
+7. **Bindings.** Version-2 confirmation ties H, block id, checkpoint,
+   successor chain id, **and the mandatory platform id** to the
+   declaration; the checkpoint hash is recomputed from the artifact, never
+   trusted as a string. Replay across heights, exports, or chains cannot
+   verify.
 
 ## 3. Verification evidence
 
-- Unit + gate tests: 317 `pulsevm_core`, 109 `pulsevm_database`, 6 offline
-  verifier tests — including rejection of pair-less manifests, roster-less
-  commitments, tampered signatures, quorum shortfall, checkpoint mismatch,
-  late votes, inflated tallies, and unreadable timing. The SHiP log read
-  path carries a regression test proving reads observe unflushed deferred
-  appends (a follow-mode tail-read failure found by the rehearsal).
-- Contract fixture (`contracts/cutover/test-local.sh`): 14/14 — outsider
-  rejection, wrong-height votes, double votes, strict-quorum boundary
-  (finalizes only past 2/3), locked freeze, vote scan reproducing the tally.
-- Full rehearsal PASS at H=163 (fresh chain, default two-step memo path):
-  declared at memo block 137 (K=26), offline pair verification green, flip
-  gate opened, H+1=164 parent-linked to H_ID, state equivalence 11/11
-  accounts, boundary traffic 10/10 exactly-once.
+- Unit + gate tests: workspace green (counts move with the suite — verify
+  with `cargo test --workspace --locked`) — `pulsevm_core` lib,
+  `pulsevm_database` lib, `pulsevm_chain_types`, 25 voter
+  example (including Leap-4/5 authority parsing: tags 0 and 1 parse;
+  flat-key, threshold-2, multi-key, and unknown-tag shapes refuse), 9
+  offline verifier example — including
+  rejection of pair-less manifests, roster-less commitments, non-unit
+  transported weights, duplicate declaration members, tampered
+  signatures, exact-2/3 quorums (legacy path included), quorum
+  shortfall, checkpoint mismatch, stale schedule versions,
+  proposed-schedule checkpoints, late votes, inflated tallies, unreadable
+  timing, pause-headless legacy confirmations, post-H proofs that stop
+  short of or run past the attested pause head, deferred rows due in the
+  pause window, table-less checkpoints with a valid pair, and
+  confirmation-time schedule drift or staging; plus the determinism
+  proof that two independent conversions of one export give byte-identical
+  checkpoints. The attach side carries `migration_attach` lib tests: schedule pin
+  (version match, unit weights, duplicate/bad-key/empty/pinned-conflict
+  rejection) and post-H recording (broken linkage, traffic, rotation,
+  unknown producer, forged key, non-K1 signature, missing schedule,
+  wrong blockroot, foreign schedule hash, missing state fields,
+  block/state count skew, foreign block id) with a round-trip of the
+  recorded proof through the real restore gate — over Leap's true
+  producer signature digest (the exact root/hash pair bound by recovery)
+  and the verbatim carried block ids. The SHiP
+  log read path carries a regression test proving reads observe unflushed
+  deferred appends (a follow-mode tail-read failure found by the
+  rehearsal). Database-stack clippy clean; pinned-nightly fmt clean.
+- Contract fixture (`contracts/cutover/test-local.sh`, 4-member count
+  quorum: 1 and 2 of 4 must not finalize, 3 of 4 must) and scale fixture
+  (`contracts/cutover/test-scale.sh`, 21 members: 15 of 21) — outsider
+  rejection, wrong-height votes, double votes, exact-half non-finalization,
+  locked freeze, vote scan reproducing the tally. Fixture scripts validate
+  with `bash -n` and embedded-Python compile checks here; they execute
+  against a Leap fixture node in rehearsal/CI.
+- Full rehearsal PASS at H=340 (fresh chain, default two-step memo path
+  over the new proof bytes): declared at memo block 311 (K=29), offline
+  pair verification green, flip gate opened, H+1=341 parent-linked to H_ID,
+  state equivalence 11/11 accounts, boundary traffic 10/10 exactly-once —
+  see [xpr-handover-rehearsal.md](./xpr-handover-rehearsal.md). That run
+  proves the true-digest record (header-state staged per post-H header),
+  the verbatim carried ids, the seed-planted producers table (boot gate
+  reports the roster match; a table-less checkpoint fails closed at the
+  same gate), the learn-then-bind platform re-issue, and the live finding
+  that an empty pending schedule is the norm (no hash-to-roster comparison
+  is attempted — a wrong pin failed an earlier run of the same rehearsal
+  live and was removed).
 
 ## 4. What mainnet still needs (inputs)
 
@@ -121,4 +164,7 @@ against independently replayed XPR state:
   section of `initialize`)
 - Manifest + verifier: `crates/pulsevm_database/src/xpr_import.rs`,
   `crates/pulsevm_database/examples/xpr_verify_manifest.rs`
+- Attach-side schedule/post-H recording (lib + tool):
+  `crates/pulsevm_core/src/migration_attach.rs`,
+  `crates/pulsevm_core/examples/xpr_attach_source_block.rs`
 - Rehearsal: `docker/handover/run-handover.sh`

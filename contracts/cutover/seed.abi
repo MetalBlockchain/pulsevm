@@ -40,20 +40,6 @@
             "base": "",
             "fields": [
                 {
-                    "name": "head",
-                    "type": "producer_head"
-                },
-                {
-                    "name": "tail",
-                    "type": "bytes"
-                }
-            ]
-        },
-        {
-            "name": "producer_head",
-            "base": "",
-            "fields": [
-                {
                     "name": "owner",
                     "type": "name"
                 },

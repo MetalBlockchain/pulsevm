@@ -58,10 +58,11 @@ State transfer is implemented and does not need reinventing:
 3. Attach the id-exact source block to the manifest and generate the
    migration genesis (chain ID committed to the checkpoint hash). Publish
    `genesis.json`, the chain config, and the resulting BlockchainID.
-   Rebuild the halt roster at H from the checkpoint's own producers table
-   (`xpr_verify_manifest --emit-roster`, weights from `total_votes` at H):
-   votes drift every block, so a roster built earlier is stale, and only a
-   roster whose keys match checkpoint state passes the restore cross-check.
+   Rebuild the halt roster at H as the active schedule (names, schedule
+   keys, version) with unit weights (`xpr_verify_manifest --emit-roster`
+   lists actives as the starting point; trim to the coordinated schedule):
+   only members key-anchored to checkpoint state pass the restore
+   cross-check, and standbys are simply not in the quorum.
    Validate the finished manifest offline with `xpr_verify_manifest` before
    publishing it — the second exporting party repeats this check on their
    own re-export.
@@ -71,8 +72,9 @@ State transfer is implemented and does not need reinventing:
    exchanges, and frontend operators. The BP commitment backing the
    cutoff is the on-chain cutover ceremony (`contracts/cutover/`, see
    `docs/xpr-halt-ceremony.md`): producers vote the H freeze with their
-   block-signing keys, 2/3+1 by stake, manually or via the auto-voter
-   shipped in the upgrade — no XPR protocol feature required.
+   block-signing keys, 2/3+1 by count over the frozen schedule (15 of 21),
+   manually or via the auto-voter shipped in the upgrade — no XPR
+   protocol feature required.
 
 ## 4. Validators
 
@@ -269,7 +271,14 @@ Every item is measurable; any red item aborts the phase.
    transactions in the sidecar execute on the A-Chain with A-Chain state.
    Audit the deferred list at H: anything whose XPR-side assumptions
    (oracle values, time-sensitive logic) no longer hold must be cancelled
-   pre-export or handled by the contract owners on day one. Regular
+   pre-export or handled by the contract owners on day one. The export
+   enforces the mechanical half pre-H: the attach tool and the offline
+   verifier refuse any sidecar with a deferred due in the (H, P] pause
+   window (`check_no_deferred_due_in_window` in
+   `crates/pulsevm_database/src/xpr_import.rs`), because a row executable
+   on a post-H block would set the block's `transaction_mroot` and fail
+   the boot closed at the emptiness gate. The rejection names the sender
+   and transaction so the row can be cancelled pre-export. Regular
    transactions are expiry-checked with no delays or extensions
    (`crates/pulsevm_core/src/chain/transaction/transaction.rs`), so no
    stale pre-H transaction can execute late. Owner: contract owners plus
@@ -284,14 +293,27 @@ Every item is measurable; any red item aborts the phase.
   export of the same block. Attach with
   `cargo run -p pulsevm_core --example xpr_attach_source_block -- <manifest>
   <get-block> <out> --halt-key-v2 <wif>`.
-- Weighted roster: `MigrationManifest.halt_roster` (manifest version 2)
-  carries `{producer, key, weight}` entries; the restore verifies a
-  two-thirds weight quorum (`signed*3 >= total*2`) instead of the single-key
-  path, for version 1 and 2 commitments alike. Attach with `--halt-roster
-  <roster.json>`. Verification lives in
-  `crates/pulsevm_chain_types/src/migration.rs`, the restore gate in
+- Weighted roster: retired. The roster is the declared set at unit weight
+  (`HaltWeight::MEMBER` for every member — anything else fails closed as an
+  exporter moving the denominator), and the restore verifies a strict count
+  quorum (`signed*3 > total*2`, so exactly-two-thirds fails) instead of the
+  single-key path, for version 1 and 2 commitments alike. Verification lives
+  in `crates/pulsevm_chain_types/src/migration.rs`, the restore gate in
   `crates/pulsevm_core/src/chain/controller.rs`.
 - State binding: post-restore, every rostered name must resolve to the same
   signing key in the checkpoint's `eosio.system` `producers` table, so the
-  exporter cannot invent members. Weights are not compared (they drift
-  block to block); the quorum math runs over the transported roster.
+  exporter cannot invent members.
+- Schedule pin at export: `xpr_attach_source_block --schedule
+  <get_producer_schedule.json>` records the frozen active schedule (names,
+  schedule keys, version) into `MigrationManifest.halt_schedule`, pinned to
+  H's header version. The restore gate requires the recorded schedule to
+  equal the declared set exactly, both ways, so the post-H signatures and
+  the declaration quorum resolve against the same set.
+- Post-H emptiness proof: `xpr_attach_source_block --post-block
+  <get_block.json>` (repeatable, in height order) records every header from
+  H+1 to the pause head into `MigrationManifest.halt_post_blocks`. Each
+  header is authenticated at record time — hash-linked from the trusted H
+  id, empty transaction root, no schedule change or version rotation, signed
+  by the recorded schedule key for its producer — and the restore gate
+  re-verifies the packed proof from the manifest. An absent proof fails
+  closed: unattested windows do not boot.

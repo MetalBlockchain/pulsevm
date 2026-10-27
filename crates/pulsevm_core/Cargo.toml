@@ -35,6 +35,7 @@ wasmer-middlewares = "7.4.0"
 wat = "1"
 
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }
+pulsevm_chain_types = { path = "../pulsevm_chain_types" }
 pulsevm_constants = { path = "../pulsevm_constants" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_error = { path = "../pulsevm_error" }
@@ -60,7 +61,6 @@ arena-shadow = []
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 wat = "1"
-pulsevm_chain_types = { path = "../pulsevm_chain_types" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 # Signing the same digest twice with different nonce data, to build a
 # transaction whose signatures are distinct but recover the same key.

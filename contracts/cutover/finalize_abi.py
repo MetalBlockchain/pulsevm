@@ -52,6 +52,7 @@ STRUCTS = [
             {"name": "id", "type": "uint64"},
             {"name": "h", "type": "uint32"},
             {"name": "source_chain_id", "type": "checksum256"},
+            {"name": "schedule_version", "type": "uint32"},
             {"name": "total_weight", "type": "uint128"},
             {"name": "voted_weight", "type": "uint128"},
             {"name": "finalized", "type": "bool"},

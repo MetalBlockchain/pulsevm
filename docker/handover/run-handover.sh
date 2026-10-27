@@ -402,42 +402,46 @@ leap_tapos_push() { # $1=wif $2=mode rest=mode args
     return 1
 }
 
-# Fixture-only schedule seeder for the contract vehicle: the bare fixture
-# chain carries no system `producers` table, so the cutover contract's init
-# would freeze an empty schedule. This deploys the throwaway seeder as
-# code=eosio (the only writer allowed there) and plants the single-member
-# row mirroring the replayed genesis schedule (owner eosio, fixture dev
-# key, weight 1.0). NEVER on mainnet: there the live schedule is real.
-deploy_fixture_seeder() { # $1=dev wif
-    local wif="$1"
-    echo "handover: contract vehicle: planting the fixture schedule row..."
+plant_fixture_producers_table() { # $1=eosio wif $2=roster key (EOS or PUB_K1_)
+    # Deploy the seed helper onto eosio and emplace the fixture producers
+    # row (owner eosio, roster schedule key, active). The row's binary
+    # layout is the 8-field mainnet producer_info shape the restore gate
+    # decodes; the key arrives as 33 compressed bytes (b58-decoded like
+    # the contract path's roster handling).
+    local wif="$1" roster_key="$2" key33 votes_hex
     local seed_wasm="$REPO_ROOT/contracts/cutover/seed.wasm"
     local seed_abi="$REPO_ROOT/contracts/cutover/seed.abi"
-    [[ -f "$seed_wasm" && -f "$seed_abi" ]] || fail "cutover contracts not built (contracts/cutover)"
-    local key33
-    key33="$("$PROBE_BIN" pubkey "$wif")" || fail "dev key to pubkey failed"
-    [[ "${#key33}" == 66 ]] || fail "dev pubkey is not 33 compressed bytes"
-    local code_hash
-    code_hash="$(leap_post "$LEAP_API" /v1/chain/get_code '{"account_name":"eosio"}' \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["code_hash"])')"
-    if [[ "$code_hash" == "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
-        echo "handover: deploying fixture seeder as code=eosio..."
-        leap_tapos_push "$wif" setcode eosio "$seed_wasm" || fail "seeder setcode failed"
-        leap_tapos_push "$wif" setabi eosio "$seed_abi" || fail "seeder setabi failed"
-        leap_wait_effect "seeder code on eosio" /v1/chain/get_code '{"account_name":"eosio"}' \
-            'json.load(sys.stdin)["code_hash"]' '!0000000000000000000000000000000000000000000000000000000000000000'
-    fi
-    local rows
-    rows="$(leap_post "$LEAP_API" /v1/chain/get_table_rows \
-        '{"json":false,"code":"eosio","scope":"eosio","table":"producers","limit":1}' \
-        | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["rows"]))')"
-    if [[ "$rows" == 0 ]]; then
-        local votes_hex
-        votes_hex="$(python3 -c 'import struct; print(struct.pack("<d", 1.0).hex())')"
-        leap_tapos_push "$wif" cseed eosio eosio eosio "$votes_hex" "$key33" 1 \
-            || fail "schedule seed row failed"
-    fi
-    echo "handover: fixture schedule row present"
+    [[ -f "$seed_wasm" && -f "$seed_abi" ]] || fail "seed contract not built (contracts/cutover)"
+    key33="$(python3 - "$roster_key" <<'PYEOF'
+import hashlib, sys
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(text):
+    value = 0
+    for char in text:
+        value = value * 58 + B58.index(char)
+    raw = value.to_bytes((value.bit_length() + 7) // 8, "big") if value else b""
+    return b"\x00" * (len(text) - len(text.lstrip("1"))) + raw
+if sys.argv[1].startswith("EOS"):
+    body, suffix = sys.argv[1][3:], b""
+else:
+    body, suffix = sys.argv[1][len("PUB_K1_"):], b"K1"
+raw = b58decode(body)
+assert len(raw) == 37 and raw[0] in (2, 3), "not a compressed K1 key"
+assert hashlib.new("ripemd160", raw[:-4] + suffix).digest()[:4] == raw[-4:], "bad checksum"
+print(raw[:33].hex())
+PYEOF
+)" || fail "seed roster key decode failed"
+    [[ "${#key33}" == 66 ]] || fail "seed key is not 33 compressed bytes"
+    votes_hex="$(python3 -c 'import struct; print(struct.pack("<d", 1.0).hex())')"
+    leap_tapos_push "$wif" setcode eosio "$seed_wasm" || fail "seed setcode failed"
+    echo "handover: seed helper deployed on eosio"
+    leap_tapos_push "$wif" setabi eosio "$seed_abi" || fail "seed setabi failed"
+    leap_tapos_push "$wif" cseed eosio eosio eosio "$votes_hex" "$key33" 1 \
+        || fail "seed setprod failed"
+    echo "handover: fixture producers row planted (eosio active under roster key)"
+    leap_wait_effect "seeded producers row" /v1/chain/get_table_rows \
+        '{"json":true,"code":"eosio","scope":"eosio","table":"producers","limit":1}' \
+        'json.load(sys.stdin)["rows"][0]["owner"]' "eosio"
 }
 
 two_step_ceremony_and_freeze() {
@@ -460,9 +464,13 @@ two_step_ceremony_and_freeze() {
     local roster_key
     roster_key="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
     printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
-    if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
-        deploy_fixture_seeder "$halt_key"
-    fi
+    # The restore gate binds the roster to the on-chain producers table
+    # and fails closed when it is absent (real XPR always carries it).
+    # The fixture chain runs no system contract, so plant the synthetic
+    # row with the seed helper before H: code eosio / scope eosio, exact
+    # producer_info layout, fixture producer active under the roster key.
+    # The snapshot export then carries it and the boot cross-check runs.
+    plant_fixture_producers_table "$halt_key" "$roster_key"
     local producer_cid
     producer_cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)"
     [[ -n "$producer_cid" ]] || fail "xpr-producer container not found"
@@ -501,8 +509,64 @@ two_step_ceremony_and_freeze() {
             leap_wait_effect "contract code on $CONTRACT_ACCT" /v1/chain/get_code \
                 '{"account_name":"'"$CONTRACT_ACCT"'"}' 'json.load(sys.stdin)["code_hash"]' \
                 '!0000000000000000000000000000000000000000000000000000000000000000'
+            # The freeze takes the schedule explicitly: the single fixture
+            # member (eosio on the dev key) at the live active version. A
+            # rotation before H fails the unanimity check below.
+            local live_version roster_key_hex
+            live_version="$(leap_post "$LEAP_API" /v1/chain/get_producer_schedule '{}' \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["version"])')" \
+                || fail "could not read live schedule version"
+            roster_key_hex="$(python3 - "$roster_key" <<'PYEOF2'
+import hashlib, sys
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(text):
+    value = 0
+    for char in text:
+        value = value * 58 + B58.index(char)
+    raw = value.to_bytes((value.bit_length() + 7) // 8, "big") if value else b""
+    return b"\x00" * (len(text) - len(text.lstrip("1"))) + raw
+def compressed(key):
+    if key.startswith("EOS"):
+        body, suffix = key[3:], b""
+    else:
+        body, suffix = key[len("PUB_K1_"):], b"K1"
+    raw = b58decode(body)
+    assert len(raw) == 37 and raw[0] in (2, 3), "not a compressed K1 key"
+    assert hashlib.new("ripemd160", raw[:-4] + suffix).digest()[:4] == raw[-4:], "bad checksum"
+    return raw[:33].hex()
+print(compressed(sys.argv[1]))
+PYEOF2
+)" || fail "roster key decode failed"
             local init_hex
-            init_hex="$(python3 -c "import struct; print((struct.pack('<I', $H) + bytes.fromhex('$x_chain')).hex())")"
+            init_hex="$(python3 - "$H" "$x_chain" "$live_version" "$roster_key_hex" <<'PYEOF2'
+import struct, sys
+def varuint(v):
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+def name_to_u64(name):
+    charmap = ".12345abcdefghijklmnopqrstuvwxyz"
+    def sym(c):
+        if "a" <= c <= "z":
+            return ord(c) - ord("a") + 6
+        if "1" <= c <= "5":
+            return ord(c) - ord("1") + 1
+        return 0
+    v = 0
+    for i in range(12):
+        v = (v << 5) | sym(name[i] if i < len(name) else ".")
+    return (v << 4) | (sym(name[12]) if len(name) == 13 else 0)
+h, chain, version, key = int(sys.argv[1]), bytes.fromhex(sys.argv[2]), int(sys.argv[3]), bytes.fromhex(sys.argv[4])
+out = bytearray(struct.pack("<I", h) + chain + struct.pack("<I", version))
+out += varuint(1) + struct.pack("<Q", name_to_u64("eosio")) + varuint(0) + key
+print(bytes(out).hex())
+PYEOF2
+)" || fail "contract init packing failed"
             leap_tapos_push "$halt_key" raw "$CONTRACT_ACCT" init "$CONTRACT_ACCT" "$init_hex" || fail "contract init H=$H failed"
             echo "handover: schedule frozen for H=$H"
             leap_wait_effect "frozen ceremony H=$H" /v1/chain/get_table_rows \
@@ -818,6 +882,11 @@ PYEOF
         fi
         echo "handover: producer paused; network frozen at P=$P (snapshot holds exact H=$H)"
         echo "$P" >"$WORK_DIR/P"
+        # Per-signer frozen heads: both validators converged on P, and the
+        # confirmation attests this agreed head as the quorum's pause
+        # observation.
+        echo "$v1_head" >"$WORK_DIR/P_V1"
+        echo "$v2_head" >"$WORK_DIR/P_V2"
         break
     done
     echo "$H" >"$WORK_DIR/H"
@@ -837,6 +906,30 @@ b = json.load(open(sys.argv[1]))
 sys.exit(0 if (not b.get("transactions") and not b.get("new_producers")) else 1)
 PYEOF
     echo "handover: network frozen at P=$(cat "$WORK_DIR/P"), cutover H=$H id=$H_ID; memo block $MEMO_BLOCK (K=$K)"
+    # Post-H emptiness evidence (H+1..P) and the frozen active schedule: the
+    # validators stay live while the producer is paused, so fetch every
+    # header past H from one of them. The attach tool authenticates each
+    # header against the recorded schedule key and packs the restore gate's
+    # proof; a header carrying traffic fails there, not here. An empty range
+    # (P=H) stages nothing and the gate accepts the bare H anchor.
+    leap_post "$LEAP_V1_API" /v1/chain/get_producer_schedule '{}' >"$WORK_DIR/schedule-H.json" \
+        || fail "get_producer_schedule at H=$H failed"
+    echo "handover: frozen schedule staged: $WORK_DIR/schedule-H.json"
+    post_n=$((H + 1))
+    while [[ "$post_n" -le "$P" ]]; do
+        curl --fail --silent --max-time 15 -X POST "$LEAP_V1_API/v1/chain/get_block" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
+            -d "{\"block_num_or_id\":\"$post_n\"}" >"$WORK_DIR/block-post-$post_n.json" \
+            || fail "get_block post-H $post_n failed"
+        # The header state carries the blockroot and pending-schedule hash
+        # the producer signature covers: the attach tool needs it to
+        # recompute Leap's signature digest for each staged header.
+        leap_post "$LEAP_V1_API" /v1/chain/get_block_header_state "{\"block_num_or_id\":\"$post_n\"}" \
+            >"$WORK_DIR/block-post-$post_n.state.json" \
+            || fail "get_block_header_state post-H $post_n failed"
+        post_n=$((post_n + 1))
+    done
+    echo "handover: post-H headers staged: H+1..P ($((P - H)) blocks)"
     # The snapshot was taken pre-pause on the running producer: bind it to
     # the cutover H (same id ⇒ same deterministic state) and stage it from
     # the root-owned producer volume, the legacy pattern. Blocks H+1..P are
@@ -1068,7 +1161,13 @@ PYEOF
 confirm_attach_verify() { # $1=platform-chain-id
     local platform_chain="$1"
     local confirm_out CONF_DIGEST NEW_CHAIN h_version vote_version
-    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
+    # Each validator reported its own frozen head while converging on P
+    # (saved as P_V1/P_V2): the agreed head is the quorum's pause
+    # attestation, and the gate requires the post-H proof to cover exactly
+    # it. The ceremony tool refuses unless every signer attests the same
+    # head, so a divergent freeze fails here, not at boot.
+    P="$(cat "$WORK_DIR/P")" || fail "could not read frozen head P"
+    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
         || fail "confirmation failed"
     echo "handover: $confirm_out"
     CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
@@ -1092,12 +1191,51 @@ confirm_attach_verify() { # $1=platform-chain-id
         echo "handover: schedule version $h_version unanimous across votes and H"
         attach_args+=(--contract-ceremony "$WORK_DIR/fragment.json" --schedule-version "$h_version")
     fi
+    # A checkpoint taken mid-rotation would boot the new chain with a pending
+    # proposal the ceremony never froze (global_property carries it, but the
+    # checkpoint cannot prove its absence later). Read the schedule staged
+    # from a live validator at the freeze and record the absence; anything
+    # staged fails closed here, not at boot. A live query is impossible here
+    # by design: the shared tail stops the XPR network after staging it, and
+    # the frozen network all reported the identical schedule anyway.
+    [[ -f "$WORK_DIR/schedule-H.json" ]] \
+        || fail "frozen schedule not staged (H+1..P collection runs before the stop)"
+    staged="$(python3 -c 'import json,sys; s = json.load(open(sys.argv[1])); print(" ".join(k for k in ("pending", "proposed") if (s.get(k) or {}).get("producers")))' "$WORK_DIR/schedule-H.json")" \
+        || fail "could not read staged producer schedule at H"
+    [[ -z "$staged" ]] \
+        || fail "schedule change staged at H ($staged): freeze the ceremony after it activates"
+    echo "handover: no proposed schedule at H"
+    attach_args+=(--proposed-schedule false)
+    # The frozen schedule pins the roster the post-H signatures (and the
+    # declaration quorum) resolve against; the staged H+1..P headers are the
+    # emptiness proof the restore gate re-verifies from the manifest.
+    attach_args+=(--schedule "$WORK_DIR/schedule-H.json")
+    post_n=$((H + 1))
+    while [[ "$post_n" -le "$P" ]]; do
+        [[ -f "$WORK_DIR/block-post-$post_n.json" ]] || fail "post-H header $post_n not staged"
+        [[ -f "$WORK_DIR/block-post-$post_n.state.json" ]] || fail "post-H header state $post_n not staged"
+        attach_args+=(--post-block "$WORK_DIR/block-post-$post_n.json" --post-state "$WORK_DIR/block-post-$post_n.state.json")
+        post_n=$((post_n + 1))
+    done
+    # Deferred-transaction inventory: no migrated deferred may be due
+    # between H and P (it would set a post-H transaction_mroot and fail
+    # the boot closed at the emptiness gate). The rehearsal fixture chain
+    # carries no deferred activity, so the check runs only when the export
+    # staged a sidecar — mainnet exports always do.
+    verify_sidecar_args=()
+    if [[ -f "$export_dir/deferred-transactions.json" ]]; then
+        attach_args+=(--deferred-sidecar "$export_dir/deferred-transactions.json")
+        verify_sidecar_args+=(--deferred-sidecar "$export_dir/deferred-transactions.json")
+    else
+        echo "handover: no deferred sidecar staged; skipping the pause-window inventory check"
+    fi
     "$ATTACH_BIN" \
         "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
         "${attach_args[@]}" \
         || fail "source block attach failed (H must be an empty block)"
     mv "$manifest.attached" "$manifest"
     "$VERIFY_BIN" "$manifest" "$export_dir/migration.snapshot" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" \
+        "${verify_sidecar_args[@]}" \
         || fail "offline pair verification failed"
     printf '%s %s %s %s\n' \
         "$(sha256sum "$manifest" | awk '{print $1}')" \
@@ -1236,11 +1374,10 @@ cmd_checkpoint() {
         # (base + checkpoint binding + fixture key); its derived successor
         # id is what the confirmation chains (new_chain), while the
         # platform id it binds is the launcher's id (see PLATFORM_CHAIN).
-        # On the memo path the fixture chain
-        # carries no producers table, so the state cross-check logs its skip
-        # exactly as designed for table-less fixtures; on the contract path
-        # the seeded schedule row is exported with the checkpoint, so the
-        # light-client set-equality check runs and must pass.
+        # The freeze plants the fixture producers row (seed helper on
+        # eosio) before H on every vehicle, so the export carries it and
+        # the light-client set-equality check runs and must pass — a
+        # checkpoint without the table fails closed at the boot gate.
         CEREMONY_BIN="${CEREMONY_BIN:-$REPO_ROOT/target/release/examples/xpr_halt_ceremony}"
         ATTACH_BIN="$REPO_ROOT/target/release/examples/xpr_attach_source_block"
         VERIFY_BIN="$REPO_ROOT/target/release/examples/xpr_verify_manifest"

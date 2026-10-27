@@ -29,7 +29,7 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_verify_manifest <manifest.json> <checkpoint> [--work-dir <dir>] [--genesis <migration-genesis.json>] [--platform-chain-id <hex>]"
+        "Usage: xpr_verify_manifest <manifest.json> <checkpoint> [--work-dir <dir>] [--genesis <migration-genesis.json>] [--platform-chain-id <hex>] [--deferred-sidecar <deferred-transactions.json>]"
     );
     eprintln!("       xpr_verify_manifest --emit-roster <checkpoint> [--work-dir <dir>]");
     eprintln!("  Verifies the manifest, halt proof, roster, and state binding,");
@@ -87,6 +87,7 @@ fn main() -> ExitCode {
     let mut work_dir: Option<PathBuf> = None;
     let mut genesis: Option<String> = None;
     let mut platform: Option<[u8; 32]> = None;
+    let mut deferred_sidecar: Option<String> = None;
     while let Some(arg) = args.next() {
         if arg == "--work-dir" {
             let Some(dir) = args.next() else {
@@ -94,6 +95,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             work_dir = Some(PathBuf::from(dir));
+        } else if arg == "--deferred-sidecar" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            deferred_sidecar = Some(path.to_string_lossy().into_owned());
         } else if arg == "--genesis" {
             let Some(path) = args.next() else {
                 usage();
@@ -125,6 +132,7 @@ fn main() -> ExitCode {
         work_dir.as_deref(),
         genesis.as_deref(),
         platform.as_ref(),
+        deferred_sidecar.as_deref(),
     )
 }
 
@@ -134,6 +142,7 @@ fn run(
     work_dir: Option<&Path>,
     genesis_path: Option<&str>,
     platform_chain_id: Option<&[u8; 32]>,
+    deferred_sidecar_path: Option<&str>,
 ) -> ExitCode {
     let manifest: MigrationManifest = match fs::read(manifest_path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -310,6 +319,11 @@ fn run(
             Some(version) => println!("schedule version: {version} (unanimous across votes and H)"),
             None => println!("schedule version: unattested"),
         }
+        if let Some(sidecar_path) = deferred_sidecar_path
+            && let Err(error) = check_deferred_inventory(&manifest, sidecar_path)
+        {
+            return fail(error);
+        }
     }
 
     let Some(roster) = pair_roster else {
@@ -340,6 +354,65 @@ fn run(
     println!("PASS");
     drop(scratch_guard);
     ExitCode::SUCCESS
+}
+
+/// Decode the timestamp slot of one packed (or source) header on the
+/// deferred rows' clock. Post-H entries lead with the 64-byte
+/// root/schedule-hash prefix, so the 4-byte little-endian slot starts at
+/// `prefix`; the source block has no prefix. Anything shorter fails
+/// closed.
+fn packed_block_time_us(packed_hex: &str, prefix: usize) -> Result<i64, String> {
+    let bytes = hex::decode(packed_hex)
+        .map_err(|error| format!("post-H packed block is not hexadecimal: {error}"))?;
+    if bytes.len() < prefix + 4 {
+        return Err("post-H packed block is shorter than its timestamp slot".into());
+    }
+    let slot = u32::from_le_bytes(
+        bytes[prefix..prefix + 4]
+            .try_into()
+            .map_err(|_| "post-H packed block timestamp is not 4 bytes".to_string())?,
+    );
+    Ok(pulsevm_database::antelope_slot_to_unix_micros(slot))
+}
+
+/// Export-time deferred-transaction inventory over the manifest's staged
+/// window: the cutover source block opens the window, the last staged
+/// post-H header closes it (or H itself when the pause landed exactly on
+/// it). A row due in-window would set a post-H `transaction_mroot` and
+/// fail the boot closed at the emptiness gate — failing here names the
+/// row pre-H instead.
+fn check_deferred_inventory(
+    manifest: &MigrationManifest,
+    sidecar_path: &str,
+) -> Result<(), String> {
+    let bytes = std::fs::read(sidecar_path)
+        .map_err(|error| format!("cannot read deferred sidecar {sidecar_path}: {error}"))?;
+    let sidecar = pulsevm_database::DeferredTransactionSidecar::from_json_bytes(&bytes)
+        .map_err(|error| format!("deferred sidecar {sidecar_path} rejected: {error}"))?;
+    let source = manifest.source_block.as_deref().ok_or_else(|| {
+        "halt proof requires an attached source block for the deferred inventory window".to_string()
+    })?;
+    let start = packed_block_time_us(source, 0)?;
+    let mut end = start;
+    if let Some(blocks) = manifest.halt_post_blocks.as_ref() {
+        // Post-H entries lead with the 64-byte recorded root/schedule-hash
+        // prefix; their header (and timestamp slot) starts past it.
+        const POST_H_PREFIX_LEN: usize = 64;
+        for packed in blocks {
+            end = end.max(packed_block_time_us(packed, POST_H_PREFIX_LEN)?);
+        }
+    }
+    if end < start {
+        return Err(format!(
+            "deferred inventory window ends ({end}) before it starts ({start}): refusing an unorderable window"
+        ));
+    }
+    pulsevm_database::check_no_deferred_due_in_window(&sidecar.transactions, start, end)?;
+    println!(
+        "deferred inventory: ok ({} sidecar rows, none due between {start} and {end})",
+        sidecar.transactions.len()
+    );
+    Ok(())
 }
 
 fn emit_roster(checkpoint_path: &Path, work_dir: Option<&Path>) -> ExitCode {
@@ -411,10 +484,9 @@ fn verify_roster_against_checkpoint(
         println!("note: no producers table in checkpoint state; cross-check skipped");
         return Ok(());
     }
-    // The pair path enforces the light-client rule: the declared set must
-    // equal the on-chain schedule exactly (same members, same keys; weights
-    // pinned by the frozen tally when contract evidence is attached, by
-    // H-state on the memo path).
+    // The pair path enforces the light-client rule: every declared member
+    // must be active in checkpoint state with the same schedule key
+    // (weights are 1 by construction, so there is no H-state weight pin).
     match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)? {
         Some(matched) => {
             println!("roster schedule match: ok ({matched} producers)");
@@ -422,10 +494,6 @@ fn verify_roster_against_checkpoint(
         None => {
             println!("note: no producers table in checkpoint state; cross-check skipped");
         }
-    }
-    if manifest.halt_contract_ceremony.is_none() {
-        let matched = pulsevm_database::check_halt_roster_weights_match_state(roster, &state_keys)?;
-        println!("roster weight pin: ok ({matched} producers, memo path)");
     }
     Ok(())
 }
@@ -453,6 +521,9 @@ mod tests {
     use super::run;
 
     fn producer_info_row(owner: u64, key: &[u8; 33]) -> Vec<u8> {
+        // Head-only 8-field mainnet shape: live XPR producers rows carry no
+        // authority tail, and the state decoder fails closed on trailing
+        // bytes. The schedule key is the only consensus-relevant key.
         let mut row = Vec::new();
         row.extend_from_slice(&owner.to_le_bytes());
         row.extend_from_slice(&100.0f64.to_le_bytes());
@@ -464,13 +535,6 @@ mod tests {
         row.extend_from_slice(&0u32.to_le_bytes());
         row.extend_from_slice(&0i64.to_le_bytes());
         row.extend_from_slice(&0u16.to_le_bytes());
-        // Canonical 1-of-1 authority tail over the schedule key (live layout).
-        row.push(0); // variant index
-        row.extend_from_slice(&1u32.to_le_bytes()); // threshold
-        row.push(1); // one key
-        row.push(0); // K1 key type
-        row.extend_from_slice(key);
-        row.extend_from_slice(&1u16.to_le_bytes()); // weight
         row
     }
 
@@ -538,6 +602,52 @@ mod tests {
         path
     }
 
+    /// Pack one synthetic post-H empty block: `pulsevm_core::block` wire
+    /// layout, recorded root and roster-derived schedule hash leading,
+    /// signed by the schedule key over Leap's signature digest. Mirrors
+    /// the handover's real post-H headers; the gate walk decodes it.
+    fn pack_post_block(
+        previous: &[u8; 32],
+        producer: u64,
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        schedule_hash: [u8; 32],
+    ) -> String {
+        let mut header = Vec::new();
+        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&producer.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(previous);
+        header.extend_from_slice(&[0u8; 32]); // empty transaction root
+        header.extend_from_slice(&[0u8; 32]); // empty action root
+        header.extend_from_slice(&1u32.to_le_bytes()); // schedule version
+        header.push(0); // no schedule change
+        header.push(0); // no header extensions
+        let root = [0xA1; 32];
+        let mut digest_and_root = Vec::with_capacity(64);
+        digest_and_root.extend_from_slice(&header_digest);
+        digest_and_root.extend_from_slice(&root);
+        let bound = pulsevm_crypto::Digest::hash(&digest_and_root).0;
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&bound);
+        bound_and_schedule.extend_from_slice(&schedule_hash);
+        let digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let mut packed = Vec::with_capacity(64 + header.len() + 99);
+        packed.extend_from_slice(&root);
+        packed.extend_from_slice(&schedule_hash);
+        packed.extend_from_slice(&header);
+        packed.push(0); // K1 tag
+        packed.extend_from_slice(&signing.sign(&digest).compact65());
+        packed.push(0); // no transactions
+        packed.push(0); // no block extensions
+        // The entry carries the block's id verbatim: the gate chains it,
+        // never recomputing Leap's id formula.
+        let num = u32::from_be_bytes(previous[0..4].try_into().unwrap()) + 1;
+        let mut id = pulsevm_crypto::Digest::hash(&header).0;
+        id[0..4].copy_from_slice(&num.to_be_bytes());
+        packed.extend_from_slice(&id);
+        hex::encode(&packed)
+    }
+
     /// Build a checkpoint whose producers table holds one producer, plus a
     /// matching manifest carrying the two-step pair and the on-chain
     /// ceremony (run with the matching successor chain id). When
@@ -581,9 +691,13 @@ mod tests {
         let checkpoint = dir.path().join("migration.snapshot");
         std::fs::write(&checkpoint, &checkpoint_bytes).unwrap();
 
+        // Height-consistent H id: the post-chain walk derives each height
+        // as parent-num + 1, so the fixture anchor embeds H itself.
+        let mut hid = [9u8; 32];
+        hid[0..4].copy_from_slice(&7u32.to_be_bytes());
         let mut manifest = MigrationManifest::new(
             b"fixture log",
-            [9; 32],
+            hid,
             &checkpoint_bytes,
             7,
             ImportSummary::default(),
@@ -601,7 +715,7 @@ mod tests {
         manifest = manifest.with_halt_roster(vec![MigrationHaltRosterEntry {
             producer: "prod.a".to_string(),
             key: roster_key.to_string(),
-            weight: pulsevm_chain_types::HaltWeight(100),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
         }]);
         // The migration genesis binds the checkpoint; confirmations and the
         // restore gate derive the successor id from these exact bytes.
@@ -614,7 +728,7 @@ mod tests {
         let mut members = vec![HaltDeclarationMember {
             producer: "prod.a".to_string(),
             key: signing.public_key().to_string(),
-            weight: pulsevm_chain_types::HaltWeight(100),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
         }];
         HaltDeclaration::sort_members(&mut members);
         let unsigned = HaltDeclaration {
@@ -643,10 +757,13 @@ mod tests {
             version: HaltConfirmation::VERSION,
             declaration_digest: hex::encode(declaration.digest().unwrap()),
             halt_height: 7,
-            halt_block_id: "09".repeat(32),
+            // The fixture stages one post-H header (block 8): the attested
+            // pause head is exactly 8.
+            pause_height: 8,
+            halt_block_id: hex::encode(hid),
             checkpoint_sha256: manifest.checkpoint_sha256.clone(),
             new_chain_id: hex::encode(genesis_id),
-            platform_chain_id: Some(hex::encode(FIXTURE_PLATFORM)),
+            platform_chain_id: hex::encode(FIXTURE_PLATFORM),
             signatures: Vec::new(),
         };
         let conf_digest = template.digest().unwrap();
@@ -665,8 +782,8 @@ mod tests {
         manifest.halt_contract_ceremony = Some(pulsevm_database::HaltContractCeremony {
             contract: "cutover".to_string(),
             declaration_digest: hex::encode(decl_digest),
-            total_weight: pulsevm_chain_types::HaltWeight(100),
-            voted_weight: pulsevm_chain_types::HaltWeight(100),
+            total_weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            voted_weight: pulsevm_chain_types::HaltWeight::MEMBER,
             finalized: true,
             finalized_block: 6,
             init_time: 0,
@@ -679,6 +796,21 @@ mod tests {
             }],
         });
         manifest.halt_schedule_version = Some(1);
+        // The synthetic checkpoint stages no schedule: attest the absence
+        // the pair verifier requires.
+        manifest.halt_proposed_schedule = Some(false);
+        // The recorded schedule is the declared set, and the empty window
+        // (block 8, signed by the schedule key) links from H: the fixture
+        // proves nothing lands after the freeze.
+        manifest.halt_schedule = Some(vec![MigrationHaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: signing.public_key().to_string(),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
+        }]);
+        // The staged header names a fixed schedule hash: the gate binds the
+        // exact (root, hash) pair through the producer signature, so any
+        // consistent value exercises the real check.
+        manifest.halt_post_blocks = Some(vec![pack_post_block(&hid, owner, &signing, [0x5E; 32])]);
         let manifest_path = dir.path().join("migration.manifest.json");
         std::fs::write(
             &manifest_path,
@@ -709,7 +841,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -726,7 +859,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -742,7 +876,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -770,7 +905,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(wrong.to_str().expect("genesis path is UTF-8")),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -786,7 +922,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -803,7 +940,93 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&other)
+                Some(&other),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    /// Sidecar for the deferred-inventory path: the fixture window opens
+    /// at the zero-slot source block (the Antelope epoch in deferred
+    /// time) and closes at the block-8 header the fixture stages.
+    fn write_sidecar(dir: &std::path::Path, transactions: serde_json::Value) -> std::path::PathBuf {
+        let path = dir.join("deferred-transactions.json");
+        let sidecar = serde_json::json!({
+            "version": 2,
+            "source_block_id": "00".repeat(32),
+            "account_metadata": [],
+            "code": [],
+            "permissions": [],
+            "global_action_sequence": 0,
+            "input_transactions": [],
+            "transactions": transactions,
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+        path
+    }
+
+    fn deferred_row(delay_until: i64, expiration: i64) -> serde_json::Value {
+        serde_json::json!({
+            "sender": 1111,
+            "sender_id": "1",
+            "payer": 1111,
+            "trx_id": "aa".repeat(32),
+            "delay_until": delay_until,
+            "expiration": expiration,
+            "published": delay_until - 1_000_000,
+            "packed_trx": "00",
+        })
+    }
+
+    #[test]
+    fn accepts_a_sidecar_with_nothing_due_in_the_window() {
+        let fixture = fixture(false);
+        // The zero-slot source block opens the window at the Antelope
+        // epoch (946684800000000); block 8 closes it later. A row due
+        // after the pause head and an empty inventory both pass.
+        let start = pulsevm_database::antelope_slot_to_unix_micros(0);
+        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020304);
+        assert!(end > start);
+        for transactions in [
+            serde_json::json!([]),
+            serde_json::json!([deferred_row(end + 1, end + 1_000_000)]),
+            serde_json::json!([deferred_row(start - 2_000_000, start - 1)]),
+        ] {
+            let sidecar = write_sidecar(fixture.dir.path(), transactions);
+            assert_eq!(
+                run(
+                    &fixture.manifest,
+                    &fixture.checkpoint,
+                    None,
+                    Some(genesis_str(&fixture)),
+                    Some(&FIXTURE_PLATFORM),
+                    Some(sidecar.to_str().unwrap()),
+                ),
+                std::process::ExitCode::SUCCESS
+            );
+        }
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn rejects_a_sidecar_with_a_row_due_in_the_window() {
+        let fixture = fixture(false);
+        let start = pulsevm_database::antelope_slot_to_unix_micros(0);
+        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020304);
+        let sidecar = write_sidecar(
+            fixture.dir.path(),
+            serde_json::json!([deferred_row(start + 1, end)]),
+        );
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM),
+                Some(sidecar.to_str().unwrap()),
             ),
             std::process::ExitCode::SUCCESS
         );
@@ -827,7 +1050,8 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(genesis_str(&fixture)),
-                Some(&FIXTURE_PLATFORM)
+                Some(&FIXTURE_PLATFORM),
+                None,
             ),
             std::process::ExitCode::SUCCESS
         );

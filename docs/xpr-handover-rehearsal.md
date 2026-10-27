@@ -14,7 +14,35 @@ restores the checkpoint, verifies the halt commitment, authors H+1, and
 stops the replay. From the customer's seat the network never stops — it
 swaps, with every boundary transaction landing exactly once.
 
-Latest proven run (local Mac, `TERMINAL_HEIGHT=150`, two-step cutover):
+Latest proven run (EC2 `ubuntu@52.30.206.93`, `TERMINAL_HEIGHT=300`,
+two-step memo cutover over the new proof bytes):
+
+- XPR consensus (1 producer + 2 validators) → declared **H=340** at memo
+  block 311 (K=29, within max lag 30); confirmation `42978113…dbcb2`
+  binds checkpoint + successor chain; offline verifier PASS, flip gate
+  opened at H.
+- Post-H proof over Leap's true producer digest
+  (`sha256(sha256(sha256(header) || blockroot) || schedule_hash)` with the
+  blockroot read as the header state's last active node): one staged
+  header (H+1=341) recorded with its header state and verified at record
+  time; the state's hash is bound by the signature itself (with no staged
+  change Leap serves the EMPTY pending schedule, so no hash-to-roster
+  comparison is attempted — a wrong pin failed the first run of this
+  rehearsal live and was removed).
+- Seed helper plants the fixture producers row on `eosio` before H, so
+  the export carries the system table and the boot cross-check runs:
+  `migration halt roster matches checkpoint schedule: 1 producers` on
+  all nodes. A table-less checkpoint fails closed at the same gate
+  (proven by the previous run, which refused exactly there).
+- Learn-then-bind: first boot ran under a fresh runner id, the gate
+  refused the derived platform binding, the ceremony re-ran against the
+  boot's actual id, nodes relaunched in place — block **341 builds on
+  H** (parent link asserted).
+- State equivalence **11/11** via payload-compared authorities.
+- Boundary audit **10/10 txs exactly-once** (5 pre-halt on old chain, 5
+  post-halt on new chain; none lost, none duplicated).
+
+Earlier proven run (local Mac, `TERMINAL_HEIGHT=150`, two-step cutover):
 
 - XPR consensus (1 producer + 2 validators) → declared **H=187** at head 160
   (K=27, within max lag 30); declaration `adfd985e…09bfcc501f` memo'd
@@ -157,11 +185,12 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
 
 - Promotion re-identifies the chain; same-ID in-process promotion is unmodeled.
 - The two-step cutover ran with a 1-member fixture roster (single key). The
-  restore gate supports a weighted 2/3 roster quorum and checkpoint-bound
-  version 2 commitments (see [halt ceremony](xpr-halt-ceremony.md)), and
-  quorum math is unit-tested (`migration.rs`, `xpr_import.rs`), but a live
-  rehearsal with distinct per-validator keys, a voted schedule, and a signed
-  roster distribution path is still unproven.
+  restore gate enforces a strict 2/3+1 count quorum over the unit-weight
+  schedule with mandatory version-2 platform-bound commitments
+  (see [halt ceremony](xpr-halt-ceremony.md)), and quorum math is
+  unit-tested (`migration.rs`, `xpr_import.rs`), but a live rehearsal with
+  distinct per-validator keys, a voted schedule, and a signed roster
+  distribution path is still unproven.
 - CEX freeze/re-enable, gateway cutover, and Hyperion reindex runbooks live
   in the migration design doc, not in this rehearsal.
 - Resuming boot into the same workdir overwrites the plugin binary and kills

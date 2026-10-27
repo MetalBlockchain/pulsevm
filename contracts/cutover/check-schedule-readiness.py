@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Pre-ceremony readiness audit for the cutover contract (Gap 2 gate).
+"""Pre-ceremony readiness audit for the cutover contract.
 
-Every ACTIVE producer in the live `eosio.producers` table must be a plain
-1-of-1 K1 key with sane weight, or the contract's init aborts and the
-ceremony cannot start. Multisig or non-K1 schedules are loudly unsupported
-by design, so this tool fails closed BEFORE coordination spends a freeze
-on them. Run it at T-14, at freeze time, and from the rehearsal preflight.
+The ceremony freezes the ACTIVE SCHEDULE (one member, one vote), so this
+tool proves the freeze candidates before coordination spends one on them:
+every scheduled producer must be active with a valid K1 key, and each
+producers-table `producer_key` must equal the schedule's
+`block_signing_key`. A mismatch would mint a freeze nobody can sign for.
+Multisig or non-K1 schedules are loudly unsupported by design. Run it at
+T-14, at freeze time, and from the rehearsal preflight.
 
 Usage:
     check-schedule-readiness.py --api URL [--host-header HOST]
@@ -13,21 +15,22 @@ Usage:
 
 Checks (hard failures, exit 1):
   - each active producer's schedule key is a valid K1 key (PUB_K1_ or
-    legacy EOS with checksum) — the roster freezes the schedule key, and
-    a non-K1 key would mint an entry nobody can sign for;
+    legacy EOS with checksum);
   - where the row carries an `authority` field (non-XPR chains), it must
     be threshold 1, exactly one weight-1 key, no accounts, no waits, and
     equal to the schedule key. XPR mainnet rows carry NO authority
     (verified live: 8 fields, 90 bytes) — the schedule key is the only
     consensus-relevant key, so absence is the expected shape, not a
     failure;
-  - total_votes parses (Leap 5 renders float64 as a decimal string) to a
-    finite number with 0 < v < 1e30 (contract bounds).
+  - every active-schedule member is active in the producers table with the
+    same key (table key vs schedule key compared parsed, never as
+    strings).
 A staged pending/proposed schedule also fails unless --allow-pending: the
-frozen roster must name the set that will actually produce H.
+frozen schedule must name the set that will actually produce H.
 
-Informational only: active count, total active weight, top-21 weight
-share (the schedule is a subset of the active set the quorum counts).
+Informational only: active count, schedule version and size, active
+standbys outside the schedule (they simply are not in the quorum).
+total_votes is not checked: with unit weights there is nothing to drift.
 """
 
 import argparse
@@ -108,7 +111,9 @@ def main():
         print("readiness: FAIL: no active producers found")
         return 1
 
-    total_weight = 0.0
+    # Key validity per active row. total_votes is deliberately ignored: the
+    # ceremony is a count quorum over the active schedule, so vote
+    # magnitudes are informational only (printed below), never gating.
     for row in active:
         name = row.get("owner", "?")
         problems = []
@@ -142,15 +147,6 @@ def main():
                 and auth_key != schedule_key
             ):
                 problems.append("authority key differs from schedule key")
-        try:
-            # Leap 5 renders float64 as a decimal string; accept both.
-            votes = float(row.get("total_votes"))
-        except (TypeError, ValueError):
-            votes = float("nan")
-        if not (0 < votes < 1e30):
-            problems.append(f"total_votes out of bounds: {row.get('total_votes')}")
-        else:
-            total_weight += votes
         if problems:
             failures.append(f"{name}: {'; '.join(problems)}")
 
@@ -162,7 +158,7 @@ def main():
     except Exception as error:  # noqa: BLE001 - report and fail closed
         print(f"readiness: FAIL: cannot read producer schedule: {error}")
         return 1
-    # Mirrors the voter's read_schedule_blocked: pending OR proposed counts
+    # Mirrors the voter's read_live_schedule: pending OR proposed counts
     # as staged. Null slots (Leap returns explicit nulls) mean unstaged.
     staged = {}
     for slot in ("pending", "proposed"):
@@ -174,24 +170,53 @@ def main():
         print(f"readiness: FAIL: schedule change staged ({detail}); freeze after it activates")
         return 1
 
-    def safe_votes(row):
+    # The freeze must name the ACTIVE SCHEDULE, and the schedule keys must
+    # match the producers table row-for-row: a producer_key that differs
+    # from the schedule's block_signing_key would mint a freeze nobody can
+    # sign for. Standbys (active but unscheduled) are informational only —
+    # they simply are not in the quorum.
+    active_slot = schedule.get("active") or {}
+    scheduled = (active_slot.get("producers") or [])
+    schedule_version = active_slot.get("version")
+    table_keys = {}
+    for row in rows:
         try:
-            return float(row.get("total_votes", 0))
-        except (TypeError, ValueError):
-            return 0.0
-
-    weights = sorted((safe_votes(row) for row in active), reverse=True)
-    top21_share = sum(weights[:21]) / total_weight if total_weight else 0.0
+            table_keys[row.get("owner")] = parse_k1(row.get("producer_key", ""))
+        except ValueError:
+            continue
+    active_names = {row.get("owner") for row in active}
+    if not scheduled:
+        print("readiness: FAIL: producer schedule carries no active producers")
+        return 1
+    for producer in scheduled:
+        name = producer.get("producer_name", "?")
+        try:
+            scheduled_key = parse_k1(producer.get("block_signing_key", ""))
+        except ValueError as error:
+            failures.append(f"{name}: bad schedule key: {error}")
+            continue
+        if name not in active_names:
+            failures.append(f"{name}: scheduled but not active in the producers table")
+        elif table_keys.get(name) != scheduled_key:
+            failures.append(
+                f"{name}: producers.producer_key differs from the schedule signing key"
+            )
+    scheduled_names = {p.get("producer_name") for p in scheduled}
+    standbys = sorted(active_names - scheduled_names)
     print(
         f"readiness: {len(active)} active producers checked, {len(failures)} failures; "
-        f"total active weight {total_weight:.6g}, top-21 share {top21_share:.1%}"
+        f"schedule version {schedule_version} with {len(scheduled)} members, "
+        f"{len(standbys)} active standbys outside the schedule"
     )
     if staged:
         detail = ", ".join(f"{slot} ({len(names)})" for slot, names in staged.items())
         print(f"readiness: note: schedule change staged ({detail}), allowed by flag")
     if failures:
         return 1
-    print("readiness: PASS: all active schedule keys are valid K1")
+    print(
+        "readiness: PASS: frozen schedule candidates match live schedule keys, "
+        "no change staged"
+    )
     return 0
 
 

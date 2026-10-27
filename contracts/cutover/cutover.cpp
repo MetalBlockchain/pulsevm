@@ -1,30 +1,34 @@
 // XPR -> A-Chain cutover ceremony contract.
 //
 // The old validator set commits on-chain to a cutover height H: the contract
-// freezes the live schedule at init, tallies block-signing-key signatures
-// over the cutover digest, and flips a finalized flag at strict 2/3+1
-// weight. The A-Chain restore gate reads this state from the checkpoint and
-// re-verifies the tally; vote timing comes from the actions' inclusion
-// blocks, which are XPR consensus.
+// freezes the coordinated active schedule at init, tallies block-signing-key
+// signatures over the cutover digest, and flips a finalized flag at strict
+// 2/3+1 count quorum. The A-Chain restore gate reads this state from the
+// checkpoint and re-verifies the tally; vote timing comes from the actions'
+// inclusion blocks, which are XPR consensus.
 //
 // Design notes (see docs/xpr-halt-ceremony.md):
-// - Membership and weights come from the live `eosio.producers` table read
-//   in-contract at init: the roster is never prover-supplied. Scope and code
-//   are both hardcoded to `eosio`; the table must exist or init aborts.
-// - Only 1-of-1 single-key authorities are supported. init fails closed on
-//   any threshold != 1, key count != 1, non-K1 key, or authority key !=
-//   schedule key. Multisig schedules need a new ceremony, loudly, not a
-//   silent tally of the wrong keys.
-// - Weights are u128 truncated from float64 total_votes (finite,
-//   non-negative, and below 1e30, checked). XPR mainnet magnitudes (1e20+)
-//   saturate u64, so u64 tallying would collapse stake into a member count.
-//   The A-Chain verifier uses the identical conversion; tallies agree
-//   bit-for-bit.
+// - The frozen set is the ACTIVE SCHEDULE (names, schedule keys, version),
+//   supplied by the coordinator at init: one member, one vote. Vote-weight
+//   (`total_votes`) tracking is gone — it drifted every block, let a handful
+//   of producers clear quorum alone, and let standby churn brick the freeze.
+//   Standbys are simply not in the quorum whether or not they are active.
+// - The freeze is prover-supplied, so honesty rides on two anchors the
+//   contract cannot provide: BPs verify-then-sign (the voter recomputes the
+//   declaration digest from the coordinated schedule and refuses a foreign
+//   freeze), and the A-Chain light-client check (the declared set must equal
+//   the recorded schedule with the version pinned to H, and every member
+//   key-anchored to checkpoint state). A false set cannot collect 15 of 21
+//   honest signatures.
+// - Only K1 schedule keys are supported. init fails closed on any non-K1
+//   key. Multisig schedules need a new ceremony, loudly, not a silent tally
+//   of the wrong keys.
 // - The vote digest is byte-identical to the A-Chain halt-declaration
 //   digest: domain || source-chain-id || H-be32 || member-count-be32 || per
 //   member (producer-len-be32 || producer-utf8 || key-compressed ||
-//   weight-be128), members in byte-lexicographic name order. One BP
-//   signature serves both the on-chain vote and the off-chain declaration.
+//   weight-be128, always 1), members in byte-lexicographic name order. One
+//   BP signature serves both the on-chain vote and the off-chain
+//   declaration.
 // - init is permissionless and re-runnable while no vote has landed, or
 //   once the freeze expired (see vote_window_us). A wrong-H init cannot
 //   forge a quorum (votes bind the stored H; BPs only sign the coordinated
@@ -38,13 +42,7 @@
 #include <eosio/eosio.hpp>
 #include <eosio/singleton.hpp>
 
-#include "schedule_view.hpp"
-
 namespace cutover {
-
-using schedule_view::compressed_key;
-using schedule_view::name_to_string;
-using schedule_view::system_producers_table;
 
 // PULSEVM-XPR-HALT-DECLARATION-v1: must match HALT_DECLARATION_DOMAIN in
 // pulsevm_chain_types::migration.
@@ -64,6 +62,14 @@ static uint64_t now_us() {
     return static_cast<uint64_t>(eosio::publication_time().time_since_epoch().count());
 }
 
+// One frozen schedule member as supplied to init: producer name plus its
+// schedule (block-signing) key. Weight is always 1 and is not transported.
+// (CDT reflection serializes this automatically; no serialize macro.)
+struct schedule_member {
+    eosio::name producer;
+    eosio::public_key key;
+};
+
 // Frozen ceremony state (singleton). Table typedefs live inside the
 // contract class so abigen emits them into the ABI (get_table_rows needs
 // the table definitions to decode rows).
@@ -71,6 +77,13 @@ struct [[eosio::table]] ceremony {
     uint64_t id = 0; // always 0: one ceremony per contract
     uint32_t h = 0;  // cutover height H
     eosio::checksum256 source_chain_id;
+    // The frozen schedule's version (the active schedule version at
+    // freeze time). The exporter pins every vote and H to this version;
+    // a rotation anywhere in the window fails closed off-chain.
+    uint32_t schedule_version = 0;
+    // Count quorum over unit members: total is the schedule size, voted
+    // is the signer count. Field names stay `*_weight` so existing
+    // table readers keep working; every member weighs 1.
     unsigned __int128 total_weight = 0;
     unsigned __int128 voted_weight = 0;
     bool finalized = false;
@@ -96,10 +109,8 @@ struct [[eosio::table]] member {
 };
 
 // Table iteration order is packed-uint64 order; the digest below re-sorts
-// byte-wise over canonical name strings (schedule_view::name_to_string),
-// matching the A-Chain declaration builder, so table order never leaks
-// into digests.
-
+// byte-wise over canonical name strings, matching the A-Chain declaration
+// builder, so table order never leaks into digests.
 static void append_be32(std::vector<char> &out, uint32_t value) {
     out.push_back(static_cast<char>((value >> 24) & 0xff));
     out.push_back(static_cast<char>((value >> 16) & 0xff));
@@ -113,18 +124,54 @@ static void append_be128(std::vector<char> &out, unsigned __int128 value) {
     }
 }
 
+static std::array<char, 33> compressed_key(const eosio::public_key &key) {
+    if (const auto *k1 = std::get_if<0>(&key)) {
+        return *k1;
+    }
+    eosio::check(false, "cutover: only K1 keys are supported");
+    return {};
+}
+
+// EOSIO name charmap for canonical stringification (matches the A-Chain
+// name codec; avoids any toolchain to_string drift).
+static std::string name_to_string(uint64_t value) {
+    static const char *charmap = ".12345abcdefghijklmnopqrstuvwxyz";
+    char str[14];
+    uint64_t tmp = value;
+    for (int i = 0; i <= 12; ++i) {
+        char c;
+        if (i == 0) {
+            c = charmap[tmp & 0x0f];
+            tmp >>= 4;
+        } else {
+            c = charmap[tmp & 0x1f];
+            tmp >>= 5;
+        }
+        str[12 - i] = c;
+    }
+    // Strip trailing dots (canonical form).
+    int len = 13;
+    while (len > 0 && str[len - 1] == '.') {
+        --len;
+    }
+    return std::string(str, len);
+}
+
 CONTRACT cutover : public eosio::contract {
   public:
     using eosio::contract::contract;
     using ceremony_singleton = eosio::singleton<"ceremony"_n, ceremony>;
     using member_table = eosio::multi_index<"members"_n, member>;
 
-    // Freeze the live schedule for cutover height H. Re-runnable while no
-    // vote has landed (voted_weight == 0), or once the freeze expired —
-    // even with votes on it, so an abandoned freeze can never brick the
-    // contract. Expiry is publication_time() based, hence XPR consensus
-    // time, not wall clock.
-    ACTION init(uint32_t h, const eosio::checksum256 &source_chain_id) {
+    // Freeze the coordinated active schedule for cutover height H.
+    // Re-runnable while no vote has landed (voted_weight == 0), or once
+    // the freeze expired — even with votes on it, so an abandoned freeze
+    // can never brick the contract. Expiry is publication_time() based,
+    // hence XPR consensus time, not wall clock.
+    ACTION init(uint32_t h,
+               const eosio::checksum256 &source_chain_id,
+               uint32_t schedule_version,
+               const std::vector<schedule_member> &schedule) {
         ceremony_singleton state(get_self(), get_self().value);
         if (state.exists()) {
             auto current = state.get();
@@ -139,67 +186,54 @@ CONTRACT cutover : public eosio::contract {
                 it = members.erase(it);
             }
         }
-        system_producers_table schedule(eosio::name("eosio"), eosio::name("eosio").value);
-        unsigned __int128 total = 0;
-        uint32_t count = 0;
-        // Collect active members first so the digest order (byte-wise name
-        // order) is independent of table iteration.
+        eosio::check(!schedule.empty(), "cutover: frozen schedule is empty");
+        // Sort byte-wise over canonical name strings so the digest order
+        // is independent of parameter order, matching the A-Chain
+        // declaration builder.
         struct frozen {
             std::string producer;
             eosio::public_key key;
-            unsigned __int128 weight;
         };
         std::vector<frozen> set;
-        for (const auto &row : schedule) {
-            if (!row.is_active) {
-                continue;
-            }
+        for (const auto &entry : schedule) {
             // The roster key is the schedule key, gated to K1 here (a
             // non-K1 schedule key would mint an entry nobody can sign for,
-            // and votes recover K1 only). XPR producers rows carry no
-            // authority — verified against live mainnet rows — and the
-            // schedule key is the only consensus-relevant key: producer
-            // multisig permissions, where they exist, live in account
-            // authorities that block production never consults.
-            schedule_view::compressed_key(row.producer_key);
-            // NaN fails self-equality; infinities fail the upper bound.
-            // (CDT 1.8 has no std::isfinite for contracts.)
-            eosio::check(row.total_votes == row.total_votes && row.total_votes >= 0.0 &&
-                             row.total_votes < 1.0e30,
-                         "cutover: producer vote weight is not a usable float");
-            unsigned __int128 weight = static_cast<unsigned __int128>(row.total_votes);
-            set.push_back({name_to_string(row.owner.value), row.producer_key, weight});
-            total += weight;
-            ++count;
+            // and votes recover K1 only).
+            compressed_key(entry.key);
+            eosio::check(entry.producer.value != 0, "cutover: schedule member name is empty");
+            set.push_back({name_to_string(entry.producer.value), entry.key});
         }
-        eosio::check(count > 0, "cutover: live schedule has no active producers");
-        eosio::check(total > 0, "cutover: live schedule carries no weight");
         std::sort(set.begin(), set.end(), [](const frozen &a, const frozen &b) {
             return a.producer < b.producer;
         });
+        for (size_t i = 1; i < set.size(); ++i) {
+            eosio::check(set[i - 1].producer != set[i].producer,
+                         "cutover: schedule names a producer twice");
+        }
         member_table members(get_self(), get_self().value);
         std::vector<char> message(declaration_domain,
                                   declaration_domain + sizeof(declaration_domain) - 1);
         const auto chain_bytes = source_chain_id.extract_as_byte_array();
         message.insert(message.end(), chain_bytes.begin(), chain_bytes.end());
         append_be32(message, h);
-        append_be32(message, count);
+        append_be32(message, static_cast<uint32_t>(set.size()));
         for (const auto &entry : set) {
             members.emplace(get_self(), [&](auto &row) {
                 row.producer = eosio::name(entry.producer);
                 row.key = entry.key;
-                row.weight = entry.weight;
+                row.weight = 1;
             });
             append_be32(message, static_cast<uint32_t>(entry.producer.size()));
             message.insert(message.end(), entry.producer.begin(), entry.producer.end());
             const auto key_bytes = compressed_key(entry.key);
             message.insert(message.end(), key_bytes.begin(), key_bytes.end());
-            append_be128(message, entry.weight);
+            append_be128(message, 1);
         }
         eosio::checksum256 digest =
             eosio::sha256(message.data(), static_cast<uint32_t>(message.size()));
+        unsigned __int128 total = static_cast<unsigned __int128>(set.size());
         state.set(
-            ceremony{0, h, source_chain_id, total, 0, false, digest, now_us()},
+            ceremony{0, h, source_chain_id, schedule_version, total, 0, false, digest, now_us()},
             get_self());
     }
 
@@ -207,7 +241,8 @@ CONTRACT cutover : public eosio::contract {
     // digest by the frozen schedule key. Permissionless: the signature is
     // the authorization, so anyone may relay votes. Votes land inside the
     // freeze window only; afterwards the freeze is expired (re-init for a
-    // fresh one) so a stale freeze can never finalize late.
+    // fresh one) so a stale freeze can never finalize late. One member,
+    // one vote: the tally is a count quorum.
     ACTION vote(const eosio::name &producer, const eosio::signature &sig) {
         ceremony_singleton state(get_self(), get_self().value);
         eosio::check(state.exists(), "cutover: no frozen ceremony; init first");
@@ -226,7 +261,7 @@ CONTRACT cutover : public eosio::contract {
         eosio::check(compressed_key(recovered) == compressed_key(it->key),
                      "cutover: signature is not from the frozen schedule key");
         members.modify(it, eosio::same_payer, [&](auto &row) { row.voted = true; });
-        frozen.voted_weight += it->weight;
+        frozen.voted_weight += 1;
         if (frozen.voted_weight * 3 > frozen.total_weight * 2) {
             frozen.finalized = true;
         }

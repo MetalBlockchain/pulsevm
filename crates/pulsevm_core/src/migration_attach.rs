@@ -1,0 +1,1202 @@
+//! Record the frozen XPR schedule and the post-H emptiness proof into a
+//! migration manifest.
+//!
+//! These are the file-format halves of `xpr_attach_source_block`: the example
+//! owns CLI parsing and file IO, while everything that interprets bytes
+//! lives here so unit tests can drive it against the real restore gate.
+//! The wire layout packed here must stay byte-identical to the layout the
+//! gate's `verify_migration_post_chain` parses: hand-rolled packing is
+//! deliberate, so a shared-serializer change can never silently move the
+//! consensus bytes.
+
+use std::{
+    collections::VecDeque,
+    str::FromStr,
+};
+
+use chrono::NaiveDateTime;
+use pulsevm_crypto::{
+    Digest,
+    k1::K1PublicKey,
+};
+use serde_json::Value;
+
+use crate::{
+    block::{
+        BlockHeader,
+        SignedBlock,
+        SignedBlockHeader,
+    },
+    crypto::Signature,
+    id::Id,
+    name::Name,
+};
+use pulsevm_database::{
+    BlockTimestamp,
+    HaltWeight,
+    MigrationHaltRosterEntry,
+    MigrationManifest,
+};
+
+fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("source block field {field} is missing or not a string"))
+}
+
+fn required_u64(value: &Value, field: &str) -> Result<u64, String> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("source block field {field} is missing or not an integer"))
+}
+
+fn parse_digest(value: &str) -> Result<Digest, String> {
+    let bytes =
+        hex::decode(value).map_err(|error| format!("digest is not hexadecimal: {error}"))?;
+    Ok(Digest(bytes.try_into().map_err(|_| {
+        "digest must contain exactly 32 bytes".to_string()
+    })?))
+}
+
+fn parse_extensions(value: Option<&Value>) -> Result<Vec<(u16, Vec<u8>)>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "header_extensions is not an array".to_string())?;
+    entries
+        .iter()
+        .map(|entry| {
+            let pair = entry
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| "header extension is not an [id, hex] pair".to_string())?;
+            let id = pair[0]
+                .as_u64()
+                .ok_or_else(|| "header extension id is not an integer".to_string())?
+                .try_into()
+                .map_err(|_| "header extension id does not fit u16".to_string())?;
+            let payload = pair[1]
+                .as_str()
+                .ok_or_else(|| "header extension payload is not a string".to_string())?;
+            let payload = hex::decode(payload)
+                .map_err(|error| format!("header extension payload is not hex: {error}"))?;
+            Ok((id, payload))
+        })
+        .collect()
+}
+
+/// One `get_block` response's timestamp on the deferred rows' clock
+/// (Unix microseconds): block slots count 500ms steps from the Antelope
+/// epoch, while deferred `delay_until`/`expiration` are Unix `time_point`
+/// microseconds. `source` names the file in diagnostics only.
+pub fn boundary_block_unix_micros(value: &Value, source: &str) -> Result<i64, String> {
+    let text = required_str(value, "timestamp")
+        .map_err(|error| format!("post-H block {source} timestamp unreadable: {error}"))?;
+    let slot = parse_slot(text)
+        .map_err(|error| format!("post-H block {source} timestamp invalid: {error}"))?;
+    Ok(pulsevm_database::antelope_slot_to_unix_micros(slot))
+}
+
+/// Deferred-inventory window from staged block responses: the H response
+/// opens the window at its header time, the last staged post-H response
+/// closes it — or H itself when the pause landed exactly on H and no
+/// post-H headers were staged. Each entry is `(source, response)` with
+/// `source` naming the file in diagnostics only.
+pub fn post_window_unix_micros(
+    halt: &Value,
+    posts: &[(&str, &Value)],
+) -> Result<(i64, i64), String> {
+    let start = boundary_block_unix_micros(halt, "cutover block")?;
+    let mut end = start;
+    for (source, response) in posts {
+        let value = response.get("result").unwrap_or(response);
+        // The latest observed header time closes the window: a deferred
+        // due by any staged header is due in-window.
+        end = end.max(boundary_block_unix_micros(value, source)?);
+    }
+    if end < start {
+        return Err(format!(
+            "post-H headers end ({end}) before the cutover block ({start}): refusing an unorderable window"
+        ));
+    }
+    Ok((start, end))
+}
+
+fn parse_slot(value: &str) -> Result<u32, String> {
+    let format = if value.contains('.') {
+        "%Y-%m-%dT%H:%M:%S%.f"
+    } else {
+        "%Y-%m-%dT%H:%M:%S"
+    };
+    let timestamp = NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), format)
+        .map_err(|error| format!("timestamp: {error}"))?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .expect("valid Antelope epoch")
+        .and_hms_opt(0, 0, 0)
+        .expect("valid Antelope epoch time");
+    let milliseconds = (timestamp - epoch).num_milliseconds();
+    if milliseconds < 0 || milliseconds % 500 != 0 {
+        return Err("timestamp is before the Antelope epoch or not slot-aligned".into());
+    }
+    (milliseconds / 500)
+        .try_into()
+        .map_err(|_| "timestamp slot does not fit u32".to_string())
+}
+
+/// Parse one `get_block` response into a signed block, enforcing the empty
+/// boundary shape: no transactions, no producer schedule change, no
+/// unsupported block extensions. Shared by the H anchor and every post-H
+/// header so both run the same shape check.
+pub fn parse_boundary_block(value: &Value) -> Result<SignedBlock, String> {
+    let transactions = value
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "source block has no transactions array".to_string())?;
+    if !transactions.is_empty() {
+        return Err("source block is not empty; select an empty snapshot boundary".into());
+    }
+    if value
+        .get("new_producers")
+        .is_some_and(|new_producers| !new_producers.is_null())
+    {
+        return Err("source block carries a producer schedule change".into());
+    }
+    let block_extensions = value.get("block_extensions");
+    if block_extensions.is_some_and(|extensions| {
+        !extensions.is_null() && extensions.as_array().is_none_or(|items| !items.is_empty())
+    }) {
+        return Err("source block carries unsupported block extensions".into());
+    }
+    let header_extensions = parse_extensions(value.get("header_extensions"))?;
+    Ok(SignedBlock {
+        signed_block_header: SignedBlockHeader {
+            header: BlockHeader {
+                timestamp: BlockTimestamp::new(parse_slot(required_str(value, "timestamp")?)?),
+                producer: Name::from_str(required_str(value, "producer")?)
+                    .map_err(|error| format!("producer: {error}"))?,
+                confirmed: required_u64(value, "confirmed")?
+                    .try_into()
+                    .map_err(|_| "confirmed does not fit u16".to_string())?,
+                previous: Id::from_str(required_str(value, "previous")?)
+                    .map_err(|error| format!("previous: {error}"))?,
+                transaction_mroot: parse_digest(required_str(value, "transaction_mroot")?)?,
+                action_mroot: parse_digest(required_str(value, "action_mroot")?)?,
+                schedule_version: required_u64(value, "schedule_version")?
+                    .try_into()
+                    .map_err(|_| "schedule_version does not fit u32".to_string())?,
+                new_producers: None,
+                header_extensions,
+            },
+            signature: Signature::from_str(required_str(value, "producer_signature")?)
+                .map_err(|error| format!("producer_signature: {error}"))?,
+        },
+        transactions: VecDeque::new(),
+        block_extensions: Vec::new(),
+    })
+}
+
+fn push_varuint32(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Record the frozen active schedule from a `get_producer_schedule`
+/// response: every active producer at unit weight with its schedule signing
+/// key. `source` names the file in diagnostics only. The restore gate
+/// requires this schedule to equal the declared set exactly, so record it
+/// from the same live query the freeze votes checked. Fills in
+/// `halt_schedule_version` when the contract-ceremony path did not pin one
+/// already; a conflict between the two fails closed.
+pub fn record_halt_schedule(
+    manifest: &mut MigrationManifest,
+    schedule: &Value,
+    source: &str,
+    expected_version: u32,
+) -> Result<usize, String> {
+    let active = schedule
+        .get("active")
+        .ok_or_else(|| format!("schedule {source} has no active schedule"))?;
+    let version: u32 = active
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("schedule {source} has no active version"))?
+        .try_into()
+        .map_err(|_| format!("schedule {source} version does not fit u32"))?;
+    if version != expected_version {
+        return Err(format!(
+            "schedule {source} version {version} does not match the H schedule version {expected_version}"
+        ));
+    }
+    let producers = active
+        .get("producers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("schedule {source} has no active producers"))?;
+    if producers.is_empty() {
+        return Err(format!("schedule {source} carries no producers"));
+    }
+    let mut roster = Vec::with_capacity(producers.len());
+    for producer in producers {
+        let name = producer
+            .get("producer_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("schedule {source} producer has no producer_name"))?;
+        // Leap 4+ schedules carry the block-signing key inside the producer
+        // authority (outer threshold plus threshold-and-keys), not a flat
+        // block_signing_key field. Only a single-key, threshold-1 authority
+        // maps to one roster key; anything else fails closed rather than
+        // guessing which key signs the producer's blocks.
+        let authority = producer
+            .get("authority")
+            .and_then(|authority| authority.as_array())
+            .ok_or_else(|| format!("schedule {source} producer {name} has no authority"))?;
+        let [tag, versioned] = authority.as_slice() else {
+            return Err(format!(
+                "schedule {source} producer {name} authority is not a versioned pair"
+            ));
+        };
+        // Leap 4 serves the v0 authority at tag 0, Leap 5 at tag 1; both
+        // carry the threshold-and-keys object. Anything else is a shape
+        // the exporter must not guess at.
+        let known = tag.as_u64().is_some_and(|tag| tag <= 1);
+        if !known {
+            return Err(format!(
+                "schedule {source} producer {name} authority has unknown variant tag {tag}"
+            ));
+        }
+        let threshold = versioned
+            .get("threshold")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!("schedule {source} producer {name} authority has no threshold")
+            })?;
+        if threshold != 1 {
+            return Err(format!(
+                "schedule {source} producer {name} authority threshold is {threshold}, not 1"
+            ));
+        }
+        let keys = versioned
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("schedule {source} producer {name} authority has no keys"))?;
+        let [entry] = keys.as_slice() else {
+            return Err(format!(
+                "schedule {source} producer {name} authority does not name exactly one block-signing key"
+            ));
+        };
+        let key = entry
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("schedule {source} producer {name} authority key has no key"))?;
+        K1PublicKey::from_string(key)
+            .map_err(|error| format!("schedule key for {name} is not a K1 key: {error:?}"))?;
+        if roster
+            .iter()
+            .any(|entry: &MigrationHaltRosterEntry| entry.producer == name)
+        {
+            return Err(format!("schedule {source} names {name} twice"));
+        }
+        roster.push(MigrationHaltRosterEntry {
+            producer: name.to_string(),
+            key: key.to_string(),
+            weight: HaltWeight::MEMBER,
+        });
+    }
+    let count = roster.len();
+    match manifest.halt_schedule_version {
+        Some(pinned) if pinned != version => {
+            return Err(format!(
+                "schedule {source} version {version} conflicts with the recorded schedule version {pinned}"
+            ));
+        }
+        Some(_) => {}
+        None => manifest.halt_schedule_version = Some(version),
+    }
+    manifest.halt_schedule = Some(roster);
+    Ok(count)
+}
+
+/// Leap's block-signature digest, mirrored from the consensus rule
+/// (`block_header_state::sig_digest`): the producer signs
+/// `sha256(sha256(sha256(header) || blockroot_root) || pending_schedule_hash)`,
+/// with the root read as the blockroot Merkle's last active node
+/// (`incremental_merkle::get_root`), not the bare header digest. The
+/// blockroot root commits the header to its full ancestry and the
+/// schedule hash binds the pending schedule; both inputs are
+/// authenticated by the signature itself (only the true pair recovers to
+/// the signing key), so the gate can trust the recorded values after
+/// re-verifying the signature. See `verify_migration_post_chain` for the
+/// identical computation at boot.
+pub fn leap_sig_digest(
+    header_digest: &[u8; 32],
+    blockroot_root: &[u8; 32],
+    schedule_hash: &[u8; 32],
+) -> [u8; 32] {
+    // Inner: sha256 of the header digest concatenated with the root —
+    // the header bytes are NOT re-hashed with the root.
+    let mut digest_and_root = Vec::with_capacity(64);
+    digest_and_root.extend_from_slice(header_digest);
+    digest_and_root.extend_from_slice(blockroot_root);
+    let header_bound = Digest::hash(&digest_and_root).0;
+    let mut bound_and_schedule = Vec::with_capacity(64);
+    bound_and_schedule.extend_from_slice(&header_bound);
+    bound_and_schedule.extend_from_slice(schedule_hash);
+    Digest::hash(&bound_and_schedule).0
+}
+
+/// Read one `get_block_header_state` response down to the two signature
+/// inputs the header alone cannot supply: the blockroot Merkle root (the
+/// last active node — the repo's `IncrementalBlockMerkle::root` reads the
+/// same element) and the pending schedule hash, served verbatim so no
+/// Leap packing has to be reproduced.
+pub fn read_post_state(state: &Value, source: &str) -> Result<([u8; 32], [u8; 32]), String> {
+    let nodes = state
+        .get("blockroot_merkle")
+        .and_then(|merkle| merkle.get("_active_nodes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("post-H state {source} has no blockroot active nodes"))?;
+    let root_hex = nodes
+        .last()
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("post-H state {source} has an empty blockroot"))?;
+    let root: [u8; 32] = hex::decode(root_hex)
+        .map_err(|error| format!("post-H state {source} blockroot is not hex: {error}"))?
+        .try_into()
+        .map_err(|_| format!("post-H state {source} blockroot is not 32 bytes"))?;
+    let hash_hex = state
+        .get("pending_schedule")
+        .and_then(|pending| pending.get("schedule_hash"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("post-H state {source} has no pending schedule hash"))?;
+    let schedule_hash: [u8; 32] = hex::decode(hash_hex)
+        .map_err(|error| format!("post-H state {source} schedule hash is not hex: {error}"))?
+        .try_into()
+        .map_err(|_| format!("post-H state {source} schedule hash is not 32 bytes"))?;
+    Ok((root, schedule_hash))
+}
+
+/// Record post-H headers from `get_block` responses and authenticate each
+/// one at record time: the header hash-links from the trusted H id with
+/// ascending numbers, carries an empty transaction root, introduces no
+/// schedule change, and its producer signature — over Leap's signature
+/// digest (header, blockroot, schedule hash) — recovers to the recorded
+/// schedule key for its producer. `states` carries the matching
+/// `get_block_header_state` responses in the same order; `source` names the
+/// file in diagnostics only. The packed hex (`root || schedule-hash ||
+/// header || signature || counts || block-id`) is what the restore gate
+/// re-verifies, so the packing here must stay byte-identical to its wire
+/// layout. The trailing id is the block's own Leap-stated id, chained
+/// verbatim: neither side recomputes Leap's id formula.
+pub fn record_post_blocks(
+    manifest: &mut MigrationManifest,
+    halt_id: &Id,
+    halt_height: u32,
+    halt_schedule_version: u32,
+    blocks: &[(&str, &Value)],
+    states: &[(&str, &Value)],
+) -> Result<usize, String> {
+    if blocks.len() != states.len() {
+        return Err(format!(
+            "post-H headers need one header state each: {} blocks but {} states",
+            blocks.len(),
+            states.len()
+        ));
+    }
+    let roster = manifest.halt_schedule.as_ref().ok_or_else(|| {
+        "post-H headers need a recorded schedule: record --schedule first, or attach a declaration pair carrying the roster".to_string()
+    })?;
+    let mut keys = std::collections::BTreeMap::new();
+    for entry in roster {
+        let key = K1PublicKey::from_string(&entry.key).map_err(|error| {
+            format!(
+                "recorded schedule key for {} invalid: {error:?}",
+                entry.producer
+            )
+        })?;
+        if keys.insert(entry.producer.clone(), key).is_some() {
+            return Err(format!("recorded schedule names {} twice", entry.producer));
+        }
+    }
+    // No hash pin on the state's pending schedule: with no staged change
+    // Leap serves the EMPTY pending schedule, whose hash cannot equal the
+    // active roster's (proven against live header states). The signature
+    // itself binds the exact (root, hash) pair — only the true pair
+    // recovers to the roster key — so a forged state fails at recovery,
+    // not at a comparison.
+    let halt_bytes = halt_id.as_bytes();
+    let mut expected_previous: [u8; 32] = halt_bytes
+        .try_into()
+        .map_err(|_| "halt block id is not 32 bytes".to_string())?;
+    let mut expected_num = halt_height
+        .checked_add(1)
+        .ok_or_else(|| "halt height overflows u32".to_string())?;
+    let mut packed_all = Vec::with_capacity(blocks.len());
+    for ((source, response), (state_source, state)) in blocks.iter().zip(states.iter()) {
+        let value = response.get("result").unwrap_or(response);
+        let block = parse_boundary_block(value)
+            .map_err(|error| format!("post-H block {source}: {error}"))?;
+        let header = &block.signed_block_header.header;
+        let parent_num = u32::from_be_bytes(
+            expected_previous[0..4]
+                .try_into()
+                .map_err(|_| format!("post-H block {source} has a malformed parent id"))?,
+        );
+        if parent_num.checked_add(1) != Some(expected_num) {
+            return Err(format!(
+                "post-H block {source} does not follow its parent height"
+            ));
+        }
+        if header.previous.as_bytes() != expected_previous {
+            return Err(format!(
+                "post-H block {source} does not hash-link to its parent"
+            ));
+        }
+        // Chain the block's own Leap-stated id verbatim instead of
+        // recomputing it: the id formula is Leap's business, and carrying
+        // the stated bytes keeps the record — and the gate that replays
+        // it — independent of that formula. The number check below proves
+        // the stated id belongs to this height.
+        let stated_id: [u8; 32] = value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|hex| hex::decode(hex).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| format!("post-H block {source} has no 32-byte id"))?;
+        if stated_id[0..4] != expected_num.to_be_bytes() {
+            return Err(format!(
+                "post-H block {source} id does not carry its own height"
+            ));
+        }
+        if header.transaction_mroot != Digest([0u8; 32]) {
+            return Err(format!(
+                "post-H block {source} is not empty: transaction root is set"
+            ));
+        }
+        if header.schedule_version != halt_schedule_version {
+            return Err(format!(
+                "post-H block {source} rotates the schedule version to {}",
+                header.schedule_version
+            ));
+        }
+        let state_value = state.get("result").unwrap_or(state);
+        let (blockroot_root, schedule_hash) = read_post_state(state_value, state_source)
+            .map_err(|error| format!("post-H block {source}: {error}"))?;
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(&header.timestamp.slot().to_le_bytes());
+        header_bytes.extend_from_slice(&header.producer.as_u64().to_le_bytes());
+        header_bytes.extend_from_slice(&header.confirmed.to_le_bytes());
+        header_bytes.extend_from_slice(header.previous.as_bytes());
+        header_bytes.extend_from_slice(&header.transaction_mroot.0);
+        header_bytes.extend_from_slice(&header.action_mroot.0);
+        header_bytes.extend_from_slice(&header.schedule_version.to_le_bytes());
+        header_bytes.push(0); // no schedule change (boundary-checked above)
+        push_varuint32(&mut header_bytes, header.header_extensions.len() as u32);
+        for (id, payload) in &header.header_extensions {
+            header_bytes.extend_from_slice(&id.to_le_bytes());
+            push_varuint32(&mut header_bytes, payload.len() as u32);
+            header_bytes.extend_from_slice(payload);
+        }
+        // The recorded proof leads with the two signature inputs the header
+        // cannot supply, so the gate recomputes Leap's digest from the packed
+        // bytes alone.
+        let mut packed = Vec::with_capacity(64 + header_bytes.len() + 67);
+        packed.extend_from_slice(&blockroot_root);
+        packed.extend_from_slice(&schedule_hash);
+        packed.extend_from_slice(&header_bytes);
+        let header_digest = Digest::hash(&header_bytes).0;
+        let digest = leap_sig_digest(&header_digest, &blockroot_root, &schedule_hash);
+        let signature_str = value
+            .get("producer_signature")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("post-H block {source} has no producer_signature"))?;
+        let signature = pulsevm_crypto::k1::K1Signature::from_string(signature_str)
+            .map_err(|error| format!("post-H block {source} signature is not K1: {error:?}"))?;
+        let recovered = signature.recover(&digest).map_err(|error| {
+            format!("post-H block {source} signature does not recover: {error:?}")
+        })?;
+        let producer_name = header.producer.to_string();
+        let expected_key = keys.get(&producer_name).ok_or_else(|| {
+            format!(
+                "post-H block {source} producer {producer_name} is not in the recorded schedule"
+            )
+        })?;
+        if recovered != *expected_key {
+            return Err(format!(
+                "post-H block {source} is not signed by the recorded schedule key for {producer_name}"
+            ));
+        }
+        packed.push(0); // K1 tag
+        packed.extend_from_slice(&signature.compact65());
+        packed.push(0); // no transactions (boundary-checked above)
+        packed.push(0); // no block extensions
+        packed.extend_from_slice(&stated_id);
+        expected_previous = stated_id;
+        expected_num = expected_num
+            .checked_add(1)
+            .ok_or_else(|| "post-H height overflows u32".to_string())?;
+        packed_all.push(hex::encode(&packed));
+    }
+    let count = packed_all.len();
+    manifest.halt_post_blocks = Some(packed_all);
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulsevm_crypto::{
+        R1Signature,
+        k1::K1PrivateKey,
+    };
+    use pulsevm_database::{
+        HaltDeclaration,
+        HaltDeclarationMember,
+        ImportSummary,
+        verify_migration_post_chain,
+    };
+
+    const VERSION: u32 = 1436;
+    const HEIGHT: u32 = 8;
+
+    fn slot_iso(slot: u32) -> String {
+        let ms = u64::from(slot) * 500;
+        let secs = ms / 1000;
+        let millis = ms % 1000;
+        // Test slots stay within the first minute of the Antelope epoch.
+        if millis == 0 {
+            format!("2000-01-01T00:00:{secs:02}")
+        } else {
+            format!("2000-01-01T00:00:{secs:02}.{millis:03}")
+        }
+    }
+
+    /// Independent re-derivation of the gate's empty-header wire layout: any
+    /// drift between this and [`record_post_blocks`] breaks the signatures
+    /// below or the gate oracle at the end of the round-trip test.
+    fn pack_header(slot: u32, producer: u64, previous: &[u8; 32], version: u32) -> Vec<u8> {
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&slot.to_le_bytes());
+        packed.extend_from_slice(&producer.to_le_bytes());
+        packed.extend_from_slice(&0u16.to_le_bytes());
+        packed.extend_from_slice(previous);
+        packed.extend_from_slice(&[0u8; 32]);
+        packed.extend_from_slice(&[0u8; 32]);
+        packed.extend_from_slice(&version.to_le_bytes());
+        packed.push(0); // no schedule change
+        packed.push(0); // no header extensions
+        packed
+    }
+
+    fn block_json(
+        slot: u32,
+        producer: &str,
+        previous: [u8; 32],
+        version: u32,
+        signature: &str,
+        num: u32,
+        id: [u8; 32],
+    ) -> Value {
+        serde_json::json!({
+            "timestamp": slot_iso(slot),
+            "producer": producer,
+            "confirmed": 0,
+            "previous": hex::encode(previous),
+            "transaction_mroot": "00".repeat(32),
+            "action_mroot": "00".repeat(32),
+            "schedule_version": version,
+            "new_producers": null,
+            "header_extensions": [],
+            "producer_signature": signature,
+            "transactions": [],
+            "block_num": num,
+            "id": hex::encode(id),
+        })
+    }
+
+    fn schedule_json(version: u32, members: &[(&K1PrivateKey, &str)]) -> Value {
+        schedule_json_with(
+            version,
+            &members
+                .iter()
+                .map(|(key, name)| {
+                    (
+                        (*name).to_string(),
+                        key.public_key().to_string(),
+                        1u64,
+                        1usize,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Build a `get_producer_schedule` response in the Leap 4+ shape:
+    /// each member is (name, key, threshold, key count). Multi-key members
+    /// exercise the fail-closed path.
+    fn schedule_json_with(version: u32, members: &[(String, String, u64, usize)]) -> Value {
+        serde_json::json!({
+            "active": {
+                "version": version,
+                "producers": members.iter().map(|(name, key, threshold, count)| {
+                    let keys: Vec<Value> = (0..*count).map(|i| {
+                        serde_json::json!({"key": if i == 0 { key.clone() } else { key.clone() + &i.to_string() }, "weight": 1})
+                    }).collect();
+                    serde_json::json!({
+                        "producer_name": name,
+                        "authority": [1, {"threshold": threshold, "keys": keys}],
+                    })
+                }).collect::<Vec<_>>(),
+            }
+        })
+    }
+
+    fn manifest_for(halt_id: [u8; 32]) -> MigrationManifest {
+        MigrationManifest::new(
+            b"migration attach test",
+            halt_id,
+            b"checkpoint",
+            1,
+            ImportSummary::default(),
+        )
+    }
+
+    fn declaration_for(members: &[(&K1PrivateKey, &str)]) -> HaltDeclaration {
+        let mut validator_set: Vec<HaltDeclarationMember> = members
+            .iter()
+            .map(|(key, name)| HaltDeclarationMember {
+                producer: (*name).to_string(),
+                key: key.public_key().to_string(),
+                weight: HaltWeight::MEMBER,
+            })
+            .collect();
+        validator_set.sort_by(|a, b| a.producer.cmp(&b.producer));
+        HaltDeclaration {
+            version: 2,
+            source_chain_id: "00".repeat(32),
+            last_height: HEIGHT,
+            validator_set,
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Synthetic but fixed signature inputs: every test signs and verifies
+    /// over the same root/schedule-hash pair, so the round-trip exercises
+    /// the true Leap digest path with deterministic fixtures.
+    const TEST_ROOT_A: [u8; 32] = [0xA1; 32];
+    const TEST_ROOT_B: [u8; 32] = [0xB2; 32];
+
+    fn state_json(root: &[u8; 32], schedule_hash: &[u8; 32]) -> Value {
+        serde_json::json!({
+            "blockroot_merkle": {
+                "_active_nodes": [hex::encode([0u8; 32]), hex::encode([1u8; 32]), hex::encode(root)],
+                "_node_count": 9,
+            },
+            "pending_schedule": {"schedule_hash": hex::encode(schedule_hash)},
+        })
+    }
+
+    /// Build H plus two signed post-H headers; returns the manifest with the
+    /// schedule recorded, the parsed H id, the post-H responses, and the
+    /// matching header states.
+    #[allow(clippy::type_complexity)]
+    fn frozen_setup() -> (
+        MigrationManifest,
+        [u8; 32],
+        K1PrivateKey,
+        K1PrivateKey,
+        Vec<(&'static str, Value)>,
+        Vec<(&'static str, Value)>,
+    ) {
+        let key_a = K1PrivateKey::random();
+        let key_b = K1PrivateKey::random();
+        let members = [(&key_a, "alice"), (&key_b, "bob")];
+
+        let mut halt_previous = [0u8; 32];
+        halt_previous[0..4].copy_from_slice(&7u32.to_be_bytes());
+        let halt_packed = pack_header(100, name_u64("eosio"), &halt_previous, VERSION);
+        let halt_digest = Digest::hash(&halt_packed).0;
+        let halt_json = block_json(
+            100,
+            "eosio",
+            halt_previous,
+            VERSION,
+            &key_a.sign(&halt_digest).to_string(),
+            HEIGHT,
+            halt_digest_with_num(&halt_digest, HEIGHT),
+        );
+        let halt_block = parse_boundary_block(&halt_json).expect("H parses");
+        let halt_id: [u8; 32] = halt_block
+            .id()
+            .expect("H id")
+            .as_bytes()
+            .try_into()
+            .expect("H id is 32 bytes");
+
+        let mut manifest = manifest_for(halt_id);
+        let schedule = schedule_json(VERSION, &members);
+        let recorded = record_halt_schedule(&mut manifest, &schedule, "test-schedule", VERSION)
+            .expect("schedule records");
+        assert_eq!(recorded, 2);
+        assert_eq!(manifest.halt_schedule_version, Some(VERSION));
+        // The header states name a fixed schedule hash: the record path
+        // binds the exact (root, hash) pair through the producer
+        // signature, so any consistent value exercises the real check.
+        let schedule_hash = FIXTURE_SCHEDULE_HASH;
+
+        let mut previous = halt_id;
+        let mut posts = Vec::new();
+        let mut post_states = Vec::new();
+        for (num, (slot, (key, name, root))) in (HEIGHT + 1..).zip(
+            [101u32, 102]
+                .into_iter()
+                .zip([(&key_a, "alice", TEST_ROOT_A), (&key_b, "bob", TEST_ROOT_B)]),
+        ) {
+            let packed = pack_header(slot, name_u64(name), &previous, VERSION);
+            let header_digest = Digest::hash(&packed).0;
+            let digest = leap_sig_digest(&header_digest, &root, &schedule_hash);
+            let id = halt_digest_with_num(&header_digest, num);
+            let json = block_json(
+                slot,
+                name,
+                previous,
+                VERSION,
+                &key.sign(&digest).to_string(),
+                num,
+                id,
+            );
+            posts.push((name, json));
+            post_states.push((name, state_json(&root, &schedule_hash)));
+            previous = id;
+        }
+        (manifest, halt_id, key_a, key_b, posts, post_states)
+    }
+
+    fn name_u64(name: &str) -> u64 {
+        Name::from_str(name).expect("valid producer name").as_u64()
+    }
+
+    fn halt_digest_with_num(digest: &[u8; 32], num: u32) -> [u8; 32] {
+        let mut id = *digest;
+        id[0..4].copy_from_slice(&num.to_be_bytes());
+        id
+    }
+
+    /// Fixed schedule hash the fixtures stage: the signature binds the
+    /// exact (root, hash) pair Leap signed over, so any consistent value
+    /// exercises the real check.
+    const FIXTURE_SCHEDULE_HASH: [u8; 32] = [0x5E; 32];
+
+    #[test]
+    fn schedule_records_unit_weights_and_pins_version() {
+        let key_a = K1PrivateKey::random();
+        let key_b = K1PrivateKey::random();
+        let schedule = schedule_json(VERSION, &[(&key_a, "alice"), (&key_b, "bob")]);
+        let mut manifest = manifest_for([7u8; 32]);
+        let recorded =
+            record_halt_schedule(&mut manifest, &schedule, "test-schedule", VERSION).unwrap();
+        assert_eq!(recorded, 2);
+        assert_eq!(manifest.halt_schedule_version, Some(VERSION));
+        let roster = manifest.halt_schedule.expect("schedule recorded");
+        assert!(
+            roster
+                .iter()
+                .all(|entry| entry.weight == HaltWeight::MEMBER)
+        );
+        let names: Vec<_> = roster.iter().map(|entry| entry.producer.as_str()).collect();
+        assert_eq!(names, ["alice", "bob"]);
+    }
+
+    #[test]
+    fn schedule_rejects_version_mismatch() {
+        let key = K1PrivateKey::random();
+        let schedule = schedule_json(VERSION + 1, &[(&key, "alice")]);
+        let mut manifest = manifest_for([7u8; 32]);
+        let error =
+            record_halt_schedule(&mut manifest, &schedule, "test-schedule", VERSION).unwrap_err();
+        assert!(
+            error.contains("does not match the H schedule version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schedule_rejects_duplicate_bad_key_and_empty() {
+        let key = K1PrivateKey::random();
+        let mut manifest = manifest_for([7u8; 32]);
+        let dup = schedule_json(VERSION, &[(&key, "alice"), (&key, "alice")]);
+        let error = record_halt_schedule(&mut manifest, &dup, "s", VERSION).unwrap_err();
+        assert!(error.contains("twice"), "{error}");
+        let bad_key = schedule_json_with(
+            VERSION,
+            &[("alice".to_string(), "not-a-key".to_string(), 1, 1)],
+        );
+        let error = record_halt_schedule(&mut manifest, &bad_key, "s", VERSION).unwrap_err();
+        assert!(error.contains("not a K1 key"), "{error}");
+        let empty = serde_json::json!({
+            "active": {"version": VERSION, "producers": []}
+        });
+        let error = record_halt_schedule(&mut manifest, &empty, "s", VERSION).unwrap_err();
+        assert!(error.contains("no producers"), "{error}");
+    }
+
+    #[test]
+    fn schedule_rejects_multi_key_and_threshold_authorities() {
+        let key = K1PrivateKey::random();
+        let key_str = key.public_key().to_string();
+        let mut manifest = manifest_for([7u8; 32]);
+        // Two keys: no single block-signing key to record.
+        let multi = schedule_json_with(VERSION, &[("alice".to_string(), key_str.clone(), 1, 2)]);
+        let error = record_halt_schedule(&mut manifest, &multi, "s", VERSION).unwrap_err();
+        assert!(error.contains("exactly one block-signing key"), "{error}");
+        // Threshold 2 with one key: the key alone cannot sign.
+        let thresholded =
+            schedule_json_with(VERSION, &[("alice".to_string(), key_str.clone(), 2, 1)]);
+        let error = record_halt_schedule(&mut manifest, &thresholded, "s", VERSION).unwrap_err();
+        assert!(error.contains("threshold is 2, not 1"), "{error}");
+        // Missing authority entirely (pre-Leap-4 shape): fail closed.
+        let flat = serde_json::json!({
+            "active": {
+                "version": VERSION,
+                "producers": [{"producer_name": "alice", "block_signing_key": key_str}],
+            }
+        });
+        let error = record_halt_schedule(&mut manifest, &flat, "s", VERSION).unwrap_err();
+        assert!(error.contains("has no authority"), "{error}");
+    }
+
+    #[test]
+    fn schedule_accepts_legacy_eos_key_form() {
+        // Real Leap 5 responses render schedule keys in legacy EOS form;
+        // the roster must accept them exactly as nodeos serves them.
+        let schedule = schedule_json_with(
+            VERSION,
+            &[(
+                "eosio".to_string(),
+                "EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV".to_string(),
+                1,
+                1,
+            )],
+        );
+        let mut manifest = manifest_for([7u8; 32]);
+        let recorded = record_halt_schedule(&mut manifest, &schedule, "s", VERSION).unwrap();
+        assert_eq!(recorded, 1);
+    }
+
+    #[test]
+    fn schedule_rejects_conflict_with_pinned_version() {
+        let key = K1PrivateKey::random();
+        let schedule = schedule_json(VERSION, &[(&key, "alice")]);
+        let mut manifest = manifest_for([7u8; 32]);
+        manifest.halt_schedule_version = Some(VERSION + 1);
+        let error = record_halt_schedule(&mut manifest, &schedule, "s", VERSION).unwrap_err();
+        assert!(
+            error.contains("conflicts with the recorded schedule version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn post_blocks_roundtrip_through_the_restore_gate() {
+        let (mut manifest, halt_id, key_a, key_b, posts, post_states) = frozen_setup();
+        let refs: Vec<(&str, &Value)> = posts.iter().map(|(name, json)| (*name, json)).collect();
+        let state_refs: Vec<(&str, &Value)> = post_states
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let recorded = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &state_refs,
+        )
+        .unwrap();
+        assert_eq!(recorded, 2);
+        // The recorded headers are structurally sound before the gate runs:
+        // first links from H, second links from the first, roots are empty.
+        let packed = manifest.halt_post_blocks.clone().expect("posts recorded");
+        assert_eq!(packed.len(), 2);
+        let first = hex::decode(&packed[0]).unwrap();
+        assert_eq!(&first[0..32], &TEST_ROOT_A);
+        assert_eq!(&first[32..64], &FIXTURE_SCHEDULE_HASH);
+        assert_eq!(&first[78..110], &halt_id);
+        assert_eq!(&first[110..142], &[0u8; 32]);
+        // The real restore gate is the oracle: it parses the recorded hex
+        // with its own parser and re-authenticates every link and signature.
+        // The two staged headers (HEIGHT+1, HEIGHT+2) cover exactly the
+        // attested pause head.
+        let declaration = declaration_for(&[(&key_a, "alice"), (&key_b, "bob")]);
+        let attested = verify_migration_post_chain(
+            &manifest,
+            &declaration,
+            HEIGHT,
+            &halt_id,
+            VERSION,
+            HEIGHT + 2,
+        )
+        .expect("gate accepts the recorded proof");
+        assert_eq!(attested, 2);
+    }
+
+    #[test]
+    fn post_blocks_reject_broken_linkage() {
+        let (mut manifest, halt_id, key_a, key_b, mut posts, post_states) = frozen_setup();
+        let mut tampered = posts.remove(0).1.clone();
+        tampered["previous"] = serde_json::json!(hex::encode([9u8; 32]));
+        posts.insert(0, ("alice", tampered));
+        let refs: Vec<(&str, &Value)> = posts.iter().map(|(n, j)| (*n, j)).collect();
+        let state_refs: Vec<(&str, &Value)> = post_states
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &state_refs,
+        )
+        .unwrap_err();
+        assert!(error.contains("hash-link"), "{error}");
+        let _ = (key_a, key_b);
+    }
+
+    #[test]
+    fn post_blocks_reject_traffic_rotation_and_unknown_producers() {
+        let (mut manifest, halt_id, key_a, key_b, posts, post_states) = frozen_setup();
+        let stated_hash = FIXTURE_SCHEDULE_HASH;
+        // A transaction in the first post-H header.
+        let mut with_tx = posts[0].1.clone();
+        with_tx["transactions"] = serde_json::json!([{"trx": "00".repeat(32)}]);
+        let refs = vec![("alice", &with_tx)];
+        let single_state = vec![("alice", &post_states[0].1)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &single_state,
+        )
+        .unwrap_err();
+        assert!(error.contains("not empty"), "{error}");
+        // A schedule version rotation mid-window.
+        let mut rotated = posts[0].1.clone();
+        rotated["schedule_version"] = serde_json::json!(VERSION + 1);
+        let refs = vec![("alice", &rotated)];
+        let single_state = vec![("alice", &post_states[0].1)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &single_state,
+        )
+        .unwrap_err();
+        assert!(error.contains("rotates"), "{error}");
+        // A producer outside the recorded schedule, validly signed over the
+        // true Leap digest (wrong roster, right cryptography).
+        let key_c = K1PrivateKey::random();
+        let unknown_packed = pack_header(101, name_u64("carol"), &halt_id, VERSION);
+        let unknown_header = Digest::hash(&unknown_packed).0;
+        let unknown_digest = leap_sig_digest(&unknown_header, &TEST_ROOT_A, &stated_hash);
+        let unknown = block_json(
+            101,
+            "carol",
+            halt_id,
+            VERSION,
+            &key_c.sign(&unknown_digest).to_string(),
+            HEIGHT + 1,
+            halt_digest_with_num(&unknown_header, HEIGHT + 1),
+        );
+        let unknown_state = state_json(&TEST_ROOT_A, &stated_hash);
+        let refs = vec![("carol", &unknown)];
+        let states = vec![("carol", &unknown_state)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &states,
+        )
+        .unwrap_err();
+        assert!(error.contains("not in the recorded schedule"), "{error}");
+        // Alice's header signed by Bob's key: recovers, but not to Alice.
+        let forged_packed = pack_header(101, name_u64("alice"), &halt_id, VERSION);
+        let forged_header = Digest::hash(&forged_packed).0;
+        let forged_digest = leap_sig_digest(&forged_header, &TEST_ROOT_A, &stated_hash);
+        let forged = block_json(
+            101,
+            "alice",
+            halt_id,
+            VERSION,
+            &key_b.sign(&forged_digest).to_string(),
+            HEIGHT + 1,
+            halt_digest_with_num(&forged_header, HEIGHT + 1),
+        );
+        let forged_state = state_json(&TEST_ROOT_A, &stated_hash);
+        let refs = vec![("alice", &forged)];
+        let states = vec![("alice", &forged_state)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &states,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("not signed by the recorded schedule key"),
+            "{error}"
+        );
+        let _ = key_a;
+    }
+
+    #[test]
+    fn post_blocks_reject_non_k1_signatures_and_missing_schedule() {
+        let (mut manifest, halt_id, _, _, posts, post_states) = frozen_setup();
+        let mut non_k1 = posts[0].1.clone();
+        // Well-formed R1 encoding, so the boundary parser accepts it and the
+        // record step is what refuses the non-K1 signature.
+        non_k1["producer_signature"] =
+            serde_json::json!(R1Signature::from_compact65(&[1u8; 65]).to_string());
+        let refs = vec![("alice", &non_k1)];
+        let single_state = vec![("alice", &post_states[0].1)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &single_state,
+        )
+        .unwrap_err();
+        assert!(error.contains("not K1"), "{error}");
+        // No schedule recorded at all: fail closed instead of trusting any key.
+        let mut bare = manifest_for(halt_id);
+        let refs: Vec<(&str, &Value)> = posts.iter().map(|(name, json)| (*name, json)).collect();
+        let state_refs: Vec<(&str, &Value)> = post_states
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let error = record_post_blocks(
+            &mut bare,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &state_refs,
+        )
+        .unwrap_err();
+        assert!(error.contains("recorded schedule"), "{error}");
+    }
+
+    #[test]
+    fn post_blocks_reject_wrong_root_wrong_hash_and_state_mismatch() {
+        let (mut manifest, halt_id, _, _, posts, post_states) = frozen_setup();
+        let refs: Vec<(&str, &Value)> = posts.iter().map(|(name, json)| (*name, json)).collect();
+        // A blockroot from a different window: the signature no longer
+        // recovers to the schedule key.
+        let mut wrong_root = post_states.clone();
+        let stated_hash = FIXTURE_SCHEDULE_HASH;
+        wrong_root[0].1 = state_json(&[0xFF; 32], &stated_hash);
+        let wrong_root_refs: Vec<(&str, &Value)> = wrong_root
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &wrong_root_refs,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("not signed by the recorded schedule key"),
+            "{error}"
+        );
+        // A schedule hash from a different schedule: the staged pair no
+        // longer matches what the producer signed, so recovery misses the
+        // roster key. The signature binds the exact pair; there is no
+        // comparison to fool.
+        let mut wrong_hash = post_states.clone();
+        wrong_hash[1].1 = state_json(&TEST_ROOT_B, &[0xEE; 32]);
+        let wrong_hash_refs: Vec<(&str, &Value)> = wrong_hash
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &wrong_hash_refs,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("not signed by the recorded schedule key"),
+            "{error}"
+        );
+        // Missing header-state fields fail closed before any crypto runs.
+        let bare_state = serde_json::json!({"blockroot_merkle": {}, "pending_schedule": {}});
+        let bare_refs = vec![("alice", &bare_state), ("bob", &post_states[1].1)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &bare_refs,
+        )
+        .unwrap_err();
+        assert!(error.contains("blockroot"), "{error}");
+        // Block/state count skew fails closed instead of zipping silently.
+        let short_refs = vec![(post_states[0].0, &post_states[0].1)];
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &short_refs,
+        )
+        .unwrap_err();
+        assert!(error.contains("one header state each"), "{error}");
+    }
+
+    #[test]
+    fn boundary_parser_rejects_schedule_changes_and_extensions() {
+        let (_, _, _, _, posts, _) = frozen_setup();
+        let mut changed = posts[0].1.clone();
+        changed["new_producers"] = serde_json::json!({"version": VERSION + 1, "producers": []});
+        let error = parse_boundary_block(&changed).unwrap_err();
+        assert!(error.contains("schedule change"), "{error}");
+        let mut extended = posts[0].1.clone();
+        extended["block_extensions"] = serde_json::json!([[1, "00"]]);
+        let error = parse_boundary_block(&extended).unwrap_err();
+        assert!(error.contains("block extensions"), "{error}");
+    }
+}

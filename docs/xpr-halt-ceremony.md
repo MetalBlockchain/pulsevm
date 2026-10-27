@@ -18,8 +18,15 @@ pre-commitment window is gone. One signature cannot do both jobs:
 
 - `M_decl = sha256("DECL" || C || H || S)` — signable at H-K (everything in
   it exists: source chain id, terminal height, full ordered validator set).
-- `M_conf = sha256("CONF" || decl_digest || H || H_ID || S_H || N)` —
+- `M_conf = sha256("CONF" || decl_digest || H || P || H_ID || S_H || N || PLAT)` —
   signable only at H (needs the terminal block id and the state hash).
+  `P` is the highest pause head the quorum observed frozen; every
+  confirmer signs the same unanimous `P` (a frozen network observes one
+  head — disagreement means the network is not frozen and refuses). The
+  post-H emptiness proof must cover exactly H+1 through `P`, so a proof
+  that stops short of the quorum's own observation fails the boot closed.
+  `PLAT` is the MetalGo blockchain id wallets sign under, bound
+  positionally and mandatorily.
 
 Two digests is the minimum. Time forces it.
 
@@ -75,37 +82,39 @@ Per signature, in order: parse the claimed key → `recover(digest)` must
 equal it (forgery dies) → key must be in declared S, exact match
 (outsiders die) → dedupe (re-signing adds nothing). Then:
 
-- Numerator: sum of signer weights. Denominator: sum of the **full
-  schedule's** weights from independently replayed XPR state — never from
-  the declaration (a self-reported denominator is a self-graded quorum).
+- Numerator: signer count. Denominator: the declared set's size. The
+  declaration carries the roster, and the light-client cross-check below
+  pins that roster to the frozen schedule — never trusted on its own
+  (a self-reported denominator is a self-graded quorum, so the roster is
+  verified, not assumed).
 - Threshold: `signed x 3 > total x 2`, integer math. Strictly greater —
   exactly-two-thirds fails. That's the +1 in 2/3+1.
 
-Weights are pinned to the **frozen on-chain tally** whenever contract
-evidence is attached: the singleton's totals must equal the declared
-total and the recomputed signer weight, so quorum math runs over frozen
-values no exporter can inflate. Pinning weights to H-state instead would
-make the ceremony uncompletable on mainnet — `total_votes` drifts every
-block, so a freeze at H-K would never match H-state weights; the memo
-path (no frozen singleton) keeps the exact H-state pin and therefore
-needs a quiet window. Weights are u128 truncated from `total_votes` —
-mainnet magnitudes (~1e20+) saturate u64, silently turning a stake quorum
-into a member count — and JSON carries them as decimal strings; the
-contract and the verifier use the identical conversion so tallies agree
-bit-for-bit.
+Every member weighs exactly 1: the quorum is a **count quorum** over the
+frozen active schedule (names, schedule keys, version), matching Leap
+irreversibility exactly — 15 of 21, never a vote-weight fraction. Vote
+weight (`total_votes`) tracking is gone: it drifted every block, let a
+handful of large producers clear quorum alone, and let standby churn
+brick the freeze. Standbys are simply not in the quorum whether or not
+they are active. The singleton's totals are member counts, not weights;
+the memo path tallies the same count quorum without a frozen singleton.
+Weights stay on the wire as decimal-string `1`s so digests keep their
+shape; anything else fails closed at declaration parse.
 
 ## The light-client rule (trust anchor)
 
 The A-Chain replays XPR with full validation, so it independently knows
-the schedule, every block id, and the full state at every height. The
-declared set must **equal** the replayed schedule — same members both
-ways, same keys. (Weights are pinned by the frozen tally, not by H-state;
-see above.) This single check closes the subset attack (a declaration
-naming only its signer verifies against itself but cannot match the
-on-chain schedule it did not author). Membership or key drift between
-H-K and H fails closed and restarts governance — same as a schedule
-change. One cutover means there is no retry path: a failed ceremony is a
-new governance decision, not an automatic round.
+the schedule, every block id, and the full state at every height. Every
+declared member must be **active in checkpoint state with the same
+schedule key** — key-for-key anchoring that closes the gap where
+`producers.producer_key` can differ from the schedule's signing key.
+Membership exactness against the true schedule rides on the version pin
+(the attested schedule version must equal H's header version, so a
+divergent schedule fails closed as stale) plus the count quorum itself:
+15 of 21 schedule signatures cannot be forged by a standby subset. Member
+or key drift between H-K and H fails closed and restarts governance —
+same as a schedule change. One cutover means there is no retry path: a
+failed ceremony is a new governance decision, not an automatic round.
 
 ## Vehicles (transport, not proof)
 
@@ -119,20 +128,21 @@ delivers the proof bytes is compliant. In order of preference:
    bytes carry the full declaration. The executed proposal with 2/3+
    producer approvals *is* the commitment.
 2. **Dedicated `cutover` contract** (built, fixture-proven):
-   `init(H, source_chain_id)` freezes the **live `eosio.producers` table**
-   in-contract — the set is read from chain state, never supplied by a
-   caller — keeping only active rows, enforcing 1-of-1 single-key
-   authorities whose key equals the schedule key, and computing the
-   declaration digest over the frozen roster. `vote(producer, sig)`
-   recovers the block-signing key over that digest, checks membership in
-   the frozen set, rejects doubles, and adds the member's frozen weight;
-   `voted * 3 > total * 2` finalizes and locks the freeze (re-init is
-   allowed only before the first vote). Weights are u128 (mainnet
-   `total_votes` saturates u64); the digest is byte-identical to the
-   off-chain declaration, so one BP signature serves both tallies. The
-   relay is permissionless — the signature inside the action is the
-   authorization — so any party can submit votes; outsiders, wrong-height
-   digests, doubles, and post-finalize votes all fail in-contract.
+   `init(H, source_chain_id, schedule_version, schedule)` freezes the
+   **coordinated active schedule** — names, schedule keys, version — one
+   member, one vote, no vote weights anywhere. The set is supplied by the
+   coordinator (the chain exposes no schedule table to contracts), keyed
+   to K1, unique, and sorted into the declaration digest, which is
+   byte-identical to the off-chain declaration, so one BP signature
+   serves both tallies. `vote(producer, sig)` recovers the block-signing
+   key over that digest, checks membership in the frozen set, rejects
+   doubles, and adds one; `voted * 3 > total * 2` finalizes. Re-init is
+   allowed while voteless, or once the 7-day freeze window expires —
+   even with votes on it — so an abandoned freeze can never brick the
+   contract. The relay is permissionless — the signature inside the
+   action is the authorization — so any party can submit votes;
+   outsiders, wrong-height digests, doubles, and post-finalize votes all
+   fail in-contract.
 3. **Memo vehicle** (rehearsal): the declaration digest encoded on-chain;
    the set travels off-chain and is validated against replayed state.
    Proves the crypto and the sequence with zero deployment.
@@ -149,9 +159,19 @@ operator once the frozen set matches the coordinated parameters:
 
 - Refuses anything but the exact freeze: wrong height, wrong source
   chain, a digest that does not recompute locally, keys outside the frozen
-  set, double votes, votes at or after H, and a staged producer schedule
-  change (pending/proposed): a freeze taken under a rotating set signs
-  nothing. Every refusal is logged.
+  set, double votes, votes at or after H, a schedule version that is not
+  the coordinated one (frozen, live, and config must agree all three
+  ways), a staged producer schedule change (pending/proposed), and a
+  frozen set that no longer matches the live active schedule (member or
+  schedule-key drift since the freeze): a freeze taken under a rotating
+  or stale set signs nothing. Every refusal is logged.
+- Re-checks the schedule at confirmation time, not just at declaration
+  time: the voter re-reads the live schedule before signing the
+  confirmation and refuses on a staged change (pending or proposed), a
+  version mismatch, or member/key drift — so a rotation between the vote
+  and H+1 attests nothing. The confirmation carries the voter's own
+  observed pause head into the coordinator, where the highest attested
+  head becomes the `P` the proof must cover.
 - Keys come from owner-only files, never the command line, and are never
   logged. `--dry-run` evaluates and logs every decision without signing.
 - `--print-digest` prints the currently actionable signing digest as JSON
@@ -162,8 +182,11 @@ operator once the frozen set matches the coordinated parameters:
 - After H is final it signs the confirmation and delivers it to the
   coordinator (whose block id, checkpoint, successor id, and platform id
   are cross-checked against the local node and config) or writes it to a
-  file. The confirmation binds the platform chain id from the ceremony
-  config; without it the restore gate refuses.
+  file. The version-2 confirmation always binds the platform chain id;
+  the field is mandatory and unbound evidence is rejected outright. The
+  unsigned template is built by one shared library constructor, so the
+  voter, the coordinator tool, and external `--print-digest` signers all
+  sign the same bytes by construction.
 - The vote it submits is byte-identical to the manual `cvote` path, so
   automated and manual fleets verify together
   (`contracts/cutover/test-voter.sh`: dry-run refusal, print-digest
@@ -201,16 +224,57 @@ and the verifier replays it off-chain: singleton finalized on the
 verified declaration digest, every vote a rostered schedule key inside
 the declaration window **and under H's schedule version** (a rotation
 anywhere in the window fails closed), captured tally equal to the
-recomputed signer weight, strict quorum on the recomputation. The
-confirmation still chains declaration → terminal block → checkpoint →
-successor chain id **plus the platform (MetalGo blockchain) id wallets
-sign under**; the contract evidence replaces only the inclusion block,
-never the checks.
+recomputed signer count, strict quorum on the recomputation. The
+version-2 confirmation still chains declaration → terminal block →
+checkpoint → successor chain id **plus the mandatory platform (MetalGo
+blockchain) id wallets sign under**; the contract evidence replaces only
+the inclusion block, never the checks.
 
 One deployment gotcha the fixture proved: Leap `setabi` carries the
 *packed binary* `abi_def`, not the JSON text (`cleos` packs client-side).
 Submitting raw JSON executes but leaves nothing `get_abi` or
 `get_table_rows` can unpack. The probe tool packs for cleos parity.
+
+## Post-H window (what the exporter stages)
+
+The version pin does not stop at H. The rehearsal stages
+`schedule-H.json` (the live `get_producer_schedule` at the freeze),
+every header from H+1 to the pause head (`block-post-N.json`), and each
+header's `get_block_header_state` (`block-post-N.state.json`), and the
+attach tool records all three: the schedule at unit weight pinned to H's
+header version, each post-H header hash-linked from the trusted H id
+with an empty transaction root and signed by the recorded schedule key
+for its producer. The state supplies the two signature inputs the
+header cannot — the blockroot root and the pending schedule hash — so
+the signature is re-verified over Leap's true digest
+(`sha256(sha256(sha256(header) || root) || schedule_hash)`). The state's hash
+is bound by the signature itself: only the exact (root, hash) pair Leap
+signed recovers to the roster key, so there is no hash-to-roster
+comparison to fool — and none is attempted, because with no staged
+change Leap serves the EMPTY pending schedule, whose hash cannot equal
+the active roster's (proven against live header states on the first
+rehearsal run). `P` itself comes from the validators' own frozen-head
+observations (recorded per signer, required to agree — the ceremony tool
+refuses a split view of a supposedly frozen network) and is signed into
+the step-two confirmation, so the coverage bound is quorum-attested, not
+coordinator-typed. The restore gate re-verifies the packed proof,
+requires the recorded schedule to equal the declared set exactly, and
+requires the staged headers to cover exactly H+1 through the attested
+`P`, so the 330-block confirmation window Paul flagged cannot hide
+traffic the checkpoint is missing: a header carrying transactions, a
+rotation, or a signature from outside the frozen set fails the export, a
+proof that stops short of the quorum's own head fails the boot, and an
+unstaged window fails the boot.
+
+Prevention is procedural, verification is cryptographic. On the source
+side, the fleet admission lock plus the edge freeze PREVENTS post-H
+traffic: nothing new is admitted, and the validators stop building. On
+our side, the staged proof VERIFIES the freeze held: the gate replays
+every header H+1 through the highest attested pause head rather than
+trusting the lock. The two halves belong to different parties — the fleet
+operates the freeze, the A-Chain checks it — so a broken freeze cannot
+strand users: the gate turns it into a refused boot, loudly, before H+1
+is ever produced, instead of promoting state the schedule never endorsed.
 
 ## What XPR verifies vs what the A-Chain verifies
 

@@ -6,6 +6,7 @@
   "producer": "yourproducer",
   "source_chain_id": "<64 hex chars of the XPR chain id, published with the ceremony>",
   "height": 123456789,
+  "schedule_version": 1234,
   "roster_file": "/etc/cutover/roster.json",
   "vote_key_file": "/etc/cutover/vote.key",
   "payer_account": "yourproducer",
@@ -14,7 +15,7 @@
   "dry_run": false,
   "enabled": true,
   "confirmation": {
-    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly. platform_chain_id is the MetalGo blockchain id wallets sign under, from the ceremony config; the restore gate refuses confirmations that do not bind it.",
+    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly. platform_chain_id is the MetalGo blockchain id wallets sign under, from the ceremony config; it is mandatory because version-2 confirmations always bind it.",
     "coordinator_url": "https://cutover-coordinator.example.com",
     "out_file": "/var/lib/cutover/confirmation.json",
     "migration_genesis": "/etc/cutover/migration.genesis.json",

@@ -108,24 +108,52 @@ mk_push() { push_issue "$(mk_tx "$@")"; }
 read -r HEAD_NUM CHAIN_ID <<<"$(tapos)"
 echo "cutover-voter-test: chain $CHAIN_ID at head $HEAD_NUM"
 
-echo "cutover-voter-test: deploying ceremony contract and seeding one producer..."
-read -r BP_WIF BP_PUB32 <<<"$("$PROBE_BIN" newkey)"
-# NOTE: newkey prints raw compressed hex; the canonical display form comes
-# from the frozen on-chain row (see roster.json below), never hand-built.
+echo "cutover-voter-test: deploying the ceremony contract..."
+# NOTE: the canonical key display form comes from the frozen on-chain row
+# (see roster.json below), never hand-built.
 mk_push newaccount "$CHAIN_ID" "$DEV_WIF" cutover >/dev/null
 mk_push setcode "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.wasm" >/dev/null
 mk_push setabi "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.abi" >/dev/null
-mk_push setcode "$CHAIN_ID" "$DEV_WIF" eosio "$SCRIPT_DIR/seed.wasm" >/dev/null
-mk_push setabi "$CHAIN_ID" "$DEV_WIF" eosio "$SCRIPT_DIR/seed.abi" >/dev/null
-VOTES_HEX="$(python3 -c 'import struct; print(struct.pack("<d", 1.0).hex())')"
-PUB33="$("$PROBE_BIN" pubkey "$BP_WIF")"
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio bpvoter "$VOTES_HEX" "$PUB33" 1 >/dev/null
-pass "contract deployed, one producer seeded"
+# The freeze must name the live active schedule or the voter's
+# freeze-vs-schedule check refuses: the fixture chain produces as "eosio"
+# under the dev key, so the one-member schedule is exactly that.
+PUB33="$("$PROBE_BIN" pubkey "$DEV_WIF")"
+pass "contract deployed"
 
+# The freeze takes the schedule explicitly: one member here, so the first
+# vote finalizes. No producers table is read by the contract.
+SCHED_VERSION="$(rpc /v1/chain/get_producer_schedule '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["version"])')"
 H=$(( $(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])') + 60 ))
-echo "cutover-voter-test: init H=$H..."
+echo "cutover-voter-test: init H=$H, freezing the one-member schedule (version $SCHED_VERSION)..."
 mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
-    "$(python3 -c "import struct; print((struct.pack('<I', $H) + bytes.fromhex('$CHAIN_ID')).hex())")" >/dev/null
+    "$(python3 - "$H" "$CHAIN_ID" "$SCHED_VERSION" "eosio" "$PUB33" <<'PYEOF'
+import struct, sys
+def varuint(v):
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+def name_to_u64(s):
+    charmap = ".12345abcdefghijklmnopqrstuvwxyz"
+    def sym(c):
+        if "a" <= c <= "z":
+            return ord(c) - ord("a") + 6
+        if "1" <= c <= "5":
+            return ord(c) - ord("1") + 1
+        return 0
+    v = 0
+    for i in range(12):
+        v = (v << 5) | sym(s[i] if i < len(s) else ".")
+    return (v << 4) | (sym(s[12]) if len(s) == 13 else 0)
+out = bytearray(struct.pack("<I", int(sys.argv[1])) + bytes.fromhex(sys.argv[2]) + struct.pack("<I", int(sys.argv[3])))
+out += varuint(1) + struct.pack("<Q", name_to_u64(sys.argv[4])) + varuint(0) + bytes.fromhex(sys.argv[5])
+print(bytes(out).hex())
+PYEOF
+)" >/dev/null
 FROZEN_DIGEST="$(table_rows cutover cutover ceremony | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["declaration_digest"])')"
 [[ -n "$FROZEN_DIGEST" ]] || fail "no frozen ceremony"
 pass "ceremony frozen at H=$H"
@@ -136,7 +164,7 @@ pass "ceremony frozen at H=$H"
 # pause fails loud instead of going quiet.
 
 # Voter key files must be owner-only or the voter refuses to start.
-printf '%s' "$BP_WIF" >"$WORK/vote.key"; chmod 600 "$WORK/vote.key"
+printf '%s' "$DEV_WIF" >"$WORK/vote.key"; chmod 600 "$WORK/vote.key"
 printf '%s' "$DEV_WIF" >"$WORK/payer.key"; chmod 600 "$WORK/payer.key"
 # The roster mirrors the frozen on-chain member row byte-for-byte (whatever
 # string form the node renders): the recomputed digest must equal the
@@ -159,8 +187,8 @@ mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=s
         stop="\"stop_producer\":{\"at_h\":true,\"producer_api_url\":\"$5\"}"
     fi
     cat >"$out" <<EOF
-{"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"bpvoter",
- "source_chain_id":"$CHAIN_ID","height":$1,"roster_file":"$WORK/roster.json",
+{"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"eosio",
+ "source_chain_id":"$CHAIN_ID","height":$1,"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
@@ -191,7 +219,7 @@ import json, sys
 shape = json.load(open(sys.argv[1]))
 want = sys.argv[2]
 assert shape["role"] == "declaration", shape
-assert shape["producer"] == "bpvoter", shape
+assert shape["producer"] == "eosio", shape
 assert shape["digest"] == want, (shape["digest"], want)
 PYEOF
 pass "print-digest matches the frozen declaration digest"
@@ -210,7 +238,7 @@ echo "cutover-voter-test: status reports the loop state as JSON..."
 python3 - "$WORK/status.json" "$H" <<'PYEOF'
 import json, sys
 st = json.load(open(sys.argv[1]))
-assert st["producer"] == "bpvoter", st
+assert st["producer"] == "eosio", st
 assert st["height"] == int(sys.argv[2]), st
 assert st["vote"] in ("pending", "on-chain"), st
 assert st["freeze_match"] is True, st
@@ -296,11 +324,12 @@ grep -q "vote submitted" "$WORK/live.log" || fail "no vote submitted: $(tail -5 
 VOTED="$(table_rows cutover cutover members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
 [[ "$VOTED" == "True" || "$VOTED" == "true" || "$VOTED" == "1" ]] || fail "vote did not land on-chain (voted=$VOTED)"
 grep -q "delivered to coordinator" "$WORK/live.log" || fail "no confirmation delivered"
-python3 - "$WORK/confirmations.jsonl" "$PLATFORM" <<'PYEOF'
+python3 - "$WORK/confirmations.jsonl" "$PLATFORM" "$H" <<'PYEOF'
 import json, sys
-conf = json.load(open(sys.argv[1]))
-assert conf["producer"] == "bpvoter", conf
+conf = [json.loads(line) for line in open(sys.argv[1]) if line.strip()][-1]
+assert conf["producer"] == "eosio", conf
 assert conf["platform_chain_id"] == sys.argv[2], conf
+assert isinstance(conf["pause_height"], int) and conf["pause_height"] >= int(sys.argv[3]), conf
 PYEOF
 pass "vote landed and platform-bound confirmation delivered unattended"
 

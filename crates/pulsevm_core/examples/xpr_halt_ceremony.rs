@@ -35,7 +35,16 @@ fn usage() {
         "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json --key WIF [--key WIF...] --out declaration.json"
     );
     eprintln!(
-        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] --out confirmation.json"
+        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] [--pause-height P...] --out confirmation.json"
+    );
+    eprintln!(
+        "  --pause-height is each signer's observed frozen head (repeat once per --key, or pass once"
+    );
+    eprintln!(
+        "  for all keys of one operator): all signers must attest the same head — a frozen network"
+    );
+    eprintln!(
+        "  observes one head, so disagreement means the network is not frozen and the tool refuses."
     );
     eprintln!("  The successor chain id is derived from the migration genesis (the same");
     eprintln!("  bytes the new network boots from), never typed by hand.");
@@ -102,6 +111,7 @@ struct DeclareRequest {
 struct ConfirmRequest {
     declaration: String,
     height: u32,
+    pause_heads: Vec<u32>,
     block_id: String,
     checkpoint: String,
     genesis: String,
@@ -158,6 +168,7 @@ impl ConfirmRequest {
     fn parse(mut args: env::ArgsOs) -> Result<Self, String> {
         let mut declaration = None;
         let mut height = None;
+        let mut pause_heads = Vec::new();
         let mut block_id = None;
         let mut checkpoint = None;
         let mut genesis = None;
@@ -169,6 +180,8 @@ impl ConfirmRequest {
                 declaration = Some(take_value(&mut args, "--declaration")?);
             } else if arg == "--height" {
                 height = Some(parse_height(&take_value(&mut args, "--height")?)?);
+            } else if arg == "--pause-height" {
+                pause_heads.push(parse_height(&take_value(&mut args, "--pause-height")?)?);
             } else if arg == "--block-id" {
                 block_id = Some(take_value(&mut args, "--block-id")?);
             } else if arg == "--checkpoint" {
@@ -185,9 +198,15 @@ impl ConfirmRequest {
                 return Err(format!("unknown confirm flag {}", arg.to_string_lossy()));
             }
         }
+        if pause_heads.is_empty() {
+            return Err(
+                "confirm needs --pause-height: each signer's observed frozen head".to_string(),
+            );
+        }
         Ok(Self {
             declaration: declaration.ok_or_else(|| "confirm needs --declaration".to_string())?,
             height: height.ok_or_else(|| "confirm needs --height".to_string())?,
+            pause_heads,
             block_id: block_id.ok_or_else(|| "confirm needs --block-id".to_string())?,
             checkpoint: checkpoint.ok_or_else(|| "confirm needs --checkpoint".to_string())?,
             genesis: genesis.ok_or_else(|| "confirm needs --genesis".to_string())?,
@@ -324,6 +343,37 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
     let declaration_digest = declaration
         .verify(request.height)
         .map_err(|error| format!("declaration rejected: {error}"))?;
+    // Every signer attests the same frozen head: one --pause-height applies
+    // to every --key of one operator, or repeat it once per key. A frozen
+    // network observes one head, so signers who disagree are not looking at
+    // a frozen network — the tool refuses instead of minting a quorum over
+    // an unobserved tail. The unanimous head is the highest attested head
+    // the restore gate requires the post-H proof to cover.
+    let pause_height = if request.pause_heads.len() == 1 {
+        request.pause_heads[0]
+    } else {
+        if request.pause_heads.len() != request.keys.len() {
+            return Err(format!(
+                "got {} --pause-height values for {} --key values: pass one head for all keys, or one per key",
+                request.pause_heads.len(),
+                request.keys.len()
+            ));
+        }
+        let first = request.pause_heads[0];
+        if request.pause_heads.iter().any(|head| *head != first) {
+            return Err(
+                "signers disagree on the observed pause head: the network is not frozen, refusing to confirm"
+                    .into(),
+            );
+        }
+        first
+    };
+    if pause_height < request.height {
+        return Err(format!(
+            "observed pause head {pause_height} predates cutover height {}",
+            request.height
+        ));
+    }
     // The successor id is derived from the migration genesis the new network
     // boots from, so the ceremony can never bind a hand-typed id.
     let new_chain_id = successor_chain_id(&request.genesis)?;
@@ -334,19 +384,18 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
     let platform_id = pulsevm_crypto::parse_chain_id(&request.platform_chain_id)
         .map_err(|error| format!("--platform-chain-id: {error}"))?;
     let platform_hex = pulsevm_crypto::chain_id_hex(&platform_id);
-    let template = HaltConfirmation {
-        version: HaltConfirmation::VERSION,
-        declaration_digest: hex::encode(declaration_digest),
-        halt_height: request.height,
-        halt_block_id: request.block_id.clone(),
-        checkpoint_sha256: request.checkpoint.clone(),
-        new_chain_id,
-        platform_chain_id: Some(platform_hex),
-        signatures: Vec::new(),
-    };
-    let digest = template
-        .digest()
-        .map_err(|error| format!("confirmation digest: {error}"))?;
+    // One shared library constructor builds every agent's template, so the
+    // coordinator tool and the voter sign the same bytes by construction.
+    let (template, digest) = HaltConfirmation::unsigned(
+        &hex::encode(declaration_digest),
+        request.height,
+        pause_height,
+        &request.block_id,
+        &request.checkpoint,
+        &new_chain_id,
+        &platform_hex,
+    )
+    .map_err(|error| format!("confirmation template: {error}"))?;
     let mut signatures = Vec::new();
     for signing in signing_keys(&request.keys)? {
         let member = member_for_key(&declaration.validator_set, &signing)?;

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Fixture test for the cutover ceremony contract on a throwaway single-node
-# Leap chain. Seeds a synthetic schedule (mainnet-scale vote weights),
-# freezes it via init, and exercises every vote path: outsider rejection,
-# wrong-height digest, double vote, boundary quorum (not-finalized then
-# finalized at strict 2/3+1), post-finalize and post-vote re-init rejection,
-# plus an independent Python reimplementation of the declaration digest and
-# the u128 tally that must match the contract bit-for-bit. The freeze
-# window (init_time stamp, re-init re-stamp) is asserted as plumbing; the
-# 7-day expiry itself is not exercised here — no test chain can wait it
-# out, and time-travel would invalidate the fixture — so expiry is covered
-# by the voter predicate unit tests (same constant, same comparison) plus
-# the boundary that a live freeze always carries a sane init_time.
+# Leap chain. Freezes an explicit 4-member schedule via init (one member,
+# one vote — no vote weights anywhere) and exercises every vote path:
+# outsider rejection, wrong-height digest, double vote, boundary quorum
+# (1 and 2 of 4 must NOT finalize, 3 of 4 must, at strict 2/3+1),
+# post-finalize and post-vote re-init rejection, plus an independent Python
+# reimplementation of the declaration digest and the count tally that must
+# match the contract bit-for-bit. The freeze window (init_time stamp,
+# re-init re-stamp) is asserted as plumbing; the 7-day expiry itself is
+# not exercised here — no test chain can wait it out, and time-travel
+# would invalidate the fixture — so expiry is covered by the voter
+# predicate unit tests (same constant, same comparison) plus the boundary
+# that a live freeze always carries a sane init_time.
 #
-# Nothing here touches mainnet. The seeder contract is fixture-only.
+# Nothing here touches mainnet.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -131,23 +132,6 @@ echo "cutover-fixture: chain $CHAIN_ID at head $HEAD_NUM"
 [[ "$CHAIN_ID" != "0000000000000000000000000000000000000000000000000000000000000000" ]] \
     || fail "chain id unreadable"
 
-# Four BPs with mainnet-scale weights, plus one inactive row the freeze
-# must skip. Weights chosen so bp1 alone (44%) cannot finalize, bp1+bp2
-# (70.7%) can: the strict boundary, with real magnitudes.
-BP_W1=5.251494364735212e21
-BP_W2=3.1e21
-BP_W3=3.0e21
-BP_W4=1.5e20
-BP_INACTIVE_W=9.0e21
-declare -a BP_WIF BP_PUB BP_NAME
-for i in 0 1 2 3 4; do
-    read -r wif pub32 <<<"$("$PROBE" newkey)"
-    BP_WIF[$i]="$wif"
-    BP_PUB[$i]="$("$PROBE" pubkey "$wif")"
-    BP_NAME[$i]="bp$(printf '%s' abcde | cut -c$((i + 1)))test"
-done
-echo "cutover-fixture: BPs ${BP_NAME[*]}"
-
 # Every probe mode takes tapos as <chain-id> <wif> <ref-num> <ref-prefix>
 # <exp> followed by mode args, so mk_tx splices fresh tapos after <wif>.
 mk_tx() { # $mode $chain $wif [mode-args...] -> issueTx body
@@ -165,36 +149,75 @@ echo "cutover-fixture: creating contract account..."
 mk_push newaccount "$CHAIN_ID" "$DEV_WIF" cutover >/dev/null
 check "account created"
 
+# Four BPs with no weights anywhere: the frozen schedule is a count
+# quorum, so 1 and 2 of 4 must not finalize and 3 of 4 must.
+declare -a BP_WIF BP_PUB BP_NAME
+for i in 0 1 2 3; do
+    read -r wif _ <<<"$("$PROBE" newkey)"
+    BP_WIF[$i]="$wif"
+    BP_PUB[$i]="$("$PROBE" pubkey "$wif")"
+    BP_NAME[$i]="bp$(printf '%s' abcd | cut -c$((i + 1)))test"
+done
+echo "cutover-fixture: BPs ${BP_NAME[*]}"
+
 echo "cutover-fixture: deploying contracts..."
 mk_push setcode "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.wasm" >/dev/null
 mk_push setabi "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.abi" >/dev/null
-# The seeder must run as code `eosio`: Leap forbids creating objects in
-# another contract's table, so only code=eosio can plant the fixture
-# schedule rows. Fixture-only; the throwaway chain is discarded after.
-mk_push setcode "$CHAIN_ID" "$DEV_WIF" eosio "$SCRIPT_DIR/seed.wasm" >/dev/null
-mk_push setabi "$CHAIN_ID" "$DEV_WIF" eosio "$SCRIPT_DIR/seed.abi" >/dev/null
 check "contracts deployed"
 
-f64hex() { python3 -c 'import struct,sys; print(struct.pack("<d", float(sys.argv[1])).hex())' "$1"; }
-echo "cutover-fixture: seeding the synthetic schedule..."
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio "${BP_NAME[0]}" "$(f64hex "$BP_W1")" "${BP_PUB[0]}" 1 >/dev/null
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio "${BP_NAME[1]}" "$(f64hex "$BP_W2")" "${BP_PUB[1]}" 1 >/dev/null
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio "${BP_NAME[2]}" "$(f64hex "$BP_W3")" "${BP_PUB[2]}" 1 >/dev/null
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio "${BP_NAME[3]}" "$(f64hex "$BP_W4")" "${BP_PUB[3]}" 1 >/dev/null
-mk_push cseed "$CHAIN_ID" "$DEV_WIF" eosio eosio "${BP_NAME[4]}" "$(f64hex "$BP_INACTIVE_W")" "${BP_PUB[4]}" 0 >/dev/null
-check "5 rows seeded (4 active + 1 inactive)"
+# Pack the init action: h LE + chain + schedule_version LE + member count
+# varuint + per member (name u64 LE + key variant varuint(0=K1) + 33 bytes).
+# The schedule is explicit — the contract reads no on-chain table — and the
+# frozen version is the live active schedule version at freeze time.
+init_hex() { # $1=H -> hex
+    python3 - "$1" "$CHAIN_ID" "$SCHED_VERSION" "${BP_NAME[@]}" "${BP_PUB[@]}" <<'PYEOF'
+import struct, sys
+h, chain, version = int(sys.argv[1]), bytes.fromhex(sys.argv[2]), int(sys.argv[3])
+rest = sys.argv[4:]
+n = len(rest) // 2
+names, keys = rest[:n], [bytes.fromhex(k) for k in rest[n:]]
+def char_to_symbol(c):
+    if "a" <= c <= "z":
+        return ord(c) - ord("a") + 6
+    if "1" <= c <= "5":
+        return ord(c) - ord("1") + 1
+    return 0
+def name_to_u64(s):
+    assert len(s) <= 13, s
+    v = 0
+    for i in range(12):
+        v = (v << 5) | char_to_symbol(s[i] if i < len(s) else ".")
+    v = (v << 4) | (char_to_symbol(s[12]) if len(s) == 13 else 0)
+    return v
+def varuint(v):
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+out = bytearray(struct.pack("<I", h) + chain + struct.pack("<I", version))
+out += varuint(len(names))
+for name, key in zip(names, keys):
+    assert len(key) == 33, len(key)
+    out += struct.pack("<Q", name_to_u64(name)) + varuint(0) + key
+print(bytes(out).hex())
+PYEOF
+}
 
+SCHED_VERSION="$(rpc /v1/chain/get_producer_schedule '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["version"])')"
+echo "cutover-fixture: freezing the 4-member schedule (version $SCHED_VERSION)..."
 H1=$(( $(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])') + 20 ))
 echo "cutover-fixture: init H=$H1..."
-mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
-    "$(python3 -c "import struct; print((struct.pack('<I', $H1) + bytes.fromhex('$CHAIN_ID')).hex())")" >/dev/null
-read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST INIT_US <<<"$(
+mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover "$(init_hex "$H1")" >/dev/null
+read -r FROZEN_H FROZEN_VERSION VOTED TOTAL FINALIZED DIGEST INIT_US <<<"$(
     table_rows cutover cutover ceremony | python3 -c '
 import json,sys
 c = json.load(sys.stdin)[0]
-print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"], c["init_time"])' )"
-# Frozen roster for the tool-built votes: weights as decimal strings keep
-# mainnet magnitudes exact through JSON (no float round-trip).
+print(c["h"], c["schedule_version"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["declaration_digest"], c["init_time"])' )"
+# Frozen roster for the tool-built votes: unit weights as decimal strings.
 table_rows cutover cutover members | python3 -c "
 import json,sys
 rows = json.load(sys.stdin)
@@ -204,10 +227,12 @@ print(len(rows))"
 COUNT="$(python3 -c "import json; print(len(json.load(open('$WORK/members.json'))))")"
 echo "cutover-fixture: frozen $COUNT members"
 [[ "$FROZEN_H" == "$H1" ]] || fail "init froze wrong H"
+[[ "$FROZEN_VERSION" == "$SCHED_VERSION" ]] || fail "init froze wrong schedule version"
 [[ "$FINALIZED" == "0" ]] || fail "fresh ceremony finalized"
-[[ "$COUNT" == "4" ]] || fail "init must freeze exactly the 4 active producers"
+[[ "$COUNT" == "4" ]] || fail "init must freeze exactly the 4 schedule members"
+[[ "$TOTAL" == "4" ]] || fail "frozen total must be the 4-member count"
 [[ "$VOTED" == "0" ]] || fail "fresh ceremony has votes"
-check "init froze 4 active members at H=$H1 (inactive skipped)"
+check "init froze the 4-member schedule at H=$H1 (version $SCHED_VERSION)"
 # Freeze instant bounds the vote window: it must be chain time (the fixture
 # produces in real time, so within an hour of wall clock either way).
 NOW_US="$(python3 -c 'import time; print(time.time_ns() // 1000)')"
@@ -221,8 +246,7 @@ check "init stamped a sane freeze instant (window anchor present)"
 # on the still-voteless ceremony, so no second chain is needed.
 echo "cutover-fixture: re-init before votes is allowed..."
 H2=$((H1 + 7))
-mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
-    "$(python3 -c "import struct; print((struct.pack('<I', $H2) + bytes.fromhex('$CHAIN_ID')).hex())")" >/dev/null
+mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover "$(init_hex "$H2")" >/dev/null
 read -r FROZEN_H VOTED TOTAL FINALIZED DIGEST INIT_US2 <<<"$(
     table_rows cutover cutover ceremony | python3 -c '
 import json,sys
@@ -235,10 +259,10 @@ print(c["h"], c["voted_weight"], c["total_weight"], int(c["finalized"]), c["decl
 check "re-init moved the freeze to H=$H2"
 H1=$H2
 
-# Independent reimplementation of the declaration digest and the u128 tally:
-# the contract must match this Python bit-for-bit (digest) and in value
-# (tally), or the votes below fail. Weights are the script-known doubles,
-# so no JSON float round-trip pollutes the comparison.
+# Independent reimplementation of the declaration digest and the count
+# tally: the contract must match this Python bit-for-bit (digest) and in
+# value (tally), or the votes below fail. Every member weighs 1, so the
+# digest binds unit weights and the tally is a member count.
 python3 - "$WORK/members.json" "$CHAIN_ID" "$H1" "$DIGEST" "$TOTAL" <<'PYEOF'
 import hashlib, json, struct, sys
 
@@ -270,6 +294,7 @@ def eos_key_to_bytes(s):
     return raw[:33]
 
 members = sorted(json.load(open(sys.argv[1])), key=lambda m: m["producer"])
+assert all(int(m["weight"]) == 1 for m in members), "every frozen member must weigh 1"
 chain = bytes.fromhex(sys.argv[2])
 h = int(sys.argv[3])
 msg = bytearray(DOMAIN) + chain + struct.pack(">I", h) + struct.pack(">I", len(members))
@@ -282,21 +307,13 @@ digest = hashlib.sha256(bytes(msg)).hexdigest()
 assert digest == sys.argv[4], f"digest mismatch:\n contract {sys.argv[4]}\n python   {digest}"
 print(f"digest match: {digest[:16]}...")
 
-expected_total = sum(
-    int(v)
-    for v in (5.251494364735212e21, 3.1e21, 3.0e21, 1.5e20)
-)
-assert expected_total == int(sys.argv[5]), (
-    f"tally mismatch: contract {sys.argv[5]} python {expected_total}"
-)
-print(f"tally match: total {expected_total}")
-# python ints are exact: the quorum boundary below uses these, not floats.
-w = [5.251494364735212e21, 3.1e21, 3.0e21, 1.5e20]
-wi = [int(x) for x in w]
-t = sum(wi)
-assert wi[0] * 3 <= t * 2, "bp1 alone must not finalize"
-assert (wi[0] + wi[1]) * 3 > t * 2, "bp1+bp2 must finalize"
-print("quorum boundary confirmed in exact integers")
+assert int(sys.argv[5]) == len(members) == 4, f"tally mismatch: contract {sys.argv[5]}"
+# Count quorum over 4: 1 and 2 of 4 must not finalize (3 and 6 <= 8),
+# 3 of 4 must (9 > 8) — the 15-of-21 shape at fixture scale.
+assert 1 * 3 <= 4 * 2, "1 of 4 must not finalize"
+assert 2 * 3 <= 4 * 2, "2 of 4 must not finalize"
+assert 3 * 3 > 4 * 2, "3 of 4 must finalize"
+print("quorum boundary confirmed: 3 of 4 to finalize")
 PYEOF
 check "contract digest and tally match the independent implementation"
 
@@ -328,10 +345,9 @@ do_vote_again() {
     done
     do_vote 0
 }
-do_vote_late() { do_vote 2; }
+do_vote_late() { do_vote 3; }
 do_reinit_locked() {
-    mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
-        "$(python3 -c "import struct; print((struct.pack('<I', $H3) + bytes.fromhex('$CHAIN_ID')).hex())")"
+    mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover "$(init_hex "$H3")"
 }
 
 echo "cutover-fixture: outsider vote must fail..."
@@ -350,27 +366,37 @@ echo "cutover-fixture: wrong-height vote must fail..."
 expect_fail "wrong-height vote" "not from the frozen schedule key" \
     do_vote_wrong_h
 
-echo "cutover-fixture: first valid vote (bp1, 44%: must NOT finalize)..."
+echo "cutover-fixture: first valid vote (1 of 4: must NOT finalize)..."
 TX1="$(do_vote 0)"
 echo "cutover-fixture: vote tx $TX1"
 read -r VOTED FINALIZED <<<"$(table_rows cutover cutover ceremony | python3 -c '
 import json,sys
 c = json.load(sys.stdin)[0]
 print(c["voted_weight"], int(c["finalized"]))')"
-[[ "$FINALIZED" == "0" ]] || fail "bp1 alone finalized at 44%"
-check "bp1 vote counted, tally open"
+[[ "$FINALIZED" == "0" ]] || fail "1 of 4 finalized"
+check "first vote counted, tally open"
 
 echo "cutover-fixture: double vote must fail..."
 expect_fail "double vote" "already voted" do_vote_again
 
-echo "cutover-fixture: second vote (bp1+bp2, 70.7%: must finalize)..."
+echo "cutover-fixture: second vote (2 of 4, exactly half: must NOT finalize)..."
 TX2="$(do_vote 1)"
 echo "cutover-fixture: vote tx $TX2"
 read -r VOTED FINALIZED <<<"$(table_rows cutover cutover ceremony | python3 -c '
 import json,sys
 c = json.load(sys.stdin)[0]
 print(c["voted_weight"], int(c["finalized"]))')"
-[[ "$FINALIZED" == "1" ]] || fail "bp1+bp2 did not finalize at 70.7%"
+[[ "$FINALIZED" == "0" ]] || fail "2 of 4 finalized at exactly half"
+check "second vote counted, tally still open"
+
+echo "cutover-fixture: third vote (3 of 4: must finalize)..."
+TX3="$(do_vote 2)"
+echo "cutover-fixture: vote tx $TX3"
+read -r VOTED FINALIZED <<<"$(table_rows cutover cutover ceremony | python3 -c '
+import json,sys
+c = json.load(sys.stdin)[0]
+print(c["voted_weight"], int(c["finalized"]))')"
+[[ "$FINALIZED" == "1" ]] || fail "3 of 4 did not finalize"
 check "quorum reached: finalized at strict 2/3+1"
 
 echo "cutover-fixture: post-finalize vote must fail..."
@@ -391,26 +417,27 @@ SCAN_LOG="$WORK/scan.log"
     --declare-out "$WORK/declaration.json" \
     --host-header '0.0.0.0:8888' >"$SCAN_LOG" 2>&1 \
     || fail "vote scan failed: $(tail -3 "$SCAN_LOG")"
-grep -q "schedule_version=0" "$SCAN_LOG" || fail "scanner must attest the unanimous schedule version"
-python3 - "$WORK/fragment.json" "$WORK/declaration.json" "$DIGEST" "$TOTAL" "$VOTED" "$H1" "${BP_NAME[0]}" "${BP_NAME[1]}" <<'PYEOF'
+grep -q "schedule_version=$SCHED_VERSION" "$SCAN_LOG" || fail "scanner must attest the unanimous schedule version"
+python3 - "$WORK/fragment.json" "$WORK/declaration.json" "$DIGEST" "$TOTAL" "$VOTED" "$H1" "${BP_NAME[0]}" "${BP_NAME[1]}" "${BP_NAME[2]}" <<'PYEOF'
 import json, sys
 frag = json.load(open(sys.argv[1]))
 decl = json.load(open(sys.argv[2]))
-digest, total, voted, h, bp1, bp2 = (sys.argv[3], int(sys.argv[4]),
-    int(sys.argv[5]), int(sys.argv[6]), sys.argv[7], sys.argv[8])
+digest, total, voted, h = (sys.argv[3], int(sys.argv[4]),
+    int(sys.argv[5]), int(sys.argv[6]))
+quorum = sorted(sys.argv[7:10])
 assert frag["contract"] == "cutover", frag["contract"]
 assert frag["declaration_digest"] == digest, "fragment digest must equal the frozen digest"
-assert int(frag["total_weight"]) == total, "fragment total must equal the frozen roster"
-assert int(frag["voted_weight"]) == voted, "fragment tally must equal the on-chain tally"
+assert int(frag["total_weight"]) == total == 4, "fragment total must equal the 4-member roster"
+assert int(frag["voted_weight"]) == voted == 3, "fragment tally must equal the on-chain tally"
 assert frag["finalized"] is True, "fragment must capture a completed tally"
 assert frag["finalized_block"] < h, "finality must predate H"
-assert len(frag["votes"]) == 2, f"want exactly the 2 counted votes, got {len(frag['votes'])}"
+assert len(frag["votes"]) == 3, f"want exactly the 3 counted votes, got {len(frag['votes'])}"
 names = sorted(v["producer"] for v in frag["votes"])
-assert names == sorted([bp1, bp2]), f"fragment voters {names} are not the quorum"
+assert names == quorum, f"fragment voters {names} are not the quorum"
 # The exporter-built declaration carries the frozen roster plus the scanned
 # signatures; its digest is the ceremony digest by construction.
 assert decl["last_height"] == h, "declaration must target H"
-assert len(decl["signatures"]) == 2, "declaration must carry the 2 vote signatures"
+assert len(decl["signatures"]) == 3, "declaration must carry the 3 vote signatures"
 assert decl["validator_set"] and len(decl["validator_set"]) == 4
 for v in frag["votes"]:
     assert v["block"] < h, f"vote block {v['block']} must predate H={h}"
@@ -418,7 +445,7 @@ for v in frag["votes"]:
     # verifier parses both PUB_K1_ and EOS forms.
     assert v["key"].startswith(("PUB_K1_", "EOS")), v["key"]
     assert v["signature"].startswith("SIG_K1_"), v["signature"]
-print(f"fragment ok: 2 votes digest {digest[:16]}... tally {voted}/{total}")
+print(f"fragment ok: 3 votes digest {digest[:16]}... tally {voted}/{total}")
 PYEOF
 check "vote scan reproduces the on-chain tally as verifier evidence"
 

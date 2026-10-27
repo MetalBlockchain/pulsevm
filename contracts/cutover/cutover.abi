@@ -14,6 +14,28 @@
                 {
                     "name": "source_chain_id",
                     "type": "checksum256"
+                },
+                {
+                    "name": "schedule_version",
+                    "type": "uint32"
+                },
+                {
+                    "name": "schedule",
+                    "type": "schedule_member[]"
+                }
+            ]
+        },
+        {
+            "name": "schedule_member",
+            "base": "",
+            "fields": [
+                {
+                    "name": "producer",
+                    "type": "name"
+                },
+                {
+                    "name": "key",
+                    "type": "public_key"
                 }
             ]
         },
@@ -48,6 +70,10 @@
                     "type": "checksum256"
                 },
                 {
+                    "name": "schedule_version",
+                    "type": "uint32"
+                },
+                {
                     "name": "total_weight",
                     "type": "uint128"
                 },
@@ -62,6 +88,10 @@
                 {
                     "name": "declaration_digest",
                     "type": "checksum256"
+                },
+                {
+                    "name": "init_time",
+                    "type": "uint64"
                 }
             ]
         },
