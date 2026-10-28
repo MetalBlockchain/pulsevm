@@ -885,8 +885,9 @@ impl HaltConfirmation {
     /// Verify the confirmation: version 2, declaration link, height,
     /// terminal block id, checkpoint, successor chain id, and platform chain
     /// id must all match the expected cutover values, the pause head must
-    /// not predate H, and the same declared set's quorum must have signed
-    /// the confirmation digest (which binds the pause head positionally).
+    /// sit strictly past H, and the same declared set's quorum must have
+    /// signed the confirmation digest (which binds the pause head
+    /// positionally).
     /// The platform binding is mandatory: version 1 confirmations are
     /// rejected outright, so no evidence can silently skip the id wallets
     /// sign under. The post-H coverage itself is enforced by
@@ -924,11 +925,13 @@ impl HaltConfirmation {
             )));
         }
         // The pause head is the highest frozen height the quorum observed:
-        // it cannot predate the terminal block, and the restore gate
-        // requires the post-H proof to cover exactly H+1 through it.
-        if self.pause_height < expected_height {
+        // it must sit strictly past the terminal block (a pause exactly on
+        // H stages no proof and cannot distinguish a frozen network from a
+        // bare anchor), and the restore gate requires the post-H proof to
+        // cover exactly H+1 through it.
+        if self.pause_height <= expected_height {
             return Err(ChainError::InternalError(format!(
-                "halt confirmation pause head {} predates cutover height {}",
+                "halt confirmation pause head {} does not sit past cutover height {}",
                 self.pause_height, expected_height
             )));
         }

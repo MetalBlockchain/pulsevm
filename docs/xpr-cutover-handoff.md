@@ -70,9 +70,13 @@ against independently replayed XPR state:
    at T-14 and at freeze time: valid K1 schedule keys, producers-table
    keys equal to the schedule signing keys, no staged schedule rotation —
    a single bad row dooms the ceremony before BPs spend signatures on
-   it. The restore additionally requires the export-time attestation that
-   the checkpoint carries no proposed schedule (hydration keeps only the
-   parsed chain config, so absence cannot be re-derived later).
+   it. The declared set must equal the checkpoint's active producer set
+   exactly, both ways: a standby subset with matching keys would
+   otherwise pass with a denominator it chose. The restore additionally
+   requires the export-time attestation that the checkpoint carries no
+   proposed schedule, derived from the same schedule file the roster
+   comes from — never hand-typed (hydration keeps only the parsed chain
+   config, so absence cannot be re-derived later).
 7. **Bindings.** Version-2 confirmation ties H, block id, checkpoint,
    successor chain id, **and the mandatory platform id** to the
    declaration; the checkpoint hash is recomputed from the artifact, never
@@ -83,29 +87,36 @@ against independently replayed XPR state:
 
 - Unit + gate tests: workspace green (counts move with the suite — verify
   with `cargo test --workspace --locked`) — `pulsevm_core` lib,
-  `pulsevm_database` lib, `pulsevm_chain_types`, 25 voter
+  `pulsevm_database` lib, `pulsevm_chain_types`, voter
   example (including Leap-4/5 authority parsing: tags 0 and 1 parse;
-  flat-key, threshold-2, multi-key, and unknown-tag shapes refuse), 9
+  flat-key, threshold-2, multi-key, and unknown-tag shapes refuse; agreed
+  pause-head startup refusal, stop-at-P predicate, stale `at_h` refusal),
   offline verifier example — including
   rejection of pair-less manifests, roster-less commitments, non-unit
   transported weights, duplicate declaration members, tampered
   signatures, exact-2/3 quorums (legacy path included), quorum
   shortfall, checkpoint mismatch, stale schedule versions,
   proposed-schedule checkpoints, late votes, inflated tallies, unreadable
-  timing, pause-headless legacy confirmations, post-H proofs that stop
-  short of or run past the attested pause head, deferred rows due in the
+  timing, pause-on-H confirmations, post-H proofs that stop
+  short of or run past the attested pause head, sibling ids staged under
+  the wrong number, missing or substituted cutover-block entries,
+  standby-subset rosters, deferred rows due in the
   pause window, table-less checkpoints with a valid pair, and
   confirmation-time schedule drift or staging; plus the determinism
-  proof that two independent conversions of one export give byte-identical
-  checkpoints. The attach side carries `migration_attach` lib tests: schedule pin
+  proofs that two independent conversions of one export give byte-identical
+  checkpoints — both through the producer-table path and through the real
+  importer path (sidecar, protocol state, resources), which is the per-BP
+  signing input. The attach side carries `migration_attach` lib tests: schedule pin
   (version match, unit weights, duplicate/bad-key/empty/pinned-conflict
-  rejection) and post-H recording (broken linkage, traffic, rotation,
+  rejection, derived proposed-schedule absence, staged-rotation refusal)
+  and post-H recording (broken linkage, traffic, rotation,
   unknown producer, forged key, non-K1 signature, missing schedule,
   wrong blockroot, foreign schedule hash, missing state fields,
-  block/state count skew, foreign block id) with a round-trip of the
+  block/state count skew, foreign or sibling-staged block ids, H-entry
+  foreign signatures and substituted anchors) with a round-trip of the
   recorded proof through the real restore gate — over Leap's true
   producer signature digest (the exact root/hash pair bound by recovery)
-  and the verbatim carried block ids. The SHiP
+  and header-derived block ids recomputed on both sides. The SHiP
   log read path carries a regression test proving reads observe unflushed
   deferred appends (a follow-mode tail-read failure found by the
   rehearsal). Database-stack clippy clean; pinned-nightly fmt clean.
@@ -121,13 +132,14 @@ against independently replayed XPR state:
   pair verification green, flip gate opened, H+1=341 parent-linked to H_ID,
   state equivalence 11/11 accounts, boundary traffic 10/10 exactly-once —
   see [xpr-handover-rehearsal.md](./xpr-handover-rehearsal.md). That run
-  proves the true-digest record (header-state staged per post-H header),
-  the verbatim carried ids, the seed-planted producers table (boot gate
-  reports the roster match; a table-less checkpoint fails closed at the
-  same gate), the learn-then-bind platform re-issue, and the live finding
-  that an empty pending schedule is the norm (no hash-to-roster comparison
-  is attempted — a wrong pin failed an earlier run of the same rehearsal
-  live and was removed).
+  proves the true-digest record (header-state staged per post-H header,
+  plus H's own header state for the signature-checked anchor), the
+  header-derived ids recomputed on both sides, the seed-planted producers
+  table (boot gate reports the roster match both ways; a table-less
+  checkpoint fails closed at the same gate), the learn-then-bind platform
+  re-issue, and the live finding that an empty pending schedule is the
+  norm (no hash-to-roster comparison is attempted — a wrong pin failed an
+  earlier run of the same rehearsal live and was removed).
 
 ## 4. What mainnet still needs (inputs)
 

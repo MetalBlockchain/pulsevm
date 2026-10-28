@@ -1,11 +1,13 @@
 {
-  "_comment": "xpr_cutover_voter config. Copy, fill in, chmod 600. The voter refuses to start if either key file is readable by group or others.",
+  "_comment": "xpr_cutover_voter config. Copy, fill in, chmod 600. The voter refuses to start if either key file is readable by group or others. pause_height is the ceremony-agreed pause head P (a fixed H+k, strictly past height): every producer stops at P and every confirmation signs P.",
+
   "nodeos_url": "http://127.0.0.1:8888",
   "host_header": "0.0.0.0:8888",
   "contract": "cutover",
   "producer": "yourproducer",
   "source_chain_id": "<64 hex chars of the XPR chain id, published with the ceremony>",
   "height": 123456789,
+  "pause_height": 123456799,
   "schedule_version": 1234,
   "roster_file": "/etc/cutover/roster.json",
   "vote_key_file": "/etc/cutover/vote.key",
@@ -23,8 +25,8 @@
     "platform_chain_id": "<64 hex chars of the MetalGo blockchain id, published with the ceremony>"
   },
   "stop_producer": {
-    "_comment": "Opt-in local halt. When at_h is true, the voter pauses its own producer (Leap producer/pause) after delivering the confirmation for H, then proves it is paused. A contract cannot stop block production, only the producer can. Omit or set at_h false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint.",
-    "at_h": false,
+    "_comment": "Opt-in local halt. When at_pause is true, the voter pauses its own producer (Leap producer/pause) once its confirmation for the agreed pause_height is delivered and the local head has reached P, then proves it is paused. A contract cannot stop block production, only the producer can. Omit or set at_pause false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint. at_h was removed: configs still carrying it are refused.",
+    "at_pause": false,
     "producer_api_url": "http://127.0.0.1:8888"
   }
 }

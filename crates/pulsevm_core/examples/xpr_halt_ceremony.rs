@@ -343,12 +343,13 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
     let declaration_digest = declaration
         .verify(request.height)
         .map_err(|error| format!("declaration rejected: {error}"))?;
-    // Every signer attests the same frozen head: one --pause-height applies
-    // to every --key of one operator, or repeat it once per key. A frozen
-    // network observes one head, so signers who disagree are not looking at
-    // a frozen network — the tool refuses instead of minting a quorum over
-    // an unobserved tail. The unanimous head is the highest attested head
-    // the restore gate requires the post-H proof to cover.
+    // Every signer attests the agreed pause head: one --pause-height applies
+    // to every --key of one operator, or repeat it once per key, but all
+    // values must agree. The ceremony agrees P up front (a fixed H+k the
+    // producers stop at); each signer confirms that agreed head, never its
+    // own observed tip, so a quorum over 15 divergent heads is unformable
+    // by construction. The agreed head is the highest attested head the
+    // restore gate requires the post-H proof to cover.
     let pause_height = if request.pause_heads.len() == 1 {
         request.pause_heads[0]
     } else {
@@ -362,15 +363,18 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
         let first = request.pause_heads[0];
         if request.pause_heads.iter().any(|head| *head != first) {
             return Err(
-                "signers disagree on the observed pause head: the network is not frozen, refusing to confirm"
+                "signers disagree on the agreed pause head: every key must confirm the same P, refusing to confirm"
                     .into(),
             );
         }
         first
     };
-    if pause_height < request.height {
+    // The pause head must sit strictly past H: a pause exactly on H stages
+    // no proof, so the gate (and the confirmation digest itself, which
+    // binds P positionally) fails it closed.
+    if pause_height <= request.height {
         return Err(format!(
-            "observed pause head {pause_height} predates cutover height {}",
+            "agreed pause head {pause_height} does not sit past cutover height {}",
             request.height
         ));
     }

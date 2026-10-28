@@ -104,17 +104,21 @@ shape; anything else fails closed at declaration parse.
 ## The light-client rule (trust anchor)
 
 The A-Chain replays XPR with full validation, so it independently knows
-the schedule, every block id, and the full state at every height. Every
-declared member must be **active in checkpoint state with the same
-schedule key** — key-for-key anchoring that closes the gap where
-`producers.producer_key` can differ from the schedule's signing key.
-Membership exactness against the true schedule rides on the version pin
-(the attested schedule version must equal H's header version, so a
-divergent schedule fails closed as stale) plus the count quorum itself:
-15 of 21 schedule signatures cannot be forged by a standby subset. Member
-or key drift between H-K and H fails closed and restarts governance —
-same as a schedule change. One cutover means there is no retry path: a
-failed ceremony is a new governance decision, not an automatic round.
+the schedule, every block id, and the full state at every height. The
+declared set must **equal the checkpoint's active producer set exactly,
+both ways, with matching schedule keys**. The forward direction is
+key-for-key anchoring that closes the gap where
+`producers.producer_key` can differ from the schedule's signing key. The
+reverse direction closes the standby-subset attack: without it, three
+active standbys could declare themselves as the roster, record the same
+three as the schedule, and pass 3-of-3 over a quorum whose denominator
+they chose. The checkpoint (bound by the confirmation's checkpoint sha)
+is the only authenticated roster, so the version pin and the count quorum
+— necessary but not sufficient, since a subset copies H's version and
+picks its own denominator — cannot substitute for it. Member or key drift
+between H-K and H fails closed and restarts governance — same as a
+schedule change. One cutover means there is no retry path: a failed
+ceremony is a new governance decision, not an automatic round.
 
 ## Vehicles (transport, not proof)
 
@@ -192,19 +196,27 @@ operator once the frozen set matches the coordinated parameters:
   (`contracts/cutover/test-voter.sh`: dry-run refusal, print-digest
   parity, unattended live vote, platform-bound coordinator delivery,
   lying-coordinator and wrong-platform refusal).
-- Opt-in local halt: with `stop_producer.at_h` set plus the local
-  `producer_api_url`, the voter pauses its own producer right after
-  delivering the confirmation (Leap `producer/pause`, then proves
-  `paused`) and keeps enforcing it. A contract cannot stop block
-  production, only the producer can, so this is the half of the halt
-  that lives in the binary. Off by default; half-configured (armed
-  without a URL) refuses to start; a pause that will not verify is
-  retried in-loop and logged loudly instead of degrading to a warning.
-  A node restart clears Leap's in-memory pause, which is why the voter
-  re-asserts rather than pausing once and exiting. To resume production
-  deliberately, stop the voter first: a manual resume while it runs gets
-  re-paused on the next poll. Near H the loop polls every second so the
-  pause lands promptly, then drops back to the configured cadence.
+- Opt-in local halt: with `stop_producer.at_pause` set plus the local
+  `producer_api_url`, the voter pauses its own producer once its
+  confirmation for the agreed `pause_height` is delivered and the local
+  head has reached P (Leap `producer/pause`, then proves `paused`) and
+  keeps enforcing it. Every signer confirms the same agreed head P — a
+  fixed H+k set before the freeze — never its own observed tip, so
+  divergent voters cannot split the quorum digest; a coordinator
+  publishing a different P is refused. Only a voter that delivered its
+  own confirmation pauses, so an aborted ceremony never halts a live
+  chain by accident: the fleet pact must therefore ensure every
+  scheduled producer confirms. A contract cannot stop block production,
+  only the producer can, so this is the half of the halt that lives in
+  the binary. Off by default; half-configured (armed without a URL) or
+  stale (`at_h`, which stopped at H) refuses to start; a pause that
+  will not verify is retried in-loop and logged loudly instead of
+  degrading to a warning. A node restart clears Leap's in-memory pause,
+  which is why the voter re-asserts rather than pausing once and
+  exiting. To resume production deliberately, stop the voter first: a
+  manual resume while it runs gets re-paused on the next poll. Near H
+  the loop polls every second so the pause lands promptly, then drops
+  back to the configured cadence.
 
 What automation cannot do is decide: H, the source chain, and the roster
 come from the coordinated config, and a failed ceremony restarts
@@ -265,6 +277,15 @@ traffic the checkpoint is missing: a header carrying transactions, a
 rotation, or a signature from outside the frozen set fails the export, a
 proof that stops short of the quorum's own head fails the boot, and an
 unstaged window fails the boot.
+
+Capture ordering matters: Leap only serves `get_block_header_state` for
+still-reversible blocks, while the freeze protocol requires the
+validators' LIB to cover H (making H irreversible everywhere) before the
+producer pauses. The rehearsal therefore captures H's pair in the same
+poll iteration that first observes head == H (before snapshotting),
+captures each H+1.. tip the moment it appears during the LIB wait, and
+tops up only the fresh tip from a validator after the pause. Fetching any
+pair after finality has passed fails closed and supersedes the round.
 
 Prevention is procedural, verification is cryptographic. On the source
 side, the fleet admission lock plus the edge freeze PREVENTS post-H

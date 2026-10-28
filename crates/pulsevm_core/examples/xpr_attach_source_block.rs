@@ -21,6 +21,7 @@ use pulsevm_core::{
     migration_attach::{
         parse_boundary_block,
         post_window_unix_micros,
+        record_halt_block,
         record_halt_schedule,
         record_post_blocks,
     },
@@ -65,7 +66,7 @@ use serde_json::Value;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>] [--declaration <declaration.json> --confirmation <confirmation.json> [--declaration-inclusion <height>] [--confirmation-inclusion <height>] [--max-declaration-lag <K>] [--max-confirmation-lag <J>] [--contract-ceremony <fragment.json> --schedule-version <n> --proposed-schedule <true|false>] [--schedule <schedule.json>] [--post-block <get-block.json> --post-state <header-state.json>]... [--deferred-sidecar <deferred-transactions.json>]"
+        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>] [--declaration <declaration.json> --confirmation <confirmation.json> [--declaration-inclusion <height>] [--confirmation-inclusion <height>] [--max-declaration-lag <K>] [--max-confirmation-lag <J>] [--contract-ceremony <fragment.json> --schedule-version <n>] [--schedule <schedule.json>] [--halt-state <header-state.json>] [--post-block <get-block.json> --post-state <header-state.json>]... [--deferred-sidecar <deferred-transactions.json>]"
     );
     eprintln!(
         "  --halt-key-v2 signs a version 2 checkpoint-bound commitment; --halt-roster attaches a"
@@ -84,12 +85,13 @@ fn usage() {
         "  the declaration digest); --schedule-version records the unanimous schedule version"
     );
     eprintln!("  across votes and H (required with contract evidence; export-enforced).");
-    eprintln!("  --proposed-schedule records whether the checkpoint carries a proposed producer");
-    eprintln!(
-        "  schedule (read from the live get_producer_schedule at export time); only false boots."
-    );
     eprintln!("  --schedule records the frozen active schedule from a get_producer_schedule");
-    eprintln!("  response (unit weight, H version pinned); --post-block records one get_block");
+    eprintln!("  response (unit weight, H version pinned); --halt-state records H itself as a");
+    eprintln!(
+        "  gate entry from H's get_block plus H's get_block_header_state: the state supplies"
+    );
+    eprintln!("  the blockroot and schedule hash Leap signed over, and the entry opens the window");
+    eprintln!("  on a signature-checked H. --post-block records one get_block");
     eprintln!("  response per post-H header, hash-linked from H and signed by the recorded key;");
     eprintln!("  every --post-block needs its matching --post-state (get_block_header_state, same");
     eprintln!("  order): the state supplies the blockroot and schedule hash Leap signed over.");
@@ -122,6 +124,7 @@ fn main() -> ExitCode {
     let mut confirmation: Option<String> = None;
     let mut timing = PairTiming::default();
     let mut schedule: Option<String> = None;
+    let mut halt_state: Option<String> = None;
     let mut post_blocks: Vec<String> = Vec::new();
     let mut post_states: Vec<String> = Vec::new();
     let mut deferred_sidecar: Option<String> = None;
@@ -213,25 +216,22 @@ fn main() -> ExitCode {
             };
             timing.schedule_version = Some(version);
         } else if arg == "--proposed-schedule" {
-            let Some(value) = args.next() else {
-                usage();
-                return ExitCode::from(2);
-            };
-            let flag = value.to_string_lossy();
-            timing.proposed_schedule = Some(match flag.as_ref() {
-                "true" => true,
-                "false" => false,
-                _ => {
-                    eprintln!("--proposed-schedule needs true or false");
-                    return ExitCode::from(2);
-                }
-            });
+            eprintln!(
+                "--proposed-schedule was removed: absence of a pending or proposed schedule is now derived from --schedule, never hand-typed"
+            );
+            return ExitCode::from(2);
         } else if arg == "--schedule" {
             let Some(path) = args.next() else {
                 usage();
                 return ExitCode::from(2);
             };
             schedule = Some(path.to_string_lossy().into_owned());
+        } else if arg == "--halt-state" {
+            let Some(path) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            halt_state = Some(path.to_string_lossy().into_owned());
         } else if arg == "--post-block" {
             let Some(path) = args.next() else {
                 usage();
@@ -276,6 +276,7 @@ fn main() -> ExitCode {
         confirmation.as_deref(),
         timing,
         schedule.as_deref(),
+        halt_state.as_deref(),
         &post_blocks,
         &post_states,
         deferred_sidecar.as_deref(),
@@ -302,10 +303,6 @@ struct PairTiming {
     max_confirmation_lag: Option<u32>,
     contract_ceremony: Option<String>,
     schedule_version: Option<u32>,
-    /// Whether the checkpoint carries a proposed producer schedule in
-    /// `global_property`, read from the live schedule at export time. Only
-    /// `Some(false)` boots.
-    proposed_schedule: Option<bool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +317,7 @@ fn attach(
     confirmation_path: Option<&str>,
     timing: PairTiming,
     schedule_path: Option<&str>,
+    halt_state_path: Option<&str>,
     post_block_paths: &[String],
     post_state_paths: &[String],
     deferred_sidecar_path: Option<&str>,
@@ -334,7 +332,10 @@ fn attach(
     .map_err(|error| format!("parse source block: {error}"))?;
     let value = value.get("result").unwrap_or(&value);
 
-    let block = parse_boundary_block(&value)?;
+    // H itself is an ordinary source-chain block and may carry traffic:
+    // the snapshot covers the state its transactions produced. Only the
+    // post-H window must be empty.
+    let block = parse_boundary_block(&value, true)?;
     let id = block
         .id()
         .map_err(|error| format!("calculate source block id: {error}"))?;
@@ -435,6 +436,15 @@ fn attach(
                 "cutover pair height does not match source block height {height}"
             ));
         }
+        // The pause head must sit strictly past H: a pause exactly on H
+        // stages no proof, so the gate (and the confirmation itself)
+        // fails it closed. Fail fast here instead of shipping it.
+        if confirmation.pause_height <= height {
+            return Err(format!(
+                "confirmation pause head {} does not sit past cutover height {height}",
+                confirmation.pause_height
+            ));
+        }
         if confirmation.halt_block_id != id.to_string() {
             return Err("confirmation block id does not match the source block".into());
         }
@@ -486,7 +496,9 @@ fn attach(
             manifest.halt_contract_ceremony = Some(ceremony);
         }
         manifest.halt_schedule_version = timing.schedule_version;
-        manifest.halt_proposed_schedule = timing.proposed_schedule;
+        // The proposed-schedule absence is derived from --schedule by
+        // record_halt_schedule, never hand-typed: the gate requires
+        // Some(false), and anything staged fails the record fast.
         // Fail fast at record time with provenance errors; the restore gate
         // re-verifies the same rule from the manifest.
         pulsevm_database::check_halt_inclusion_window(
@@ -509,10 +521,11 @@ fn attach(
         }
         manifest = manifest.with_halt_roster(roster);
     }
-    // The frozen active schedule and the post-H emptiness proof are recorded
-    // after the pair/roster so a declared set is already in place to sign
-    // against; both are authenticated at record time and re-verified by the
-    // restore gate straight from the manifest.
+    // The frozen active schedule, the cutover block entry, and the post-H
+    // emptiness proof are recorded after the pair/roster so a declared set
+    // is already in place to sign against; all three are authenticated at
+    // record time and re-verified by the restore gate straight from the
+    // manifest.
     let halt_version = block.signed_block_header.header.schedule_version;
     if let Some(schedule_path) = schedule_path {
         let bytes = fs::read(schedule_path)
@@ -521,6 +534,40 @@ fn attach(
             .map_err(|error| format!("parse schedule {schedule_path}: {error}"))?;
         let entries = record_halt_schedule(&mut manifest, &schedule, schedule_path, halt_version)?;
         eprintln!("recorded halt schedule from {schedule_path}: {entries} producers");
+    }
+    // The two-step pair opens a window the gate re-verifies, so it must
+    // carry the full evidence: the recorded schedule to resolve keys
+    // against and the H header state to open the window on a
+    // signature-checked H. The gate fails closed without either, so the
+    // record fails fast here instead of shipping an unbootable manifest.
+    if manifest.halt_declaration.is_some() {
+        if manifest.halt_schedule.is_none() {
+            return Err(
+                "the cutover pair needs --schedule: the H entry resolves H's producer key against the recorded schedule"
+                    .to_string(),
+            );
+        }
+        let halt_state_path = halt_state_path.ok_or_else(|| {
+            "the cutover pair needs --halt-state: the H entry is recorded from H's get_block_header_state"
+                .to_string()
+        })?;
+        let state_bytes = fs::read(halt_state_path)
+            .map_err(|error| format!("read H header state {halt_state_path}: {error}"))?;
+        let halt_state: Value = serde_json::from_slice(&state_bytes)
+            .map_err(|error| format!("parse H header state {halt_state_path}: {error}"))?;
+        let entry = record_halt_block(
+            &mut manifest,
+            &value,
+            &halt_state,
+            &id,
+            height,
+            halt_version,
+            &block_path.to_string_lossy(),
+        )?;
+        eprintln!("recorded cutover block entry for H={height} {id}");
+        let _ = entry;
+    } else if halt_state_path.is_some() {
+        return Err("--halt-state without --declaration stages no cutover pair".to_string());
     }
     if !post_block_paths.is_empty() {
         if post_block_paths.len() != post_state_paths.len() {
@@ -570,8 +617,9 @@ fn attach(
         if !post_state_paths.is_empty() {
             return Err("--post-state without --post-block stages no evidence".to_string());
         }
-        // The pause landed exactly on H: the window is the H instant
-        // itself, and only a row due exactly then fails.
+        // No post-H window staged (legacy commitment path without the
+        // two-step pair): the window is the H instant itself, and only a
+        // row due exactly then fails.
         check_deferred_inventory(&value, &[], sidecar_path)?;
     } else if !post_state_paths.is_empty() {
         return Err("--post-state without --post-block stages no evidence".to_string());

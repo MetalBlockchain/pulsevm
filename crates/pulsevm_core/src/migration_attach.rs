@@ -106,9 +106,10 @@ pub fn boundary_block_unix_micros(value: &Value, source: &str) -> Result<i64, St
 
 /// Deferred-inventory window from staged block responses: the H response
 /// opens the window at its header time, the last staged post-H response
-/// closes it — or H itself when the pause landed exactly on H and no
-/// post-H headers were staged. Each entry is `(source, response)` with
-/// `source` naming the file in diagnostics only.
+/// closes it — or H itself when no post-H headers are staged (legacy
+/// commitment path without the two-step pair; the pair always stages a
+/// window past H). Each entry is `(source, response)` with `source`
+/// naming the file in diagnostics only.
 pub fn post_window_unix_micros(
     halt: &Value,
     posts: &[(&str, &Value)],
@@ -150,16 +151,23 @@ fn parse_slot(value: &str) -> Result<u32, String> {
         .map_err(|_| "timestamp slot does not fit u32".to_string())
 }
 
-/// Parse one `get_block` response into a signed block, enforcing the empty
-/// boundary shape: no transactions, no producer schedule change, no
-/// unsupported block extensions. Shared by the H anchor and every post-H
-/// header so both run the same shape check.
-pub fn parse_boundary_block(value: &Value) -> Result<SignedBlock, String> {
+/// Parse one `get_block` response into a signed block, enforcing the
+/// boundary shape: no producer schedule change, no unsupported block
+/// extensions. Whether transactions are allowed depends on the caller:
+/// post-H headers must be empty (the window proves nothing landed after
+/// the freeze), while the cutover block H itself is an ordinary
+/// source-chain block and may carry traffic — the snapshot covers the
+/// state its transactions produced. Shared by the H anchor and every
+/// post-H header so both run the same shape check otherwise.
+pub fn parse_boundary_block(
+    value: &Value,
+    allow_transactions: bool,
+) -> Result<SignedBlock, String> {
     let transactions = value
         .get("transactions")
         .and_then(Value::as_array)
         .ok_or_else(|| "source block has no transactions array".to_string())?;
-    if !transactions.is_empty() {
+    if !allow_transactions && !transactions.is_empty() {
         return Err("source block is not empty; select an empty snapshot boundary".into());
     }
     if value
@@ -216,6 +224,53 @@ fn push_varuint32(bytes: &mut Vec<u8>, mut value: u32) {
     }
 }
 
+/// Pack one boundary header in the gate's wire layout (timestamp, producer,
+/// confirmed, previous, roots, schedule version, schedule-change flag,
+/// header extensions): the exact bytes Leap hashes for the block id and the
+/// producer signs over. Shared by the H entry and every post-H entry so the
+/// two can never drift apart; the hand-rolled packing stays byte-identical
+/// to `BlockHeader::pack` for boundary headers by construction (the id
+/// cross-checks on both sides prove it on every run).
+fn pack_block_header_bytes(header: &BlockHeader) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&header.timestamp.slot().to_le_bytes());
+    bytes.extend_from_slice(&header.producer.as_u64().to_le_bytes());
+    bytes.extend_from_slice(&header.confirmed.to_le_bytes());
+    bytes.extend_from_slice(header.previous.as_bytes());
+    bytes.extend_from_slice(&header.transaction_mroot.0);
+    bytes.extend_from_slice(&header.action_mroot.0);
+    bytes.extend_from_slice(&header.schedule_version.to_le_bytes());
+    bytes.push(0); // no schedule change (boundary-checked by every caller)
+    push_varuint32(&mut bytes, header.header_extensions.len() as u32);
+    for (id, payload) in &header.header_extensions {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        push_varuint32(&mut bytes, payload.len() as u32);
+        bytes.extend_from_slice(payload);
+    }
+    bytes
+}
+
+/// The recorded schedule as a producer-name to signing-key map. Shared by
+/// the H entry and the post-H window so both resolve producers against the
+/// same set the gate compares to the declaration.
+fn recorded_schedule_keys(
+    roster: &[MigrationHaltRosterEntry],
+) -> Result<std::collections::BTreeMap<String, K1PublicKey>, String> {
+    let mut keys = std::collections::BTreeMap::new();
+    for entry in roster {
+        let key = K1PublicKey::from_string(&entry.key).map_err(|error| {
+            format!(
+                "recorded schedule key for {} invalid: {error:?}",
+                entry.producer
+            )
+        })?;
+        if keys.insert(entry.producer.clone(), key).is_some() {
+            return Err(format!("recorded schedule names {} twice", entry.producer));
+        }
+    }
+    Ok(keys)
+}
+
 /// Record the frozen active schedule from a `get_producer_schedule`
 /// response: every active producer at unit weight with its schedule signing
 /// key. `source` names the file in diagnostics only. The restore gate
@@ -250,6 +305,26 @@ pub fn record_halt_schedule(
     if producers.is_empty() {
         return Err(format!("schedule {source} carries no producers"));
     }
+    // A checkpoint taken mid-rotation would boot the new chain with a
+    // pending proposal the ceremony never froze. The staged schedule must
+    // carry no pending or proposed change: absence is recorded into the
+    // manifest (the gate requires `Some(false)`), anything staged fails
+    // fast here instead of shipping an unbootable manifest. This is
+    // derived from the same file the roster comes from — never hand-typed
+    // — so the attestation cannot diverge from the recorded schedule.
+    for stage in ["pending", "proposed"] {
+        let staged = schedule
+            .get(stage)
+            .and_then(|staged| staged.get("producers"))
+            .and_then(Value::as_array)
+            .is_some_and(|producers| !producers.is_empty());
+        if staged {
+            return Err(format!(
+                "schedule {source} stages a {stage} producer schedule: freeze the ceremony after it activates"
+            ));
+        }
+    }
+    manifest.halt_proposed_schedule = Some(false);
     let mut roster = Vec::with_capacity(producers.len());
     for producer in producers {
         let name = producer
@@ -400,8 +475,9 @@ pub fn read_post_state(state: &Value, source: &str) -> Result<([u8; 32], [u8; 32
 /// file in diagnostics only. The packed hex (`root || schedule-hash ||
 /// header || signature || counts || block-id`) is what the restore gate
 /// re-verifies, so the packing here must stay byte-identical to its wire
-/// layout. The trailing id is the block's own Leap-stated id, chained
-/// verbatim: neither side recomputes Leap's id formula.
+/// layout. The trailing id is the header-derived block id (Leap's formula,
+/// checked against the response's stated id above): both sides recompute
+/// it instead of chaining stated bytes.
 pub fn record_post_blocks(
     manifest: &mut MigrationManifest,
     halt_id: &Id,
@@ -420,18 +496,7 @@ pub fn record_post_blocks(
     let roster = manifest.halt_schedule.as_ref().ok_or_else(|| {
         "post-H headers need a recorded schedule: record --schedule first, or attach a declaration pair carrying the roster".to_string()
     })?;
-    let mut keys = std::collections::BTreeMap::new();
-    for entry in roster {
-        let key = K1PublicKey::from_string(&entry.key).map_err(|error| {
-            format!(
-                "recorded schedule key for {} invalid: {error:?}",
-                entry.producer
-            )
-        })?;
-        if keys.insert(entry.producer.clone(), key).is_some() {
-            return Err(format!("recorded schedule names {} twice", entry.producer));
-        }
-    }
+    let keys = recorded_schedule_keys(roster)?;
     // No hash pin on the state's pending schedule: with no staged change
     // Leap serves the EMPTY pending schedule, whose hash cannot equal the
     // active roster's (proven against live header states). The signature
@@ -448,7 +513,7 @@ pub fn record_post_blocks(
     let mut packed_all = Vec::with_capacity(blocks.len());
     for ((source, response), (state_source, state)) in blocks.iter().zip(states.iter()) {
         let value = response.get("result").unwrap_or(response);
-        let block = parse_boundary_block(value)
+        let block = parse_boundary_block(value, false)
             .map_err(|error| format!("post-H block {source}: {error}"))?;
         let header = &block.signed_block_header.header;
         let parent_num = u32::from_be_bytes(
@@ -466,22 +531,6 @@ pub fn record_post_blocks(
                 "post-H block {source} does not hash-link to its parent"
             ));
         }
-        // Chain the block's own Leap-stated id verbatim instead of
-        // recomputing it: the id formula is Leap's business, and carrying
-        // the stated bytes keeps the record — and the gate that replays
-        // it — independent of that formula. The number check below proves
-        // the stated id belongs to this height.
-        let stated_id: [u8; 32] = value
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|hex| hex::decode(hex).ok())
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| format!("post-H block {source} has no 32-byte id"))?;
-        if stated_id[0..4] != expected_num.to_be_bytes() {
-            return Err(format!(
-                "post-H block {source} id does not carry its own height"
-            ));
-        }
         if header.transaction_mroot != Digest([0u8; 32]) {
             return Err(format!(
                 "post-H block {source} is not empty: transaction root is set"
@@ -493,24 +542,41 @@ pub fn record_post_blocks(
                 header.schedule_version
             ));
         }
+        // The block id is derived from the parsed header — Leap's formula
+        // (sha256 of the packed header with the number spliced into the
+        // first four bytes, as `SignedBlock::id` computes) — and the
+        // response's stated id must equal the recomputation exactly. The
+        // trailing entry id the gate replays is this derived id, so an
+        // empty sibling stated under the real block's number never enters
+        // the proof. It runs after the shape checks above so a malformed
+        // header keeps its own diagnostic; the number check below proves
+        // the derived id belongs to this height.
+        let stated_id: [u8; 32] = value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|hex| hex::decode(hex).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| format!("post-H block {source} has no 32-byte id"))?;
+        let derived_id: [u8; 32] = block
+            .id()
+            .map_err(|error| format!("post-H block {source} id cannot be derived: {error}"))?
+            .as_bytes()
+            .try_into()
+            .map_err(|_| format!("post-H block {source} derived id is not 32 bytes"))?;
+        if stated_id != derived_id {
+            return Err(format!(
+                "post-H block {source} stated id does not derive from its header"
+            ));
+        }
+        if stated_id[0..4] != expected_num.to_be_bytes() {
+            return Err(format!(
+                "post-H block {source} id does not carry its own height"
+            ));
+        }
         let state_value = state.get("result").unwrap_or(state);
         let (blockroot_root, schedule_hash) = read_post_state(state_value, state_source)
             .map_err(|error| format!("post-H block {source}: {error}"))?;
-        let mut header_bytes = Vec::new();
-        header_bytes.extend_from_slice(&header.timestamp.slot().to_le_bytes());
-        header_bytes.extend_from_slice(&header.producer.as_u64().to_le_bytes());
-        header_bytes.extend_from_slice(&header.confirmed.to_le_bytes());
-        header_bytes.extend_from_slice(header.previous.as_bytes());
-        header_bytes.extend_from_slice(&header.transaction_mroot.0);
-        header_bytes.extend_from_slice(&header.action_mroot.0);
-        header_bytes.extend_from_slice(&header.schedule_version.to_le_bytes());
-        header_bytes.push(0); // no schedule change (boundary-checked above)
-        push_varuint32(&mut header_bytes, header.header_extensions.len() as u32);
-        for (id, payload) in &header.header_extensions {
-            header_bytes.extend_from_slice(&id.to_le_bytes());
-            push_varuint32(&mut header_bytes, payload.len() as u32);
-            header_bytes.extend_from_slice(payload);
-        }
+        let header_bytes = pack_block_header_bytes(header);
         // The recorded proof leads with the two signature inputs the header
         // cannot supply, so the gate recomputes Leap's digest from the packed
         // bytes alone.
@@ -556,6 +622,98 @@ pub fn record_post_blocks(
     Ok(count)
 }
 
+/// Record the cutover block H itself as a gate entry (root ||
+/// schedule-hash || header || signature || block-id — no counts: H may
+/// carry traffic), authenticated like a post-H header minus the emptiness
+/// proof: H's schedule version, no schedule rotation, and a producer
+/// signature — over Leap's true digest with H's header-state root and
+/// pending schedule hash — that recovers to the recorded schedule key for
+/// H's producer. The entry's derived id must equal the trusted H id, so
+/// the window opens on the block the confirmation binds, not on an
+/// exporter substitution. `halt` is the `get_block` response for H,
+/// `halt_state` its `get_block_header_state` response; `source` names the
+/// files in diagnostics only.
+pub fn record_halt_block(
+    manifest: &mut MigrationManifest,
+    halt: &Value,
+    halt_state: &Value,
+    halt_id: &Id,
+    halt_height: u32,
+    halt_schedule_version: u32,
+    source: &str,
+) -> Result<String, String> {
+    let roster = manifest.halt_schedule.as_ref().ok_or_else(|| {
+        "the H entry needs a recorded schedule: record --schedule first, or attach a declaration pair carrying the roster".to_string()
+    })?;
+    let keys = recorded_schedule_keys(roster)?;
+    let value = halt.get("result").unwrap_or(halt);
+    let block = parse_boundary_block(value, true)
+        .map_err(|error| format!("cutover block {source}: {error}"))?;
+    let header = &block.signed_block_header.header;
+    // H itself is an ordinary source-chain block: it may carry traffic
+    // (the snapshot covers the state its transactions produced), so no
+    // emptiness check. Only the post-H window must be empty.
+    if header.schedule_version != halt_schedule_version {
+        return Err(format!(
+            "cutover block {source} rotates the schedule version to {}",
+            header.schedule_version
+        ));
+    }
+    for (id, _) in &header.header_extensions {
+        if *id == 1 {
+            return Err(format!(
+                "cutover block {source} carries a producer schedule change"
+            ));
+        }
+    }
+    let state_value = halt_state.get("result").unwrap_or(halt_state);
+    let (blockroot_root, schedule_hash) = read_post_state(state_value, source)
+        .map_err(|error| format!("cutover block {source}: {error}"))?;
+    let header_bytes = pack_block_header_bytes(header);
+    let header_digest = Digest::hash(&header_bytes).0;
+    let digest = leap_sig_digest(&header_digest, &blockroot_root, &schedule_hash);
+    let signature_str = value
+        .get("producer_signature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("cutover block {source} has no producer_signature"))?;
+    let signature = pulsevm_crypto::k1::K1Signature::from_string(signature_str)
+        .map_err(|error| format!("cutover block {source} signature is not K1: {error:?}"))?;
+    let recovered = signature
+        .recover(&digest)
+        .map_err(|error| format!("cutover block {source} signature does not recover: {error:?}"))?;
+    let producer_name = header.producer.to_string();
+    let expected_key = keys.get(&producer_name).ok_or_else(|| {
+        format!("cutover block {source} producer {producer_name} is not in the recorded schedule")
+    })?;
+    if recovered != *expected_key {
+        return Err(format!(
+            "cutover block {source} is not signed by the recorded schedule key for {producer_name}"
+        ));
+    }
+    // The entry must open on the trusted H: the confirmation binds this id,
+    // so a substituted H fails here instead of anchoring the window.
+    let mut derived_id = header_digest;
+    derived_id[0..4].copy_from_slice(&halt_height.to_be_bytes());
+    if derived_id.as_slice() != halt_id.as_bytes() {
+        return Err(format!(
+            "cutover block {source} id does not derive to the trusted cutover id"
+        ));
+    }
+    // The H entry carries no transaction/block-extension counts: H may
+    // carry traffic, and the entry proves the anchor (id, signature,
+    // version), not the contents — emptiness is the post-H window's job.
+    let mut packed = Vec::with_capacity(64 + header_bytes.len() + 65);
+    packed.extend_from_slice(&blockroot_root);
+    packed.extend_from_slice(&schedule_hash);
+    packed.extend_from_slice(&header_bytes);
+    packed.push(0); // K1 tag
+    packed.extend_from_slice(&signature.compact65());
+    packed.extend_from_slice(&derived_id);
+    let hex = hex::encode(&packed);
+    manifest.halt_h_block = Some(hex.clone());
+    Ok(hex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +725,7 @@ mod tests {
         HaltDeclaration,
         HaltDeclarationMember,
         ImportSummary,
+        verify_migration_halt_block,
         verify_migration_post_chain,
     };
 
@@ -710,36 +869,52 @@ mod tests {
         })
     }
 
+    /// H's own header-state root: distinct from the post-H roots so a test
+    /// that swaps states across heights fails at signature recovery.
+    const TEST_ROOT_H: [u8; 32] = [0xC0; 32];
+
     /// Build H plus two signed post-H headers; returns the manifest with the
-    /// schedule recorded, the parsed H id, the post-H responses, and the
-    /// matching header states.
+    /// schedule recorded, the parsed H id, the H response and its header
+    /// state, the post-H responses, and the matching header states.
     #[allow(clippy::type_complexity)]
     fn frozen_setup() -> (
         MigrationManifest,
         [u8; 32],
         K1PrivateKey,
         K1PrivateKey,
+        Value,
+        Value,
         Vec<(&'static str, Value)>,
         Vec<(&'static str, Value)>,
     ) {
         let key_a = K1PrivateKey::random();
         let key_b = K1PrivateKey::random();
         let members = [(&key_a, "alice"), (&key_b, "bob")];
+        // The header states name a fixed schedule hash: the record path
+        // binds the exact (root, hash) pair through the producer
+        // signature, so any consistent value exercises the real check.
+        let schedule_hash = FIXTURE_SCHEDULE_HASH;
 
         let mut halt_previous = [0u8; 32];
         halt_previous[0..4].copy_from_slice(&7u32.to_be_bytes());
-        let halt_packed = pack_header(100, name_u64("eosio"), &halt_previous, VERSION);
+        let halt_packed = pack_header(100, name_u64("alice"), &halt_previous, VERSION);
         let halt_digest = Digest::hash(&halt_packed).0;
+        // H is produced by a schedule member and signed over Leap's true
+        // digest with its own header-state inputs — exactly like every
+        // post-H header, so the record path authenticates H the same way
+        // it authenticates the window.
+        let halt_sig_digest = leap_sig_digest(&halt_digest, &TEST_ROOT_H, &schedule_hash);
         let halt_json = block_json(
             100,
-            "eosio",
+            "alice",
             halt_previous,
             VERSION,
-            &key_a.sign(&halt_digest).to_string(),
+            &key_a.sign(&halt_sig_digest).to_string(),
             HEIGHT,
             halt_digest_with_num(&halt_digest, HEIGHT),
         );
-        let halt_block = parse_boundary_block(&halt_json).expect("H parses");
+        let halt_state_json = state_json(&TEST_ROOT_H, &schedule_hash);
+        let halt_block = parse_boundary_block(&halt_json, false).expect("H parses");
         let halt_id: [u8; 32] = halt_block
             .id()
             .expect("H id")
@@ -753,10 +928,6 @@ mod tests {
             .expect("schedule records");
         assert_eq!(recorded, 2);
         assert_eq!(manifest.halt_schedule_version, Some(VERSION));
-        // The header states name a fixed schedule hash: the record path
-        // binds the exact (root, hash) pair through the producer
-        // signature, so any consistent value exercises the real check.
-        let schedule_hash = FIXTURE_SCHEDULE_HASH;
 
         let mut previous = halt_id;
         let mut posts = Vec::new();
@@ -783,7 +954,16 @@ mod tests {
             post_states.push((name, state_json(&root, &schedule_hash)));
             previous = id;
         }
-        (manifest, halt_id, key_a, key_b, posts, post_states)
+        (
+            manifest,
+            halt_id,
+            key_a,
+            key_b,
+            halt_json,
+            halt_state_json,
+            posts,
+            post_states,
+        )
     }
 
     fn name_u64(name: &str) -> u64 {
@@ -880,6 +1060,41 @@ mod tests {
     }
 
     #[test]
+    fn schedule_derives_proposed_absence_and_rejects_staged_rotations() {
+        let key = K1PrivateKey::random();
+        // A clean schedule records the absence the gate requires.
+        let mut manifest = manifest_for([7u8; 32]);
+        record_halt_schedule(
+            &mut manifest,
+            &schedule_json(VERSION, &[(&key, "alice")]),
+            "s",
+            VERSION,
+        )
+        .unwrap();
+        assert_eq!(manifest.halt_proposed_schedule, Some(false));
+        // A staged pending schedule fails the record fast: the checkpoint
+        // would otherwise boot with a proposal the ceremony never froze.
+        let mut pending = schedule_json(VERSION, &[(&key, "alice")]);
+        pending["pending"] = serde_json::json!({
+            "version": VERSION + 1,
+            "producers": [{"producer_name": "alice", "authority": [1, {"threshold": 1, "keys": [{"key": key.public_key().to_string(), "weight": 1}]}]}],
+        });
+        let mut manifest = manifest_for([7u8; 32]);
+        let error = record_halt_schedule(&mut manifest, &pending, "s", VERSION).unwrap_err();
+        assert!(error.contains("pending"), "{error}");
+        assert_eq!(manifest.halt_proposed_schedule, None);
+        // Same for a staged proposed schedule.
+        let mut proposed = schedule_json(VERSION, &[(&key, "alice")]);
+        proposed["proposed"] = serde_json::json!({
+            "version": VERSION + 1,
+            "producers": [{"producer_name": "alice", "authority": [1, {"threshold": 1, "keys": [{"key": key.public_key().to_string(), "weight": 1}]}]}],
+        });
+        let mut manifest = manifest_for([7u8; 32]);
+        let error = record_halt_schedule(&mut manifest, &proposed, "s", VERSION).unwrap_err();
+        assert!(error.contains("proposed"), "{error}");
+    }
+
+    #[test]
     fn schedule_accepts_legacy_eos_key_form() {
         // Real Leap 5 responses render schedule keys in legacy EOS form;
         // the roster must accept them exactly as nodeos serves them.
@@ -912,7 +1127,7 @@ mod tests {
 
     #[test]
     fn post_blocks_roundtrip_through_the_restore_gate() {
-        let (mut manifest, halt_id, key_a, key_b, posts, post_states) = frozen_setup();
+        let (mut manifest, halt_id, key_a, key_b, _, _, posts, post_states) = frozen_setup();
         let refs: Vec<(&str, &Value)> = posts.iter().map(|(name, json)| (*name, json)).collect();
         let state_refs: Vec<(&str, &Value)> = post_states
             .iter()
@@ -955,8 +1170,109 @@ mod tests {
     }
 
     #[test]
+    fn halt_block_roundtrip_through_the_restore_gate() {
+        let (mut manifest, halt_id, _, _, halt_json, halt_state_json, _, _) = frozen_setup();
+        let recorded = record_halt_block(
+            &mut manifest,
+            &halt_json,
+            &halt_state_json,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            "halt",
+        )
+        .expect("H records");
+        assert_eq!(manifest.halt_h_block.as_deref(), Some(recorded.as_str()));
+        // The real restore gate is the oracle: it parses the recorded H
+        // with its own parser and re-authenticates the derived id,
+        // emptiness, version, and producer signature.
+        verify_migration_halt_block(&manifest, HEIGHT, &halt_id, VERSION)
+            .expect("gate accepts the recorded H");
+    }
+
+    #[test]
+    fn halt_block_rejects_a_foreign_signature_and_a_substituted_anchor() {
+        let (mut manifest, halt_id, _, _, halt_json, halt_state_json, _, _) = frozen_setup();
+        // Signed by an outsider over the true digest: recovery succeeds,
+        // but the key is not in the recorded schedule.
+        let key_c = K1PrivateKey::random();
+        let mut foreign = halt_json.clone();
+        let packed = pack_header(
+            100,
+            name_u64("alice"),
+            &{
+                let mut previous = [0u8; 32];
+                previous[0..4].copy_from_slice(&7u32.to_be_bytes());
+                previous
+            },
+            VERSION,
+        );
+        let header_digest = Digest::hash(&packed).0;
+        let digest = leap_sig_digest(&header_digest, &TEST_ROOT_H, &FIXTURE_SCHEDULE_HASH);
+        foreign["producer_signature"] = serde_json::json!(key_c.sign(&digest).to_string());
+        let error = record_halt_block(
+            &mut manifest,
+            &foreign,
+            &halt_state_json,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            "halt",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("not signed by the recorded schedule key"),
+            "{error}"
+        );
+        // Anchored at the wrong id: the entry must open on the trusted H.
+        let mut wrong_anchor = [9u8; 32];
+        wrong_anchor[0..4].copy_from_slice(&HEIGHT.to_be_bytes());
+        let error = record_halt_block(
+            &mut manifest,
+            &halt_json,
+            &halt_state_json,
+            &Id::new(wrong_anchor),
+            HEIGHT,
+            VERSION,
+            "halt",
+        )
+        .unwrap_err();
+        assert!(error.contains("trusted cutover id"), "{error}");
+    }
+
+    #[test]
+    fn post_blocks_reject_a_sibling_stated_under_the_wrong_id() {
+        let (mut manifest, halt_id, key_a, key_b, _, _, mut posts, post_states) = frozen_setup();
+        // Flip a byte in the first response id past its embedded height:
+        // the stated number still names HEIGHT+1, but the id is no longer
+        // the header's. The record path must derive the id instead of
+        // chaining the stated bytes.
+        let mut tampered = posts.remove(0).1.clone();
+        let mut id_bytes = hex::decode(tampered["id"].as_str().expect("stated id")).unwrap();
+        id_bytes[4] ^= 1;
+        tampered["id"] = serde_json::json!(hex::encode(&id_bytes));
+        posts.insert(0, ("alice", tampered));
+        let refs: Vec<(&str, &Value)> = posts.iter().map(|(n, j)| (*n, j)).collect();
+        let state_refs: Vec<(&str, &Value)> = post_states
+            .iter()
+            .map(|(name, json)| (*name, json))
+            .collect();
+        let error = record_post_blocks(
+            &mut manifest,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            &refs,
+            &state_refs,
+        )
+        .unwrap_err();
+        assert!(error.contains("id"), "{error}");
+        let _ = (key_a, key_b);
+    }
+
+    #[test]
     fn post_blocks_reject_broken_linkage() {
-        let (mut manifest, halt_id, key_a, key_b, mut posts, post_states) = frozen_setup();
+        let (mut manifest, halt_id, key_a, key_b, _, _, mut posts, post_states) = frozen_setup();
         let mut tampered = posts.remove(0).1.clone();
         tampered["previous"] = serde_json::json!(hex::encode([9u8; 32]));
         posts.insert(0, ("alice", tampered));
@@ -980,7 +1296,7 @@ mod tests {
 
     #[test]
     fn post_blocks_reject_traffic_rotation_and_unknown_producers() {
-        let (mut manifest, halt_id, key_a, key_b, posts, post_states) = frozen_setup();
+        let (mut manifest, halt_id, key_a, key_b, _, _, posts, post_states) = frozen_setup();
         let stated_hash = FIXTURE_SCHEDULE_HASH;
         // A transaction in the first post-H header.
         let mut with_tx = posts[0].1.clone();
@@ -1074,7 +1390,7 @@ mod tests {
 
     #[test]
     fn post_blocks_reject_non_k1_signatures_and_missing_schedule() {
-        let (mut manifest, halt_id, _, _, posts, post_states) = frozen_setup();
+        let (mut manifest, halt_id, _, _, _, _, posts, post_states) = frozen_setup();
         let mut non_k1 = posts[0].1.clone();
         // Well-formed R1 encoding, so the boundary parser accepts it and the
         // record step is what refuses the non-K1 signature.
@@ -1113,7 +1429,7 @@ mod tests {
 
     #[test]
     fn post_blocks_reject_wrong_root_wrong_hash_and_state_mismatch() {
-        let (mut manifest, halt_id, _, _, posts, post_states) = frozen_setup();
+        let (mut manifest, halt_id, _, _, _, _, posts, post_states) = frozen_setup();
         let refs: Vec<(&str, &Value)> = posts.iter().map(|(name, json)| (*name, json)).collect();
         // A blockroot from a different window: the signature no longer
         // recovers to the schedule key.
@@ -1189,14 +1505,14 @@ mod tests {
 
     #[test]
     fn boundary_parser_rejects_schedule_changes_and_extensions() {
-        let (_, _, _, _, posts, _) = frozen_setup();
+        let (_, _, _, _, _, _, posts, _) = frozen_setup();
         let mut changed = posts[0].1.clone();
         changed["new_producers"] = serde_json::json!({"version": VERSION + 1, "producers": []});
-        let error = parse_boundary_block(&changed).unwrap_err();
+        let error = parse_boundary_block(&changed, false).unwrap_err();
         assert!(error.contains("schedule change"), "{error}");
         let mut extended = posts[0].1.clone();
         extended["block_extensions"] = serde_json::json!([[1, "00"]]);
-        let error = parse_boundary_block(&extended).unwrap_err();
+        let error = parse_boundary_block(&extended, false).unwrap_err();
         assert!(error.contains("block extensions"), "{error}");
     }
 }

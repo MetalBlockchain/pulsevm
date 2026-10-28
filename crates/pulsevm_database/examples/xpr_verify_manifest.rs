@@ -480,21 +480,43 @@ fn verify_roster_against_checkpoint(
         ));
     }
     let state_keys = migration_state_producer_keys(&database)?;
+    // The boot gate fails closed without the producers table — a
+    // checkpoint without it cannot prove the declared set is the on-chain
+    // schedule — so the offline verifier mirrors the refusal instead of
+    // skipping: PASS here always means the boot gate would see the same
+    // cross-check.
     if state_keys.is_empty() {
-        println!("note: no producers table in checkpoint state; cross-check skipped");
-        return Ok(());
+        return Err(
+            "checkpoint carries no producers table: cannot prove the declared set is the on-chain schedule"
+                .to_string(),
+        );
     }
-    // The pair path enforces the light-client rule: every declared member
-    // must be active in checkpoint state with the same schedule key
-    // (weights are 1 by construction, so there is no H-state weight pin).
+    // The pair path enforces the light-client rule both ways: the declared
+    // set must equal the checkpoint's active producer set exactly, with
+    // matching schedule keys (weights are 1 by construction, so there is
+    // no H-state weight pin).
     match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)? {
         Some(matched) => {
             println!("roster schedule match: ok ({matched} producers)");
         }
         None => {
-            println!("note: no producers table in checkpoint state; cross-check skipped");
+            return Err(
+                "checkpoint carries no producers table: cannot prove the declared set is the on-chain schedule"
+                    .to_string(),
+            );
         }
     }
+    // Pause-window deferred inventory over the rows actually restored: the
+    // export-side check runs only when a sidecar is staged, but these rows
+    // are what the boot would promote — a row due between H and P fails
+    // here with the row named instead of at the emptiness gate.
+    let (window_start, window_end) = pulsevm_database::manifest_pause_window_us(manifest)
+        .map_err(|error| format!("pause window unreadable from staged manifest: {error}"))?;
+    pulsevm_database::check_no_arena_deferred_due_in_window(
+        &database.arena_deferred_transactions(),
+        window_start,
+        window_end,
+    )?;
     Ok(())
 }
 
@@ -611,7 +633,10 @@ mod tests {
         producer: u64,
         signing: &pulsevm_crypto::k1::K1PrivateKey,
         schedule_hash: [u8; 32],
-    ) -> String {
+        // Post-H entries carry the two zero counts the gate requires; the
+        // H entry omits them (H may carry traffic the entry does not stage).
+        with_counts: bool,
+    ) -> (String, [u8; 32]) {
         let mut header = Vec::new();
         header.extend_from_slice(&0x01020304u32.to_le_bytes());
         header.extend_from_slice(&producer.to_le_bytes());
@@ -623,6 +648,7 @@ mod tests {
         header.push(0); // no schedule change
         header.push(0); // no header extensions
         let root = [0xA1; 32];
+        let header_digest = pulsevm_crypto::Digest::hash(&header).0;
         let mut digest_and_root = Vec::with_capacity(64);
         digest_and_root.extend_from_slice(&header_digest);
         digest_and_root.extend_from_slice(&root);
@@ -637,24 +663,28 @@ mod tests {
         packed.extend_from_slice(&header);
         packed.push(0); // K1 tag
         packed.extend_from_slice(&signing.sign(&digest).compact65());
-        packed.push(0); // no transactions
-        packed.push(0); // no block extensions
-        // The entry carries the block's id verbatim: the gate chains it,
-        // never recomputing Leap's id formula.
+        if with_counts {
+            packed.push(0); // no transactions
+            packed.push(0); // no block extensions
+        }
+        // The entry carries the header-derived block id, which the gate
+        // recomputes from the packed header and requires to match exactly.
         let num = u32::from_be_bytes(previous[0..4].try_into().unwrap()) + 1;
         let mut id = pulsevm_crypto::Digest::hash(&header).0;
         id[0..4].copy_from_slice(&num.to_be_bytes());
         packed.extend_from_slice(&id);
-        hex::encode(&packed)
+        (hex::encode(&packed), id)
     }
 
     /// Build a checkpoint whose producers table holds one producer, plus a
     /// matching manifest carrying the two-step pair and the on-chain
     /// ceremony (run with the matching successor chain id). When
     /// `tamper_roster` is set the roster key is swapped so the state
-    /// binding must fail. Legacy roster-less manifests are not built: the
-    /// verifier rejects them.
-    fn fixture(tamper_roster: bool) -> Fixture {
+    /// binding must fail. When `with_producers` is unset the checkpoint
+    /// carries no producers table, so the roster cross-check must fail
+    /// closed. Legacy roster-less manifests are not built: the verifier
+    /// rejects them.
+    fn fixture(tamper_roster: bool, with_producers: bool) -> Fixture {
         let dir = tempfile::TempDir::new().unwrap();
         let system = Name::from_str("eosio").unwrap().as_u64();
         let producers = Name::from_str("producers").unwrap().as_u64();
@@ -665,24 +695,29 @@ mod tests {
 
         let mut db =
             Database::new(dir.path().join("build").to_str().unwrap(), 64 * 1024 * 1024).unwrap();
-        let mut table_row = vec![0u8];
-        for value in [system, system, producers, 55u64] {
-            table_row.extend_from_slice(&value.to_le_bytes());
-        }
-        let mut kv_row = vec![0u8];
-        for value in [system, system, producers, owner, 55u64] {
-            kv_row.extend_from_slice(&value.to_le_bytes());
-        }
-        let value = producer_info_row(owner, &signing.public_key().compressed());
-        kv_row.push(value.len() as u8);
-        kv_row.extend_from_slice(&value);
+        let deltas = if with_producers {
+            let mut table_row = vec![0u8];
+            for value in [system, system, producers, 55u64] {
+                table_row.extend_from_slice(&value.to_le_bytes());
+            }
+            let mut kv_row = vec![0u8];
+            for value in [system, system, producers, owner, 55u64] {
+                kv_row.extend_from_slice(&value.to_le_bytes());
+            }
+            let value = producer_info_row(owner, &signing.public_key().compressed());
+            kv_row.push(value.len() as u8);
+            kv_row.extend_from_slice(&value);
+            vec![
+                table_delta("contract_table", table_row),
+                table_delta("contract_row", kv_row),
+            ]
+        } else {
+            Vec::new()
+        };
         let entry = StateHistoryEntry {
             magic: 0,
             block_id: [0; 32],
-            deltas: vec![
-                table_delta("contract_table", table_row),
-                table_delta("contract_row", kv_row),
-            ],
+            deltas,
         };
         hydrate_full_state(&mut db, &entry).unwrap();
         db.set_revision(7).unwrap();
@@ -691,10 +726,13 @@ mod tests {
         let checkpoint = dir.path().join("migration.snapshot");
         std::fs::write(&checkpoint, &checkpoint_bytes).unwrap();
 
-        // Height-consistent H id: the post-chain walk derives each height
-        // as parent-num + 1, so the fixture anchor embeds H itself.
-        let mut hid = [9u8; 32];
-        hid[0..4].copy_from_slice(&7u32.to_be_bytes());
+        // The cutover block is a gate entry too: its header derives the H
+        // id, so the window opens on a signature-checked H. The post-chain
+        // walk derives each height as parent-num + 1, so the H header
+        // chains from a parent embedding 6.
+        let mut parent6 = [6u8; 32];
+        parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
+        let (h_block, hid) = pack_post_block(&parent6, owner, &signing, [0x5E; 32], false);
         let mut manifest = MigrationManifest::new(
             b"fixture log",
             hid,
@@ -807,10 +845,12 @@ mod tests {
             key: signing.public_key().to_string(),
             weight: pulsevm_chain_types::HaltWeight::MEMBER,
         }]);
+        manifest.halt_h_block = Some(h_block);
         // The staged header names a fixed schedule hash: the gate binds the
         // exact (root, hash) pair through the producer signature, so any
         // consistent value exercises the real check.
-        manifest.halt_post_blocks = Some(vec![pack_post_block(&hid, owner, &signing, [0x5E; 32])]);
+        let (post8, _) = pack_post_block(&hid, owner, &signing, [0x5E; 32], true);
+        manifest.halt_post_blocks = Some(vec![post8]);
         let manifest_path = dir.path().join("migration.manifest.json");
         std::fs::write(
             &manifest_path,
@@ -834,7 +874,7 @@ mod tests {
 
     #[test]
     fn verifies_matching_fixture_end_to_end() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         assert_eq!(
             run(
                 &fixture.manifest,
@@ -852,7 +892,27 @@ mod tests {
 
     #[test]
     fn rejects_fixture_with_forged_roster_key() {
-        let fixture = fixture(true);
+        let fixture = fixture(true, true);
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn rejects_fixture_without_producers_table() {
+        // The boot gate fails closed without the producers table, and the
+        // offline verifier mirrors it: a manifest that validates without
+        // the state binding would let an unattested roster boot.
+        let fixture = fixture(false, false);
         assert_ne!(
             run(
                 &fixture.manifest,
@@ -869,7 +929,7 @@ mod tests {
 
     #[test]
     fn verifies_cutover_pair_end_to_end() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         assert_eq!(
             run(
                 &fixture.manifest,
@@ -886,7 +946,7 @@ mod tests {
 
     #[test]
     fn rejects_pair_on_wrong_successor_chain() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         // A migration genesis with a different initial key derives a
         // different successor id, which the confirmation does not bind.
         let wrong = write_genesis(
@@ -915,7 +975,7 @@ mod tests {
 
     #[test]
     fn rejects_pair_when_roster_diverges_from_declared_set() {
-        let fixture = fixture(true);
+        let fixture = fixture(true, true);
         assert_ne!(
             run(
                 &fixture.manifest,
@@ -932,7 +992,7 @@ mod tests {
 
     #[test]
     fn rejects_pair_when_platform_diverges() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         let other = [0x52; 32];
         assert_ne!(
             run(
@@ -982,7 +1042,7 @@ mod tests {
 
     #[test]
     fn accepts_a_sidecar_with_nothing_due_in_the_window() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         // The zero-slot source block opens the window at the Antelope
         // epoch (946684800000000); block 8 closes it later. A row due
         // after the pause head and an empty inventory both pass.
@@ -1012,7 +1072,7 @@ mod tests {
 
     #[test]
     fn rejects_a_sidecar_with_a_row_due_in_the_window() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         let start = pulsevm_database::antelope_slot_to_unix_micros(0);
         let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020304);
         let sidecar = write_sidecar(
@@ -1035,7 +1095,7 @@ mod tests {
 
     #[test]
     fn rejects_pair_when_confirmation_is_missing() {
-        let fixture = fixture(false);
+        let fixture = fixture(false, true);
         let mut manifest: MigrationManifest =
             serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
         manifest.halt_confirmation = None;

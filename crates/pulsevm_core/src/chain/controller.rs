@@ -1482,6 +1482,29 @@ impl Controller {
                         )));
                     }
                 }
+                // Pause-window deferred inventory at restore, not just at
+                // export: the export-side check runs only when a sidecar is
+                // staged, but these are the rows actually promoted — a row
+                // due between H and P would have executed on a post-H block
+                // and set its transaction root, so the boot fails closed
+                // here with the row named instead of at the emptiness gate.
+                // Only the two-step pair stages a window (H..P); legacy
+                // manifests carry no post-H proof to check against.
+                if migration_roster.is_some() {
+                    let (window_start, window_end) =
+                        pulsevm_database::manifest_pause_window_us(&manifest).map_err(|error| {
+                            ChainError::GenesisError(format!(
+                                "migration pause window unreadable: {error}"
+                            ))
+                        })?;
+                    let restored = self.db.arena_deferred_transactions();
+                    pulsevm_database::check_no_arena_deferred_due_in_window(
+                        &restored,
+                        window_start,
+                        window_end,
+                    )
+                    .map_err(ChainError::GenesisError)?;
+                }
                 // Leap's second deferred-transaction retirement feature removes all
                 // pending generated transactions when activated. A checkpoint made
                 // before that activation can still carry rows, so normalize them
@@ -10892,6 +10915,7 @@ mod tests {
     /// the handover's real post-H headers; the restore gate walks it.
     fn pack_post_block(
         previous: &[u8; 32],
+        slot: u32,
         producer: u64,
         signing: &pulsevm_crypto::K1PrivateKey,
         schedule_version: u32,
@@ -10899,7 +10923,7 @@ mod tests {
         schedule_hash: [u8; 32],
     ) -> Result<(String, [u8; 32]), ChainError> {
         let mut header = Vec::new();
-        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&slot.to_le_bytes());
         header.extend_from_slice(&producer.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(previous);
@@ -10933,8 +10957,8 @@ mod tests {
             })?) + 1;
         let mut id = header_digest;
         id[0..4].copy_from_slice(&num.to_be_bytes());
-        // The entry carries the block's id verbatim: the gate chains it,
-        // never recomputing Leap's id formula.
+        // The entry carries the header-derived block id, which the gate
+        // recomputes from the packed header and requires to match exactly.
         packed.extend_from_slice(&id);
         Ok((hex::encode(&packed), id))
     }
@@ -11081,19 +11105,31 @@ mod tests {
         );
         // Post-H emptiness window: two signed empty blocks hash-linked from
         // H (pause head P = H + 2 in the fixture), proving nothing landed
-        // after the freeze. Producers sign in fixture order.
+        // after the freeze. Producers sign in fixture order. Slots advance
+        // past H's slot so the staged window is time-ordered like a real
+        // freeze (the restore gate derives the deferred inventory bounds
+        // from these slots).
         let post_producer = |index: usize| {
             crate::chain::name::Name::from_str(producers[index])
                 .map(|name| name.as_u64())
                 .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))
         };
-        // The staged headers name the roster-derived schedule hash the
+        let source_bytes = hex::decode(manifest["source_block"].as_str().ok_or_else(|| {
+            ChainError::InternalError("manifest has no attached source block".into())
+        })?)
+        .map_err(|e| {
+            ChainError::InternalError(format!("fixture source block is not hexadecimal: {e}"))
+        })?;
+        let halt_slot = u32::from_le_bytes(source_bytes[0..4].try_into().map_err(|_| {
+            ChainError::InternalError("fixture source block shorter than its timestamp slot".into())
+        })?);
         // The staged headers name a fixed schedule hash: the gate binds
         // the exact (root, hash) pair through the producer signature, so
         // any consistent value exercises the real check.
         const FIXTURE_SCHED_HASH: [u8; 32] = [0x5E; 32];
         let (post_next, next_id) = pack_post_block(
             &source_block_id.0.0,
+            halt_slot + 1,
             post_producer(0)?,
             &keys[0],
             header_schedule_version,
@@ -11103,6 +11139,7 @@ mod tests {
         let second = (1 % producers.len().max(1)) as usize;
         let (post_last, _) = pack_post_block(
             &next_id,
+            halt_slot + 2,
             post_producer(second)?,
             &keys[second],
             header_schedule_version,
@@ -11110,6 +11147,55 @@ mod tests {
             FIXTURE_SCHED_HASH,
         )?;
         manifest["halt_post_blocks"] = json!([post_next, post_last]);
+        // The cutover block entry: H's real header bytes (decoded from the
+        // staged source block), signed over Leap's true digest with H's own
+        // header-state inputs by the schedule key for H's producer. The
+        // gate re-derives the H id from this entry and requires it to
+        // equal the terminal block the confirmation binds.
+        const FIXTURE_H_ROOT: [u8; 32] = [0xC1; 32];
+        let mut position = 0;
+        let decoded = SignedBlock::read(&source_bytes, &mut position).map_err(|error| {
+            ChainError::InternalError(format!("fixture source block cannot be decoded: {error}"))
+        })?;
+        if position != source_bytes.len() {
+            return Err(ChainError::InternalError(
+                "fixture source block has trailing bytes".into(),
+            ));
+        }
+        let halt_header = decoded.signed_block_header.header;
+        let halt_header_bytes = halt_header.pack().map_err(|error| {
+            ChainError::InternalError(format!("fixture H header cannot be packed: {error}"))
+        })?;
+        let halt_header_digest = pulsevm_crypto::Digest::hash(&halt_header_bytes).0;
+        let halt_bound = {
+            let mut digest_and_root = Vec::with_capacity(64);
+            digest_and_root.extend_from_slice(&halt_header_digest);
+            digest_and_root.extend_from_slice(&FIXTURE_H_ROOT);
+            pulsevm_crypto::Digest::hash(&digest_and_root).0
+        };
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&halt_bound);
+        bound_and_schedule.extend_from_slice(&FIXTURE_SCHED_HASH);
+        let halt_digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let halt_producer = halt_header.producer.to_string();
+        let halt_key_index = producers
+            .iter()
+            .position(|name| *name == halt_producer.as_str())
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "fixture H producer {halt_producer} is not in the recorded schedule"
+                ))
+            })?;
+        // No counts: the staged source block may carry traffic, which the
+        // H entry does not stage — it proves the anchor, not emptiness.
+        let mut halt_entry = Vec::with_capacity(64 + halt_header_bytes.len() + 98);
+        halt_entry.extend_from_slice(&FIXTURE_H_ROOT);
+        halt_entry.extend_from_slice(&FIXTURE_SCHED_HASH);
+        halt_entry.extend_from_slice(&halt_header_bytes);
+        halt_entry.push(0); // K1 tag
+        halt_entry.extend_from_slice(&keys[halt_key_index].sign(&halt_digest).compact65());
+        halt_entry.extend_from_slice(&source_block_id.0.0);
+        manifest["halt_h_block"] = json!(hex::encode(&halt_entry));
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
             .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
         Ok(())
@@ -11350,25 +11436,29 @@ mod tests {
             _source_revision,
             source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
-        let keys = halt_v2_keys()?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let pair_keys = [pulse_k1];
         attach_halt_pair(
             &manifest_path,
             &migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &pair_keys,
+            &["pulse"],
+            &[0],
             &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &pair_keys,
+            &["pulse"],
+            &[0],
             false,
         )?;
         // Corrupt one commitment signature in place; the rostered quorum no
@@ -11455,8 +11545,10 @@ mod tests {
             }));
         }
         // Unit schedule weights: the legacy commitment vehicle tallies the
-        // same count quorum as the pair.
-        let roster: Vec<serde_json::Value> = keys
+        // same count quorum as the pair. Sorted by producer, mirroring the
+        // declaration's member order, so the transport roster matches the
+        // declared set entry-wise regardless of caller order.
+        let mut roster: Vec<serde_json::Value> = keys
             .iter()
             .zip(producers.iter())
             .map(|(key, producer)| {
@@ -11467,6 +11559,12 @@ mod tests {
                 })
             })
             .collect();
+        roster.sort_by(|a, b| {
+            a["producer"]
+                .as_str()
+                .cmp(&b["producer"].as_str())
+                .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+        });
         manifest["halt_roster"] = json!(roster);
         manifest["halt_commitment"] = json!({
             "version": 2,
@@ -11515,24 +11613,31 @@ mod tests {
             &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
         )
         .await?;
+        // The declared set must equal the full checkpoint schedule, both
+        // ways: pulse produced H, so it is a member of the frozen set.
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
             &migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
             &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
             false,
         )?;
         let config_bytes = json!({
@@ -11563,6 +11668,11 @@ mod tests {
         let schedule_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
         let (
             checkpoint,
             manifest_path,
@@ -11572,26 +11682,34 @@ mod tests {
             source_block_num,
             _source_revision,
             source_chain_id,
-        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
-        let keys = halt_v2_keys()?;
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+        )
+        .await?;
+        // One of three weight units cannot carry a two-thirds quorum: the
+        // pair itself carries 3/3 (so the failure under test is the
+        // commitment's), while the commitment signs with one member.
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
             &migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
             &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[1],
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[2],
             false,
         )?;
         let config_bytes = json!({
@@ -11636,25 +11754,29 @@ mod tests {
             _source_revision,
             source_chain_id,
         ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
-        let keys = halt_v2_keys()?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let pair_keys = [pulse_k1];
         attach_halt_pair(
             &manifest_path,
             &migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &pair_keys,
+            &["pulse"],
+            &[0],
             &chain_id.0.0,
         )?;
         attach_halt_commitment_v2(
             &manifest_path,
             source_block_num,
             &source_block_id,
-            &keys,
-            &["prod.a", "prod.b"],
-            &[0, 1],
+            &pair_keys,
+            &["pulse"],
+            &[0],
             true,
         )?;
         let config_bytes = json!({
