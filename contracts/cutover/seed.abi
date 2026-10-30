@@ -1,0 +1,106 @@
+{
+    "____comment": "This file was generated with eosio-abigen. DO NOT EDIT ",
+    "version": "eosio::abi/1.2",
+    "types": [],
+    "structs": [
+        {
+            "name": "clear",
+            "base": "",
+            "fields": [
+                {
+                    "name": "owner",
+                    "type": "name"
+                }
+            ]
+        },
+        {
+            "name": "setprod",
+            "base": "",
+            "fields": [
+                {
+                    "name": "owner",
+                    "type": "name"
+                },
+                {
+                    "name": "votes",
+                    "type": "float64"
+                },
+                {
+                    "name": "key",
+                    "type": "bytes"
+                },
+                {
+                    "name": "active",
+                    "type": "bool"
+                }
+            ]
+        },
+        {
+            "name": "producer_row",
+            "base": "",
+            "fields": [
+                {
+                    "name": "owner",
+                    "type": "name"
+                },
+                {
+                    "name": "total_votes",
+                    "type": "float64"
+                },
+                {
+                    "name": "producer_key",
+                    "type": "public_key"
+                },
+                {
+                    "name": "is_active",
+                    "type": "bool"
+                },
+                {
+                    "name": "url",
+                    "type": "string"
+                },
+                {
+                    "name": "unpaid_blocks",
+                    "type": "uint32"
+                },
+                {
+                    "name": "last_claim_time",
+                    "type": "int64"
+                },
+                {
+                    "name": "location",
+                    "type": "uint16"
+                }
+            ]
+        }
+    ],
+    "actions": [
+        {
+            "name": "clear",
+            "type": "clear",
+            "ricardian_contract": ""
+        },
+        {
+            "name": "setprod",
+            "type": "setprod",
+            "ricardian_contract": ""
+        }
+    ],
+    "tables": [
+        {
+            "name": "producers",
+            "index_type": "i64",
+            "key_names": [
+                "owner"
+            ],
+            "key_types": [
+                "name"
+            ],
+            "type": "producer_row"
+        }
+    ],
+    "kv_tables": {},
+    "ricardian_clauses": [],
+    "variants": [],
+    "action_results": []
+}

@@ -118,6 +118,12 @@ The default programming language for Pulse contracts will be TypeScript, accompa
 
 Even though Pulse is based on EOS, there are quite some differences when it comes to smart contracts. A migration will be necessary for most smart contracts. This migration should however be relatively simple for most contracts.
 
+For the XPR Network state migration (snapshot → SHiP export → Arena
+checkpoint → new chain), see the canonical plan
+[`docs/xpr-achain-migration.md`](docs/xpr-achain-migration.md), the
+[halt ceremony](docs/xpr-halt-ceremony.md) for the freeze commitment, and
+the [handover rehearsal](docs/xpr-handover-rehearsal.md) proof record.
+
 ### Intrinsics
 
 - `is_account(name n): bool`: Verifies that n is an existing account

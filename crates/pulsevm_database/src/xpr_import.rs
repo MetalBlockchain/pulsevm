@@ -134,6 +134,30 @@ pub struct ImportSummary {
     pub index_long_double_rows: u64,
 }
 
+/// One weighted-roster entry for halt-quorum verification, in the
+/// human-inspectable string-key form the manifest stores. Keys parse to
+/// [`pulsevm_chain_types::HaltRosterEntry`] via [`MigrationManifest::roster_entries`].
+/// Weights are decimal strings in JSON (see [`pulsevm_chain_types::HaltWeight`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationHaltRosterEntry {
+    pub producer: String,
+    pub key: String,
+    pub weight: pulsevm_chain_types::HaltWeight,
+}
+
+/// One memo-vehicle declaration account: the on-chain name committing to
+/// the declaration digest, plus the Antelope slot it was created in. The
+/// names are deterministic from the digest (`h` + round letter + hex
+/// nibbles mapped to `a`–`p`), so the gate re-decodes them instead of
+/// trusting the exporter; the slot must predate H. Both are bound by the
+/// checkpoint only through existence: the restore gate and the offline
+/// verifier require every recorded name to exist in the restored state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationMemoAccount {
+    pub name: String,
+    pub created_slot: u32,
+}
+
 /// A durable, human-inspectable commitment to one XPR-to-Arena conversion.
 ///
 /// The arena checkpoint envelope protects its payload, while this manifest
@@ -157,16 +181,146 @@ pub struct MigrationManifest {
     pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
+    /// The old network's signed halt commitment. Optional for legacy
+    /// manifests; when present the restore verifies it against the source
+    /// block before trusting the checkpoint, so a node never promotes state
+    /// the source chain did not agree to freeze.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_commitment: Option<pulsevm_chain_types::HaltCommitment>,
+    /// Step one of the two-step cutover: the source schedule's signed
+    /// declaration that `last_height` is the last block it authors on the
+    /// source chain id. Made while H is still in the future and recorded
+    /// on the source chain before H arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_declaration: Option<pulsevm_chain_types::HaltDeclaration>,
+    /// Step two of the cutover: the same quorum's confirmation binding the
+    /// declaration to the terminal block id, the checkpoint, and the
+    /// successor chain id. Required whenever `halt_declaration` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_confirmation: Option<pulsevm_chain_types::HaltConfirmation>,
+    /// Block height carrying the declaration commitment (memo block or the
+    /// block by which the declaration quorum was complete on-chain).
+    /// Provenance for the vote-timing rule; absent when signatures were
+    /// collected off-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_declaration_inclusion: Option<u32>,
+    /// Block height carrying the confirmation quorum on-chain. Must postdate
+    /// H: a confirmation references H_ID, which cannot exist inside H
+    /// itself. Absent when the confirmation was signed off-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_confirmation_inclusion: Option<u32>,
+    /// Ceremony freshness bound K: a declaration inclusion older than H-K
+    /// is stale and fails closed. Unset means no freshness bound is
+    /// claimed; the structural bound (inclusion strictly before H) always
+    /// applies when an inclusion is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_max_declaration_lag: Option<u32>,
+    /// Ceremony liveness bound J: a confirmation inclusion past H+J misses
+    /// the deadline and fails closed. Unset means no deadline is claimed;
+    /// the structural bound (inclusion strictly after H) always applies
+    /// when an inclusion is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_max_confirmation_lag: Option<u32>,
     /// Commits the chainbase sidecar that supplies every field SHiP v0 omits,
     /// including replay-protection rows. The field keeps its original name for
     /// migration-manifest compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_transaction_sidecar_sha256: Option<String>,
+    /// Weighted producer roster for halt-quorum verification. Absent for
+    /// version 1 manifests, whose restore falls back to the single-key path.
+    /// Present implies version 2 (see [`MigrationManifest::with_halt_roster`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_roster: Option<Vec<MigrationHaltRosterEntry>>,
+    /// On-chain cutover-contract evidence for the step-one declaration: the
+    /// captured `ceremony` singleton plus every `vote` action the exporter
+    /// scanned. When present, the verifier replays the tally off-chain
+    /// (digest link, windows, membership, recomputed weights, strict
+    /// quorum) instead of trusting the recorded inclusion block alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_contract_ceremony: Option<pulsevm_chain_types::HaltContractCeremony>,
+    /// The producer-schedule version every vote — and the terminal block —
+    /// sat under, attested by the exporter. A rotation mid-ceremony changes
+    /// the schedule version, so unanimity here proves the frozen set was
+    /// the active schedule for the whole window; combined with the key-anchored
+    /// schedule check against checkpoint state, a divergent schedule fails
+    /// closed either as a stale version or a mismatched set. Required for the
+    /// two-step pair (memo and contract vehicles alike): the pair verifier
+    /// pins it to H's header version unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_schedule_version: Option<u32>,
+    /// The active producer schedule as read from H's header state
+    /// (names plus schedule keys, unit weights). The pair verifier requires
+    /// it to equal the declared set exactly: the declaration must name the
+    /// recorded schedule, no more and no less. Recorded by
+    /// `xpr_attach_source_block --halt-state` from the header state captured
+    /// at the freeze instant (header state is served only while reversible,
+    /// and no export nodeos can serve H later) — never from a live
+    /// `get_producer_schedule` query, which an exporter could point
+    /// anywhere; publication of the schedule hash weeks ahead (T-30) is
+    /// what lets every party check the recorded set is the coordinated one
+    /// rather than an exporter invention — the gate binds it to the
+    /// declaration, the checkpoint (via the confirmed sha), and H's
+    /// version, but the coordinated set itself is a governance fact, not a
+    /// derivable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_schedule: Option<Vec<MigrationHaltRosterEntry>>,
+    /// Packed signed XPR blocks H+1 through the pause head, in order: the
+    /// emptiness proof for the post-H window. The pair verifier hash-links
+    /// every header from the trusted H id, requires empty transaction
+    /// roots and producer signatures from the recorded schedule, derives
+    /// every block id from its header, and rejects schedule changes in the
+    /// window — so a non-participating producer's transactions cannot hide
+    /// behind fleet procedure. The window is never empty (the pause head
+    /// sits strictly past H): an empty list fails closed, and absence is
+    /// not an unattested window. Recorded by
+    /// `xpr_attach_source_block --post-block` after the pause, with each
+    /// header's signature inputs from `--post-state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_post_blocks: Option<Vec<String>>,
+    /// Packed signed XPR cutover block H itself (root || schedule-hash ||
+    /// header || signature || block-id — no counts, because H may carry
+    /// traffic): the H signature proof. The gate parses it with the shared
+    /// entry reader, checks the derived id is H with H's schedule version,
+    /// and requires the producer signature — over Leap's true digest with
+    /// the entry's recorded root and schedule hash — to recover to the
+    /// recorded schedule key for H's producer. The recorded window is bound
+    /// by this signature, so the proof cannot open on an unattested H.
+    /// Recorded by `xpr_attach_source_block --halt-state` from H's
+    /// `get_block` plus H's `get_block_header_state`; absence fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_h_block: Option<String>,
+    /// Export-time attestation of whether the checkpoint carries a proposed
+    /// producer schedule in `global_property`. Must be `Some(false)`: a
+    /// checkpoint taken mid-rotation would boot the new chain with a pending
+    /// proposal the ceremony never froze, so the restore fails closed on
+    /// `Some(true)` (proposed) and on `None` (unattested). Derived by
+    /// `record_halt_schedule` from the same header state the roster comes
+    /// from — never hand-typed — so a staged pending schedule fails the
+    /// record fast; the raw bytes are not recoverable from the checkpoint
+    /// afterward (hydrate keeps only the parsed chain config), so absence
+    /// cannot be re-derived at restore time.
+    /// Memo-vehicle declaration accounts: the on-chain names committing to
+    /// the declaration digest, with the Antelope slot each was created in.
+    /// Recorded by `xpr_attach_source_block --memo-accounts` from the
+    /// harness-captured `get_account` responses (names re-decoded to the
+    /// digest and creation required before H at record time). The pair
+    /// verifier re-decodes the names and re-checks the timing; the restore
+    /// gate and the offline verifier additionally require every recorded
+    /// name to exist in the restored checkpoint state — that existence is
+    /// what proves the declaration landed on-chain before H, instead of a
+    /// bare asserted inclusion height. Absent for the contract vehicle
+    /// (whose scanned votes carry their own block heights) and for legacy
+    /// commitments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_proposed_schedule: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_memo_accounts: Option<Vec<MigrationMemoAccount>>,
     pub import_summary: ImportSummary,
 }
 
 impl MigrationManifest {
     pub const VERSION: u16 = 1;
+    pub const VERSION_V2: u16 = 2;
 
     pub fn new(
         source_state_history: &[u8],
@@ -184,6 +338,21 @@ impl MigrationManifest {
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
             deferred_transaction_sidecar_sha256: None,
+            halt_commitment: None,
+            halt_declaration: None,
+            halt_confirmation: None,
+            halt_declaration_inclusion: None,
+            halt_confirmation_inclusion: None,
+            halt_max_declaration_lag: None,
+            halt_max_confirmation_lag: None,
+            halt_roster: None,
+            halt_contract_ceremony: None,
+            halt_schedule_version: None,
+            halt_proposed_schedule: None,
+            halt_memo_accounts: None,
+            halt_schedule: None,
+            halt_post_blocks: None,
+            halt_h_block: None,
             import_summary,
         }
     }
@@ -203,17 +372,68 @@ impl MigrationManifest {
         self
     }
 
+    /// Attach the weighted producer roster for halt-quorum verification and
+    /// mark the manifest version 2. Version 1 manifests (no roster) keep the
+    /// single-key restore path.
+    pub fn with_halt_roster(mut self, roster: Vec<MigrationHaltRosterEntry>) -> Self {
+        self.version = Self::VERSION_V2;
+        self.halt_roster = Some(roster);
+        self
+    }
+
+    /// Parse the manifest roster into verifier entries. Returns `Ok(None)`
+    /// when the manifest carries no roster. Verification entry points must
+    /// treat `None` as a rejection: a roster-less commitment cannot prove a
+    /// schedule quorum, so the single-key path is not accepted anywhere.
+    /// Every transported weight must be exactly 1 (the frozen schedule, not
+    /// a vote-weight tally): an exporter cannot move the denominator.
+    pub fn roster_entries(
+        &self,
+    ) -> Result<Option<Vec<pulsevm_chain_types::HaltRosterEntry>>, String> {
+        let Some(roster) = self.halt_roster.as_ref() else {
+            return Ok(None);
+        };
+        roster
+            .iter()
+            .map(|entry| {
+                if entry.weight != pulsevm_chain_types::HaltWeight::MEMBER {
+                    return Err(format!(
+                        "halt roster weight for {} is {} (expected the schedule weight 1)",
+                        entry.producer, entry.weight.0
+                    ));
+                }
+                let key =
+                    pulsevm_crypto::k1::K1PublicKey::from_string(&entry.key).map_err(|e| {
+                        format!("halt roster key for {} invalid: {e:?}", entry.producer)
+                    })?;
+                Ok(pulsevm_chain_types::HaltRosterEntry {
+                    producer: entry.producer.clone(),
+                    key,
+                    weight: entry.weight,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some)
+    }
+
+    /// Supported manifest versions: 1 (single-key halt) and 2 (roster +
+    /// checkpoint-bound halt). Anything else fails closed.
+    fn check_version(&self) -> Result<(), String> {
+        if self.version != Self::VERSION && self.version != Self::VERSION_V2 {
+            return Err(format!(
+                "unsupported migration manifest version {} (expected {} or {})",
+                self.version,
+                Self::VERSION,
+                Self::VERSION_V2
+            ));
+        }
+        Ok(())
+    }
     /// Verify that `checkpoint` is precisely the artifact this manifest
     /// describes. The checkpoint envelope itself is checked by restore; this
     /// method establishes its migration provenance before restore begins.
     pub fn verify_checkpoint(&self, checkpoint: &[u8]) -> Result<(), String> {
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let actual = hex::encode(Digest::hash(checkpoint).as_bytes());
         if actual != self.checkpoint_sha256 {
             return Err(format!(
@@ -236,13 +456,7 @@ impl MigrationManifest {
     /// multi-gigabyte envelope in the controller process.
     pub fn verify_checkpoint_path(&self, checkpoint: impl AsRef<Path>) -> Result<(), String> {
         let path = checkpoint.as_ref();
-        if self.version != Self::VERSION {
-            return Err(format!(
-                "unsupported migration manifest version {} (expected {})",
-                self.version,
-                Self::VERSION
-            ));
-        }
+        self.check_version()?;
         let mut file = File::open(path)
             .map_err(|error| format!("cannot read checkpoint {}: {error}", path.display()))?;
         let length = file
@@ -292,6 +506,1048 @@ impl MigrationManifest {
         }
         Ok(())
     }
+}
+
+/// One `eosio` `producers`-table row as restored from checkpoint state:
+/// the block-signing key bound to a producer name. (`eosio.system` holds no
+/// such table on XPR mainnet — the account does not exist there; the live
+/// schedule table is code `eosio`, scope `eosio`.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StateProducerKey {
+    pub key: [u8; 33],
+    pub is_active: bool,
+    /// Vote weight as recorded on-chain. Quorum math runs over the
+    /// transported roster's integer weights, not this float; it is exposed
+    /// so roster builders start from the same source of truth.
+    pub total_votes: f64,
+}
+
+/// Decode one `producer_info` row in Leap 5.0.3 `fc::raw` layout: owner,
+/// `total_votes`, key type, 33-byte key, `is_active`, url, unpaid blocks,
+/// last claim time, location. XPR mainnet rows carry NO authority tail
+/// (verified live against mainnet: 8 fields, 90 bytes), so the schedule
+/// key is taken as the signing key after a K1 validity gate — the same
+/// rule the ceremony contract's `init` enforces. Vote weights are consumed
+/// but not returned: they drift every block between the roster reference
+/// and the checkpoint, so the cross-check binds names to keys and leaves
+/// weights to the quorum math over the transported roster. `finish`
+/// enforces exact consumption, so any future system-contract field
+/// addition fails this decoder loudly instead of silently changing shape.
+fn decode_producer_info_row(bytes: &[u8]) -> Result<(u64, StateProducerKey), XprImportError> {
+    let mut row = RowCursor::new(bytes);
+    let owner = row.u64()?;
+    let total_votes = f64::from_le_bytes(row.fixed::<8>()?);
+    if row.varuint()? != 0 {
+        return Err(bad("XPR producer uses a non-K1 signing key"));
+    }
+    let key = row.fixed::<33>()?;
+    let is_active = row.bool()?;
+    let _url = row.bytes()?;
+    let _unpaid_blocks = row.u32()?;
+    let _last_claim_time = row.i64()?;
+    let _location = row.u16()?;
+    row.finish()?;
+    Ok((
+        owner,
+        StateProducerKey {
+            key,
+            is_active,
+            total_votes,
+        },
+    ))
+}
+
+/// Derive the producer-name to signing-key map from restored checkpoint
+/// state (code `eosio`, scope `eosio`, table `producers` — the live XPR
+/// schedule table, verified against mainnet). Returns an empty map when the
+/// table is absent, which only happens for synthetic fixtures: real XPR
+/// checkpoints always carry the schedule table.
+pub fn migration_state_producer_keys(
+    db: &Database,
+) -> Result<BTreeMap<u64, StateProducerKey>, String> {
+    use std::str::FromStr;
+    let system = pulsevm_name::Name::from_str("eosio")
+        .map_err(|e| format!("invalid system account name: {e}"))?
+        .as_u64();
+    let producers = pulsevm_name::Name::from_str("producers")
+        .map_err(|e| format!("invalid producers table name: {e}"))?
+        .as_u64();
+    let mut map = BTreeMap::new();
+    for (primary, value) in db.arena_table_range(system, system, producers) {
+        let (owner, entry) = decode_producer_info_row(&value)
+            .map_err(|e| format!("producers row {primary} undecodable: {e}"))?;
+        if owner != primary {
+            return Err(format!(
+                "producers row {primary} carries a mismatched owner {owner}"
+            ));
+        }
+        if map.insert(owner, entry).is_some() {
+            return Err(format!("duplicate producers row for owner {owner}"));
+        }
+    }
+    Ok(map)
+}
+
+/// Emit a starting-point halt roster from checkpoint state: every active
+/// producer with the unit schedule weight. The ceremony roster must be this
+/// whole active set, never a trimmed subset — the restore gate requires
+/// exact set equality against checkpoint state, so the operator verifies
+/// the template against the coordinated schedule (names, schedule keys,
+/// version) and aborts on any divergence instead of trimming it: a subset
+/// roster picks its own quorum denominator. `total_votes` is deliberately
+/// ignored (it drifts every block); every entry weighs 1.
+pub fn migration_halt_roster_template(
+    db: &Database,
+) -> Result<Vec<MigrationHaltRosterEntry>, String> {
+    let mut roster = Vec::new();
+    for (owner, entry) in migration_state_producer_keys(db)? {
+        if !entry.is_active {
+            continue;
+        }
+        let key = pulsevm_crypto::k1::K1PublicKey::from_compressed(&entry.key)
+            .map_err(|e| format!("producers row {owner} holds an invalid key: {e:?}"))?;
+        roster.push(MigrationHaltRosterEntry {
+            producer: pulsevm_name::Name::new(owner).to_string(),
+            key: key.to_string(),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
+        });
+    }
+    Ok(roster)
+}
+
+/// Bind a transported halt roster to checkpoint content: every rostered
+/// producer name must resolve to exactly the same signing key in the
+/// restored state. Returns the number of bound entries. Weights are
+/// deliberately not compared: they move every block, so a weight pinned
+/// at the roster reference legitimately differs from checkpoint state.
+/// `is_active` is likewise not enforced here (a producer may retire
+/// between the reference and the checkpoint); activity enforcement
+/// belongs to the on-chain ceremony that pins the roster.
+///
+/// This lenient form guards the legacy single-step commitments. The
+/// two-step cutover uses [`check_halt_roster_matches_state`], which
+/// additionally requires every declared member to be active with the same
+/// key: a declaration naming only its signer verifies against itself, so
+/// each member is key-anchored to checkpoint state.
+pub fn check_halt_roster_against_state(
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    state: &BTreeMap<u64, StateProducerKey>,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let mut matched = 0;
+    for entry in roster {
+        let name = pulsevm_name::Name::from_str(&entry.producer)
+            .map_err(|e| format!("halt roster producer name invalid: {e}"))?
+            .as_u64();
+        let state_key = state.get(&name).ok_or_else(|| {
+            format!(
+                "halt roster producer {} is not present in checkpoint state",
+                entry.producer
+            )
+        })?;
+        if state_key.key != entry.key.compressed() {
+            return Err(format!(
+                "halt roster key for {} does not match checkpoint state",
+                entry.producer
+            ));
+        }
+        matched += 1;
+    }
+    Ok(matched)
+}
+
+/// Verify a manifest's halt commitment against the terminal block it names.
+/// Both versions verify against the attached weighted roster under the
+/// strict two-thirds quorum (version 2 additionally binds the migration
+/// checkpoint). A manifest without a roster fails closed: the legacy
+/// single-key path cannot prove the schedule agreed, so it promotes
+/// nothing. This is the same check the restore gate runs; the offline
+/// verifier reuses it so a manifest can be validated without booting a
+/// node.
+pub fn verify_migration_halt_commitment(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    checkpoint_sha256: &[u8; 32],
+) -> Result<(), String> {
+    use pulsevm_chain_types::HaltCommitment;
+    let commitment = manifest
+        .halt_commitment
+        .as_ref()
+        .ok_or_else(|| "migration manifest carries no halt commitment".to_string())?;
+    let roster = manifest.roster_entries()?.ok_or_else(|| {
+        "migration halt commitment carries no roster: single-key commitments prove nothing about the schedule"
+            .to_string()
+    })?;
+    match commitment.version {
+        HaltCommitment::VERSION => commitment
+            .verify_weighted_quorum(height, block_id, &roster)
+            .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        HaltCommitment::VERSION_V2 => commitment
+            .verify_weighted_quorum_v2(height, block_id, checkpoint_sha256, &roster)
+            .map_err(|e| format!("migration halt commitment rejected: {e}")),
+        other => Err(format!("unsupported halt commitment version {other}")),
+    }
+}
+
+/// Vote-timing rule for the two-step cutover: a commitment is only valid
+/// inside its window. Votes are XPR transactions, so their inclusion height
+/// is XPR consensus — unlike off-chain signature timestamps, which are
+/// merely asserted. Declaration votes must land strictly before H (H stays
+/// empty and the commitment is a genuine pre-commitment); confirmation
+/// votes must land strictly after H (a confirmation references H_ID, which
+/// cannot exist inside H itself). The freshness bound K and the deadline J
+/// apply when the ceremony claims them. Sides without a recorded inclusion
+/// are skipped: off-chain signatures carry no trustworthy timestamp.
+pub fn check_halt_inclusion_window(
+    height: u32,
+    declaration_inclusion: Option<u32>,
+    max_declaration_lag: Option<u32>,
+    confirmation_inclusion: Option<u32>,
+    max_confirmation_lag: Option<u32>,
+) -> Result<(), String> {
+    if let Some(inclusion) = declaration_inclusion {
+        if inclusion >= height {
+            return Err(format!(
+                "declaration commitment at block {inclusion} does not predate cutover height {height}"
+            ));
+        }
+        if let Some(max_lag) = max_declaration_lag
+            && inclusion.saturating_add(max_lag) < height
+        {
+            return Err(format!(
+                "declaration commitment at block {inclusion} is older than the ceremony window (H={height}, max lag {max_lag})"
+            ));
+        }
+    }
+    if let Some(inclusion) = confirmation_inclusion {
+        if inclusion <= height {
+            return Err(format!(
+                "confirmation commitment at block {inclusion} does not postdate cutover height {height}"
+            ));
+        }
+        if let Some(max_lag) = max_confirmation_lag
+            && inclusion > height.saturating_add(max_lag)
+        {
+            return Err(format!(
+                "confirmation commitment at block {inclusion} misses the ceremony deadline (H={height}, max lag {max_lag})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify on-chain cutover-contract evidence for the step-one declaration:
+/// the captured singleton must be finalized on the verified declaration
+/// digest, every scanned vote must be a rostered schedule key inside the
+/// declaration window and under `expected_schedule_version`, and the
+/// captured tally must match the recomputed signer weight under the strict
+/// quorum. The attested schedule version must equal the expected (H's)
+/// version: presence alone proves nothing, so a version the exporter merely
+/// asserts without matching H fails closed, as does any vote from another
+/// version. A manifest without contract evidence verifies nothing here:
+/// the pair then requires a recorded declaration inclusion instead, so one
+/// of the two always proves the quorum committed before H.
+pub fn verify_migration_contract_evidence(
+    manifest: &MigrationManifest,
+    height: u32,
+    roster: &[pulsevm_chain_types::HaltRosterEntry],
+    declaration_digest: &[u8; 32],
+    expected_schedule_version: u32,
+) -> Result<(), String> {
+    let Some(ceremony) = manifest.halt_contract_ceremony.as_ref() else {
+        return Ok(());
+    };
+    if manifest.halt_schedule_version != Some(expected_schedule_version) {
+        return Err(format!(
+            "migration cutover contract evidence attests schedule version {:?} (expected H's version {expected_schedule_version})",
+            manifest.halt_schedule_version
+        ));
+    }
+    ceremony
+        .verify(
+            height,
+            manifest.halt_max_declaration_lag,
+            roster,
+            declaration_digest,
+            expected_schedule_version,
+        )
+        .map_err(|e| format!("migration cutover contract evidence rejected: {e}"))
+}
+
+/// Bound on post-H emptiness evidence. Bounds decode work at restore; a
+/// genuinely longer pause needs a fresh export window, not a bigger
+/// constant. The window is H+1 through the agreed pause head P (every
+/// producer stops at P — there is no LIB wait and no tail past P), so a
+/// normal cutover stages tens of blocks, never thousands.
+pub const MAX_POST_H_BLOCKS: usize = 4096;
+
+/// One decoded post-H header: exactly the fields the emptiness walk
+/// checks, in `pulsevm_core::block` pack order (timestamp, producer,
+/// confirmed, previous, roots, schedule version, schedule change flag,
+/// header extensions, K1 signature, transaction count, block extensions).
+/// Anything else in a post-H block fails closed, so the reader stays
+/// minimal on purpose — extend it only with a matching fixture.
+struct PostHeader {
+    producer: u64,
+    previous: [u8; 32],
+    transaction_mroot: [u8; 32],
+    schedule_version: u32,
+    blockroot: [u8; 32],
+    schedule_hash: [u8; 32],
+    header_span: (usize, usize),
+    signature_compact: [u8; 65],
+}
+
+fn read_u32_le(bytes: &[u8], pos: &mut usize, label: &str) -> Result<u32, String> {
+    let end = pos
+        .checked_add(4)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| format!("{label} ends mid-header (truncated u32)"))?;
+    let value = u32::from_le_bytes(
+        bytes[*pos..end]
+            .try_into()
+            .map_err(|_| format!("{label} ends mid-header (truncated u32)"))?,
+    );
+    *pos = end;
+    Ok(value)
+}
+
+fn read_varuint32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
+    let mut value: u32 = 0;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes
+            .get(*pos)
+            .ok_or_else(|| "post-H block ends mid-header (truncated varuint)".to_string())?;
+        *pos += 1;
+        value |= u32::from(byte & 0x7f)
+            .checked_shl(shift)
+            .ok_or_else(|| "post-H block varuint overflows u32".to_string())?;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("post-H block varuint overflows u32".to_string())
+}
+
+fn read_exact<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], String> {
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "post-H block ends mid-header (truncated field)".to_string())?;
+    let slice = &bytes[*pos..end];
+    *pos = end;
+    Ok(slice)
+}
+
+/// Decode one packed post-H signed block, enforcing the emptiness shape:
+/// no schedule change (inline or extension), K1 producer signature, no
+/// transactions, no block extensions. Returns the header view, the block's
+/// Leap-stated id from the end of the entry (which the walk recomputes
+/// from the header and requires to match), and the total bytes consumed;
+/// trailing bytes fail at the call site.
+/// Shared entry prefix: blockroot root, pending schedule hash, header
+/// (rotations and schedule-change extensions are policed for both layouts —
+/// a rotation at H changes the set the ceremony froze just as one in the
+/// window does), and the K1 producer signature. Post-H entries append counts
+/// plus the block id; the H entry appends only the block id, because H
+/// itself is an ordinary source-chain block that may carry traffic.
+fn read_entry_prefix(packed: &[u8], label: &str) -> Result<(PostHeader, usize), String> {
+    let mut pos = 0;
+    // The record path leads each entry with the two signature inputs the
+    // header cannot supply: the blockroot root and the pending schedule
+    // hash for this height.
+    let blockroot: [u8; 32] = read_exact(packed, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| format!("{label} ends mid-blockroot (truncated root)"))?;
+    let schedule_hash: [u8; 32] = read_exact(packed, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| format!("{label} ends mid-schedule-hash (truncated hash)"))?;
+    let header_start = pos;
+    let _timestamp = read_u32_le(packed, &mut pos, label)?;
+    let producer = {
+        let raw = read_exact(packed, &mut pos, 8)?;
+        u64::from_le_bytes(
+            raw.try_into()
+                .map_err(|_| format!("{label} ends mid-header (truncated producer)"))?,
+        )
+    };
+    let _confirmed = read_exact(packed, &mut pos, 2)?;
+    let previous: [u8; 32] = read_exact(packed, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| format!("{label} ends mid-header (truncated previous)"))?;
+    let transaction_mroot: [u8; 32] = read_exact(packed, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| format!("{label} ends mid-header (truncated transaction mroot)"))?;
+    let _action_mroot = read_exact(packed, &mut pos, 32)?;
+    let schedule_version = read_u32_le(packed, &mut pos, label)?;
+    let has_schedule_change = read_exact(packed, &mut pos, 1)?[0] != 0;
+    if has_schedule_change {
+        return Err(format!("{label} carries a producer schedule change"));
+    }
+    let extension_count = read_varuint32(packed, &mut pos)?;
+    for _ in 0..extension_count {
+        let id = {
+            let raw = read_exact(packed, &mut pos, 2)?;
+            u16::from_le_bytes(
+                raw.try_into()
+                    .map_err(|_| format!("{label} ends mid-header (truncated extension id)"))?,
+            )
+        };
+        let len = read_varuint32(packed, &mut pos)? as usize;
+        let _payload = read_exact(packed, &mut pos, len)?;
+        // Extension 1 is the producer-schedule change: a rotation inside
+        // the window changes the set the ceremony froze.
+        if id == 1 {
+            return Err(format!("{label} carries a producer schedule change"));
+        }
+    }
+    let header_end = pos;
+    let tag = read_exact(packed, &mut pos, 1)?[0];
+    if tag != 0 {
+        return Err(format!("{label} carries a non-K1 producer signature"));
+    }
+    let signature_compact: [u8; 65] = read_exact(packed, &mut pos, 65)?
+        .try_into()
+        .map_err(|_| format!("{label} ends mid-signature (truncated compact)"))?;
+    Ok((
+        PostHeader {
+            producer,
+            previous,
+            transaction_mroot,
+            schedule_version,
+            blockroot,
+            schedule_hash,
+            header_span: (header_start, header_end),
+            signature_compact,
+        },
+        pos,
+    ))
+}
+
+fn read_post_block(packed: &[u8]) -> Result<(PostHeader, [u8; 32], usize), String> {
+    let (header, mut pos) = read_entry_prefix(packed, "post-H block")?;
+    let transaction_count = read_varuint32(packed, &mut pos)?;
+    if transaction_count != 0 {
+        return Err("post-H block is not empty: it carries transactions".to_string());
+    }
+    let extension_bytes = read_varuint32(packed, &mut pos)?;
+    if extension_bytes != 0 {
+        return Err("post-H block carries block extensions".to_string());
+    }
+    // The entry ends with the block's Leap-stated id, which the gate
+    // recomputes from the header (Leap's formula) and requires to match.
+    let block_id: [u8; 32] = read_exact(packed, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| "post-H block ends mid-id (truncated block id)".to_string())?;
+    Ok((header, block_id, pos))
+}
+
+/// The H entry carries no counts — H may carry traffic, so the counts would
+/// name transactions the entry does not stage. The entry is exactly the
+/// shared prefix plus the block id; anything trailing fails closed.
+fn read_halt_block_entry(packed: &[u8]) -> Result<(PostHeader, [u8; 32]), String> {
+    const LABEL: &str = "cutover block";
+    let (header, pos) = read_entry_prefix(packed, LABEL)?;
+    if pos + 32 != packed.len() {
+        return Err(format!(
+            "{LABEL} entry is not exactly prefix plus block id ({} trailing bytes)",
+            packed.len().saturating_sub(pos + 32)
+        ));
+    }
+    let block_id: [u8; 32] = packed[pos..pos + 32]
+        .try_into()
+        .map_err(|_| format!("{LABEL} ends mid-id (truncated block id)"))?;
+    Ok((header, block_id))
+}
+
+/// Entry authentication shared by the H entry and the post-H window (see
+/// [`verify_migration_post_chain`]): packed entry layout, the recorded
+/// schedule key map, and Leap's true signature digest.
+/// The recorded schedule as a producer-name to signing-key map: the H
+/// entry and every post-H header resolve producers against it, so both
+/// compare against the same set the pair verifier matches to the
+/// declaration. The recorded schedule is a unit-weight set; anything else
+/// is an exporter moving the denominator.
+fn recorded_schedule_key_map(
+    recorded: &[MigrationHaltRosterEntry],
+) -> Result<std::collections::BTreeMap<String, pulsevm_crypto::k1::K1PublicKey>, String> {
+    let mut schedule_keys = std::collections::BTreeMap::new();
+    for entry in recorded {
+        if entry.weight != pulsevm_chain_types::HaltWeight::MEMBER {
+            return Err(format!(
+                "recorded schedule weight for {} is not the schedule weight 1",
+                entry.producer
+            ));
+        }
+        let key = pulsevm_crypto::k1::K1PublicKey::from_string(&entry.key).map_err(|e| {
+            format!(
+                "recorded schedule key for {} invalid: {e:?}",
+                entry.producer
+            )
+        })?;
+        if schedule_keys.insert(entry.producer.clone(), key).is_some() {
+            return Err(format!("recorded schedule names {} twice", entry.producer));
+        }
+    }
+    Ok(schedule_keys)
+}
+
+/// Leap's producer signature digest for one packed entry
+/// (`block_header_state::sig_digest`): sha256(sha256(header_digest ||
+/// blockroot) || schedule_hash), plus the header digest itself for the
+/// block-id derivation. Verifying the bare header digest instead would
+/// accept signatures no Leap node produced — and hashing the header bytes
+/// with the root instead of the header digest would reject the signatures
+/// Leap nodes produce.
+fn leap_entry_digest(header: &PostHeader, header_bytes: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let header_digest = pulsevm_crypto::Digest::hash(header_bytes).0;
+    let bound = {
+        let mut digest_and_root = Vec::with_capacity(64);
+        digest_and_root.extend_from_slice(&header_digest);
+        digest_and_root.extend_from_slice(&header.blockroot);
+        pulsevm_crypto::Digest::hash(&digest_and_root).0
+    };
+    let mut bound_and_schedule = Vec::with_capacity(64);
+    bound_and_schedule.extend_from_slice(&bound);
+    bound_and_schedule.extend_from_slice(&header.schedule_hash);
+    let digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+    (header_digest, digest)
+}
+
+/// Verify the cutover block H entry: the packed H header must derive the
+/// trusted H id, carry H's schedule version, introduce no schedule change,
+/// and carry a producer signature — over Leap's true digest with the
+/// entry's recorded root and schedule hash — that recovers to the recorded
+/// schedule key for H's producer. The window opens on exactly the block
+/// the confirmation binds; a substituted H fails here instead of anchoring
+/// the proof. H may carry traffic (it is an ordinary source-chain block),
+/// so the entry proves the anchor, not emptiness — only the post-H window
+/// must be empty.
+pub fn verify_migration_halt_block(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    schedule_version: u32,
+) -> Result<u32, String> {
+    let packed_hex = manifest.halt_h_block.as_ref().ok_or_else(|| {
+        "migration cutover pair carries no cutover-block evidence: the window cannot open on an unattested H"
+            .to_string()
+    })?;
+    let packed = hex::decode(packed_hex)
+        .map_err(|e| format!("cutover block entry is not hexadecimal: {e}"))?;
+    let (header, stated_id) =
+        read_halt_block_entry(&packed).map_err(|e| format!("cutover block entry rejected: {e}"))?;
+    let header_bytes = &packed[header.header_span.0..header.header_span.1];
+    let (header_digest, digest) = leap_entry_digest(&header, header_bytes);
+    // The entry must open on the trusted H: derive its id and require it
+    // to equal the terminal block the confirmation binds.
+    let mut derived_id = header_digest;
+    derived_id[0..4].copy_from_slice(&height.to_be_bytes());
+    if stated_id != derived_id {
+        return Err("cutover block entry id does not derive from its header".to_string());
+    }
+    if &stated_id != block_id {
+        return Err(
+            "cutover block entry id does not match the terminal block the confirmation binds"
+                .to_string(),
+        );
+    }
+    // No emptiness check: H is an ordinary source-chain block and may
+    // carry traffic — the entry proves the anchor (id, signature, version),
+    // not the contents. Only the post-H window must be empty.
+    if header.schedule_version != schedule_version {
+        return Err(format!(
+            "cutover block carries schedule version {} (expected {schedule_version})",
+            header.schedule_version
+        ));
+    }
+    let Some(recorded) = manifest.halt_schedule.as_ref() else {
+        return Err("migration cutover pair carries no recorded schedule".to_string());
+    };
+    let schedule_keys = recorded_schedule_key_map(recorded)?;
+    let producer_name = pulsevm_name::Name::new(header.producer).to_string();
+    let scheduled_key = schedule_keys.get(&producer_name).ok_or_else(|| {
+        format!("cutover block producer {producer_name} is not in the recorded schedule")
+    })?;
+    let signature = pulsevm_crypto::k1::K1Signature::from_compact65(&header.signature_compact);
+    let recovered = signature
+        .recover(&digest)
+        .map_err(|e| format!("cutover block signature unrecoverable: {e:?}"))?;
+    if recovered != *scheduled_key {
+        return Err(format!(
+            "cutover block is not signed by the scheduled key for {producer_name}"
+        ));
+    }
+    // The entry's header bytes lead with the Leap timestamp slot (pack
+    // order timestamp[4] | producer[8] | ...): return it so the memo
+    // inclusion proof can require every recorded memo account to predate H.
+    let slot_bytes: [u8; 4] = header_bytes
+        .get(..4)
+        .and_then(|slot| slot.try_into().ok())
+        .ok_or_else(|| "cutover block entry header has no timestamp slot".to_string())?;
+    Ok(u32::from_le_bytes(slot_bytes))
+}
+
+/// Committee-membership pin for the two-step cutover (the light-client
+/// rule): the declared set must equal the recorded schedule exactly, both
+/// ways, with matching schedule keys. The recorded schedule comes from H's
+/// header state, captured at the freeze instant and bound to the trusted H
+/// id (which the checkpoint's snapshot shares) — never from the producers
+/// table, which carries every active row while the schedule
+/// names only the committee. The forward direction closes key substitution
+/// (a declaration key differing from the schedule key fails); the reverse
+/// direction closes the standby-subset attack (a subset naming only some
+/// scheduled producers fails, so no minority passes over a denominator it
+/// chose). Neither the version pin nor the count quorum can substitute for
+/// this: a subset copies H's version and picks its own denominator.
+/// Weights are not compared: every member weighs 1 by construction
+/// (enforced at declaration parse and at record time), so there is no
+/// drift to pin.
+pub fn check_declaration_matches_recorded_schedule(
+    declaration: &pulsevm_chain_types::HaltDeclaration,
+    schedule_keys: &std::collections::BTreeMap<String, pulsevm_crypto::k1::K1PublicKey>,
+) -> Result<usize, String> {
+    let mut declared: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = Vec::new();
+    for member in &declaration.validator_set {
+        let key = pulsevm_crypto::k1::K1PublicKey::from_string(&member.key).map_err(|e| {
+            format!(
+                "halt declaration key for {} invalid: {e:?}",
+                member.producer
+            )
+        })?;
+        declared.push((member.producer.clone(), key));
+    }
+    declared.sort();
+    let mut recorded_sorted: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = schedule_keys
+        .iter()
+        .map(|(producer, key)| (producer.clone(), *key))
+        .collect();
+    recorded_sorted.sort();
+    if declared != recorded_sorted {
+        return Err("migration halt declaration does not match the recorded schedule".to_string());
+    }
+    Ok(declared.len())
+}
+
+/// Memo-vehicle inclusion proof: the declaration digest must re-decode
+/// from the recorded memo account names, and every recorded account must
+/// predate H. The names are deterministic from the digest (`h` + one round
+/// letter + hex nibbles mapped to `a`–`p`), so re-decoding proves the
+/// declaration text is committed on-chain — not merely asserted in the
+/// manifest — and the slot bound proves it landed before H instead of in
+/// it. A manifest without memo accounts (contract vehicle, legacy
+/// commitments) verifies nothing here: the contract fragment carries its
+/// own vote heights, and legacy paths carry no declaration. Returns the
+/// account count. Existence in checkpoint state is checked separately by
+/// [`verify_memo_accounts_exist`], where the state is available: names that
+/// decode but name no account fail there, not here.
+pub fn verify_migration_memo_accounts(
+    manifest: &MigrationManifest,
+    declaration_digest: &[u8; 32],
+    h_slot: u32,
+) -> Result<usize, String> {
+    let Some(accounts) = manifest.halt_memo_accounts.as_ref() else {
+        return Ok(0);
+    };
+    if accounts.is_empty() {
+        return Err(
+            "migration memo inclusion records no accounts: stage the declaration accounts or drop the record"
+                .to_string(),
+        );
+    }
+    let mut nibbles = String::with_capacity(64);
+    for account in accounts {
+        let name = account.name.as_str();
+        // `h` + one round letter + the digest nibbles mapped a-p.
+        let mut chars = name.chars();
+        let (Some('h'), Some(_round), rest) = (chars.next(), chars.next(), chars.as_str()) else {
+            return Err(format!(
+                "migration memo account {name} does not carry the declaration digest"
+            ));
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+            return Err(format!(
+                "migration memo account {name} does not carry the declaration digest"
+            ));
+        }
+        for byte in rest.bytes() {
+            let hex = if byte <= b'j' {
+                b'0' + (byte - b'a')
+            } else {
+                b'a' + (byte - b'k')
+            };
+            nibbles.push(hex as char);
+        }
+        if account.created_slot >= h_slot {
+            return Err(format!(
+                "migration memo account {name} was created at slot {} (H is slot {h_slot}): the declaration must land before H",
+                account.created_slot
+            ));
+        }
+    }
+    if nibbles.len() != 64 {
+        return Err(format!(
+            "migration memo accounts decode to {} hex nibbles, not the 64 of a declaration digest",
+            nibbles.len()
+        ));
+    }
+    if hex::decode(&nibbles).map_err(|e| format!("migration memo digest unreadable: {e}"))?
+        != declaration_digest
+    {
+        return Err("migration memo accounts do not decode to the declaration digest".to_string());
+    }
+    Ok(accounts.len())
+}
+
+/// Checkpoint-state half of the memo inclusion proof: every recorded memo
+/// account must exist in the restored state. The digest re-decode (see
+/// [`verify_migration_memo_accounts`]) proves the names commit to the
+/// declaration; this proves the named accounts are really on-chain — a
+/// manifest that records fictional names fails here even when they decode.
+/// Runs wherever restored state is available (restore gate, offline
+/// verifier); manifests without memo accounts verify nothing and return 0.
+pub fn verify_memo_accounts_exist(
+    database: &Database,
+    manifest: &MigrationManifest,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let Some(accounts) = manifest.halt_memo_accounts.as_ref() else {
+        return Ok(0);
+    };
+    for memo in accounts {
+        let owner = pulsevm_name::Name::from_str(&memo.name)
+            .map_err(|e| format!("migration memo account {} invalid: {e}", memo.name))?;
+        if !database.arena_account_exists(owner.as_u64()) {
+            return Err(format!(
+                "migration memo account {} does not exist in checkpoint state: the declaration landing is unproven",
+                memo.name
+            ));
+        }
+    }
+    Ok(accounts.len())
+}
+
+/// Verify the post-H emptiness proof plus the recorded schedule: every
+/// header hash-links from the trusted H id with ascending numbers, carries
+/// an empty transaction root, introduces no schedule change, and is signed
+/// by the recorded schedule key for its producer over Leap's true digest
+/// (`sha256(sha256(sha256(header) || blockroot) || schedule_hash)`, recomputed
+/// from the entry's recorded root and hash) — and the recorded schedule
+/// equals the declared set exactly (see
+/// [`check_declaration_matches_recorded_schedule`]). The entry's hash is
+/// bound by the signature itself, not by a comparison: only the exact
+/// (root, hash) pair Leap signed recovers to the roster key. Each entry
+/// trails its block's Leap-stated id, which the walk recomputes from the
+/// packed header (Leap's formula: sha256 of the header with the number
+/// spliced in) and requires to match exactly. The staged
+/// headers must cover exactly H+1 through `pause_height`, the agreed pause
+/// head every producer stopped at: a proof that stops short leaves the
+/// tail past the last staged header unproven, and a proof that runs past
+/// the agreed head carries headers past the agreed stop. The pause
+/// head must sit strictly past H: a pause exactly on H stages no proof and
+/// cannot distinguish a frozen network from a bare anchor, so it fails
+/// closed here and in the confirmation itself. Returns the attested pause
+/// length. An absent proof or an absent schedule fails closed: unattested
+/// windows do not boot.
+pub fn verify_migration_post_chain(
+    manifest: &MigrationManifest,
+    declaration: &pulsevm_chain_types::HaltDeclaration,
+    height: u32,
+    block_id: &[u8; 32],
+    schedule_version: u32,
+    pause_height: u32,
+) -> Result<usize, String> {
+    if pause_height <= height {
+        return Err(format!(
+            "migration cutover pair attests pause head {pause_height} at or below cutover height {height}: the pause head must sit strictly past H"
+        ));
+    }
+    let expected_len = (pause_height - height) as usize;
+    let Some(blocks) = manifest.halt_post_blocks.as_ref() else {
+        return Err("migration cutover pair carries no post-H emptiness evidence".to_string());
+    };
+    let Some(recorded) = manifest.halt_schedule.as_ref() else {
+        return Err("migration cutover pair carries no recorded schedule".to_string());
+    };
+    if blocks.len() > MAX_POST_H_BLOCKS {
+        return Err(format!(
+            "migration cutover pair attests {} post-H blocks (limit {MAX_POST_H_BLOCKS})",
+            blocks.len()
+        ));
+    }
+    // Exact coverage of the attested pause head: stopping short would
+    // leave H+len+1..P unproven, running long would stage headers past
+    // what the quorum attested. P is the agreed stop every producer
+    // halted at — not an observed tip — so the covered window is exactly
+    // H+1..P by construction, and the 15-of-21 confirmation over H_ID
+    // stands in for Leap finality instead of a LIB wait.
+    if blocks.len() != expected_len {
+        return Err(format!(
+            "migration cutover pair stages {} post-H blocks but the quorum attested pause head {pause_height} (H={height}): the proof must cover exactly H+1 through the attested pause head",
+            blocks.len()
+        ));
+    }
+    // The recorded schedule is a unit-weight set; anything else is an
+    // exporter moving the denominator.
+    let schedule_keys = recorded_schedule_key_map(recorded)?;
+    // Declared set == recorded schedule, both ways: the declaration must
+    // name the recorded set exactly, so neither side can smuggle a member.
+    // This is the committee-membership pin (it replaced the producers-table
+    // cross-check: the table carries every active row while the schedule
+    // names only the committee, so the table cannot authenticate the set).
+    check_declaration_matches_recorded_schedule(declaration, &schedule_keys)?;
+    // No hash pin on the staged pending schedule: with no staged change
+    // Leap serves the EMPTY pending schedule, whose hash cannot equal the
+    // active roster's (proven against live header states). The producer
+    // signature binds the exact (root, hash) pair below — only the true
+    // pair recovers to the roster key — so a forged state fails at
+    // recovery, not at a comparison.
+    let mut expected_num = height
+        .checked_add(1)
+        .ok_or_else(|| "migration cutover height overflows u32".to_string())?;
+    let mut expected_previous = *block_id;
+    for packed_hex in blocks {
+        let packed =
+            hex::decode(packed_hex).map_err(|e| format!("post-H block is not hexadecimal: {e}"))?;
+        let (header, stated_id, consumed) = read_post_block(&packed)
+            .map_err(|e| format!("post-H block {expected_num} rejected: {e}"))?;
+        if consumed != packed.len() {
+            return Err(format!(
+                "post-H block {expected_num} has {} trailing bytes",
+                packed.len() - consumed
+            ));
+        }
+        let parent_num = u32::from_be_bytes(
+            header.previous[0..4]
+                .try_into()
+                .map_err(|_| format!("post-H block {expected_num} has a malformed previous id"))?,
+        );
+        if parent_num.checked_add(1) != Some(expected_num) {
+            return Err(format!(
+                "post-H block {expected_num} does not follow its parent height"
+            ));
+        }
+        if header.previous != expected_previous {
+            return Err(format!(
+                "post-H block {expected_num} does not hash-link to its parent"
+            ));
+        }
+        if header.transaction_mroot != [0u8; 32] {
+            return Err(format!(
+                "post-H block {expected_num} is not empty: non-empty transaction root"
+            ));
+        }
+        // The window must not rotate the schedule: the version is H's,
+        // pinned by the caller, on every header.
+        if header.schedule_version != schedule_version {
+            return Err(format!(
+                "post-H block {expected_num} carries schedule version {} (expected {schedule_version})",
+                header.schedule_version
+            ));
+        }
+        let producer_name = pulsevm_name::Name::new(header.producer).to_string();
+        let scheduled_key = schedule_keys.get(&producer_name).ok_or_else(|| {
+            format!("post-H block {expected_num} producer {producer_name} is not in the recorded schedule")
+        })?;
+        let header_bytes = &packed[header.header_span.0..header.header_span.1];
+        let (header_digest, digest) = leap_entry_digest(&header, header_bytes);
+        let signature = pulsevm_crypto::k1::K1Signature::from_compact65(&header.signature_compact);
+        let recovered = signature
+            .recover(&digest)
+            .map_err(|e| format!("post-H block {expected_num} signature unrecoverable: {e:?}"))?;
+        if recovered != *scheduled_key {
+            return Err(format!(
+                "post-H block {expected_num} is not signed by the scheduled key for {producer_name}"
+            ));
+        }
+        // The block id is derived, never carried: Leap's formula hashes
+        // the packed header and splices the block number into the first
+        // four bytes. The stated trailing id must equal the recomputation
+        // exactly — checking only the embedded number would let an empty
+        // sibling ride under the real block's number while the real,
+        // non-empty block hides beside the proof.
+        let mut derived_id = header_digest;
+        derived_id[0..4].copy_from_slice(&expected_num.to_be_bytes());
+        if stated_id != derived_id {
+            return Err(format!(
+                "post-H block {expected_num} id does not derive from its header"
+            ));
+        }
+        expected_previous = stated_id;
+        expected_num = expected_num
+            .checked_add(1)
+            .ok_or_else(|| "post-H block height overflows u32".to_string())?;
+    }
+    Ok(blocks.len())
+}
+
+/// Verify the two-step cutover pair: the declaration must carry a quorum
+/// of the declared set over the cutover height, the confirmation must chain
+/// that exact declaration to the terminal block, the checkpoint, this
+/// chain's id, and the configured platform id, and an attached transport
+/// roster — when present — must match the declared set entry-wise so the
+/// two encodings cannot diverge. The attested schedule version must equal
+/// `header_schedule_version` (H's version) unconditionally, the manifest
+/// must attest no proposed schedule in the checkpoint, the staged H entry
+/// must derive the terminal block with a recorded-schedule producer
+/// signature, and the staged post-H headers must cover exactly
+/// H+1 through the confirmation's pause head, which must sit strictly past
+/// H. Recorded inclusion heights are window-checked via
+/// [`check_halt_inclusion_window`];
+/// attached contract evidence is replayed via
+/// [`verify_migration_contract_evidence`] with every vote pinned to
+/// `header_schedule_version`.
+/// Pre-commitment timing must be provable one of two ways: the on-chain
+/// ceremony (per-vote timing), or a recorded declaration inclusion (the
+/// digest on-chain before H, as the memo and msig vehicles record). A pair
+/// with neither fails closed — off-chain signatures alone say nothing
+/// about when they were made.
+/// Returns the declared set. Committee membership is pinned here, not
+/// against the producers table: the declaration must equal the recorded
+/// schedule exactly (both ways, same keys), and that schedule comes from
+/// H's header state, captured at the freeze instant — the table carries
+/// every active row while the schedule names only the committee. This is
+/// the same check the
+/// restore gate runs; the offline verifier reuses it so a manifest can be
+/// validated without booting a node. The restore gate always configures a
+/// platform id (`Some`); `None` is the legacy and offline-tolerant path (a
+/// confirmation that binds a platform still has its signatures checked,
+/// but the id itself goes unconfirmed — the gate remains the enforcer,
+/// since only boot config knows the real id).
+pub fn verify_migration_halt_pair(
+    manifest: &MigrationManifest,
+    height: u32,
+    block_id: &[u8; 32],
+    checkpoint_sha256: &[u8; 32],
+    new_chain_id: &[u8; 32],
+    header_schedule_version: u32,
+    platform_chain_id: Option<&[u8; 32]>,
+) -> Result<Vec<pulsevm_chain_types::HaltRosterEntry>, String> {
+    let declaration = manifest.halt_declaration.as_ref().ok_or_else(|| {
+        "two-step cutover requires a halt declaration in the migration manifest".to_string()
+    })?;
+    let declaration_digest = declaration
+        .verify(height)
+        .map_err(|e| format!("migration halt declaration rejected: {e}"))?;
+    let roster = declaration
+        .roster()
+        .map_err(|e| format!("migration halt declaration set invalid: {e}"))?;
+    // The transport roster is inspectability sugar over the same set: when
+    // the exporter attaches both, they must agree exactly.
+    if let Some(transport) = manifest.roster_entries()?
+        && transport != roster
+    {
+        return Err("migration halt roster does not match the declared validator set".to_string());
+    }
+    let confirmation = manifest.halt_confirmation.as_ref().ok_or_else(|| {
+        "two-step cutover requires a halt confirmation chaining the declaration".to_string()
+    })?;
+    confirmation
+        .verify(
+            &declaration_digest,
+            &roster,
+            height,
+            block_id,
+            checkpoint_sha256,
+            new_chain_id,
+            platform_chain_id,
+        )
+        .map_err(|e| format!("migration halt confirmation rejected: {e}"))?;
+    // The version pin is unconditional (memo and contract vehicles alike):
+    // the attested schedule version must equal H's header version, so a
+    // divergent schedule fails closed as a stale version even when no
+    // contract evidence is attached.
+    if manifest.halt_schedule_version != Some(header_schedule_version) {
+        return Err(format!(
+            "migration cutover pair attests schedule version {:?} (expected H's version {header_schedule_version})",
+            manifest.halt_schedule_version
+        ));
+    }
+    // A checkpoint taken mid-rotation would boot the new chain with a
+    // pending proposal the ceremony never froze: only an explicit
+    // export-time attestation of absence boots.
+    if manifest.halt_proposed_schedule != Some(false) {
+        return Err(format!(
+            "migration cutover pair attests a proposed schedule {:?}: the checkpoint must carry no pending proposal",
+            manifest.halt_proposed_schedule
+        ));
+    }
+    // The cutover block itself is signature-checked first: the window must
+    // open on exactly the block the confirmation binds, with an empty root
+    // and a producer signature from the recorded schedule.
+    let h_slot = verify_migration_halt_block(manifest, height, block_id, header_schedule_version)?;
+    // Memo-vehicle inclusion proof: the digest re-decodes from the recorded
+    // memo names and every recorded account predates H — the declaration
+    // provably landed on-chain before the cutoff, not as an asserted
+    // number. (Existence in checkpoint state is checked at restore, where
+    // the state is available.)
+    verify_migration_memo_accounts(manifest, &declaration_digest, h_slot)?;
+    // Post-H emptiness plus the recorded schedule: every header hash-links
+    // from H, carries an empty root, and is signed by a recorded schedule
+    // key, the recorded schedule equals the declared set, and the staged
+    // headers cover exactly H+1 through the confirmation's pause head —
+    // the highest head the quorum attested, strictly past H. A fleet that
+    // did not keep the window empty cannot produce this evidence, and a
+    // proof that stops short of the quorum's own observation fails closed.
+    verify_migration_post_chain(
+        manifest,
+        declaration,
+        height,
+        block_id,
+        header_schedule_version,
+        confirmation.pause_height,
+    )?;
+    check_halt_inclusion_window(
+        height,
+        manifest.halt_declaration_inclusion,
+        manifest.halt_max_declaration_lag,
+        manifest.halt_confirmation_inclusion,
+        manifest.halt_max_confirmation_lag,
+    )?;
+    verify_migration_contract_evidence(
+        manifest,
+        height,
+        &roster,
+        &declaration_digest,
+        header_schedule_version,
+    )?;
+    // Pre-commitment timing must be provable: either the on-chain ceremony
+    // replays the quorum's votes before H, or the declaration digest was
+    // recorded on-chain (memo / msig execution) before H. Off-chain
+    // signatures alone say nothing about when they were made.
+    if manifest.halt_contract_ceremony.is_none() && manifest.halt_declaration_inclusion.is_none() {
+        return Err("migration halt declaration has no pre-commitment timing evidence: attach the on-chain cutover ceremony or record the declaration inclusion block".to_string());
+    }
+    Ok(roster)
+}
+
+/// Schedule-version offset in a packed `signed_block` prefix, in this
+/// codebase's pack order (which the id check proves reproduces the wire
+/// layout bit-for-bit): timestamp[4] | producer[8] | confirmed[u16] |
+/// previous[32] | transaction_mroot[32] | action_mroot[32] |
+/// schedule_version[u32 LE] — the version starts at byte 110.
+///
+/// The restore gate reads H's version from the decoded source block; the
+/// offline verifier reuses this prefix parse because it cannot decode full
+/// blocks. A wrong offset fails closed (the version will not match H), so
+/// this helper can only refuse, never admit — and a golden test pins the
+/// offset against a decoded block in the controller migration tests.
+pub fn packed_source_block_schedule_version(packed_hex: &str) -> Result<u32, String> {
+    const OFFSET: usize = 4 + 8 + 2 + 32 + 32 + 32;
+    const PREFIX: usize = OFFSET + 4;
+    let bytes =
+        hex::decode(packed_hex).map_err(|e| format!("source block is not hexadecimal: {e}"))?;
+    if bytes.len() < PREFIX {
+        return Err(format!(
+            "source block prefix is {} bytes, need at least {PREFIX} for the schedule version",
+            bytes.len()
+        ));
+    }
+    let raw: [u8; 4] = bytes[OFFSET..PREFIX]
+        .try_into()
+        .map_err(|_| "source block schedule version slice is not 4 bytes".to_string())?;
+    Ok(u32::from_le_bytes(raw))
 }
 
 /// A malformed or unsupported XPR state-history input.
@@ -449,6 +1705,131 @@ impl DeferredTransactionSidecar {
         }
         Ok(sidecar)
     }
+}
+
+/// Unix microseconds of the Antelope epoch (2000-01-01T00:00:00Z): block
+/// slots count 500ms steps from here, while deferred `delay_until` and
+/// `expiration` are Unix `time_point` microseconds. The offset converts
+/// staged post-H header times into the deferred rows' clock.
+pub const ANTELOPE_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+/// Convert an Antelope block slot (500ms steps since the Antelope epoch)
+/// to Unix microseconds. Saturates instead of wrapping: the result feeds
+/// a comparison, never a hash, and a hostile slot must refuse, not wrap.
+pub fn antelope_slot_to_unix_micros(slot: u32) -> i64 {
+    const HALF_SECOND_MICROS: i64 = 500_000;
+    (slot as i64)
+        .saturating_mul(HALF_SECOND_MICROS)
+        .saturating_add(ANTELOPE_EPOCH_UNIX_MICROS)
+}
+
+/// Export-time deferred-transaction inventory: no migrated deferred
+/// transaction may be due in the (H, P] pause window. Any row executable
+/// on a post-H block would set the block's `transaction_mroot` and fail
+/// the boot closed at the emptiness gate — correct, but only after the
+/// ceremony, the snapshot, and the freeze have all run. This check runs
+/// where the exporter stages the window (the attach tool and the offline
+/// verifier) and fails closed pre-H instead, naming the offending sender
+/// and transaction.
+///
+/// A row fires in-window when its delay has elapsed by the pause head
+/// (`delay_until <= window_end_us`) while it is still unexpired at the
+/// window start (`expiration >= window_start_us`): that covers both live
+/// executions and expired-receipt retirements (an `expired` receipt still
+/// lands in the block, so the root still moves). Rows due after P, and
+/// rows already expired before the window, cross the boundary by design
+/// and are accepted here — they execute (or stay retired) on the new
+/// chain under its own scheduler.
+pub fn check_no_deferred_due_in_window(
+    transactions: &[DeferredTransactionSidecarRow],
+    window_start_us: i64,
+    window_end_us: i64,
+) -> Result<(), String> {
+    if window_end_us < window_start_us {
+        return Err(format!(
+            "deferred inventory window ends ({window_end_us}) before it starts ({window_start_us}): refusing an unorderable window"
+        ));
+    }
+    for row in transactions {
+        if row.delay_until <= window_end_us && row.expiration >= window_start_us {
+            return Err(format!(
+                "deferred transaction {} (sender {}) is due in the pause window: delay_until {} expiration {} overlap [{window_start_us}, {window_end_us}] — cancel it pre-export or it fails the boot at the emptiness gate",
+                row.trx_id, row.sender, row.delay_until, row.expiration
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Restore-side deferred-transaction inventory: no migrated deferred row
+/// may be due in the staged (H, P] pause window. The export-time inventory
+/// runs only when a sidecar is staged, but these are the rows actually
+/// promoted — so the restore gate re-checks them straight from the manifest
+/// window instead of trusting the export. A row due in-window would have
+/// executed on a post-H block and set its `transaction_mroot`, which the
+/// emptiness gate would then refuse; failing here names the row at boot.
+pub fn check_no_arena_deferred_due_in_window(
+    rows: &[crate::backend::DeferredTransaction],
+    window_start_us: i64,
+    window_end_us: i64,
+) -> Result<(), String> {
+    if window_end_us < window_start_us {
+        return Err(format!(
+            "deferred inventory window ends ({window_end_us}) before it starts ({window_start_us}): refusing an unorderable window"
+        ));
+    }
+    for row in rows {
+        if row.delay_until <= window_end_us && row.expiration >= window_start_us {
+            return Err(format!(
+                "migrated deferred transaction {} (sender {}) is due in the pause window: delay_until {} expiration {} overlap [{window_start_us}, {window_end_us}] — cancel it pre-export or the boot fails at the emptiness gate",
+                hex::encode(row.trx_id),
+                row.sender,
+                row.delay_until,
+                row.expiration
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pause-window bounds straight from the manifest: H's Unix time from the
+/// attached source-block slot, P's from the last staged post-H header slot
+/// (offset past the 64-byte root/schedule-hash prefix). The restore gate
+/// uses this for the deferred inventory, so the window never depends on an
+/// optionally staged sidecar. A manifest without staged post-H headers has
+/// no window: P must sit strictly past H, so that fails closed here.
+pub fn manifest_pause_window_us(manifest: &MigrationManifest) -> Result<(i64, i64), String> {
+    fn slot_at(hex_text: &str, prefix: usize, what: &str) -> Result<u32, String> {
+        let bytes =
+            hex::decode(hex_text).map_err(|error| format!("{what} is not hexadecimal: {error}"))?;
+        if bytes.len() < prefix + 4 {
+            return Err(format!("{what} is shorter than its timestamp slot"));
+        }
+        Ok(u32::from_le_bytes(
+            bytes[prefix..prefix + 4]
+                .try_into()
+                .map_err(|_| format!("{what} timestamp is not 4 bytes"))?,
+        ))
+    }
+    let source = manifest.source_block.as_deref().ok_or_else(|| {
+        "halt proof requires an attached source block for the pause-window inventory".to_string()
+    })?;
+    let start = antelope_slot_to_unix_micros(slot_at(source, 0, "source block")?);
+    let blocks = manifest.halt_post_blocks.as_ref().ok_or_else(|| {
+        "migration cutover pair carries no post-H emptiness evidence for the pause-window inventory"
+            .to_string()
+    })?;
+    let last = blocks.last().ok_or_else(|| {
+        "migration cutover pair stages no post-H headers: the pause head must sit strictly past H"
+            .to_string()
+    })?;
+    let end = antelope_slot_to_unix_micros(slot_at(last, 64, "last staged post-H header")?);
+    if end < start {
+        return Err(format!(
+            "pause window ends ({end}) before it starts ({start}): refusing an unorderable window"
+        ));
+    }
+    Ok((start, end))
 }
 
 /// Hydrate the portable portion of a full XPR chain-state-history snapshot.
@@ -4122,6 +5503,191 @@ mod tests {
         );
     }
 
+    fn deferred_row(
+        sender: u64,
+        trx: u8,
+        delay_until: i64,
+        expiration: i64,
+    ) -> DeferredTransactionSidecarRow {
+        DeferredTransactionSidecarRow {
+            sender,
+            sender_id: "1".to_string(),
+            payer: sender,
+            trx_id: hex::encode([trx; 32]),
+            delay_until,
+            expiration,
+            published: delay_until - 1_000_000,
+            packed_trx: "00".to_string(),
+        }
+    }
+
+    #[test]
+    fn deferred_inventory_rejects_rows_due_in_the_pause_window() {
+        // Window (H, P]: block H+1 opens at `start`, the pause head lands
+        // at `end` — both in deferred (Unix-microsecond) time.
+        let start = 1_700_000_000_000_000i64;
+        let end = start + 5_000_000;
+        // Due mid-window: fails closed naming the sender and transaction.
+        let err = check_no_deferred_due_in_window(
+            &[deferred_row(1111, 0xaa, start + 1_000_000, end + 1_000_000)],
+            start,
+            end,
+        )
+        .unwrap_err();
+        assert!(err.contains("1111"), "naming the sender, got: {err}");
+        assert!(
+            err.contains(&hex::encode([0xaau8; 32])),
+            "naming the transaction, got: {err}"
+        );
+        // Delay exactly on the pause head still executes in-window.
+        assert!(
+            check_no_deferred_due_in_window(
+                &[deferred_row(1111, 0xab, end, end + 1_000_000)],
+                start,
+                end
+            )
+            .is_err(),
+            "a delay on the pause head is due in-window"
+        );
+        // A row whose delay elapsed before H but is still unexpired at the
+        // window start fires on the first post-H block: rejected too.
+        assert!(
+            check_no_deferred_due_in_window(
+                &[deferred_row(1111, 0xac, start - 1, start)],
+                start,
+                end
+            )
+            .is_err(),
+            "a row unexpired at the window start fires in-window"
+        );
+        // An inverted window is a caller bug: fail closed, not vacuous.
+        assert!(check_no_deferred_due_in_window(&[], end, start - 1).is_err());
+    }
+
+    #[test]
+    fn deferred_inventory_accepts_rows_outside_the_window() {
+        let start = 1_700_000_000_000_000i64;
+        let end = start + 5_000_000;
+        // Due after the pause head: crosses the boundary by design.
+        check_no_deferred_due_in_window(
+            &[deferred_row(1111, 0xaa, end + 1, end + 1_000_000)],
+            start,
+            end,
+        )
+        .expect("a row due after P must cross the boundary");
+        // Already expired before the window opens: retired pre-H.
+        check_no_deferred_due_in_window(
+            &[deferred_row(1111, 0xab, start - 2_000_000, start - 1)],
+            start,
+            end,
+        )
+        .expect("a row expired before the window must be accepted");
+        // Empty sidecars carry nothing due.
+        check_no_deferred_due_in_window(&[], start, end).expect("empty inventory is accepted");
+        // A pause that lands exactly on H attests an empty window: only a
+        // row due exactly then fails.
+        check_no_deferred_due_in_window(
+            &[deferred_row(1111, 0xac, start + 1, start + 1_000_000)],
+            start,
+            start,
+        )
+        .expect("an empty window accepts later rows");
+        assert!(
+            check_no_deferred_due_in_window(
+                &[deferred_row(1111, 0xad, start, start + 1_000_000)],
+                start,
+                start
+            )
+            .is_err(),
+            "a row due exactly at H fires on the boundary"
+        );
+    }
+
+    fn arena_row(
+        sender: u64,
+        trx: u8,
+        delay_until: i64,
+        expiration: i64,
+    ) -> crate::backend::DeferredTransaction {
+        crate::backend::DeferredTransaction {
+            sender,
+            sender_id: 1,
+            payer: sender,
+            trx_id: [trx; 32],
+            delay_until,
+            expiration,
+            published: delay_until - 1_000_000,
+            packed_trx: vec![0],
+        }
+    }
+
+    #[test]
+    fn restore_inventory_rejects_arena_rows_due_in_the_pause_window() {
+        let start = 1_700_000_000_000_000i64;
+        let end = start + 5_000_000;
+        let err = check_no_arena_deferred_due_in_window(
+            &[arena_row(2222, 0xbb, start + 1_000_000, end + 1_000_000)],
+            start,
+            end,
+        )
+        .unwrap_err();
+        assert!(err.contains("2222"), "naming the sender, got: {err}");
+        assert!(
+            err.contains(&hex::encode([0xbbu8; 32])),
+            "naming the transaction, got: {err}"
+        );
+        // Rows outside the window and empty restores boot.
+        check_no_arena_deferred_due_in_window(
+            &[arena_row(2222, 0xbb, end + 1, end + 1_000_000)],
+            start,
+            end,
+        )
+        .expect("a row due after P must boot");
+        check_no_arena_deferred_due_in_window(&[], start, end).expect("no rows must boot");
+        assert!(check_no_arena_deferred_due_in_window(&[], end, start - 1).is_err());
+    }
+
+    #[test]
+    fn pause_window_bounds_come_from_the_staged_manifest() {
+        fn block_hex(slot: u32, prefix: usize, len: usize) -> String {
+            let mut bytes = vec![0u8; len];
+            bytes[prefix..prefix + 4].copy_from_slice(&slot.to_le_bytes());
+            hex::encode(&bytes)
+        }
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let mut manifest =
+            MigrationManifest::new(b"log", [7u8; 32], &checkpoint, 7, ImportSummary::default());
+        // No source block: no window.
+        assert!(manifest_pause_window_us(&manifest).is_err());
+        manifest.source_block = Some(block_hex(1_000, 0, 120));
+        // No post-H headers: the pause head must sit strictly past H.
+        manifest.halt_post_blocks = Some(vec![]);
+        assert!(manifest_pause_window_us(&manifest).is_err());
+        // P's time comes from the last staged header, past H's 64-byte prefix.
+        manifest.halt_post_blocks =
+            Some(vec![block_hex(1_004, 64, 128), block_hex(1_006, 64, 128)]);
+        assert_eq!(
+            manifest_pause_window_us(&manifest).unwrap(),
+            (
+                antelope_slot_to_unix_micros(1_000),
+                antelope_slot_to_unix_micros(1_006)
+            )
+        );
+    }
+
+    #[test]
+    fn antelope_slots_convert_to_deferred_time() {
+        // Slot 0 is the Antelope epoch: 2000-01-01T00:00:00Z in Unix micros.
+        assert_eq!(antelope_slot_to_unix_micros(0), 946_684_800_000_000);
+        // One slot is half a second.
+        assert_eq!(
+            antelope_slot_to_unix_micros(2) - antelope_slot_to_unix_micros(0),
+            1_000_000
+        );
+        // Monotonic across the full u32 range: saturates, never wraps.
+        assert!(antelope_slot_to_unix_micros(u32::MAX) > antelope_slot_to_unix_micros(0));
+    }
+
     #[test]
     fn migration_manifest_accepts_pre_deferred_summary() {
         let manifest: MigrationManifest = serde_json::from_str(
@@ -4156,6 +5722,2047 @@ mod tests {
         assert_eq!(manifest.import_summary.accounts, 3);
         assert_eq!(manifest.import_summary.deferred_transactions, 0);
         assert_eq!(manifest.import_summary.input_transactions, 0);
+    }
+
+    #[test]
+    fn migration_manifest_v2_roster_roundtrips_and_parses() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq".to_string(),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
+        }]);
+        assert_eq!(manifest.version, MigrationManifest::VERSION_V2);
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: MigrationManifest = serde_json::from_str(&json).unwrap();
+        let roster = parsed
+            .roster_entries()
+            .expect("roster must parse")
+            .expect("v2 manifest must carry a roster");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].producer, "prod.a");
+        assert_eq!(roster[0].weight, pulsevm_chain_types::HaltWeight::MEMBER);
+        assert!(parsed.verify_checkpoint(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn migration_manifest_rejects_unsupported_version() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let mut manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        manifest.version = 99;
+        assert!(manifest.verify_checkpoint(&checkpoint).is_err());
+    }
+
+    use std::str::FromStr as _;
+
+    fn pack_producer_info(
+        owner: u64,
+        key_bytes: &[u8; 33],
+        key_type: u64,
+        is_active: bool,
+        votes: f64,
+    ) -> Vec<u8> {
+        fn varuint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        let mut row = Vec::new();
+        row.extend_from_slice(&owner.to_le_bytes());
+        row.extend_from_slice(&votes.to_le_bytes());
+        varuint(key_type, &mut row);
+        row.extend_from_slice(key_bytes);
+        row.push(u8::from(is_active));
+        varuint(3, &mut row);
+        row.extend_from_slice(b"url");
+        row.extend_from_slice(&0u32.to_le_bytes());
+        row.extend_from_slice(&0i64.to_le_bytes());
+        row.extend_from_slice(&0u16.to_le_bytes());
+        // Head-only, exactly the live mainnet shape: XPR producers rows
+        // carry no authority tail, so nothing follows the location field.
+        row
+    }
+
+    fn test_key(seed: &str) -> pulsevm_crypto::k1::K1PublicKey {
+        pulsevm_crypto::k1::K1PrivateKey::from_seed_string(seed)
+            .expect("deterministic test key")
+            .public_key()
+    }
+
+    #[test]
+    fn migration_state_producer_keys_decodes_producer_info_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let row = pack_producer_info(owner, &key.compressed(), 0, true, 12345.0);
+        let (decoded_owner, decoded) =
+            decode_producer_info_row(&row).expect("valid row must decode");
+        assert_eq!(decoded_owner, owner);
+        assert_eq!(decoded.key, key.compressed());
+        assert!(decoded.is_active);
+    }
+
+    #[test]
+    fn migration_state_producer_keys_rejects_bad_rows() {
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        // Non-K1 key type: nothing downstream can sign for this roster
+        // entry, so the freeze must refuse it.
+        assert!(
+            decode_producer_info_row(&pack_producer_info(owner, &key.compressed(), 1, true, 1.0))
+                .is_err()
+        );
+        // Trailing bytes past the head: a future system-contract field
+        // addition must fail loudly, never silently decode.
+        let mut trailed = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
+        trailed.push(0);
+        assert!(decode_producer_info_row(&trailed).is_err());
+        // Truncated row.
+        let mut short = pack_producer_info(owner, &key.compressed(), 0, true, 1.0);
+        short.truncate(short.len() - 2);
+        assert!(decode_producer_info_row(&short).is_err());
+    }
+
+    fn state_key(key: &[u8; 33]) -> StateProducerKey {
+        StateProducerKey {
+            key: *key,
+            is_active: true,
+            total_votes: 0.0,
+        }
+    }
+
+    #[test]
+    fn halt_roster_cross_check_binds_keys_to_checkpoint_state() {
+        let key_a = test_key("state-roster-1");
+        let key_b = test_key("state-roster-2");
+        let owner_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let owner_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        let mut state = BTreeMap::new();
+        state.insert(owner_a, state_key(&key_a.compressed()));
+        state.insert(owner_b, state_key(&key_b.compressed()));
+        let roster = vec![
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: key_a,
+                weight: pulsevm_chain_types::HaltWeight(2),
+            },
+            pulsevm_chain_types::HaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: key_b,
+                weight: pulsevm_chain_types::HaltWeight(1),
+            },
+        ];
+        assert_eq!(check_halt_roster_against_state(&roster, &state).unwrap(), 2);
+        // Swapped key must fail: the roster no longer matches checkpoint state.
+        let forged = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: key_b,
+            weight: pulsevm_chain_types::HaltWeight(2),
+        }];
+        assert!(check_halt_roster_against_state(&forged, &state).is_err());
+        // Unknown producer must fail.
+        let unknown = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: key_b,
+            weight: pulsevm_chain_types::HaltWeight(1),
+        }];
+        assert!(check_halt_roster_against_state(&unknown, &state).is_err());
+    }
+
+    fn declaration_of(
+        members: &[(&str, &pulsevm_crypto::k1::K1PublicKey)],
+    ) -> pulsevm_chain_types::HaltDeclaration {
+        pulsevm_chain_types::HaltDeclaration {
+            version: 1,
+            source_chain_id: "00".repeat(32),
+            last_height: 8,
+            validator_set: members
+                .iter()
+                .map(|(name, key)| pulsevm_chain_types::HaltDeclarationMember {
+                    producer: name.to_string(),
+                    key: key.to_string(),
+                    weight: pulsevm_chain_types::HaltWeight(1),
+                })
+                .collect(),
+            signatures: Vec::new(),
+        }
+    }
+
+    fn recorded_map(
+        members: &[(&str, &pulsevm_crypto::k1::K1PublicKey)],
+    ) -> std::collections::BTreeMap<String, pulsevm_crypto::k1::K1PublicKey> {
+        members
+            .iter()
+            .map(|(name, key)| (name.to_string(), **key))
+            .collect()
+    }
+
+    #[test]
+    fn schedule_match_pins_the_declared_set_both_ways() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        // The recorded schedule comes from the snapshot's header state, so
+        // the fixtures below stand in for that artifact — never for the
+        // producers table, which carries every active row while the
+        // schedule names only the committee.
+        let schedule = recorded_map(&[("prod.a", &key_a), ("prod.b", &key_b)]);
+        // Exact match passes and reports the committee size.
+        let declaration = declaration_of(&[("prod.a", &key_a), ("prod.b", &key_b)]);
+        assert_eq!(
+            check_declaration_matches_recorded_schedule(&declaration, &schedule).unwrap(),
+            2
+        );
+        // A standby subset declaring itself fails: without the reverse
+        // direction it would pass with a denominator it chose and boot a
+        // minority chain.
+        let subset = declaration_of(&[("prod.a", &key_a)]);
+        let err = check_declaration_matches_recorded_schedule(&subset, &schedule).unwrap_err();
+        assert!(
+            err.contains("does not match the recorded schedule"),
+            "a standby subset must fail closed, got: {err}"
+        );
+        // An extra declared member fails the same way.
+        let superset =
+            declaration_of(&[("prod.a", &key_a), ("prod.b", &key_b), ("prod.zz", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&superset, &schedule).is_err());
+        // Unknown producers fail, not silently skipped.
+        let unknown = declaration_of(&[("prod.zz", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&unknown, &schedule).is_err());
+    }
+
+    fn memo_manifest(names: &[String], created_slot: u32) -> MigrationManifest {
+        let mut manifest = MigrationManifest::new(
+            b"memo test",
+            [9u8; 32],
+            b"checkpoint",
+            1,
+            Default::default(),
+        );
+        manifest.halt_declaration = Some(pulsevm_chain_types::HaltDeclaration {
+            version: 1,
+            source_chain_id: "00".repeat(32),
+            last_height: 8,
+            validator_set: Vec::new(),
+            signatures: Vec::new(),
+        });
+        manifest.halt_memo_accounts = Some(
+            names
+                .iter()
+                .map(|name| MigrationMemoAccount {
+                    name: name.clone(),
+                    created_slot,
+                })
+                .collect(),
+        );
+        // The manifest declaration is a placeholder the memo check does not
+        // parse: only the recorded names and the expected digest matter.
+        manifest
+    }
+
+    fn memo_names_for(digest_hex: &str) -> Vec<String> {
+        let letters: String = digest_hex
+            .bytes()
+            .map(|b| {
+                let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                (b'a' + nibble) as char
+            })
+            .collect();
+        letters
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|chunk| format!("ha{}", chunk.iter().collect::<String>()))
+            .collect()
+    }
+
+    #[test]
+    fn memo_proof_decodes_names_and_requires_pre_h_creation() {
+        let digest = [0xABu8; 32];
+        let digest_hex = hex::encode(digest);
+        let names = memo_names_for(&digest_hex);
+        assert_eq!(names.len(), 7);
+        // Valid proof: names decode to the digest, all created before H.
+        let manifest = memo_manifest(&names, 50);
+        assert_eq!(
+            verify_migration_memo_accounts(&manifest, &digest, 100).unwrap(),
+            7
+        );
+        // Wrong digest fails: the names commit to exactly one digest.
+        let other = [0xCDu8; 32];
+        let err = verify_migration_memo_accounts(&manifest, &other, 100).unwrap_err();
+        assert!(err.contains("do not decode"), "{err}");
+        // Created at or after H fails: the declaration must land before H.
+        for slot in [100, 101] {
+            let late = memo_manifest(&names, slot);
+            let err = verify_migration_memo_accounts(&late, &digest, 100).unwrap_err();
+            assert!(err.contains("must land before H"), "{err}");
+        }
+        // Malformed names fail.
+        let mut broken = names.clone();
+        broken[0] = "xyz".to_string();
+        let broken_manifest = memo_manifest(&broken, 50);
+        let err = verify_migration_memo_accounts(&broken_manifest, &digest, 100).unwrap_err();
+        assert!(
+            err.contains("does not carry the declaration digest"),
+            "{err}"
+        );
+        // No memo record: the contract vehicle and legacy paths skip.
+        let mut bare = memo_manifest(&names, 50);
+        bare.halt_memo_accounts = None;
+        assert_eq!(
+            verify_migration_memo_accounts(&bare, &digest, 100).unwrap(),
+            0
+        );
+        // An empty record fails closed instead of vacuously passing.
+        let mut empty = memo_manifest(&names, 50);
+        empty.halt_memo_accounts = Some(Vec::new());
+        assert!(verify_migration_memo_accounts(&empty, &digest, 100).is_err());
+    }
+
+    #[test]
+    fn schedule_match_rejects_key_drift() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        let schedule = recorded_map(&[("prod.a", &key_a), ("prod.b", &key_b)]);
+        // A schedule-key rotation on one member fails: the frozen set no
+        // longer names the keys that produce.
+        let drifted = declaration_of(&[("prod.a", &key_b), ("prod.b", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&drifted, &schedule).is_err());
+    }
+
+    #[test]
+    fn transport_roster_rejects_non_unit_weights() {
+        // An exporter cannot move the denominator: transported weights must
+        // be exactly 1, however large the on-chain votes behind them are.
+        let (mut manifest, _, _) = halt_test_manifest();
+        let key = test_key("weight-1");
+        manifest = manifest.with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key: key.to_string(),
+            weight: pulsevm_chain_types::HaltWeight(50),
+        }]);
+        assert!(manifest.roster_entries().is_err());
+    }
+
+    #[test]
+    fn migration_state_producer_keys_derive_from_hydrated_state() {
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let key = test_key("state-roster-1");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut kv_row = secondary_prefix(system, system, producers, owner, payer);
+        bytes(
+            &mut kv_row,
+            &pack_producer_info(owner, &key.compressed(), 0, true, 12345.0),
+        );
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("contract_table", table_row),
+                delta("contract_row", kv_row),
+            ],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state(&mut db, &entry).unwrap();
+        let map = migration_state_producer_keys(&db).expect("derivation must succeed");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&owner].key, key.compressed());
+        // The template carries the same key with the on-chain vote weight.
+        let template = migration_halt_roster_template(&db).unwrap();
+        assert_eq!(template.len(), 1);
+        assert_eq!(template[0].producer, "prod.a");
+        assert_eq!(template[0].weight, pulsevm_chain_types::HaltWeight::MEMBER);
+        let parsed = pulsevm_chain_types::HaltRosterEntry {
+            producer: template[0].producer.clone(),
+            key: pulsevm_crypto::k1::K1PublicKey::from_string(&template[0].key).unwrap(),
+            weight: template[0].weight,
+        };
+        assert_eq!(parsed.key.compressed(), key.compressed());
+        let roster = vec![pulsevm_chain_types::HaltRosterEntry {
+            producer: "prod.a".to_string(),
+            key,
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
+        }];
+        assert_eq!(check_halt_roster_against_state(&roster, &map).unwrap(), 1);
+    }
+
+    #[test]
+    fn halt_roster_template_weighs_every_member_one() {
+        // `total_votes` is deliberately ignored: mainnet magnitudes (top
+        // producer ~5.25e21) would otherwise drag vote-weight quorum math
+        // back in. Every templated member weighs exactly 1.
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let big = test_key("magnitude-big");
+        let small = test_key("magnitude-small");
+        let owner_big = pulsevm_name::Name::from_str("prod.big").unwrap().as_u64();
+        let owner_small = pulsevm_name::Name::from_str("prod.small").unwrap().as_u64();
+        let votes_big = 5.251494364735212e21_f64;
+        let votes_small = 1.5792002538645e20_f64;
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut kv_big = secondary_prefix(system, system, producers, owner_big, payer);
+        bytes(
+            &mut kv_big,
+            &pack_producer_info(owner_big, &big.compressed(), 0, true, votes_big),
+        );
+        let mut kv_small = secondary_prefix(system, system, producers, owner_small, payer);
+        bytes(
+            &mut kv_small,
+            &pack_producer_info(owner_small, &small.compressed(), 0, true, votes_small),
+        );
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                delta("contract_table", table_row),
+                delta("contract_row", kv_big),
+                delta("contract_row", kv_small),
+            ],
+        };
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state(&mut db, &entry).unwrap();
+        let template = migration_halt_roster_template(&db).unwrap();
+        assert_eq!(template.len(), 2);
+        for entry in &template {
+            assert_eq!(entry.weight, pulsevm_chain_types::HaltWeight::MEMBER);
+        }
+    }
+
+    #[test]
+    fn independent_conversions_of_one_export_give_identical_checkpoints() {
+        // Every BP signs its own checkpoint, so two independent conversions
+        // of the same Leap export must give byte-identical migration.snapshot
+        // files. Convert the same entry twice into two fresh databases and
+        // compare the checkpoint bytes exactly.
+        fn convert(entry: &StateHistoryEntry) -> Vec<u8> {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state(&mut db, entry).unwrap();
+            db.set_revision(7).unwrap();
+            db.snapshot_bytes().unwrap()
+        }
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut deltas = vec![delta("contract_table", table_row)];
+        for (index, seed) in ["check-a", "check-b", "check-c"].iter().enumerate() {
+            let key = test_key(seed);
+            let owner = pulsevm_name::Name::from_str(match index {
+                0 => "prod.a",
+                1 => "prod.b",
+                _ => "prod.c",
+            })
+            .unwrap()
+            .as_u64();
+            let mut kv_row = secondary_prefix(system, system, producers, owner, payer);
+            bytes(
+                &mut kv_row,
+                &pack_producer_info(owner, &key.compressed(), 0, true, 100.0 + index as f64),
+            );
+            deltas.push(delta("contract_row", kv_row));
+        }
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas,
+        };
+        let first = convert(&entry);
+        let second = convert(&entry);
+        assert!(!first.is_empty());
+        assert_eq!(
+            first, second,
+            "independent conversions of one export must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn real_export_path_gives_identical_per_bp_checkpoints() {
+        // Every BP converts the same Leap export and signs its own
+        // checkpoint, so two independent conversions must give
+        // byte-identical snapshots through the REAL importer path — the
+        // sidecar, protocol state, and resource tables included, not just
+        // the producer rows. Convert twice into fresh databases and compare
+        // the checkpoint bytes (and their sha, the per-BP signing input)
+        // exactly.
+        fn convert(entry: &StateHistoryEntry, sidecar: &DeferredTransactionSidecar) -> Vec<u8> {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state_with_deferred_transactions(&mut db, entry, Some(sidecar)).unwrap();
+            db.set_revision(7).unwrap();
+            db.snapshot_bytes().unwrap()
+        }
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let payer = 55u64;
+        let mut table_row = vec![0];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut deltas = vec![delta("contract_table", table_row)];
+        for (index, seed) in ["check-a", "check-b", "check-c"].iter().enumerate() {
+            let key = test_key(seed);
+            let owner = pulsevm_name::Name::from_str(match index {
+                0 => "prod.a",
+                1 => "prod.b",
+                _ => "prod.c",
+            })
+            .unwrap()
+            .as_u64();
+            let mut kv_row = secondary_prefix(system, system, producers, owner, payer);
+            bytes(
+                &mut kv_row,
+                &pack_producer_info(owner, &key.compressed(), 0, true, 100.0 + index as f64),
+            );
+            deltas.push(delta("contract_row", kv_row));
+        }
+        // Chain config exactly as Leap 5 ships it (modern layout).
+        deltas.push(delta(
+            "global_property",
+            hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap(),
+        ));
+        // Two protocol features, activated in block order.
+        let mut protocol_row = vec![0, 2];
+        for (digest, block) in [([0xF0u8; 32], 100u32), ([0xF1u8; 32], 200u32)] {
+            protocol_row.push(0);
+            protocol_row.extend_from_slice(&digest);
+            protocol_row.extend_from_slice(&block.to_le_bytes());
+        }
+        deltas.push(delta("protocol_state", protocol_row));
+        // Resource limits and usage for the deferred payer.
+        let account = 11u64;
+        let mut limits_row = vec![0];
+        limits_row.extend_from_slice(&account.to_le_bytes());
+        for weight in [-1i64, 2, 4096] {
+            limits_row.extend_from_slice(&weight.to_le_bytes());
+        }
+        deltas.push(delta("resource_limits", limits_row));
+        let mut usage_row = vec![0];
+        usage_row.extend_from_slice(&account.to_le_bytes());
+        for _ in 0..2 {
+            usage_row.push(0);
+            usage_row.extend_from_slice(&1u32.to_le_bytes());
+            usage_row.extend_from_slice(&2u64.to_le_bytes());
+            usage_row.extend_from_slice(&3u64.to_le_bytes());
+        }
+        usage_row.extend_from_slice(&4u64.to_le_bytes());
+        deltas.push(delta("resource_usage", usage_row));
+        // One account with metadata, code, and an owner permission, exactly
+        // the rows the sidecar must cover one-for-one.
+        let code_hash = [0xC0u8; 32];
+        let mut account_row = vec![0];
+        account_row.extend_from_slice(&account.to_le_bytes());
+        account_row.extend_from_slice(&7u32.to_le_bytes());
+        bytes(&mut account_row, &[]);
+        deltas.push(delta("account", account_row));
+        let mut metadata_row = vec![0];
+        metadata_row.extend_from_slice(&account.to_le_bytes());
+        metadata_row.push(0);
+        metadata_row.extend_from_slice(&0i64.to_le_bytes());
+        metadata_row.push(1);
+        metadata_row.extend_from_slice(&[0, 0]);
+        metadata_row.extend_from_slice(&code_hash);
+        deltas.push(delta("account_metadata", metadata_row));
+        let mut code_row = vec![0, 0, 0];
+        code_row.extend_from_slice(&code_hash);
+        bytes(&mut code_row, &[0, 97, 115, 109]);
+        deltas.push(delta("code", code_row));
+        let mut permission_row = vec![0];
+        permission_row.extend_from_slice(&account.to_le_bytes());
+        permission_row.extend_from_slice(&111u64.to_le_bytes());
+        permission_row.extend_from_slice(&0u64.to_le_bytes());
+        permission_row.extend_from_slice(&0i64.to_le_bytes());
+        permission_row.extend_from_slice(&0u32.to_le_bytes());
+        permission_row.extend_from_slice(&[0, 0, 0]);
+        deltas.push(delta("permission", permission_row));
+        // One deferred transaction: the SHiP row carries identity and
+        // payload, the sidecar the three scheduler timestamps.
+        let trx_id = [0xD0u8; 32];
+        let packed_trx = vec![0xde, 0xad, 0xbe, 0xef];
+        let published = 1_700_000_000_000_000i64;
+        let mut generated_row = vec![0];
+        generated_row.extend_from_slice(&account.to_le_bytes());
+        generated_row.extend_from_slice(&7u64.to_le_bytes());
+        generated_row.extend_from_slice(&0u64.to_le_bytes());
+        generated_row.extend_from_slice(&account.to_le_bytes());
+        generated_row.extend_from_slice(&trx_id);
+        bytes(&mut generated_row, &packed_trx);
+        deltas.push(delta("generated_transaction", generated_row));
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [7; 32],
+            deltas,
+        };
+        let sidecar = DeferredTransactionSidecar {
+            version: DeferredTransactionSidecar::VERSION,
+            source_block_id: hex::encode(entry.block_id),
+            source_chain_id: None,
+            account_metadata: vec![AccountMetadataSidecarRow {
+                name: account,
+                recv_sequence: 7,
+                auth_sequence: 8,
+                code_sequence: 9,
+                abi_sequence: 10,
+            }],
+            code: vec![CodeSidecarRow {
+                code_hash: hex::encode(code_hash),
+                vm_type: 0,
+                vm_version: 0,
+                code_ref_count: 1,
+                first_block_used: 399_000_123,
+            }],
+            permissions: vec![PermissionSidecarRow {
+                owner: account,
+                name: 111,
+                last_used: 123_456,
+            }],
+            global_action_sequence: 987_654_321,
+            input_transactions: vec![],
+            transactions: vec![DeferredTransactionSidecarRow {
+                sender: account,
+                sender_id: "7".to_string(),
+                payer: account,
+                trx_id: hex::encode(trx_id),
+                delay_until: published + 3_600_000_000,
+                expiration: published + 7_200_000_000,
+                published,
+                packed_trx: hex::encode(&packed_trx),
+            }],
+        };
+        let first = convert(&entry, &sidecar);
+        let second = convert(&entry, &sidecar);
+        assert!(!first.is_empty());
+        assert_eq!(
+            first, second,
+            "independent conversions of one real export must be byte-identical"
+        );
+        // The per-BP signing input is the checkpoint sha: equal bytes hash
+        // equal, so every BP signs the same digest.
+        assert_eq!(
+            pulsevm_crypto::Digest::hash(&first),
+            pulsevm_crypto::Digest::hash(&second)
+        );
+    }
+
+    fn halt_test_manifest() -> (MigrationManifest, [u8; 32], [u8; 32]) {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        // Height-consistent H id: the post-chain walk derives each height
+        // as parent-num + 1, so the fixture anchor must embed H itself.
+        let mut hid = [9u8; 32];
+        hid[0..4].copy_from_slice(&7u32.to_be_bytes());
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            hid,
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        );
+        let hash: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        (manifest, hid, hash)
+    }
+
+    /// Pack one synthetic post-H signed block: `pulsevm_core::block` wire
+    /// layout, signed by `signing` over the header digest. Returns the hex
+    /// plus the block id the walk recomputes (sha256 header, number
+    /// overwritten big-endian). Mirrors the layout comment on
+    /// `read_post_block`; the handover rehearsal covers the same walk
+    /// against real Leap blocks.
+    #[allow(clippy::too_many_arguments)]
+    /// Fixed schedule hash the pair fixtures stage: the gate binds the
+    /// exact (root, hash) pair through the producer signature, so any
+    /// consistent value exercises the real check.
+    const FIXTURE_SCHEDULE_HASH: [u8; 32] = [0x5E; 32];
+
+    // Ten arguments because the fixture packs every byte the gate walks:
+    // header shape knobs plus the recorded root and schedule hash.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_post_block(
+        previous: &[u8; 32],
+        producer: u64,
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        schedule_version: u32,
+        tx_count: u32,
+        transaction_mroot: [u8; 32],
+        schedule_change: bool,
+        trailer: &[u8],
+        root: [u8; 32],
+        schedule_hash: [u8; 32],
+        // Post-H entries carry the two zero counts the gate requires; the
+        // H entry omits them (H may carry traffic the entry does not stage).
+        with_counts: bool,
+    ) -> (String, [u8; 32]) {
+        fn varuint(mut value: u32, out: &mut Vec<u8>) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        let mut header = Vec::new();
+        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&producer.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(previous);
+        header.extend_from_slice(&transaction_mroot);
+        header.extend_from_slice(&[0u8; 32]);
+        header.extend_from_slice(&schedule_version.to_le_bytes());
+        header.push(u8::from(schedule_change));
+        header.push(0); // no header extensions
+        let header_digest = pulsevm_crypto::Digest::hash(&header).0;
+        // Leap's producer signature digest: sha256(sha256(header ||
+        // blockroot) || pending-schedule-hash). The recorded proof leads
+        // with root and schedule hash so the gate recomputes this exactly.
+        let mut digest_and_root = Vec::with_capacity(64);
+        digest_and_root.extend_from_slice(&header_digest);
+        digest_and_root.extend_from_slice(&root);
+        let bound = pulsevm_crypto::Digest::hash(&digest_and_root).0;
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&bound);
+        bound_and_schedule.extend_from_slice(&schedule_hash);
+        let digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let compact = signing.sign(&digest).compact65();
+        let mut packed = Vec::with_capacity(64 + header.len() + 67);
+        packed.extend_from_slice(&root);
+        packed.extend_from_slice(&schedule_hash);
+        packed.extend_from_slice(&header);
+        packed.push(0); // K1 tag
+        packed.extend_from_slice(&compact);
+        if with_counts {
+            varuint(tx_count, &mut packed);
+            packed.push(0); // no block extensions
+        }
+        packed.extend_from_slice(trailer);
+        let num = u32::from_be_bytes(previous[0..4].try_into().unwrap()) + 1;
+        let mut id = header_digest;
+        id[0..4].copy_from_slice(&num.to_be_bytes());
+        // The entry carries the header-derived block id, which the gate
+        // recomputes from the packed header and requires to match exactly.
+        packed.extend_from_slice(&id);
+        (hex::encode(&packed), id)
+    }
+
+    fn halt_v1_commitment(
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        producer: &str,
+        height: u32,
+        id: &[u8; 32],
+    ) -> pulsevm_chain_types::HaltCommitment {
+        let digest = pulsevm_chain_types::HaltCommitment::digest(height, id);
+        pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION,
+            halt_height: height,
+            halt_block_id: hex::encode(id),
+            checkpoint_sha256: None,
+            producer_keys: vec![signing.public_key().to_string()],
+            signatures: vec![pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: signing.public_key().to_string(),
+                signature: signing.sign(&digest).to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_migration_halt_rejects_rosterless_single_key() {
+        // One valid signature with no roster proves nothing about the
+        // schedule: the legacy single-key path is rejected even though the
+        // signature itself verifies.
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        manifest.halt_commitment = Some(halt_v1_commitment(&signing, "prod.a", 7, &id));
+        let error = verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).unwrap_err();
+        assert!(
+            error.contains("no roster"),
+            "roster-less commitments must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_accepts_v2_roster_quorum_and_rejects_shortfall() {
+        let (manifest, id, checkpoint) = halt_test_manifest();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-2").unwrap();
+        let roster = vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+        ];
+        let sign = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            let digest = pulsevm_chain_types::HaltCommitment::digest_v2(7, &id, &checkpoint);
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&digest).to_string(),
+            }
+        };
+        let mut full = manifest.clone().with_halt_roster(roster);
+        let checkpoint_hex = full.checkpoint_sha256.clone();
+        full.halt_commitment = Some(pulsevm_chain_types::HaltCommitment {
+            version: pulsevm_chain_types::HaltCommitment::VERSION_V2,
+            halt_height: 7,
+            halt_block_id: hex::encode(id),
+            checkpoint_sha256: Some(checkpoint_hex),
+            producer_keys: vec![],
+            signatures: vec![sign(&k1, "prod.a"), sign(&k2, "prod.b")],
+        });
+        verify_migration_halt_commitment(&full, 7, &id, &checkpoint).unwrap();
+        // Only prod.b (1 of 2) signs: below the two-thirds quorum.
+        let mut short = full.clone();
+        short.halt_commitment.as_mut().unwrap().signatures = vec![sign(&k2, "prod.b")];
+        assert!(verify_migration_halt_commitment(&short, 7, &id, &checkpoint).is_err());
+    }
+
+    #[test]
+    fn verify_migration_halt_rejects_bad_version_and_bad_checkpoint() {
+        let (mut manifest, id, checkpoint) = halt_test_manifest();
+        let signing = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("dispatch-1").unwrap();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = 7;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &checkpoint).is_err());
+        let (mut manifest, id, _) = halt_test_manifest();
+        let mut commitment = halt_v1_commitment(&signing, "prod.a", 7, &id);
+        commitment.version = pulsevm_chain_types::HaltCommitment::VERSION_V2;
+        manifest.halt_commitment = Some(commitment);
+        assert!(verify_migration_halt_commitment(&manifest, 7, &id, &[8; 32]).is_err());
+    }
+
+    /// H's schedule version in the pair fixture: every vote and the
+    /// attested version pin to exactly this.
+    const TEST_SCHEDULE_VERSION: u32 = 42;
+    /// The platform (MetalGo blockchain) id the pair-fixture confirmation
+    /// binds: the restore always configures one, so fixtures carry one.
+    const TEST_PLATFORM_ID: [u8; 32] = [0x51; 32];
+
+    fn halt_test_pair() -> (MigrationManifest, [u8; 32], [u8; 32], [u8; 32]) {
+        let (mut manifest, _synthetic_id, checkpoint) = halt_test_manifest();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        let sched = FIXTURE_SCHEDULE_HASH;
+        // The cutover block itself is a gate entry: its header derives the
+        // H id, so the window opens on a signature-checked H. The template
+        // and the posts below all bind this derived id.
+        let mut parent6 = [6u8; 32];
+        parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
+        let (h_block, hid) = pack_post_block(
+            &parent6,
+            prod_a,
+            &k1,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [7u8; 32],
+            sched,
+            false,
+        );
+        manifest.source_block_id = hex::encode(hid);
+        let mut members = vec![
+            pulsevm_chain_types::HaltDeclarationMember {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+            pulsevm_chain_types::HaltDeclarationMember {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+        ];
+        pulsevm_chain_types::HaltDeclaration::sort_members(&mut members);
+        let unsigned = pulsevm_chain_types::HaltDeclaration {
+            version: pulsevm_chain_types::HaltDeclaration::VERSION,
+            source_chain_id: "41".repeat(32),
+            last_height: 7,
+            validator_set: members,
+            signatures: Vec::new(),
+        };
+        let decl_digest = unsigned.digest().unwrap();
+        let sign_decl = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&decl_digest).to_string(),
+            }
+        };
+        let declaration = pulsevm_chain_types::HaltDeclaration {
+            signatures: vec![sign_decl(&k1, "prod.a"), sign_decl(&k2, "prod.b")],
+            ..unsigned
+        };
+        let new_chain = [0x31; 32];
+        let template = pulsevm_chain_types::HaltConfirmation {
+            version: pulsevm_chain_types::HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(declaration.digest().unwrap()),
+            halt_height: 7,
+            // The fixture stages two post-H emptiness headers (blocks 8 and
+            // 9 below), so the attested pause head is exactly 9. The H id
+            // is derived from the staged H entry above, never synthetic.
+            pause_height: 9,
+            halt_block_id: hex::encode(hid),
+            checkpoint_sha256: hex::encode(checkpoint),
+            new_chain_id: hex::encode(new_chain),
+            platform_chain_id: hex::encode(TEST_PLATFORM_ID),
+            signatures: Vec::new(),
+        };
+        let conf_digest = template.digest().unwrap();
+        let sign_conf = |key: &pulsevm_crypto::k1::K1PrivateKey, producer: &str| {
+            pulsevm_chain_types::HaltSignature {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                signature: key.sign(&conf_digest).to_string(),
+            }
+        };
+        let mut manifest = manifest.with_halt_roster(vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+        ]);
+        manifest.halt_declaration = Some(declaration.clone());
+        manifest.halt_confirmation = Some(pulsevm_chain_types::HaltConfirmation {
+            signatures: vec![sign_conf(&k1, "prod.a"), sign_conf(&k2, "prod.b")],
+            ..template
+        });
+        // The pair always carries the on-chain ceremony: both votes land
+        // before H (blocks 5 and 6), the singleton is finalized at 6, and
+        // the captured tally equals the recomputed signer count (1 + 1).
+        // Weights are 1 and 1: both votes clear the strict count quorum at
+        // 2 of 2.
+        let vote = |producer: &str, key: &str, signature: &str, block: u32| {
+            pulsevm_chain_types::HaltContractVote {
+                producer: producer.to_string(),
+                block,
+                schedule_version: TEST_SCHEDULE_VERSION,
+                key: key.to_string(),
+                signature: signature.to_string(),
+            }
+        };
+        let key_a = declaration.validator_set[0].key.clone();
+        let key_b = declaration.validator_set[1].key.clone();
+        let sig_a = declaration.signatures[0].signature.clone();
+        let sig_b = declaration.signatures[1].signature.clone();
+        manifest.halt_contract_ceremony = Some(pulsevm_chain_types::HaltContractCeremony {
+            contract: "cutover".to_string(),
+            declaration_digest: hex::encode(decl_digest),
+            total_weight: pulsevm_chain_types::HaltWeight(2),
+            voted_weight: pulsevm_chain_types::HaltWeight(2),
+            finalized: true,
+            finalized_block: 6,
+            init_time: 0,
+            votes: vec![
+                vote("prod.a", &key_a, &sig_a, 5),
+                vote("prod.b", &key_b, &sig_b, 6),
+            ],
+        });
+        manifest.halt_schedule_version = Some(TEST_SCHEDULE_VERSION);
+        // The export attests no proposed schedule in the checkpoint: the
+        // restore fails closed on anything else.
+        manifest.halt_proposed_schedule = Some(false);
+        // The recorded schedule is the declared set: the pair fixture's
+        // empty window (blocks 8 and 9, signed by the schedule keys) links
+        // from H and proves nothing landed after the freeze.
+        manifest.halt_schedule = Some(vec![
+            MigrationHaltRosterEntry {
+                producer: "prod.a".to_string(),
+                key: k1.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+            MigrationHaltRosterEntry {
+                producer: "prod.b".to_string(),
+                key: k2.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            },
+        ]);
+        let (post8, id8) = pack_post_block(
+            &hid,
+            prod_a,
+            &k1,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let (post9, _) = pack_post_block(
+            &id8,
+            prod_b,
+            &k2,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [9u8; 32],
+            sched,
+            true,
+        );
+        manifest.halt_post_blocks = Some(vec![post8, post9]);
+        manifest.halt_h_block = Some(h_block);
+        (manifest, hid, checkpoint, new_chain)
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_accepts_and_binds_every_link() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let roster = verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("cutover pair must verify");
+        assert_eq!(roster.len(), 2);
+    }
+
+    #[test]
+    fn pair_rejects_an_unattested_or_substituted_cutover_block() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let run = |manifest: &MigrationManifest| {
+            verify_migration_halt_pair(
+                manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+        };
+        // No H entry: the window cannot open on an unattested H.
+        let mut bare = manifest.clone();
+        bare.halt_h_block = None;
+        let err = run(&bare).unwrap_err();
+        assert!(
+            err.contains("cutover-block evidence") || err.contains("unattested H"),
+            "a pair without an H entry must fail closed, got: {err}"
+        );
+        // Substituted H: the entry's derived id no longer matches the
+        // terminal block the confirmation binds.
+        let mut swapped = manifest.clone();
+        let mut raw = hex::decode(swapped.halt_h_block.clone().unwrap()).unwrap();
+        let id_off = raw.len() - 32;
+        raw[id_off + 5] ^= 1;
+        swapped.halt_h_block = Some(hex::encode(&raw));
+        let err = run(&swapped).unwrap_err();
+        assert!(
+            err.contains("cutover block"),
+            "a substituted H entry must fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn post_chain_covers_exactly_the_attested_pause_head() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let run = |manifest: &MigrationManifest| {
+            verify_migration_halt_pair(
+                manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+        };
+        // The fixture attests pause head 9 with two staged headers (8, 9):
+        // a proof that stops at 8 leaves block 9 unproven and fails closed.
+        let mut short = manifest.clone();
+        short.halt_post_blocks = Some(short.halt_post_blocks.unwrap()[..1].to_vec());
+        let err = run(&short).unwrap_err();
+        assert!(
+            err.contains("pause head 9"),
+            "a proof short of the attested pause head must fail, got: {err}"
+        );
+        // A proof that runs to block 10 stages a header past what the
+        // quorum observed: the extra header fails closed too.
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        let sched = FIXTURE_SCHEDULE_HASH;
+        let (_, id8) = pack_post_block(
+            &id,
+            prod_a,
+            &k1,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let (_, id9) = pack_post_block(
+            &id8,
+            prod_b,
+            &k2,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [9u8; 32],
+            sched,
+            true,
+        );
+        let (post10, _) = pack_post_block(
+            &id9,
+            prod_a,
+            &k1,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [10u8; 32],
+            sched,
+            true,
+        );
+        let mut long = manifest.clone();
+        long.halt_post_blocks.as_mut().unwrap().push(post10);
+        let err = run(&long).unwrap_err();
+        assert!(
+            err.contains("pause head 9"),
+            "a proof past the attested pause head must fail, got: {err}"
+        );
+        // A pause that lands exactly on H must fail closed: zero staged
+        // headers cannot distinguish a frozen network from a bare anchor,
+        // so the quorum must attest a head strictly past H (the pause
+        // head is re-signed over 7 here, and the empty window is rejected
+        // even with a matching quorum).
+        let declaration = manifest.halt_declaration.clone().unwrap();
+        let decl_digest = declaration.digest().unwrap();
+        let template = pulsevm_chain_types::HaltConfirmation {
+            version: pulsevm_chain_types::HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(decl_digest),
+            halt_height: 7,
+            pause_height: 7,
+            halt_block_id: hex::encode(id),
+            checkpoint_sha256: hex::encode(checkpoint),
+            new_chain_id: hex::encode(new_chain),
+            platform_chain_id: hex::encode(TEST_PLATFORM_ID),
+            signatures: Vec::new(),
+        };
+        let conf_digest = template.digest().unwrap();
+        let mut landed = manifest.clone();
+        landed.halt_confirmation = Some(pulsevm_chain_types::HaltConfirmation {
+            signatures: [(&k1, "prod.a"), (&k2, "prod.b")]
+                .iter()
+                .map(|(key, producer)| pulsevm_chain_types::HaltSignature {
+                    producer: producer.to_string(),
+                    key: key.public_key().to_string(),
+                    signature: key.sign(&conf_digest).to_string(),
+                })
+                .collect(),
+            ..template
+        });
+        landed.halt_post_blocks = Some(Vec::new());
+        let err = run(&landed).unwrap_err();
+        assert!(
+            err.contains("strictly past H") || err.contains("pause head"),
+            "a pause exactly on H must fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn post_chain_rejects_broken_linkage() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        // Flip a byte inside `previous` (offset 78..110), past the embedded
+        // height: the header no longer hash-links to H.
+        let mut raw = hex::decode(manifest.halt_post_blocks.as_ref().unwrap()[0].clone()).unwrap();
+        raw[80] ^= 1;
+        manifest.halt_post_blocks.as_mut().unwrap()[0] = hex::encode(&raw);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H block that does not hash-link must fail"
+        );
+    }
+
+    #[test]
+    fn post_chain_rejects_a_sibling_staged_under_the_wrong_id() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        // Flip a byte in the last staged id past its embedded height: the
+        // height bytes still name block 9, but the id is no longer the
+        // header's. The walk must derive the id instead of trusting it, so
+        // an empty sibling smuggled under the real block's number fails.
+        let mut raw = hex::decode(manifest.halt_post_blocks.as_ref().unwrap()[1].clone()).unwrap();
+        let id_off = raw.len() - 32;
+        assert_eq!(&raw[id_off..id_off + 4], &9u32.to_be_bytes());
+        raw[id_off + 4] ^= 1;
+        manifest.halt_post_blocks.as_mut().unwrap()[1] = hex::encode(&raw);
+        let err = verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("id"),
+            "a post-H block whose id does not derive from its header must fail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn post_chain_rejects_non_empty_blocks() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let k = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        // The tampered header stays first in a full two-block window (the
+        // attested pause head is 9): the gate must reject the content, not
+        // the coverage.
+        let sched = FIXTURE_SCHEDULE_HASH;
+        let chain_from = |first: &str, first_id: &[u8; 32]| {
+            let (second, _) = pack_post_block(
+                first_id,
+                prod_b,
+                &k2,
+                TEST_SCHEDULE_VERSION,
+                0,
+                [0u8; 32],
+                false,
+                &[],
+                [9u8; 32],
+                sched,
+                true,
+            );
+            vec![first.to_string(), second]
+        };
+        // A block that lists a transaction is not empty, even with a zero root.
+        let (with_tx, tx_id) = pack_post_block(
+            &id,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION,
+            1,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let mut tampered = manifest.clone();
+        tampered.halt_post_blocks = Some(chain_from(&with_tx, &tx_id));
+        assert!(
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H block carrying transactions must fail"
+        );
+        // A zero-transaction block with a non-zero root is tampered all the same.
+        let (bad_root, root_id) = pack_post_block(
+            &id,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [7u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        tampered.halt_post_blocks = Some(chain_from(&bad_root, &root_id));
+        assert!(
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H block with a non-empty transaction root must fail"
+        );
+    }
+
+    #[test]
+    fn post_chain_rejects_foreign_signatures_and_rotations() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let outsider = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("post-outsider").unwrap();
+        let k = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        // The tampered header stays first in a full two-block window (the
+        // attested pause head is 9): the gate must reject the content, not
+        // the coverage.
+        let sched = FIXTURE_SCHEDULE_HASH;
+        let chain_from = |first: &str, first_id: &[u8; 32]| {
+            let (second, _) = pack_post_block(
+                first_id,
+                prod_b,
+                &k2,
+                TEST_SCHEDULE_VERSION,
+                0,
+                [0u8; 32],
+                false,
+                &[],
+                [9u8; 32],
+                sched,
+                true,
+            );
+            vec![first.to_string(), second]
+        };
+        // Signed by a key no schedule member holds: not a producer block.
+        let (forged, forged_id) = pack_post_block(
+            &id,
+            prod_a,
+            &outsider,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let mut tampered = manifest.clone();
+        tampered.halt_post_blocks = Some(chain_from(&forged, &forged_id));
+        assert!(
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H block with a foreign signature must fail"
+        );
+        // A schedule change inside the window changes the frozen set.
+        let (rotated, rotated_id) = pack_post_block(
+            &id,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            true,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        tampered.halt_post_blocks = Some(chain_from(&rotated, &rotated_id));
+        assert!(
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H schedule change must fail"
+        );
+        // A rotated version on an otherwise valid header fails the same way.
+        let (wrong_version, version_id) = pack_post_block(
+            &id,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION + 1,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        tampered.halt_post_blocks = Some(chain_from(&wrong_version, &version_id));
+        assert!(
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err(),
+            "a post-H version rotation must fail"
+        );
+    }
+
+    #[test]
+    fn post_chain_rejects_missing_and_mismatched_schedule() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let run = |manifest: &MigrationManifest| {
+            verify_migration_halt_pair(
+                manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+            .is_err()
+        };
+        // Unattested windows and schedules fail closed, even with a valid pair.
+        let mut missing = manifest.clone();
+        missing.halt_post_blocks = None;
+        assert!(run(&missing), "missing post-H evidence must fail");
+        let mut missing_schedule = manifest.clone();
+        missing_schedule.halt_schedule = None;
+        assert!(
+            run(&missing_schedule),
+            "missing recorded schedule must fail"
+        );
+        // The recorded schedule must equal the declared set: an extra
+        // member, a dropped member, or a moved key all fail.
+        let mut extra = manifest.clone();
+        extra
+            .halt_schedule
+            .as_mut()
+            .unwrap()
+            .push(MigrationHaltRosterEntry {
+                producer: "prod.zz".to_string(),
+                key: test_key("schedule-extra").to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            });
+        assert!(run(&extra), "a schedule larger than declared must fail");
+        let mut dropped = manifest.clone();
+        dropped.halt_schedule.as_mut().unwrap().pop();
+        assert!(run(&dropped), "a schedule smaller than declared must fail");
+        let mut moved = manifest.clone();
+        moved.halt_schedule.as_mut().unwrap()[0].key = test_key("schedule-moved").to_string();
+        assert!(run(&moved), "a schedule with a moved key must fail");
+        let mut weighted = manifest.clone();
+        weighted.halt_schedule.as_mut().unwrap()[0].weight = pulsevm_chain_types::HaltWeight(50);
+        assert!(run(&weighted), "a non-unit recorded weight must fail");
+    }
+
+    #[test]
+    fn post_chain_rejects_gaps_and_overlong_windows() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let k = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let sched = FIXTURE_SCHEDULE_HASH;
+        let run = |blocks: Vec<String>| {
+            let mut tampered = manifest.clone();
+            tampered.halt_post_blocks = Some(blocks);
+            verify_migration_halt_pair(
+                &tampered,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+            .is_err()
+        };
+        // A skipped height: after block 8 the walk expects 9, but the
+        // second header's parent embeds 9, demanding 10 — the follow
+        // check breaks the chain.
+        let (post8, id8) = pack_post_block(
+            &id,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let mut jumped = id8;
+        jumped[0..4].copy_from_slice(&9u32.to_be_bytes());
+        let (post10, _) = pack_post_block(
+            &jumped,
+            prod_a,
+            &k,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [10u8; 32],
+            sched,
+            true,
+        );
+        assert!(run(vec![post8, post10]), "a skipped height must fail");
+        // A window past the bound fails closed no matter how well formed.
+        let mut chained = Vec::new();
+        let mut prev = id;
+        for _ in 0..=MAX_POST_H_BLOCKS {
+            let (packed, next) = pack_post_block(
+                &prev,
+                prod_a,
+                &k,
+                TEST_SCHEDULE_VERSION,
+                0,
+                [0u8; 32],
+                false,
+                &[],
+                [8u8; 32],
+                sched,
+                true,
+            );
+            chained.push(packed);
+            prev = next;
+        }
+        assert!(run(chained), "an overlong post-H window must fail");
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_replays_contract_evidence() {
+        // The pair fixture already carries the on-chain ceremony (both
+        // votes before H, finalized singleton, matching tally).
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("pair with contract evidence must verify");
+        // A pair stripped of its ceremony and with no recorded inclusion
+        // proves no pre-commitment timing: off-chain signatures alone say
+        // nothing about when they were made.
+        let mut bare = manifest.clone();
+        bare.halt_contract_ceremony = None;
+        assert!(
+            verify_migration_halt_pair(
+                &bare,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // The memo vehicle records the digest on-chain instead: a recorded
+        // in-window inclusion with no ceremony still verifies. The schedule
+        // version pin still applies: unanimity must be on the record even
+        // without per-vote evidence.
+        let mut memo = manifest.clone();
+        memo.halt_contract_ceremony = None;
+        memo.halt_declaration_inclusion = Some(5);
+        verify_migration_halt_pair(
+            &memo,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("recorded declaration inclusion proves pre-commitment timing");
+        // Contract evidence without the attested schedule version fails:
+        // unanimity across the window must be on the record.
+        let mut unversioned = manifest.clone();
+        unversioned.halt_schedule_version = None;
+        assert!(
+            verify_migration_halt_pair(
+                &unversioned,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A vote landing at H is not a pre-commitment: the evidence fails.
+        let mut late = manifest.clone();
+        late.halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .votes[1]
+            .block = 7;
+        assert!(
+            verify_migration_halt_pair(
+                &late,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A captured tally divorced from the recomputed signer weight fails.
+        let mut inflated = manifest.clone();
+        inflated
+            .halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .voted_weight = pulsevm_chain_types::HaltWeight(4);
+        assert!(
+            verify_migration_halt_pair(
+                &inflated,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_enforces_version_and_platform_pins() {
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("pair fixture must verify");
+        // A vote from another schedule version fails: the schedule rotated
+        // mid-ceremony and the freeze no longer names one set.
+        let mut rotated = manifest.clone();
+        rotated
+            .halt_contract_ceremony
+            .as_mut()
+            .expect("evidence attached")
+            .votes[0]
+            .schedule_version = TEST_SCHEDULE_VERSION + 1;
+        assert!(
+            verify_migration_halt_pair(
+                &rotated,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // The attested version must equal H's version, not merely exist: a
+        // version the exporter asserts without matching H fails closed.
+        let mut misattested = manifest.clone();
+        misattested.halt_schedule_version = Some(TEST_SCHEDULE_VERSION + 1);
+        assert!(
+            verify_migration_halt_pair(
+                &misattested,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // H under another version fails even with unanimous votes.
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION + 1,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A confirmation bound to another platform fails: wallets would
+        // sign under a different id than the ceremony committed to.
+        let other_platform = [0x52; 32];
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&other_platform)
+            )
+            .is_err()
+        );
+        // A confirmation stripped of its platform binding fails closed:
+        // version 2 has no unbound form, so the digest itself rejects it
+        // before any signature is checked.
+        let mut unbound = manifest.clone();
+        unbound
+            .halt_confirmation
+            .as_mut()
+            .expect("confirmation attached")
+            .platform_chain_id = String::new();
+        assert!(
+            verify_migration_halt_pair(
+                &unbound,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A checkpoint carrying a proposed schedule fails closed: the
+        // ceremony never froze the pending proposal.
+        let mut proposed = manifest.clone();
+        proposed.halt_proposed_schedule = Some(true);
+        assert!(
+            verify_migration_halt_pair(
+                &proposed,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // An unattested checkpoint fails the same way: absence must be on
+        // the record, not assumed.
+        let mut unattested = manifest.clone();
+        unattested.halt_proposed_schedule = None;
+        assert!(
+            verify_migration_halt_pair(
+                &unattested,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_signer_weight_inflation() {
+        // Move weight onto a signer in the declaration only: the frozen
+        // singleton still pins the old tally and the quorum signatures bind
+        // the old digest, so the inflated declaration verifies against
+        // nothing. Either layer fails the pair closed.
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest
+            .halt_declaration
+            .as_mut()
+            .expect("declaration attached")
+            .validator_set[0]
+            .weight = pulsevm_chain_types::HaltWeight(3);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_missing_steps() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_confirmation = None;
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_declaration = None;
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_enforces_vote_windows() {
+        // Declaration committed two blocks before H, inside a lag-10
+        // window; confirmation quorum recorded two blocks after H inside a
+        // 10-block deadline: the timing is provable and valid.
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_declaration_inclusion = Some(5);
+        manifest.halt_max_declaration_lag = Some(10);
+        manifest.halt_confirmation_inclusion = Some(9);
+        manifest.halt_max_confirmation_lag = Some(10);
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("in-window inclusions must verify");
+        // A declaration at H itself is not a pre-commitment: H must stay
+        // empty and the commitment must predate it.
+        manifest.halt_declaration_inclusion = Some(7);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A stale declaration (older than H-K) fails the freshness bound.
+        manifest.halt_declaration_inclusion = Some(5);
+        manifest.halt_max_declaration_lag = Some(1);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        manifest.halt_max_declaration_lag = Some(10);
+        // A confirmation at H itself is circular: it references H_ID,
+        // which cannot exist inside H.
+        manifest.halt_confirmation_inclusion = Some(7);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        // A confirmation past its deadline fails closed.
+        manifest.halt_confirmation_inclusion = Some(9);
+        manifest.halt_max_confirmation_lag = Some(1);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn halt_inclusion_window_handles_boundaries() {
+        // No inclusions recorded: off-chain path, skipped.
+        assert!(check_halt_inclusion_window(7, None, None, None, None).is_ok());
+        // Structural bounds without claimed K/J.
+        assert!(check_halt_inclusion_window(7, Some(6), None, None, None).is_ok());
+        assert!(check_halt_inclusion_window(7, Some(7), None, None, None).is_err());
+        assert!(check_halt_inclusion_window(7, None, None, Some(8), None).is_ok());
+        assert!(check_halt_inclusion_window(7, None, None, Some(7), None).is_err());
+        // Zero height: nothing can predate it.
+        assert!(check_halt_inclusion_window(0, Some(0), None, None, None).is_err());
+        // Saturating arithmetic near u32::MAX: no panic, bounds enforced.
+        assert!(
+            check_halt_inclusion_window(u32::MAX, Some(u32::MAX - 1), Some(10), None, None).is_ok()
+        );
+        assert!(
+            check_halt_inclusion_window(u32::MAX, None, None, Some(u32::MAX), Some(0)).is_err()
+        );
+    }
+
+    #[test]
+    fn verify_migration_halt_pair_rejects_divergent_roster_and_chain() {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        manifest.halt_roster.as_mut().unwrap()[0].weight = pulsevm_chain_types::HaltWeight(9);
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (manifest, id, checkpoint, _) = halt_test_pair();
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                7,
+                &id,
+                &checkpoint,
+                &[0x99; 32],
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        assert!(
+            verify_migration_halt_pair(
+                &manifest,
+                8,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_manifest_roster_rejects_invalid_key() {
+        let checkpoint = crate::snapshot::encode(7, b"checkpoint");
+        let manifest = MigrationManifest::new(
+            b"source state history",
+            [9; 32],
+            &checkpoint,
+            7,
+            ImportSummary::default(),
+        )
+        .with_halt_roster(vec![MigrationHaltRosterEntry {
+            producer: "prod.zz".to_string(),
+            key: "not-a-key".to_string(),
+            weight: pulsevm_chain_types::HaltWeight(10),
+        }]);
+        assert!(manifest.roster_entries().is_err());
     }
 
     fn delta(name: &str, data: Vec<u8>) -> TableDelta {

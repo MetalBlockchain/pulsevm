@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# Live test for the cutover auto-voter on a throwaway single-node Leap chain:
+# deploys the ceremony contract, freezes a one-member schedule, then proves
+# the voter (1) refuses a foreign freeze in dry-run without signing anything,
+# (2) prints the exact signing digest for an external agent, (3) signs and
+# submits a real vote unattended, (4) delivers the confirmation binding the
+# configured platform id to a coordinator that serves live chain data --
+# while refusing a coordinator that lies about the terminal block id and one
+# that serves a different platform id.
+set -u
+cd "$(dirname "$0")/../.."
+REPO_ROOT="$PWD"
+SCRIPT_DIR="$REPO_ROOT/contracts/cutover"
+IMG="${XPR_NODEOS_IMAGE:-pulsevm-xpr-handover:local}"
+PLATFORM="${XPR_PLATFORM:-linux/arm64}"
+PORT="${VOTER_TEST_PORT:-18994}"
+NODE="cutover-voter-test-node"
+API="http://127.0.0.1:${PORT}"
+WORK="$(mktemp -d /tmp/cutover-voter-test.XXXXXX)"
+VOTER_BIN="$REPO_ROOT/target/debug/examples/xpr_cutover_voter"
+PROBE_BIN="$REPO_ROOT/target/debug/examples/make_probe_tx"
+
+fail() { echo "cutover-voter-test: FAIL: $*" >&2; exit 1; }
+pass() { echo "cutover-voter-test: ok: $*"; }
+cleanup() {
+    docker rm -f "$NODE" >/dev/null 2>&1 || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+echo "cutover-voter-test: building tools..."
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example xpr_cutover_voter --example make_probe_tx) \
+    || fail "tool build failed"
+[[ -x "$VOTER_BIN" ]] || fail "voter binary missing"
+[[ -x "$PROBE_BIN" ]] || fail "probe binary missing"
+
+DEV_WIF="$(grep -o 'KEY:[A-Za-z0-9]*' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini" | head -1 | cut -d: -f2)"
+[[ -n "$DEV_WIF" ]] || fail "fixture dev key not found"
+
+echo "cutover-voter-test: starting throwaway Leap node..."
+docker rm -f "$NODE" >/dev/null 2>&1 || true
+docker run --detach --platform "$PLATFORM" --name "$NODE" \
+    -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
+    -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini:/config/config.ini:ro" \
+    -p "127.0.0.1:${PORT}:8888" \
+    "$IMG" \
+    nodeos --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json \
+    >/dev/null || fail "node start failed"
+for _ in $(seq 1 90); do
+    HEAD_NOW="$(curl --fail --silent --max-time 5 -X POST "$API/v1/chain/get_info" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}' 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])' 2>/dev/null || true)"
+    if [[ -n "${HEAD_NOW:-}" && "$HEAD_NOW" -ge 10 ]]; then
+        break
+    fi
+    sleep 1
+done
+[[ -n "${HEAD_NOW:-}" && "$HEAD_NOW" -ge 10 ]] || fail "node never reached head 10"
+
+rpc() {
+    local out code
+    out="$(curl --silent --show-error --max-time 20 -X POST "$API$1" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$2" -w '\nHTTP_CODE:%{http_code}\n' 2>&1)"
+    code="$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | cut -d: -f2)"
+    [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]] \
+        && { printf '%s' "$out" | sed '/^HTTP_CODE:/d'; return 0; }
+    echo "cutover-voter-test: rpc $1 failed (HTTP $code)" >&2
+    return 1
+}
+tapos() {
+    rpc /v1/chain/get_info '{}' | python3 -c \
+        'import json,sys; i=json.load(sys.stdin); print(i["head_block_num"], i["chain_id"])'
+}
+ref_prefix() {
+    rpc /v1/chain/get_block "{\"block_num_or_id\":$1}" | python3 -c \
+        'import json,sys; b=json.load(sys.stdin); print(b["block_num"] & 0xffff, b["ref_block_prefix"])'
+}
+table_rows() {
+    rpc /v1/chain/get_table_rows \
+        "{\"code\":\"$1\",\"scope\":\"$2\",\"table\":\"$3\",\"limit\":100,\"json\":true}" \
+        | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["rows"]))'
+}
+push_issue() {
+    local body send_out http_code txid
+    body="$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
+        || fail "unparseable issueTx body"
+    send_out="$(printf '%s' "$body" | curl --silent --show-error --max-time 20 \
+        -X POST "$API/v1/chain/send_transaction" \
+        -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d @- -w '\nHTTP_CODE:%{http_code}\n' 2>&1)"
+    http_code="$(printf '%s' "$send_out" | grep -o 'HTTP_CODE:[0-9]*' | cut -d: -f2)"
+    [[ "$http_code" == "200" || "$http_code" == "201" || "$http_code" == "202" ]] \
+        || fail "send_transaction rejected (HTTP $http_code): $(printf '%s' "$send_out" | head -c 400)"
+    txid="$(printf '%s' "$send_out" | sed '/^HTTP_CODE:/d' | python3 -c 'import json,sys; print(json.load(sys.stdin)["transaction_id"])')" \
+        || fail "no txid in response"
+    printf '%s\n' "$txid"
+}
+mk_tx() {
+    local mode="$1" chain="$2" wif="$3"
+    shift 3
+    local head ref_num ref_prefix exp
+    head="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
+    read -r ref_num ref_prefix <<<"$(ref_prefix "$head")"
+    exp=$(( $(date +%s) + 1800 ))
+    "$PROBE_BIN" "$mode" "$chain" "$wif" "$ref_num" "$ref_prefix" "$exp" "$@"
+}
+mk_push() { push_issue "$(mk_tx "$@")"; }
+
+read -r HEAD_NUM CHAIN_ID <<<"$(tapos)"
+echo "cutover-voter-test: chain $CHAIN_ID at head $HEAD_NUM"
+
+echo "cutover-voter-test: deploying the ceremony contract..."
+# NOTE: the canonical key display form comes from the frozen on-chain row
+# (see roster.json below), never hand-built.
+mk_push newaccount "$CHAIN_ID" "$DEV_WIF" cutover >/dev/null
+mk_push setcode "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.wasm" >/dev/null
+mk_push setabi "$CHAIN_ID" "$DEV_WIF" cutover "$SCRIPT_DIR/cutover.abi" >/dev/null
+# The freeze must name the live active schedule or the voter's
+# freeze-vs-schedule check refuses: the fixture chain produces as "eosio"
+# under the dev key, so the one-member schedule is exactly that.
+PUB33="$("$PROBE_BIN" pubkey "$DEV_WIF")"
+pass "contract deployed"
+
+# The freeze takes the schedule explicitly: one member here, so the first
+# vote finalizes. No producers table is read by the contract.
+SCHED_VERSION="$(rpc /v1/chain/get_producer_schedule '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["version"])')"
+H=$(( $(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])') + 60 ))
+echo "cutover-voter-test: init H=$H, freezing the one-member schedule (version $SCHED_VERSION)..."
+mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover \
+    "$(python3 - "$H" "$CHAIN_ID" "$SCHED_VERSION" "eosio" "$PUB33" <<'PYEOF'
+import struct, sys
+def varuint(v):
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+def name_to_u64(s):
+    charmap = ".12345abcdefghijklmnopqrstuvwxyz"
+    def sym(c):
+        if "a" <= c <= "z":
+            return ord(c) - ord("a") + 6
+        if "1" <= c <= "5":
+            return ord(c) - ord("1") + 1
+        return 0
+    v = 0
+    for i in range(12):
+        v = (v << 5) | sym(s[i] if i < len(s) else ".")
+    return (v << 4) | (sym(s[12]) if len(s) == 13 else 0)
+out = bytearray(struct.pack("<I", int(sys.argv[1])) + bytes.fromhex(sys.argv[2]) + struct.pack("<I", int(sys.argv[3])))
+out += varuint(1) + struct.pack("<Q", name_to_u64(sys.argv[4])) + varuint(0) + bytes.fromhex(sys.argv[5])
+print(bytes(out).hex())
+PYEOF
+)" >/dev/null
+FROZEN_DIGEST="$(table_rows cutover cutover ceremony | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["declaration_digest"])')"
+[[ -n "$FROZEN_DIGEST" ]] || fail "no frozen ceremony"
+pass "ceremony frozen at H=$H"
+
+# (4) proves the opt-in producer stop: half-configured stop fails fast,
+# dry-run rehearses the pause, a live pause lands after confirmation and is
+# re-asserted on later polls (continuous enforcement), and an unverified
+# pause fails loud instead of going quiet.
+
+# Voter key files must be owner-only or the voter refuses to start.
+printf '%s' "$DEV_WIF" >"$WORK/vote.key"; chmod 600 "$WORK/vote.key"
+printf '%s' "$DEV_WIF" >"$WORK/payer.key"; chmod 600 "$WORK/payer.key"
+# The roster mirrors the frozen on-chain member row byte-for-byte (whatever
+# string form the node renders): the recomputed digest must equal the
+# frozen one, or the voter refuses to sign.
+table_rows cutover cutover members \
+    | python3 -c 'import json,sys; print(json.dumps([{"producer":r["producer"],"key":r["key"],"weight":r["weight"]} for r in json.load(sys.stdin)]))' \
+    >"$WORK/roster.json"
+PLATFORM="$(python3 -c 'print("ee" * 32)')"
+WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
+mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty -> path
+    local out="$WORK/voter-$RANDOM.json"
+    local coord="null"
+    [[ -n "${3:-}" ]] && coord="\"$3\""
+    local plat="null"
+    [[ -n "${4:-}" ]] && plat="\"$4\""
+    local stop='"stop_producer":{"at_h":false}'
+    if [[ "${5:-}" == "HALF" ]]; then
+        stop='"stop_producer":{"at_h":true}'
+    elif [[ -n "${5:-}" ]]; then
+        stop="\"stop_producer\":{\"at_h\":true,\"producer_api_url\":\"$5\"}"
+    fi
+    cat >"$out" <<EOF
+{"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"eosio",
+ "source_chain_id":"$CHAIN_ID","height":$1,"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
+ "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
+ "poll_secs":1,"dry_run":$2,"enabled":true,
+ "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
+  "migration_genesis":null,"checkpoint_sha256":null,"platform_chain_id":$plat},
+ $stop}
+EOF
+    printf '%s' "$out"
+}
+
+echo "cutover-voter-test: dry-run refuses a foreign freeze without signing..."
+WRONG_CFG="$(mk_config $((H + 50)) true "")"
+if "$VOTER_BIN" --config "$WRONG_CFG" --dry-run --max-polls 3 >"$WORK/dry.log" 2>&1; then
+    grep -q "refusing" "$WORK/dry.log" || fail "dry-run did not explain the refusal: $(cat "$WORK/dry.log")"
+else
+    fail "dry-run with max-polls must exit 0: $(cat "$WORK/dry.log")"
+fi
+echo "cutover-voter-test: members row: $(table_rows cutover cutover members)"
+VOTED="$(table_rows cutover cutover members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
+[[ "$VOTED" == "False" || "$VOTED" == "0" ]] || fail "dry-run submitted a vote (voted=$VOTED)"
+pass "foreign freeze refused, nothing signed"
+
+echo "cutover-voter-test: print-digest exposes the exact signing digest..."
+PRINT_CFG="$(mk_config "$H" true "" "$PLATFORM")"
+"$VOTER_BIN" --config "$PRINT_CFG" --print-digest >"$WORK/digest.json" 2>"$WORK/digest.err" \
+    || fail "print-digest failed: $(cat "$WORK/digest.err")"
+python3 - "$WORK/digest.json" "$FROZEN_DIGEST" <<'PYEOF'
+import json, sys
+shape = json.load(open(sys.argv[1]))
+want = sys.argv[2]
+assert shape["role"] == "declaration", shape
+assert shape["producer"] == "eosio", shape
+assert shape["digest"] == want, (shape["digest"], want)
+PYEOF
+pass "print-digest matches the frozen declaration digest"
+
+echo "cutover-voter-test: preflight gives GO on a ready operator..."
+PREFLIGHT_CFG="$(mk_config "$H" true "" "$PLATFORM")"
+"$VOTER_BIN" --config "$PREFLIGHT_CFG" --preflight >"$WORK/preflight.log" 2>&1 \
+    || fail "preflight refused a ready setup: $(cat "$WORK/preflight.log")"
+grep -q "PREFLIGHT: GO" "$WORK/preflight.log" || fail "no preflight GO: $(cat "$WORK/preflight.log")"
+grep -q "freeze on-chain" "$WORK/preflight.log" || fail "preflight skipped the freeze check"
+pass "preflight GO before the window"
+
+echo "cutover-voter-test: status reports the loop state as JSON..."
+"$VOTER_BIN" --config "$PREFLIGHT_CFG" --status >"$WORK/status.json" 2>"$WORK/status.err" \
+    || fail "status failed: $(cat "$WORK/status.err")"
+python3 - "$WORK/status.json" "$H" <<'PYEOF'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st["producer"] == "eosio", st
+assert st["height"] == int(sys.argv[2]), st
+assert st["vote"] in ("pending", "on-chain"), st
+assert st["freeze_match"] is True, st
+assert st["schedule_blocked"] is False, st
+assert st["pause"] == "off", st
+PYEOF
+pass "status JSON matches the on-chain freeze"
+
+# Coordinator serving live chain data: block id is read from the node itself,
+# so it always matches; the voter must still verify every field.
+cat >"$WORK/coordinator.py" <<'PYEOF'
+import json, sys, urllib.request
+node, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
+plat = sys.argv[6]
+def rpc(path, body):
+    req = urllib.request.Request(node + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "Host": "0.0.0.0:8888"})
+    return json.load(urllib.request.urlopen(req, timeout=20))
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        info = rpc("/v1/chain/get_info", {})
+        h = int(self.path.rsplit("=", 1)[-1]) if "=" in self.path else H_PLACEHOLDER
+        blk = rpc("/v1/chain/get_block", {"block_num_or_id": str(h)})
+        body = {"halt_height": h, "halt_block_id": blk["id"] if mode in ("good", "bad-platform") else "00" * 32,
+                "checkpoint_sha256": "ab" * 32, "new_chain_id": "cd" * 32,
+                "platform_chain_id": plat,
+                "source_chain_id": info["chain_id"]}
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        payload = self.rfile.read(ln)
+        open(out, "ab").write(payload + b"\n")
+        data = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+H_PLACEHOLDER = int(sys.argv[4])
+PORT_FILE = sys.argv[5]
+server = HTTPServer(("127.0.0.1", 0), H)
+with open(PORT_FILE, "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
+PYEOF
+echo "cutover-voter-test: live vote plus coordinator confirmation..."
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations.jsonl" "$H" "$WORK/coord.port" "$PLATFORM" >>"$WORK/coordinator.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "coordinator died on startup: $(cat "$WORK/coordinator.log")"
+    sleep 1
+done
+COORD_PORT="$(cat "$WORK/coord.port")"
+LIVE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PORT}" "$PLATFORM")"
+# Portable timeout (no GNU timeout on macOS): background the voter, wait for
+# its log to show delivery, kill on expiry.
+"$VOTER_BIN" --config "$LIVE_CFG" >"$WORK/live.log" 2>&1 &
+VOTER_PID=$!
+VOTER_DONE=""
+for _ in $(seq 1 90); do
+    grep -q "delivered to coordinator" "$WORK/live.log" 2>/dev/null && { VOTER_DONE=1; break; }
+    kill -0 "$VOTER_PID" 2>/dev/null || break
+    sleep 2
+done
+if [[ -z "$VOTER_DONE" ]]; then
+    kill "$VOTER_PID" 2>/dev/null || true
+    wait "$VOTER_PID" 2>/dev/null || true
+    fail "voter did not deliver within 180s, first lines: $(head -8 "$WORK/live.log" | tr '\n' '|')"
+fi
+kill "$VOTER_PID" 2>/dev/null || true
+wait "$VOTER_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "vote submitted" "$WORK/live.log" || fail "no vote submitted: $(tail -5 "$WORK/live.log")"
+VOTED="$(table_rows cutover cutover members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
+[[ "$VOTED" == "True" || "$VOTED" == "true" || "$VOTED" == "1" ]] || fail "vote did not land on-chain (voted=$VOTED)"
+grep -q "delivered to coordinator" "$WORK/live.log" || fail "no confirmation delivered"
+python3 - "$WORK/confirmations.jsonl" "$PLATFORM" "$H" <<'PYEOF'
+import json, sys
+conf = [json.loads(line) for line in open(sys.argv[1]) if line.strip()][-1]
+assert conf["producer"] == "eosio", conf
+assert conf["platform_chain_id"] == sys.argv[2], conf
+assert isinstance(conf["pause_height"], int) and conf["pause_height"] >= int(sys.argv[3]), conf
+PYEOF
+pass "vote landed and platform-bound confirmation delivered unattended"
+
+echo "cutover-voter-test: lying coordinator is refused..."
+python3 "$WORK/coordinator.py" "$API" bad "$WORK/confirmations-bad.jsonl" "$H" "$WORK/coord-bad.port" "$PLATFORM" >>"$WORK/coordinator-bad.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-bad.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "bad coordinator died on startup: $(cat "$WORK/coordinator-bad.log")"
+    sleep 1
+done
+COORD_BAD_PORT="$(cat "$WORK/coord-bad.port")"
+BAD_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_BAD_PORT}")"
+# The vote is already on-chain, so the voter heads straight for the
+# confirmation, which must fail closed on the mismatched block id.
+"$VOTER_BIN" --config "$BAD_CFG" --max-polls 4 >"$WORK/bad.log" 2>&1 &
+BAD_PID=$!
+for _ in $(seq 1 15); do
+    kill -0 "$BAD_PID" 2>/dev/null || break
+    sleep 2
+done
+kill "$BAD_PID" 2>/dev/null || true
+wait "$BAD_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "does not match this node" "$WORK/bad.log" || fail "lying coordinator not refused: $(tail -5 "$WORK/bad.log")"
+[[ -s "$WORK/confirmations-bad.jsonl" ]] && fail "confirmation delivered to lying coordinator"
+pass "lying coordinator refused, nothing delivered"
+
+echo "cutover-voter-test: coordinator serving a different platform id is refused..."
+python3 "$WORK/coordinator.py" "$API" bad-platform "$WORK/confirmations-wrongplat.jsonl" "$H" "$WORK/coord-plat.port" "$WRONG_PLATFORM" >>"$WORK/coordinator-plat.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-plat.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "platform coordinator died on startup: $(cat "$WORK/coordinator-plat.log")"
+    sleep 1
+done
+COORD_PLAT_PORT="$(cat "$WORK/coord-plat.port")"
+PLAT_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PLAT_PORT}" "$PLATFORM")"
+"$VOTER_BIN" --config "$PLAT_CFG" --max-polls 4 >"$WORK/plat.log" 2>&1 &
+PLAT_PID=$!
+for _ in $(seq 1 15); do
+    kill -0 "$PLAT_PID" 2>/dev/null || break
+    sleep 2
+done
+kill "$PLAT_PID" 2>/dev/null || true
+wait "$PLAT_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "platform chain id does not match" "$WORK/plat.log" || fail "wrong platform not refused: $(tail -5 "$WORK/plat.log")"
+[[ -s "$WORK/confirmations-wrongplat.jsonl" ]] && fail "confirmation delivered to wrong-platform coordinator"
+pass "wrong platform refused, nothing delivered"
+
+echo "cutover-voter-test: half-configured stop fails fast..."
+HALF_CFG="$(mk_config "$H" true "" "" HALF)"
+if "$VOTER_BIN" --config "$HALF_CFG" --max-polls 1 >"$WORK/half.log" 2>&1; then
+    fail "half-configured stop started: $(cat "$WORK/half.log")"
+fi
+grep -q "cannot fire" "$WORK/half.log" || fail "half-config refusal unexplained: $(cat "$WORK/half.log")"
+pass "half-configured stop fails fast"
+
+# Stub Leap producer API: pause always succeeds, paused reports the argv
+# value. Hits are recorded so the test proves calls happened, not just logs.
+cat >"$WORK/stub-producer.py" <<'PYEOF'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+paused_value = sys.argv[1]
+hits_path, port_path = sys.argv[2], sys.argv[3]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(ln)
+        if self.path.endswith("/v1/producer/pause"):
+            open(hits_path, "a").write("pause\n")
+            data = b"{}"
+        elif self.path.endswith("/v1/producer/paused"):
+            data = ('{"paused":' + paused_value + "}").encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+server = HTTPServer(("127.0.0.1", 0), H)
+open(port_path, "w").write(str(server.server_address[1]))
+server.serve_forever()
+PYEOF
+start_stub() { # $1=true|false $2=hits-file $3=port-file -> pid in STUB_PID
+    python3 "$WORK/stub-producer.py" "$1" "$2" "$3" >>"$WORK/stub.log" 2>&1 &
+    STUB_PID=$!
+    for _ in $(seq 1 30); do
+        [[ -s "$3" ]] && break
+        kill -0 "$STUB_PID" 2>/dev/null || fail "producer stub died on startup: $(cat "$WORK/stub.log")"
+        sleep 1
+    done
+}
+
+echo "cutover-voter-test: dry-run rehearses the producer pause..."
+PAST_CFG="$(mk_config 5 true "" "" "http://127.0.0.1:9")"
+"$VOTER_BIN" --config "$PAST_CFG" --dry-run --max-polls 3 >"$WORK/pausedry.log" 2>&1 \
+    || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry.log")"
+grep -q "would pause the local producer at H=5" "$WORK/pausedry.log" \
+    || fail "no dry-run pause line: $(cat "$WORK/pausedry.log")"
+pass "dry-run rehearses the producer pause"
+
+echo "cutover-voter-test: live pause after confirmation, enforced continuously..."
+start_stub true "$WORK/pause-hits" "$WORK/stub.port"
+STUB_PORT="$(cat "$WORK/stub.port")"
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pause.jsonl" "$H" "$WORK/coord-pause.port" "$PLATFORM" >>"$WORK/coordinator-pause.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-pause.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "pause coordinator died on startup"
+    sleep 1
+done
+COORD_PAUSE_PORT="$(cat "$WORK/coord-pause.port")"
+PAUSE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PAUSE_PORT}" "$PLATFORM" "http://127.0.0.1:${STUB_PORT}")"
+"$VOTER_BIN" --config "$PAUSE_CFG" >"$WORK/pause.log" 2>&1 &
+PAUSE_PID=$!
+PAUSED=""
+for _ in $(seq 1 90); do
+    grep -q "local producer paused at H=" "$WORK/pause.log" 2>/dev/null && { PAUSED=1; break; }
+    kill -0 "$PAUSE_PID" 2>/dev/null || break
+    sleep 2
+done
+[[ -n "$PAUSED" ]] || { kill "$PAUSE_PID" 2>/dev/null || true; wait "$PAUSE_PID" 2>/dev/null || true; fail "producer never paused: $(tail -5 "$WORK/pause.log")"; }
+# Continuous enforcement: the voter must re-assert the pause on later polls,
+# not exit after the first one (a node restart clears Leap's in-memory pause).
+REENFORCED=""
+for _ in $(seq 1 15); do
+    [[ "$(wc -l <"$WORK/pause-hits" 2>/dev/null || echo 0)" -ge 2 ]] && { REENFORCED=1; break; }
+    sleep 2
+done
+kill "$PAUSE_PID" 2>/dev/null || true
+wait "$PAUSE_PID" 2>/dev/null || true
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+[[ -n "$REENFORCED" ]] || fail "pause asserted only once, not enforced: $(cat "$WORK/pause-hits" 2>/dev/null)"
+pass "producer paused after confirmation and re-asserted"
+
+echo "cutover-voter-test: unverified pause never goes quiet..."
+start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"
+STUB_BAD_PORT="$(cat "$WORK/stub-bad.port")"
+# The pause path sits behind a delivered confirmation, so this run needs a
+# good coordinator too: the point is the pause failing, not the delivery.
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pausebad.jsonl" "$H" "$WORK/coord-pausebad.port" "$PLATFORM" >>"$WORK/coordinator-pausebad.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-pausebad.port" ]] && break
+    kill -0 "$COORD_PID" 2>/dev/null || fail "pausebad coordinator died on startup"
+    sleep 1
+done
+COORD_BADGOOD_PORT="$(cat "$WORK/coord-pausebad.port")"
+PAUSEBAD_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_BADGOOD_PORT}" "$PLATFORM" "http://127.0.0.1:${STUB_BAD_PORT}")"
+"$VOTER_BIN" --config "$PAUSEBAD_CFG" --max-polls 8 >"$WORK/pausebad.log" 2>&1
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true
+wait "$COORD_PID" 2>/dev/null || true
+grep -q "producer pause failed" "$WORK/pausebad.log" || fail "pause failure went unlogged: $(tail -5 "$WORK/pausebad.log")"
+pass "unverified pause fails loud, never silent"
+
+echo "cutover-voter-test: PASS"
