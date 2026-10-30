@@ -145,6 +145,19 @@ pub struct MigrationHaltRosterEntry {
     pub weight: pulsevm_chain_types::HaltWeight,
 }
 
+/// One memo-vehicle declaration account: the on-chain name committing to
+/// the declaration digest, plus the Antelope slot it was created in. The
+/// names are deterministic from the digest (`h` + round letter + hex
+/// nibbles mapped to `a`–`p`), so the gate re-decodes them instead of
+/// trusting the exporter; the slot must predate H. Both are bound by the
+/// checkpoint only through existence: the restore gate and the offline
+/// verifier require every recorded name to exist in the restored state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationMemoAccount {
+    pub name: String,
+    pub created_slot: u32,
+}
+
 /// A durable, human-inspectable commitment to one XPR-to-Arena conversion.
 ///
 /// The arena checkpoint envelope protects its payload, while this manifest
@@ -235,16 +248,20 @@ pub struct MigrationManifest {
     /// pins it to H's header version unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_schedule_version: Option<u32>,
-    /// The active producer schedule as read from the live chain at export
-    /// time (names plus schedule keys, unit weights). The pair verifier
-    /// requires it to equal the declared set exactly: the declaration must
-    /// name the recorded schedule, no more and no less. Recorded by
-    /// `xpr_attach_source_block --schedule` from `get_producer_schedule`;
-    /// publication of the schedule hash weeks ahead (T-30) is what lets
-    /// every party check the recorded set is the coordinated one rather
-    /// than an exporter invention — the gate binds it to the declaration,
-    /// checkpoint state, and H's version, but the coordinated set itself
-    /// is a governance fact, not a derivable one.
+    /// The active producer schedule as read from H's header state
+    /// (names plus schedule keys, unit weights). The pair verifier requires
+    /// it to equal the declared set exactly: the declaration must name the
+    /// recorded schedule, no more and no less. Recorded by
+    /// `xpr_attach_source_block --halt-state` from the header state captured
+    /// at the freeze instant (header state is served only while reversible,
+    /// and no export nodeos can serve H later) — never from a live
+    /// `get_producer_schedule` query, which an exporter could point
+    /// anywhere; publication of the schedule hash weeks ahead (T-30) is
+    /// what lets every party check the recorded set is the coordinated one
+    /// rather than an exporter invention — the gate binds it to the
+    /// declaration, the checkpoint (via the confirmed sha), and H's
+    /// version, but the coordinated set itself is a governance fact, not a
+    /// derivable one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_schedule: Option<Vec<MigrationHaltRosterEntry>>,
     /// Packed signed XPR blocks H+1 through the pause head, in order: the
@@ -277,13 +294,27 @@ pub struct MigrationManifest {
     /// checkpoint taken mid-rotation would boot the new chain with a pending
     /// proposal the ceremony never froze, so the restore fails closed on
     /// `Some(true)` (proposed) and on `None` (unattested). Derived by
-    /// `record_halt_schedule` from the same `--schedule` file the roster
-    /// comes from — never hand-typed — so a staged pending or proposed
-    /// schedule fails the record fast; the raw bytes are not recoverable
-    /// from the checkpoint afterward (hydrate keeps only the parsed chain
-    /// config), so absence cannot be re-derived at restore time.
+    /// `record_halt_schedule` from the same header state the roster comes
+    /// from — never hand-typed — so a staged pending schedule fails the
+    /// record fast; the raw bytes are not recoverable from the checkpoint
+    /// afterward (hydrate keeps only the parsed chain config), so absence
+    /// cannot be re-derived at restore time.
+    /// Memo-vehicle declaration accounts: the on-chain names committing to
+    /// the declaration digest, with the Antelope slot each was created in.
+    /// Recorded by `xpr_attach_source_block --memo-accounts` from the
+    /// harness-captured `get_account` responses (names re-decoded to the
+    /// digest and creation required before H at record time). The pair
+    /// verifier re-decodes the names and re-checks the timing; the restore
+    /// gate and the offline verifier additionally require every recorded
+    /// name to exist in the restored checkpoint state — that existence is
+    /// what proves the declaration landed on-chain before H, instead of a
+    /// bare asserted inclusion height. Absent for the contract vehicle
+    /// (whose scanned votes carry their own block heights) and for legacy
+    /// commitments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_proposed_schedule: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_memo_accounts: Option<Vec<MigrationMemoAccount>>,
     pub import_summary: ImportSummary,
 }
 
@@ -318,6 +349,7 @@ impl MigrationManifest {
             halt_contract_ceremony: None,
             halt_schedule_version: None,
             halt_proposed_schedule: None,
+            halt_memo_accounts: None,
             halt_schedule: None,
             halt_post_blocks: None,
             halt_h_block: None,
@@ -624,76 +656,6 @@ pub fn check_halt_roster_against_state(
     Ok(matched)
 }
 
-/// Key-anchored schedule check for the two-step cutover (the light-client
-/// rule): the declared set must equal the checkpoint's active producer set
-/// exactly, both ways, with matching schedule keys. The forward direction
-/// closes the gap where `producers.producer_key` can differ from the
-/// schedule key — every declared member must be an *active* producer in
-/// checkpoint state with exactly the same key. The reverse direction closes
-/// the standby-subset attack: without it, three active standbys could
-/// declare themselves as the roster, record the same three as the
-/// schedule, and pass 3-of-3 over a quorum whose denominator they chose.
-/// The checkpoint (bound by the confirmation's checkpoint sha) is the only
-/// authenticated roster, so anything active but undeclared fails closed —
-/// the declaration must name the whole schedule, never a convenient
-/// subset. Neither the version pin nor the count quorum can substitute for
-/// this: a subset copies H's version and picks its own denominator.
-/// Weights are not compared at all: every member weighs 1 by construction
-/// (enforced at declaration parse), so there is no drift to pin. Inactive
-/// rows are not schedule members and are ignored in both directions. An
-/// absent producers table (synthetic fixtures only) yields `Ok(None)`,
-/// which every restore caller must treat as a refusal: a checkpoint
-/// without the table cannot prove the declared set is the on-chain
-/// schedule, so there is no boot without it. Real XPR checkpoints always
-/// carry the table.
-pub fn check_halt_roster_matches_state(
-    roster: &[pulsevm_chain_types::HaltRosterEntry],
-    state: &BTreeMap<u64, StateProducerKey>,
-) -> Result<Option<usize>, String> {
-    use std::str::FromStr;
-    if state.is_empty() {
-        return Ok(None);
-    }
-    for entry in roster {
-        let name = pulsevm_name::Name::from_str(&entry.producer)
-            .map_err(|e| format!("halt declaration producer name invalid: {e}"))?
-            .as_u64();
-        let state_entry = state.get(&name).ok_or_else(|| {
-            format!(
-                "halt declaration producer {} is not present in checkpoint state",
-                entry.producer
-            )
-        })?;
-        if !state_entry.is_active {
-            return Err(format!(
-                "halt declaration producer {} is not active in checkpoint state",
-                entry.producer
-            ));
-        }
-        if state_entry.key != entry.key.compressed() {
-            return Err(format!(
-                "halt declaration key for {} does not match checkpoint state",
-                entry.producer
-            ));
-        }
-    }
-    // Reverse direction: every active checkpoint producer must be declared.
-    // A roster that names only a standby subset would otherwise pass the
-    // forward check with matching keys and a matching recorded schedule.
-    for (owner, state_entry) in state {
-        if !state_entry.is_active {
-            continue;
-        }
-        let name = pulsevm_name::Name::new(*owner).to_string();
-        if !roster.iter().any(|entry| entry.producer == name) {
-            return Err(format!(
-                "checkpoint schedule producer {name} is active but not in the halt declaration: the declared set must equal the full active schedule"
-            ));
-        }
-    }
-    Ok(Some(roster.len()))
-}
-
 /// Verify a manifest's halt commitment against the terminal block it names.
 /// Both versions verify against the attached weighted roster under the
 /// strict two-thirds quorum (version 2 additionally binds the migration
@@ -813,9 +775,11 @@ pub fn verify_migration_contract_evidence(
         .map_err(|e| format!("migration cutover contract evidence rejected: {e}"))
 }
 
-/// Bound on post-H emptiness evidence: ~12x the expected ~330-block LIB
-/// window. Bounds decode work at restore; a genuinely longer pause needs a
-/// fresh export window, not a bigger constant.
+/// Bound on post-H emptiness evidence. Bounds decode work at restore; a
+/// genuinely longer pause needs a fresh export window, not a bigger
+/// constant. The window is H+1 through the agreed pause head P (every
+/// producer stops at P — there is no LIB wait and no tail past P), so a
+/// normal cutover stages tens of blocks, never thousands.
 pub const MAX_POST_H_BLOCKS: usize = 4096;
 
 /// One decoded post-H header: exactly the fields the emptiness walk
@@ -1065,7 +1029,7 @@ pub fn verify_migration_halt_block(
     height: u32,
     block_id: &[u8; 32],
     schedule_version: u32,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let packed_hex = manifest.halt_h_block.as_ref().ok_or_else(|| {
         "migration cutover pair carries no cutover-block evidence: the window cannot open on an unattested H"
             .to_string()
@@ -1115,7 +1079,153 @@ pub fn verify_migration_halt_block(
             "cutover block is not signed by the scheduled key for {producer_name}"
         ));
     }
-    Ok(())
+    // The entry's header bytes lead with the Leap timestamp slot (pack
+    // order timestamp[4] | producer[8] | ...): return it so the memo
+    // inclusion proof can require every recorded memo account to predate H.
+    let slot_bytes: [u8; 4] = header_bytes
+        .get(..4)
+        .and_then(|slot| slot.try_into().ok())
+        .ok_or_else(|| "cutover block entry header has no timestamp slot".to_string())?;
+    Ok(u32::from_le_bytes(slot_bytes))
+}
+
+/// Committee-membership pin for the two-step cutover (the light-client
+/// rule): the declared set must equal the recorded schedule exactly, both
+/// ways, with matching schedule keys. The recorded schedule comes from H's
+/// header state, captured at the freeze instant and bound to the trusted H
+/// id (which the checkpoint's snapshot shares) — never from the producers
+/// table, which carries every active row while the schedule
+/// names only the committee. The forward direction closes key substitution
+/// (a declaration key differing from the schedule key fails); the reverse
+/// direction closes the standby-subset attack (a subset naming only some
+/// scheduled producers fails, so no minority passes over a denominator it
+/// chose). Neither the version pin nor the count quorum can substitute for
+/// this: a subset copies H's version and picks its own denominator.
+/// Weights are not compared: every member weighs 1 by construction
+/// (enforced at declaration parse and at record time), so there is no
+/// drift to pin.
+pub fn check_declaration_matches_recorded_schedule(
+    declaration: &pulsevm_chain_types::HaltDeclaration,
+    schedule_keys: &std::collections::BTreeMap<String, pulsevm_crypto::k1::K1PublicKey>,
+) -> Result<usize, String> {
+    let mut declared: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = Vec::new();
+    for member in &declaration.validator_set {
+        let key = pulsevm_crypto::k1::K1PublicKey::from_string(&member.key).map_err(|e| {
+            format!(
+                "halt declaration key for {} invalid: {e:?}",
+                member.producer
+            )
+        })?;
+        declared.push((member.producer.clone(), key));
+    }
+    declared.sort();
+    let mut recorded_sorted: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = schedule_keys
+        .iter()
+        .map(|(producer, key)| (producer.clone(), *key))
+        .collect();
+    recorded_sorted.sort();
+    if declared != recorded_sorted {
+        return Err("migration halt declaration does not match the recorded schedule".to_string());
+    }
+    Ok(declared.len())
+}
+
+/// Memo-vehicle inclusion proof: the declaration digest must re-decode
+/// from the recorded memo account names, and every recorded account must
+/// predate H. The names are deterministic from the digest (`h` + one round
+/// letter + hex nibbles mapped to `a`–`p`), so re-decoding proves the
+/// declaration text is committed on-chain — not merely asserted in the
+/// manifest — and the slot bound proves it landed before H instead of in
+/// it. A manifest without memo accounts (contract vehicle, legacy
+/// commitments) verifies nothing here: the contract fragment carries its
+/// own vote heights, and legacy paths carry no declaration. Returns the
+/// account count. Existence in checkpoint state is checked separately by
+/// [`verify_memo_accounts_exist`], where the state is available: names that
+/// decode but name no account fail there, not here.
+pub fn verify_migration_memo_accounts(
+    manifest: &MigrationManifest,
+    declaration_digest: &[u8; 32],
+    h_slot: u32,
+) -> Result<usize, String> {
+    let Some(accounts) = manifest.halt_memo_accounts.as_ref() else {
+        return Ok(0);
+    };
+    if accounts.is_empty() {
+        return Err(
+            "migration memo inclusion records no accounts: stage the declaration accounts or drop the record"
+                .to_string(),
+        );
+    }
+    let mut nibbles = String::with_capacity(64);
+    for account in accounts {
+        let name = account.name.as_str();
+        // `h` + one round letter + the digest nibbles mapped a-p.
+        let mut chars = name.chars();
+        let (Some('h'), Some(_round), rest) = (chars.next(), chars.next(), chars.as_str()) else {
+            return Err(format!(
+                "migration memo account {name} does not carry the declaration digest"
+            ));
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+            return Err(format!(
+                "migration memo account {name} does not carry the declaration digest"
+            ));
+        }
+        for byte in rest.bytes() {
+            let hex = if byte <= b'j' {
+                b'0' + (byte - b'a')
+            } else {
+                b'a' + (byte - b'k')
+            };
+            nibbles.push(hex as char);
+        }
+        if account.created_slot >= h_slot {
+            return Err(format!(
+                "migration memo account {name} was created at slot {} (H is slot {h_slot}): the declaration must land before H",
+                account.created_slot
+            ));
+        }
+    }
+    if nibbles.len() != 64 {
+        return Err(format!(
+            "migration memo accounts decode to {} hex nibbles, not the 64 of a declaration digest",
+            nibbles.len()
+        ));
+    }
+    if hex::decode(&nibbles).map_err(|e| format!("migration memo digest unreadable: {e}"))?
+        != declaration_digest
+    {
+        return Err("migration memo accounts do not decode to the declaration digest".to_string());
+    }
+    Ok(accounts.len())
+}
+
+/// Checkpoint-state half of the memo inclusion proof: every recorded memo
+/// account must exist in the restored state. The digest re-decode (see
+/// [`verify_migration_memo_accounts`]) proves the names commit to the
+/// declaration; this proves the named accounts are really on-chain — a
+/// manifest that records fictional names fails here even when they decode.
+/// Runs wherever restored state is available (restore gate, offline
+/// verifier); manifests without memo accounts verify nothing and return 0.
+pub fn verify_memo_accounts_exist(
+    database: &Database,
+    manifest: &MigrationManifest,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let Some(accounts) = manifest.halt_memo_accounts.as_ref() else {
+        return Ok(0);
+    };
+    for memo in accounts {
+        let owner = pulsevm_name::Name::from_str(&memo.name)
+            .map_err(|e| format!("migration memo account {} invalid: {e}", memo.name))?;
+        if !database.arena_account_exists(owner.as_u64()) {
+            return Err(format!(
+                "migration memo account {} does not exist in checkpoint state: the declaration landing is unproven",
+                memo.name
+            ));
+        }
+    }
+    Ok(accounts.len())
 }
 
 /// Verify the post-H emptiness proof plus the recorded schedule: every
@@ -1124,17 +1234,17 @@ pub fn verify_migration_halt_block(
 /// by the recorded schedule key for its producer over Leap's true digest
 /// (`sha256(sha256(sha256(header) || blockroot) || schedule_hash)`, recomputed
 /// from the entry's recorded root and hash) — and the recorded schedule
-/// equals the declared set exactly. The entry's hash is bound by the
-/// signature itself, not by a comparison: only the exact (root, hash)
-/// pair Leap signed recovers to the roster key. Each entry trails its block's
-/// Leap-stated id, which the walk recomputes from the packed header (Leap's
-/// formula: sha256 of the header with the number spliced in) and requires
-/// to match exactly. The staged
-/// headers must cover exactly H+1 through `pause_height`, the highest
-/// pause head the quorum attested in the confirmation: a proof that stops
-/// short leaves the tail past the last staged header unproven (traffic
-/// there would hide behind the fleet's word), and a proof that runs past
-/// the attested head carries headers the quorum never observed. The pause
+/// equals the declared set exactly (see
+/// [`check_declaration_matches_recorded_schedule`]). The entry's hash is
+/// bound by the signature itself, not by a comparison: only the exact
+/// (root, hash) pair Leap signed recovers to the roster key. Each entry
+/// trails its block's Leap-stated id, which the walk recomputes from the
+/// packed header (Leap's formula: sha256 of the header with the number
+/// spliced in) and requires to match exactly. The staged
+/// headers must cover exactly H+1 through `pause_height`, the agreed pause
+/// head every producer stopped at: a proof that stops short leaves the
+/// tail past the last staged header unproven, and a proof that runs past
+/// the agreed head carries headers past the agreed stop. The pause
 /// head must sit strictly past H: a pause exactly on H stages no proof and
 /// cannot distinguish a frozen network from a bare anchor, so it fails
 /// closed here and in the confirmation itself. Returns the attested pause
@@ -1168,9 +1278,10 @@ pub fn verify_migration_post_chain(
     }
     // Exact coverage of the attested pause head: stopping short would
     // leave H+len+1..P unproven, running long would stage headers past
-    // what the quorum observed. Covering the highest attested head
-    // subsumes the irreversibility block — confirmation only happens once
-    // LIB has passed H, so the covered window always reaches past it.
+    // what the quorum attested. P is the agreed stop every producer
+    // halted at — not an observed tip — so the covered window is exactly
+    // H+1..P by construction, and the 15-of-21 confirmation over H_ID
+    // stands in for Leap finality instead of a LIB wait.
     if blocks.len() != expected_len {
         return Err(format!(
             "migration cutover pair stages {} post-H blocks but the quorum attested pause head {pause_height} (H={height}): the proof must cover exactly H+1 through the attested pause head",
@@ -1182,25 +1293,10 @@ pub fn verify_migration_post_chain(
     let schedule_keys = recorded_schedule_key_map(recorded)?;
     // Declared set == recorded schedule, both ways: the declaration must
     // name the recorded set exactly, so neither side can smuggle a member.
-    let mut declared: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = Vec::new();
-    for member in &declaration.validator_set {
-        let key = pulsevm_crypto::k1::K1PublicKey::from_string(&member.key).map_err(|e| {
-            format!(
-                "halt declaration key for {} invalid: {e:?}",
-                member.producer
-            )
-        })?;
-        declared.push((member.producer.clone(), key));
-    }
-    declared.sort();
-    let mut recorded_sorted: Vec<(String, pulsevm_crypto::k1::K1PublicKey)> = schedule_keys
-        .iter()
-        .map(|(producer, key)| (producer.clone(), *key))
-        .collect();
-    recorded_sorted.sort();
-    if declared != recorded_sorted {
-        return Err("migration halt declaration does not match the recorded schedule".to_string());
-    }
+    // This is the committee-membership pin (it replaced the producers-table
+    // cross-check: the table carries every active row while the schedule
+    // names only the committee, so the table cannot authenticate the set).
+    check_declaration_matches_recorded_schedule(declaration, &schedule_keys)?;
     // No hash pin on the staged pending schedule: with no staged change
     // Leap serves the EMPTY pending schedule, whose hash cannot equal the
     // active roster's (proven against live header states). The producer
@@ -1307,13 +1403,18 @@ pub fn verify_migration_post_chain(
 /// digest on-chain before H, as the memo and msig vehicles record). A pair
 /// with neither fails closed — off-chain signatures alone say nothing
 /// about when they were made.
-/// Returns the declared set for the checkpoint-state cross-check. This is
-/// the same check the restore gate runs; the offline verifier reuses it so
-/// a manifest can be validated without booting a node. The restore gate
-/// always configures a platform id (`Some`); `None` is the legacy and
-/// offline-tolerant path (a confirmation that binds a platform still has
-/// its signatures checked, but the id itself goes unconfirmed — the gate
-/// remains the enforcer, since only boot config knows the real id).
+/// Returns the declared set. Committee membership is pinned here, not
+/// against the producers table: the declaration must equal the recorded
+/// schedule exactly (both ways, same keys), and that schedule comes from
+/// H's header state, captured at the freeze instant — the table carries
+/// every active row while the schedule names only the committee. This is
+/// the same check the
+/// restore gate runs; the offline verifier reuses it so a manifest can be
+/// validated without booting a node. The restore gate always configures a
+/// platform id (`Some`); `None` is the legacy and offline-tolerant path (a
+/// confirmation that binds a platform still has its signatures checked,
+/// but the id itself goes unconfirmed — the gate remains the enforcer,
+/// since only boot config knows the real id).
 pub fn verify_migration_halt_pair(
     manifest: &MigrationManifest,
     height: u32,
@@ -1375,7 +1476,13 @@ pub fn verify_migration_halt_pair(
     // The cutover block itself is signature-checked first: the window must
     // open on exactly the block the confirmation binds, with an empty root
     // and a producer signature from the recorded schedule.
-    verify_migration_halt_block(manifest, height, block_id, header_schedule_version)?;
+    let h_slot = verify_migration_halt_block(manifest, height, block_id, header_schedule_version)?;
+    // Memo-vehicle inclusion proof: the digest re-decodes from the recorded
+    // memo names and every recorded account predates H — the declaration
+    // provably landed on-chain before the cutoff, not as an asserted
+    // number. (Existence in checkpoint state is checked at restore, where
+    // the state is available.)
+    verify_migration_memo_accounts(manifest, &declaration_digest, h_slot)?;
     // Post-H emptiness plus the recorded schedule: every header hash-links
     // from H, carries an empty root, and is signed by a recorded schedule
     // key, the recorded schedule equals the declared set, and the staged
@@ -5780,142 +5887,165 @@ mod tests {
         assert!(check_halt_roster_against_state(&unknown, &state).is_err());
     }
 
-    fn strict_state(
-        entries: &[(&str, &pulsevm_crypto::k1::K1PublicKey, f64, bool)],
-    ) -> BTreeMap<u64, StateProducerKey> {
-        let mut state = BTreeMap::new();
-        for (name, key, votes, active) in entries {
-            let owner = pulsevm_name::Name::from_str(name).unwrap().as_u64();
-            state.insert(
-                owner,
-                StateProducerKey {
-                    key: key.compressed(),
-                    is_active: *active,
-                    total_votes: *votes,
-                },
-            );
+    fn declaration_of(
+        members: &[(&str, &pulsevm_crypto::k1::K1PublicKey)],
+    ) -> pulsevm_chain_types::HaltDeclaration {
+        pulsevm_chain_types::HaltDeclaration {
+            version: 1,
+            source_chain_id: "00".repeat(32),
+            last_height: 8,
+            validator_set: members
+                .iter()
+                .map(|(name, key)| pulsevm_chain_types::HaltDeclarationMember {
+                    producer: name.to_string(),
+                    key: key.to_string(),
+                    weight: pulsevm_chain_types::HaltWeight(1),
+                })
+                .collect(),
+            signatures: Vec::new(),
         }
-        state
     }
 
-    fn strict_roster(
-        entries: &[(&str, &pulsevm_crypto::k1::K1PublicKey, u128)],
-    ) -> Vec<pulsevm_chain_types::HaltRosterEntry> {
-        entries
+    fn recorded_map(
+        members: &[(&str, &pulsevm_crypto::k1::K1PublicKey)],
+    ) -> std::collections::BTreeMap<String, pulsevm_crypto::k1::K1PublicKey> {
+        members
             .iter()
-            .map(|(name, key, weight)| pulsevm_chain_types::HaltRosterEntry {
-                producer: name.to_string(),
-                key: **key,
-                weight: pulsevm_chain_types::HaltWeight(*weight),
-            })
+            .map(|(name, key)| (name.to_string(), **key))
             .collect()
     }
 
     #[test]
-    fn schedule_match_anchors_every_member_to_active_state() {
+    fn schedule_match_pins_the_declared_set_both_ways() {
         let key_a = test_key("strict-1");
         let key_b = test_key("strict-2");
-        // Extra actives in state fail the ceremony: the frozen schedule
-        // must be the whole active set, never a subset — a standby subset
-        // with matching keys would otherwise pass with a denominator it
-        // chose (see schedule_match_rejects_a_standby_subset_roster).
-        let state = strict_state(&[
-            ("prod.a", &key_a, 2.0, true),
-            ("prod.b", &key_b, 1.0, true),
-            ("prod.standby", &key_b, 9.0, true),
-        ]);
-        let roster = strict_roster(&[("prod.a", &key_a, 1), ("prod.b", &key_b, 1)]);
-        assert!(check_halt_roster_matches_state(&roster, &state).is_err());
-        // Unknown producers fail, not silently skipped.
-        let mut unknown = roster.clone();
-        unknown.push(pulsevm_chain_types::HaltRosterEntry {
-            producer: "prod.zz".to_string(),
-            key: key_b,
-            weight: pulsevm_chain_types::HaltWeight(1),
-        });
-        assert!(check_halt_roster_matches_state(&unknown, &state).is_err());
-        // Inactive rows never anchor a member: a producer that retires
-        // between declaration and checkpoint restarts the ceremony.
-        let retired = strict_state(&[
-            ("prod.a", &key_a, 2.0, true),
-            ("prod.b", &key_b, 1.0, false),
-        ]);
-        assert!(check_halt_roster_matches_state(&roster, &retired).is_err());
-        // Table-less exports keep the historical skip.
+        // The recorded schedule comes from the snapshot's header state, so
+        // the fixtures below stand in for that artifact — never for the
+        // producers table, which carries every active row while the
+        // schedule names only the committee.
+        let schedule = recorded_map(&[("prod.a", &key_a), ("prod.b", &key_b)]);
+        // Exact match passes and reports the committee size.
+        let declaration = declaration_of(&[("prod.a", &key_a), ("prod.b", &key_b)]);
         assert_eq!(
-            check_halt_roster_matches_state(&roster, &BTreeMap::new()).unwrap(),
-            None
+            check_declaration_matches_recorded_schedule(&declaration, &schedule).unwrap(),
+            2
         );
-    }
-
-    #[test]
-    fn schedule_match_rejects_key_drift_and_tolerates_vote_churn() {
-        let key_a = test_key("strict-1");
-        let key_b = test_key("strict-2");
-        let state = strict_state(&[("prod.a", &key_a, 2.0, true), ("prod.b", &key_b, 1.0, true)]);
-        let roster = strict_roster(&[("prod.a", &key_a, 1), ("prod.b", &key_b, 1)]);
-        // A schedule-key rotation on one member fails: the frozen set no
-        // longer names the keys that produce.
-        let forged = strict_roster(&[("prod.a", &key_b, 1), ("prod.b", &key_b, 1)]);
-        assert!(check_halt_roster_matches_state(&forged, &state).is_err());
-        // Vote churn between freeze and H changes weights without changing
-        // the set: with unit weights there is nothing to drift, so the
-        // ceremony stays completable under arbitrary stake movement.
-        for votes in [8.0, 5.25e21, 0.5] {
-            let drifted = strict_state(&[
-                ("prod.a", &key_a, votes, true),
-                ("prod.b", &key_b, 1.0, true),
-            ]);
-            assert_eq!(
-                check_halt_roster_matches_state(&roster, &drifted).unwrap(),
-                Some(2)
-            );
-        }
-    }
-
-    #[test]
-    fn schedule_match_rejects_a_standby_subset_roster() {
-        // Three active standbys declaring themselves as the roster: every
-        // declared member is active with a matching key, so the forward
-        // check alone passes — but the checkpoint holds a wider active
-        // schedule. The roster must equal the full active set, both ways,
-        // or a minority subset passes 3-of-3 and boots a minority chain.
-        let key_a = test_key("subset-1");
-        let key_b = test_key("subset-2");
-        let key_c = test_key("subset-3");
-        let state = strict_state(&[
-            ("prod.a", &key_a, 2.0, true),
-            ("prod.b", &key_b, 1.0, true),
-            ("prod.c", &key_c, 1.0, true),
-        ]);
-        let subset = strict_roster(&[("prod.a", &key_a, 1), ("prod.b", &key_b, 1)]);
-        let err = check_halt_roster_matches_state(&subset, &state).unwrap_err();
+        // A standby subset declaring itself fails: without the reverse
+        // direction it would pass with a denominator it chose and boot a
+        // minority chain.
+        let subset = declaration_of(&[("prod.a", &key_a)]);
+        let err = check_declaration_matches_recorded_schedule(&subset, &schedule).unwrap_err();
         assert!(
-            err.contains("not in the halt declaration") || err.contains("active"),
+            err.contains("does not match the recorded schedule"),
             "a standby subset must fail closed, got: {err}"
         );
-        // The full active set still passes.
-        let full = strict_roster(&[
-            ("prod.a", &key_a, 1),
-            ("prod.b", &key_b, 1),
-            ("prod.c", &key_c, 1),
-        ]);
-        assert_eq!(
-            check_halt_roster_matches_state(&full, &state).unwrap(),
-            Some(3)
+        // An extra declared member fails the same way.
+        let superset =
+            declaration_of(&[("prod.a", &key_a), ("prod.b", &key_b), ("prod.zz", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&superset, &schedule).is_err());
+        // Unknown producers fail, not silently skipped.
+        let unknown = declaration_of(&[("prod.zz", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&unknown, &schedule).is_err());
+    }
+
+    fn memo_manifest(names: &[String], created_slot: u32) -> MigrationManifest {
+        let mut manifest = MigrationManifest::new(
+            b"memo test",
+            [9u8; 32],
+            b"checkpoint",
+            1,
+            Default::default(),
         );
-        // Inactive rows are not schedule members: a retired producer
-        // lingering in the table neither anchors a member nor bricks the
-        // ceremony.
-        let retired = strict_state(&[
-            ("prod.a", &key_a, 2.0, true),
-            ("prod.b", &key_b, 1.0, true),
-            ("prod.old", &key_c, 0.0, false),
-        ]);
-        assert_eq!(
-            check_halt_roster_matches_state(&subset, &retired).unwrap(),
-            Some(2)
+        manifest.halt_declaration = Some(pulsevm_chain_types::HaltDeclaration {
+            version: 1,
+            source_chain_id: "00".repeat(32),
+            last_height: 8,
+            validator_set: Vec::new(),
+            signatures: Vec::new(),
+        });
+        manifest.halt_memo_accounts = Some(
+            names
+                .iter()
+                .map(|name| MigrationMemoAccount {
+                    name: name.clone(),
+                    created_slot,
+                })
+                .collect(),
         );
+        // The manifest declaration is a placeholder the memo check does not
+        // parse: only the recorded names and the expected digest matter.
+        manifest
+    }
+
+    fn memo_names_for(digest_hex: &str) -> Vec<String> {
+        let letters: String = digest_hex
+            .bytes()
+            .map(|b| {
+                let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                (b'a' + nibble) as char
+            })
+            .collect();
+        letters
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|chunk| format!("ha{}", chunk.iter().collect::<String>()))
+            .collect()
+    }
+
+    #[test]
+    fn memo_proof_decodes_names_and_requires_pre_h_creation() {
+        let digest = [0xABu8; 32];
+        let digest_hex = hex::encode(digest);
+        let names = memo_names_for(&digest_hex);
+        assert_eq!(names.len(), 7);
+        // Valid proof: names decode to the digest, all created before H.
+        let manifest = memo_manifest(&names, 50);
+        assert_eq!(
+            verify_migration_memo_accounts(&manifest, &digest, 100).unwrap(),
+            7
+        );
+        // Wrong digest fails: the names commit to exactly one digest.
+        let other = [0xCDu8; 32];
+        let err = verify_migration_memo_accounts(&manifest, &other, 100).unwrap_err();
+        assert!(err.contains("do not decode"), "{err}");
+        // Created at or after H fails: the declaration must land before H.
+        for slot in [100, 101] {
+            let late = memo_manifest(&names, slot);
+            let err = verify_migration_memo_accounts(&late, &digest, 100).unwrap_err();
+            assert!(err.contains("must land before H"), "{err}");
+        }
+        // Malformed names fail.
+        let mut broken = names.clone();
+        broken[0] = "xyz".to_string();
+        let broken_manifest = memo_manifest(&broken, 50);
+        let err = verify_migration_memo_accounts(&broken_manifest, &digest, 100).unwrap_err();
+        assert!(
+            err.contains("does not carry the declaration digest"),
+            "{err}"
+        );
+        // No memo record: the contract vehicle and legacy paths skip.
+        let mut bare = memo_manifest(&names, 50);
+        bare.halt_memo_accounts = None;
+        assert_eq!(
+            verify_migration_memo_accounts(&bare, &digest, 100).unwrap(),
+            0
+        );
+        // An empty record fails closed instead of vacuously passing.
+        let mut empty = memo_manifest(&names, 50);
+        empty.halt_memo_accounts = Some(Vec::new());
+        assert!(verify_migration_memo_accounts(&empty, &digest, 100).is_err());
+    }
+
+    #[test]
+    fn schedule_match_rejects_key_drift() {
+        let key_a = test_key("strict-1");
+        let key_b = test_key("strict-2");
+        let schedule = recorded_map(&[("prod.a", &key_a), ("prod.b", &key_b)]);
+        // A schedule-key rotation on one member fails: the frozen set no
+        // longer names the keys that produce.
+        let drifted = declaration_of(&[("prod.a", &key_b), ("prod.b", &key_b)]);
+        assert!(check_declaration_matches_recorded_schedule(&drifted, &schedule).is_err());
     }
 
     #[test]

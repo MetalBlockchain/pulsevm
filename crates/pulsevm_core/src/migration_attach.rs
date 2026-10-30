@@ -36,6 +36,7 @@ use pulsevm_database::{
     HaltWeight,
     MigrationHaltRosterEntry,
     MigrationManifest,
+    MigrationMemoAccount,
 };
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -90,6 +91,15 @@ fn parse_extensions(value: Option<&Value>) -> Result<Vec<(u16, Vec<u8>)>, String
             Ok((id, payload))
         })
         .collect()
+}
+
+/// One `get_block` response's timestamp as an Antelope slot: block slots
+/// count 500ms steps from the Antelope epoch. `source` names the file in
+/// diagnostics only.
+pub fn boundary_block_slot(value: &Value, source: &str) -> Result<u32, String> {
+    let text = required_str(value, "timestamp")
+        .map_err(|error| format!("block {source} timestamp unreadable: {error}"))?;
+    parse_slot(text).map_err(|error| format!("block {source} timestamp invalid: {error}"))
 }
 
 /// One `get_block` response's timestamp on the deferred rows' clock
@@ -271,22 +281,31 @@ fn recorded_schedule_keys(
     Ok(keys)
 }
 
-/// Record the frozen active schedule from a `get_producer_schedule`
-/// response: every active producer at unit weight with its schedule signing
-/// key. `source` names the file in diagnostics only. The restore gate
-/// requires this schedule to equal the declared set exactly, so record it
-/// from the same live query the freeze votes checked. Fills in
-/// `halt_schedule_version` when the contract-ceremony path did not pin one
-/// already; a conflict between the two fails closed.
+/// Record the frozen active schedule from H's header state
+/// (`get_block_header_state`, captured by coordinator infra in the same
+/// poll iteration that first observes head == H): every active producer at
+/// unit weight with its schedule signing key. `source` names the file in
+/// diagnostics only. The restore gate requires this schedule to equal the
+/// declared set exactly. The state must be captured at the freeze — header
+/// state is served only while reversible, and no export nodeos can serve H
+/// later (a node hydrated from the H snapshot takes H as its irreversible
+/// base). A live-network `get_producer_schedule` response is
+/// exporter-pointed and cannot authenticate the committee — so the
+/// `active_schedule` envelope is required; the bare `active` envelope of a
+/// live query is refused.
+/// Fills in `halt_schedule_version` when the contract-ceremony path did
+/// not pin one already; a conflict between the two fails closed.
 pub fn record_halt_schedule(
     manifest: &mut MigrationManifest,
     schedule: &Value,
     source: &str,
     expected_version: u32,
 ) -> Result<usize, String> {
-    let active = schedule
-        .get("active")
-        .ok_or_else(|| format!("schedule {source} has no active schedule"))?;
+    let active = schedule.get("active_schedule").ok_or_else(|| {
+        format!(
+            "schedule {source} has no active_schedule: record the frozen schedule from H's header state (captured at the freeze), not from a live get_producer_schedule query"
+        )
+    })?;
     let version: u32 = active
         .get("version")
         .and_then(Value::as_u64)
@@ -306,23 +325,30 @@ pub fn record_halt_schedule(
         return Err(format!("schedule {source} carries no producers"));
     }
     // A checkpoint taken mid-rotation would boot the new chain with a
-    // pending proposal the ceremony never froze. The staged schedule must
-    // carry no pending or proposed change: absence is recorded into the
-    // manifest (the gate requires `Some(false)`), anything staged fails
-    // fast here instead of shipping an unbootable manifest. This is
-    // derived from the same file the roster comes from — never hand-typed
-    // — so the attestation cannot diverge from the recorded schedule.
-    for stage in ["pending", "proposed"] {
-        let staged = schedule
-            .get(stage)
-            .and_then(|staged| staged.get("producers"))
-            .and_then(Value::as_array)
-            .is_some_and(|producers| !producers.is_empty());
-        if staged {
-            return Err(format!(
-                "schedule {source} stages a {stage} producer schedule: freeze the ceremony after it activates"
-            ));
-        }
+    // pending proposal the ceremony never froze. The header state must
+    // carry no pending schedule: absence is recorded into the manifest
+    // (the gate requires `Some(false)`), anything staged fails fast here
+    // instead of shipping an unbootable manifest. This is derived from the
+    // same header state the roster comes from — never hand-typed — so the
+    // attestation cannot diverge from the recorded schedule. The header
+    // state carries the pending schedule nested under `pending_schedule`
+    // (with its own `schedule` object); a live-query `pending`/`proposed`
+    // envelope is refused along with the live schedule itself.
+    if schedule.get("pending").is_some() || schedule.get("proposed").is_some() {
+        return Err(format!(
+            "schedule {source} is a live get_producer_schedule envelope: record the frozen schedule from H's header state (captured at the freeze)"
+        ));
+    }
+    let pending_staged = schedule
+        .get("pending_schedule")
+        .and_then(|pending| pending.get("schedule"))
+        .and_then(|schedule| schedule.get("producers"))
+        .and_then(Value::as_array)
+        .is_some_and(|producers| !producers.is_empty());
+    if pending_staged {
+        return Err(format!(
+            "schedule {source} stages a pending producer schedule: freeze the ceremony after it activates"
+        ));
     }
     manifest.halt_proposed_schedule = Some(false);
     let mut roster = Vec::with_capacity(producers.len());
@@ -494,7 +520,7 @@ pub fn record_post_blocks(
         ));
     }
     let roster = manifest.halt_schedule.as_ref().ok_or_else(|| {
-        "post-H headers need a recorded schedule: record --schedule first, or attach a declaration pair carrying the roster".to_string()
+        "post-H headers need a recorded schedule: record --halt-state first, or attach a declaration pair carrying the roster".to_string()
     })?;
     let keys = recorded_schedule_keys(roster)?;
     // No hash pin on the state's pending schedule: with no staged change
@@ -576,6 +602,20 @@ pub fn record_post_blocks(
         let state_value = state.get("result").unwrap_or(state);
         let (blockroot_root, schedule_hash) = read_post_state(state_value, state_source)
             .map_err(|error| format!("post-H block {source}: {error}"))?;
+        // The header state must be for this block: its id must equal the
+        // derived block id, or a state from another height (with another
+        // blockroot) could be paired with this header. This runs after
+        // the field checks above so malformed states keep their own
+        // diagnostic.
+        let state_id = state_value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("post-H block {source} header state has no block id"))?;
+        if state_id != hex::encode(stated_id) {
+            return Err(format!(
+                "post-H block {source} header state is for block {state_id}, not the staged block"
+            ));
+        }
         let header_bytes = pack_block_header_bytes(header);
         // The recorded proof leads with the two signature inputs the header
         // cannot supply, so the gate recomputes Leap's digest from the packed
@@ -622,6 +662,96 @@ pub fn record_post_blocks(
     Ok(count)
 }
 
+/// Record the memo-vehicle declaration accounts from harness-captured
+/// `get_account` responses (a JSON list of `{"name", "account": {created,
+/// ...}, ...}` in chunk order — a map would lose the chunk order because
+/// JSON objects are unordered): every name must re-decode to the
+/// declaration digest and every account must predate H (by Antelope slot),
+/// otherwise the declaration's on-chain landing is unproven and the record
+/// fails fast. The digest comes from the manifest's recorded declaration;
+/// `h_slot` is H's slot (from the H block response's timestamp). The names
+/// are deterministic from the digest (`h` + round letter + hex nibbles
+/// mapped to `a`–`p`), so this re-derives the harness's chain scan instead
+/// of trusting it. Returns the recorded account count. Existence in
+/// checkpoint state is checked at restore (and by the offline verifier),
+/// where the state is available.
+pub fn record_memo_accounts(
+    manifest: &mut MigrationManifest,
+    memo_accounts: &Value,
+    h_slot: u32,
+    source: &str,
+) -> Result<usize, String> {
+    let declaration = manifest
+        .halt_declaration
+        .as_ref()
+        .ok_or_else(|| "memo accounts need a recorded declaration to decode against".to_string())?;
+    let digest = declaration
+        .digest()
+        .map_err(|error| format!("memo accounts need a valid declaration digest: {error:?}"))?;
+    let expected = hex::encode(digest);
+    let accounts = memo_accounts.as_array().ok_or_else(|| {
+        format!("memo accounts {source} is not a chunk-ordered list of name/account pairs")
+    })?;
+    if accounts.is_empty() {
+        return Err(format!(
+            "memo accounts {source} records no accounts: stage the declaration accounts or drop the file"
+        ));
+    }
+    let mut all = String::with_capacity(64);
+    let mut recorded = Vec::with_capacity(accounts.len());
+    for entry in accounts {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("memo accounts {source} entry has no name"))?;
+        let account = entry.get("account").ok_or_else(|| {
+            format!("memo account {name} in {source} has no get_account response")
+        })?;
+        let mut chars = name.chars();
+        let (Some('h'), Some(_round), rest) = (chars.next(), chars.next(), chars.as_str()) else {
+            return Err(format!(
+                "memo account {name} in {source} does not carry the declaration digest"
+            ));
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+            return Err(format!(
+                "memo account {name} in {source} does not carry the declaration digest"
+            ));
+        }
+        for byte in rest.bytes() {
+            let hex = if byte <= b'j' {
+                b'0' + (byte - b'a')
+            } else {
+                b'a' + (byte - b'k')
+            };
+            all.push(hex as char);
+        }
+        let created = account
+            .get("created")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("memo account {name} in {source} has no creation time"))?;
+        let created_slot = parse_slot(created)
+            .map_err(|error| format!("memo account {name} creation time invalid: {error}"))?;
+        if created_slot >= h_slot {
+            return Err(format!(
+                "memo account {name} in {source} was created at slot {created_slot} (H is slot {h_slot}): the declaration must land before H"
+            ));
+        }
+        recorded.push(MigrationMemoAccount {
+            name: name.to_string(),
+            created_slot,
+        });
+    }
+    if all != expected {
+        return Err(format!(
+            "memo accounts in {source} do not decode to the declaration digest"
+        ));
+    }
+    let count = recorded.len();
+    manifest.halt_memo_accounts = Some(recorded);
+    Ok(count)
+}
+
 /// Record the cutover block H itself as a gate entry (root ||
 /// schedule-hash || header || signature || block-id — no counts: H may
 /// carry traffic), authenticated like a post-H header minus the emptiness
@@ -643,7 +773,7 @@ pub fn record_halt_block(
     source: &str,
 ) -> Result<String, String> {
     let roster = manifest.halt_schedule.as_ref().ok_or_else(|| {
-        "the H entry needs a recorded schedule: record --schedule first, or attach a declaration pair carrying the roster".to_string()
+        "the H entry needs a recorded schedule from H's header state (--halt-state), or attach a declaration pair carrying the roster".to_string()
     })?;
     let keys = recorded_schedule_keys(roster)?;
     let value = halt.get("result").unwrap_or(halt);
@@ -666,11 +796,34 @@ pub fn record_halt_block(
             ));
         }
     }
-    let state_value = halt_state.get("result").unwrap_or(halt_state);
-    let (blockroot_root, schedule_hash) = read_post_state(state_value, source)
-        .map_err(|error| format!("cutover block {source}: {error}"))?;
     let header_bytes = pack_block_header_bytes(header);
     let header_digest = Digest::hash(&header_bytes).0;
+    // The entry must open on the trusted H: the confirmation binds this id,
+    // so a substituted H fails here instead of anchoring the window. This
+    // runs before the state checks so a wrong anchor keeps its own
+    // diagnostic.
+    let mut derived_id = header_digest;
+    derived_id[0..4].copy_from_slice(&halt_height.to_be_bytes());
+    if derived_id.as_slice() != halt_id.as_bytes() {
+        return Err(format!(
+            "cutover block {source} id does not derive to the trusted cutover id"
+        ));
+    }
+    let state_value = halt_state.get("result").unwrap_or(halt_state);
+    // The header state must be FOR H: its block id must equal the trusted
+    // cutover id, or a state from another height (with another schedule)
+    // could smuggle a foreign committee into the window.
+    let state_id = state_value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("cutover block {source} header state has no block id"))?;
+    if state_id != hex::encode(halt_id.as_bytes()) {
+        return Err(format!(
+            "cutover block {source} header state is for block {state_id}, not the trusted cutover block"
+        ));
+    }
+    let (blockroot_root, schedule_hash) = read_post_state(state_value, source)
+        .map_err(|error| format!("cutover block {source}: {error}"))?;
     let digest = leap_sig_digest(&header_digest, &blockroot_root, &schedule_hash);
     let signature_str = value
         .get("producer_signature")
@@ -690,18 +843,13 @@ pub fn record_halt_block(
             "cutover block {source} is not signed by the recorded schedule key for {producer_name}"
         ));
     }
-    // The entry must open on the trusted H: the confirmation binds this id,
-    // so a substituted H fails here instead of anchoring the window.
-    let mut derived_id = header_digest;
-    derived_id[0..4].copy_from_slice(&halt_height.to_be_bytes());
-    if derived_id.as_slice() != halt_id.as_bytes() {
-        return Err(format!(
-            "cutover block {source} id does not derive to the trusted cutover id"
-        ));
-    }
     // The H entry carries no transaction/block-extension counts: H may
     // carry traffic, and the entry proves the anchor (id, signature,
     // version), not the contents — emptiness is the post-H window's job.
+    // The derived id was already checked against the trusted H above, so
+    // the packed entry opens on exactly the block the confirmation binds.
+    let mut derived_id = header_digest;
+    derived_id[0..4].copy_from_slice(&halt_height.to_be_bytes());
     let mut packed = Vec::with_capacity(64 + header_bytes.len() + 65);
     packed.extend_from_slice(&blockroot_root);
     packed.extend_from_slice(&schedule_hash);
@@ -804,12 +952,16 @@ mod tests {
         )
     }
 
-    /// Build a `get_producer_schedule` response in the Leap 4+ shape:
-    /// each member is (name, key, threshold, key count). Multi-key members
-    /// exercise the fail-closed path.
+    /// Build an H header state's schedule section in the Leap shape:
+    /// `active_schedule` with the version and producers plus an empty
+    /// `pending_schedule`. Each member is (name, key, threshold, key
+    /// count). Multi-key members exercise the fail-closed path. A live
+    /// `get_producer_schedule` envelope (`active`/`pending`/`proposed`) is
+    /// deliberately not built here: record_halt_schedule refuses it, since
+    /// only H's header state authenticates the committee.
     fn schedule_json_with(version: u32, members: &[(String, String, u64, usize)]) -> Value {
         serde_json::json!({
-            "active": {
+            "active_schedule": {
                 "version": version,
                 "producers": members.iter().map(|(name, key, threshold, count)| {
                     let keys: Vec<Value> = (0..*count).map(|i| {
@@ -820,7 +972,8 @@ mod tests {
                         "authority": [1, {"threshold": threshold, "keys": keys}],
                     })
                 }).collect::<Vec<_>>(),
-            }
+            },
+            "pending_schedule": {"schedule": {"version": version, "producers": []}},
         })
     }
 
@@ -853,14 +1006,48 @@ mod tests {
         }
     }
 
+    /// Encode a declaration digest hex the way the memo vehicle names its
+    /// accounts: `h` + round letter + hex nibbles mapped to `a`–`p`, ten
+    /// per account (the last chunk holds the remainder).
+    fn memo_names_for(digest_hex: &str, round: char) -> Vec<String> {
+        let letters: String = digest_hex
+            .bytes()
+            .map(|b| {
+                let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                (b'a' + nibble) as char
+            })
+            .collect();
+        letters
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|chunk| format!("h{round}{}", chunk.iter().collect::<String>()))
+            .collect()
+    }
+
+    fn memo_json(names: &[String], created_slot: u32) -> Value {
+        Value::Array(
+            names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "account": {"created": slot_iso(created_slot)},
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Synthetic but fixed signature inputs: every test signs and verifies
     /// over the same root/schedule-hash pair, so the round-trip exercises
     /// the true Leap digest path with deterministic fixtures.
     const TEST_ROOT_A: [u8; 32] = [0xA1; 32];
     const TEST_ROOT_B: [u8; 32] = [0xB2; 32];
 
-    fn state_json(root: &[u8; 32], schedule_hash: &[u8; 32]) -> Value {
+    fn state_json(root: &[u8; 32], schedule_hash: &[u8; 32], block_id_hex: &str) -> Value {
         serde_json::json!({
+            "id": block_id_hex,
             "blockroot_merkle": {
                 "_active_nodes": [hex::encode([0u8; 32]), hex::encode([1u8; 32]), hex::encode(root)],
                 "_node_count": 9,
@@ -913,7 +1100,11 @@ mod tests {
             HEIGHT,
             halt_digest_with_num(&halt_digest, HEIGHT),
         );
-        let halt_state_json = state_json(&TEST_ROOT_H, &schedule_hash);
+        let halt_state_json = state_json(
+            &TEST_ROOT_H,
+            &schedule_hash,
+            &hex::encode(halt_digest_with_num(&halt_digest, HEIGHT)),
+        );
         let halt_block = parse_boundary_block(&halt_json, false).expect("H parses");
         let halt_id: [u8; 32] = halt_block
             .id()
@@ -951,7 +1142,7 @@ mod tests {
                 id,
             );
             posts.push((name, json));
-            post_states.push((name, state_json(&root, &schedule_hash)));
+            post_states.push((name, state_json(&root, &schedule_hash, &hex::encode(id))));
             previous = id;
         }
         (
@@ -1028,7 +1219,7 @@ mod tests {
         let error = record_halt_schedule(&mut manifest, &bad_key, "s", VERSION).unwrap_err();
         assert!(error.contains("not a K1 key"), "{error}");
         let empty = serde_json::json!({
-            "active": {"version": VERSION, "producers": []}
+            "active_schedule": {"version": VERSION, "producers": []}
         });
         let error = record_halt_schedule(&mut manifest, &empty, "s", VERSION).unwrap_err();
         assert!(error.contains("no producers"), "{error}");
@@ -1050,7 +1241,7 @@ mod tests {
         assert!(error.contains("threshold is 2, not 1"), "{error}");
         // Missing authority entirely (pre-Leap-4 shape): fail closed.
         let flat = serde_json::json!({
-            "active": {
+            "active_schedule": {
                 "version": VERSION,
                 "producers": [{"producer_name": "alice", "block_signing_key": key_str}],
             }
@@ -1074,24 +1265,76 @@ mod tests {
         assert_eq!(manifest.halt_proposed_schedule, Some(false));
         // A staged pending schedule fails the record fast: the checkpoint
         // would otherwise boot with a proposal the ceremony never froze.
+        // The header state nests it under pending_schedule.
         let mut pending = schedule_json(VERSION, &[(&key, "alice")]);
-        pending["pending"] = serde_json::json!({
-            "version": VERSION + 1,
-            "producers": [{"producer_name": "alice", "authority": [1, {"threshold": 1, "keys": [{"key": key.public_key().to_string(), "weight": 1}]}]}],
-        });
+        pending["pending_schedule"]["schedule"]["producers"] = serde_json::json!([
+            {"producer_name": "alice", "authority": [1, {"threshold": 1, "keys": [{"key": key.public_key().to_string(), "weight": 1}]}]},
+        ]);
         let mut manifest = manifest_for([7u8; 32]);
         let error = record_halt_schedule(&mut manifest, &pending, "s", VERSION).unwrap_err();
         assert!(error.contains("pending"), "{error}");
         assert_eq!(manifest.halt_proposed_schedule, None);
-        // Same for a staged proposed schedule.
-        let mut proposed = schedule_json(VERSION, &[(&key, "alice")]);
-        proposed["proposed"] = serde_json::json!({
-            "version": VERSION + 1,
-            "producers": [{"producer_name": "alice", "authority": [1, {"threshold": 1, "keys": [{"key": key.public_key().to_string(), "weight": 1}]}]}],
+        // A live get_producer_schedule envelope is refused outright: only
+        // H's header state authenticates the committee.
+        let live = serde_json::json!({
+            "active": {"version": VERSION, "producers": []},
         });
         let mut manifest = manifest_for([7u8; 32]);
-        let error = record_halt_schedule(&mut manifest, &proposed, "s", VERSION).unwrap_err();
-        assert!(error.contains("proposed"), "{error}");
+        let error = record_halt_schedule(&mut manifest, &live, "s", VERSION).unwrap_err();
+        assert!(error.contains("active_schedule"), "{error}");
+    }
+
+    #[test]
+    fn memo_accounts_record_decode_and_timing() {
+        let key = K1PrivateKey::from_seed_string("memo-1").unwrap();
+        let declaration = declaration_for(&[(&key, "alice")]);
+        let digest_hex = hex::encode(declaration.digest().unwrap());
+        let names = memo_names_for(&digest_hex, 'a');
+        assert_eq!(names.len(), 7);
+        let mut manifest = manifest_for([7u8; 32]);
+        manifest.halt_declaration = Some(declaration);
+        let count =
+            record_memo_accounts(&mut manifest, &memo_json(&names, 50), 100, "memo").unwrap();
+        assert_eq!(count, 7);
+        let recorded = manifest.halt_memo_accounts.unwrap();
+        assert_eq!(recorded.len(), 7);
+        assert!(recorded.iter().all(|m| m.created_slot == 50));
+        // A digest from another declaration fails: names commit to exactly
+        // one digest.
+        let other = declaration_for(&[(&key, "bob")]);
+        let mut bad_manifest = manifest_for([7u8; 32]);
+        bad_manifest.halt_declaration = Some(other);
+        let error = record_memo_accounts(&mut bad_manifest, &memo_json(&names, 50), 100, "memo")
+            .unwrap_err();
+        assert!(error.contains("do not decode"), "{error}");
+        // Created at or after H fails: the declaration must land before H.
+        for slot in [100, 101] {
+            let mut late_manifest = manifest_for([7u8; 32]);
+            late_manifest.halt_declaration = manifest.halt_declaration.clone();
+            let error =
+                record_memo_accounts(&mut late_manifest, &memo_json(&names, slot), 100, "memo")
+                    .unwrap_err();
+            assert!(error.contains("must land before H"), "{error}");
+        }
+        // Malformed names fail: the digest alphabet is exactly a-p after
+        // the round letter.
+        let mut broken = memo_json(&names, 50);
+        broken
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "xyz", "account": {"created": slot_iso(50)}}));
+        let mut broken_manifest = manifest_for([7u8; 32]);
+        broken_manifest.halt_declaration = manifest.halt_declaration.clone();
+        let error = record_memo_accounts(&mut broken_manifest, &broken, 100, "memo").unwrap_err();
+        assert!(
+            error.contains("does not carry the declaration digest"),
+            "{error}"
+        );
+        // No declaration recorded: nothing to decode against.
+        let mut bare = manifest_for([7u8; 32]);
+        let error =
+            record_memo_accounts(&mut bare, &memo_json(&names, 50), 100, "memo").unwrap_err();
+        assert!(error.contains("recorded declaration"), "{error}");
     }
 
     #[test]
@@ -1238,6 +1481,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("trusted cutover id"), "{error}");
+        // Header state from another height: a state carrying a different
+        // block id — with a different schedule — cannot open this window,
+        // even when the block itself is trusted.
+        let mut foreign_state = halt_state_json.clone();
+        foreign_state["id"] = serde_json::json!("ff".repeat(32));
+        let error = record_halt_block(
+            &mut manifest,
+            &halt_json,
+            &foreign_state,
+            &Id::new(halt_id),
+            HEIGHT,
+            VERSION,
+            "halt",
+        )
+        .unwrap_err();
+        assert!(error.contains("not the trusted cutover block"), "{error}");
     }
 
     #[test]
@@ -1343,7 +1602,12 @@ mod tests {
             HEIGHT + 1,
             halt_digest_with_num(&unknown_header, HEIGHT + 1),
         );
-        let unknown_state = state_json(&TEST_ROOT_A, &stated_hash);
+        let unknown_id = unknown
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let unknown_state = state_json(&TEST_ROOT_A, &stated_hash, &unknown_id);
         let refs = vec![("carol", &unknown)];
         let states = vec![("carol", &unknown_state)];
         let error = record_post_blocks(
@@ -1369,7 +1633,12 @@ mod tests {
             HEIGHT + 1,
             halt_digest_with_num(&forged_header, HEIGHT + 1),
         );
-        let forged_state = state_json(&TEST_ROOT_A, &stated_hash);
+        let forged_id = forged
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let forged_state = state_json(&TEST_ROOT_A, &stated_hash, &forged_id);
         let refs = vec![("alice", &forged)];
         let states = vec![("alice", &forged_state)];
         let error = record_post_blocks(
@@ -1435,7 +1704,13 @@ mod tests {
         // recovers to the schedule key.
         let mut wrong_root = post_states.clone();
         let stated_hash = FIXTURE_SCHEDULE_HASH;
-        wrong_root[0].1 = state_json(&[0xFF; 32], &stated_hash);
+        let first_id = posts[0]
+            .1
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        wrong_root[0].1 = state_json(&[0xFF; 32], &stated_hash, &first_id);
         let wrong_root_refs: Vec<(&str, &Value)> = wrong_root
             .iter()
             .map(|(name, json)| (*name, json))
@@ -1458,7 +1733,13 @@ mod tests {
         // roster key. The signature binds the exact pair; there is no
         // comparison to fool.
         let mut wrong_hash = post_states.clone();
-        wrong_hash[1].1 = state_json(&TEST_ROOT_B, &[0xEE; 32]);
+        let second_id = posts[1]
+            .1
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        wrong_hash[1].1 = state_json(&TEST_ROOT_B, &[0xEE; 32], &second_id);
         let wrong_hash_refs: Vec<(&str, &Value)> = wrong_hash
             .iter()
             .map(|(name, json)| (*name, json))

@@ -1,9 +1,9 @@
 //! Attach an id-exact XPR checkpoint-boundary block to a migration manifest.
 //!
-//! The source JSON is the response from `v1/chain/get_block`. Snapshot
-//! boundaries with transactions or schedule changes are deliberately rejected;
-//! choose an empty boundary block so the migration anchor can be independently
-//! reconstructed and checked without trusting pruned transaction JSON.
+//! The source JSON is the response from `v1/chain/get_block`. H itself is
+//! an ordinary source-chain block and may carry traffic (the snapshot
+//! covers the state its transactions produced); only the post-H window
+//! must be empty, and schedule changes are rejected everywhere.
 //!
 //! With `--halt-key <wif>` the tool additionally signs the old network's halt
 //! commitment over the boundary block and embeds it in the manifest, so the
@@ -19,10 +19,12 @@ use std::{
 use pulsevm_core::{
     id::Id,
     migration_attach::{
+        boundary_block_slot,
         parse_boundary_block,
         post_window_unix_micros,
         record_halt_block,
         record_halt_schedule,
+        record_memo_accounts,
         record_post_blocks,
     },
 };
@@ -66,7 +68,7 @@ use serde_json::Value;
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>] [--declaration <declaration.json> --confirmation <confirmation.json> [--declaration-inclusion <height>] [--confirmation-inclusion <height>] [--max-declaration-lag <K>] [--max-confirmation-lag <J>] [--contract-ceremony <fragment.json> --schedule-version <n>] [--schedule <schedule.json>] [--halt-state <header-state.json>] [--post-block <get-block.json> --post-state <header-state.json>]... [--deferred-sidecar <deferred-transactions.json>]"
+        "Usage: xpr_attach_source_block <manifest.json> <get-block.json> <output-manifest.json> [--halt-key <wif>] [--halt-key-v2 <wif>] [--halt-roster <roster.json>] [--declaration <declaration.json> --confirmation <confirmation.json> [--declaration-inclusion <height>] [--confirmation-inclusion <height>] [--max-declaration-lag <K>] [--max-confirmation-lag <J>] [--contract-ceremony <fragment.json> --schedule-version <n>] [--halt-state <header-state.json>] [--memo-accounts <memo-accounts.json>] [--post-block <get-block.json> --post-state <header-state.json>]... [--deferred-sidecar <deferred-transactions.json>]"
     );
     eprintln!(
         "  --halt-key-v2 signs a version 2 checkpoint-bound commitment; --halt-roster attaches a"
@@ -85,13 +87,14 @@ fn usage() {
         "  the declaration digest); --schedule-version records the unanimous schedule version"
     );
     eprintln!("  across votes and H (required with contract evidence; export-enforced).");
-    eprintln!("  --schedule records the frozen active schedule from a get_producer_schedule");
-    eprintln!("  response (unit weight, H version pinned); --halt-state records H itself as a");
-    eprintln!(
-        "  gate entry from H's get_block plus H's get_block_header_state: the state supplies"
-    );
-    eprintln!("  the blockroot and schedule hash Leap signed over, and the entry opens the window");
-    eprintln!("  on a signature-checked H. --post-block records one get_block");
+    eprintln!("  --halt-state records H itself as a gate entry from H's get_block plus H's");
+    eprintln!("  header state (captured at the freeze instant, never a live query, never a");
+    eprintln!("  get_producer_schedule response): the state supplies the blockroot and schedule");
+    eprintln!("  hash Leap signed over, and its active_schedule is the authoritative frozen");
+    eprintln!("  schedule the entry — and the gate's declaration match — resolve keys against.");
+    eprintln!("  The entry opens the window on a signature-checked H. --memo-accounts records the");
+    eprintln!("  declaration accounts (captured get_account responses): names re-decoded to the");
+    eprintln!("  digest with creation required before H. --post-block records one get_block");
     eprintln!("  response per post-H header, hash-linked from H and signed by the recorded key;");
     eprintln!("  every --post-block needs its matching --post-state (get_block_header_state, same");
     eprintln!("  order): the state supplies the blockroot and schedule hash Leap signed over.");
@@ -123,8 +126,8 @@ fn main() -> ExitCode {
     let mut declaration: Option<String> = None;
     let mut confirmation: Option<String> = None;
     let mut timing = PairTiming::default();
-    let mut schedule: Option<String> = None;
     let mut halt_state: Option<String> = None;
+    let mut memo_accounts: Option<String> = None;
     let mut post_blocks: Vec<String> = Vec::new();
     let mut post_states: Vec<String> = Vec::new();
     let mut deferred_sidecar: Option<String> = None;
@@ -217,15 +220,20 @@ fn main() -> ExitCode {
             timing.schedule_version = Some(version);
         } else if arg == "--proposed-schedule" {
             eprintln!(
-                "--proposed-schedule was removed: absence of a pending or proposed schedule is now derived from --schedule, never hand-typed"
+                "--proposed-schedule was removed: absence of a pending or proposed schedule is now derived from --halt-state, never hand-typed"
             );
             return ExitCode::from(2);
         } else if arg == "--schedule" {
+            eprintln!(
+                "--schedule was removed: the frozen schedule is now read from --halt-state (the snapshot's header state), never from a live get_producer_schedule query"
+            );
+            return ExitCode::from(2);
+        } else if arg == "--memo-accounts" {
             let Some(path) = args.next() else {
                 usage();
                 return ExitCode::from(2);
             };
-            schedule = Some(path.to_string_lossy().into_owned());
+            memo_accounts = Some(path.to_string_lossy().into_owned());
         } else if arg == "--halt-state" {
             let Some(path) = args.next() else {
                 usage();
@@ -275,8 +283,8 @@ fn main() -> ExitCode {
         declaration.as_deref(),
         confirmation.as_deref(),
         timing,
-        schedule.as_deref(),
         halt_state.as_deref(),
+        memo_accounts.as_deref(),
         &post_blocks,
         &post_states,
         deferred_sidecar.as_deref(),
@@ -316,8 +324,8 @@ fn attach(
     declaration_path: Option<&str>,
     confirmation_path: Option<&str>,
     timing: PairTiming,
-    schedule_path: Option<&str>,
     halt_state_path: Option<&str>,
+    memo_accounts_path: Option<&str>,
     post_block_paths: &[String],
     post_state_paths: &[String],
     deferred_sidecar_path: Option<&str>,
@@ -496,7 +504,7 @@ fn attach(
             manifest.halt_contract_ceremony = Some(ceremony);
         }
         manifest.halt_schedule_version = timing.schedule_version;
-        // The proposed-schedule absence is derived from --schedule by
+        // The proposed-schedule absence is derived from --halt-state by
         // record_halt_schedule, never hand-typed: the gate requires
         // Some(false), and anything staged fails the record fast.
         // Fail fast at record time with provenance errors; the restore gate
@@ -527,34 +535,27 @@ fn attach(
     // record time and re-verified by the restore gate straight from the
     // manifest.
     let halt_version = block.signed_block_header.header.schedule_version;
-    if let Some(schedule_path) = schedule_path {
-        let bytes = fs::read(schedule_path)
-            .map_err(|error| format!("read schedule {schedule_path}: {error}"))?;
-        let schedule: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("parse schedule {schedule_path}: {error}"))?;
-        let entries = record_halt_schedule(&mut manifest, &schedule, schedule_path, halt_version)?;
-        eprintln!("recorded halt schedule from {schedule_path}: {entries} producers");
-    }
     // The two-step pair opens a window the gate re-verifies, so it must
     // carry the full evidence: the recorded schedule to resolve keys
     // against and the H header state to open the window on a
-    // signature-checked H. The gate fails closed without either, so the
-    // record fails fast here instead of shipping an unbootable manifest.
+    // signature-checked H. Both come from --halt-state — the snapshot's
+    // header state, served by the export nodeos from the hydrated
+    // snapshot — so the committee is bound by the checkpoint, never by a
+    // live-network schedule query the exporter could point anywhere. The
+    // gate fails closed without either, so the record fails fast here
+    // instead of shipping an unbootable manifest.
     if manifest.halt_declaration.is_some() {
-        if manifest.halt_schedule.is_none() {
-            return Err(
-                "the cutover pair needs --schedule: the H entry resolves H's producer key against the recorded schedule"
-                    .to_string(),
-            );
-        }
         let halt_state_path = halt_state_path.ok_or_else(|| {
-            "the cutover pair needs --halt-state: the H entry is recorded from H's get_block_header_state"
+            "the cutover pair needs --halt-state (the snapshot's header state for H): it supplies both the authoritative schedule and the H entry"
                 .to_string()
         })?;
         let state_bytes = fs::read(halt_state_path)
             .map_err(|error| format!("read H header state {halt_state_path}: {error}"))?;
         let halt_state: Value = serde_json::from_slice(&state_bytes)
             .map_err(|error| format!("parse H header state {halt_state_path}: {error}"))?;
+        let entries =
+            record_halt_schedule(&mut manifest, &halt_state, halt_state_path, halt_version)?;
+        eprintln!("recorded halt schedule from {halt_state_path}: {entries} producers");
         let entry = record_halt_block(
             &mut manifest,
             &value,
@@ -566,6 +567,15 @@ fn attach(
         )?;
         eprintln!("recorded cutover block entry for H={height} {id}");
         let _ = entry;
+        if let Some(memo_path) = memo_accounts_path {
+            let memo_bytes = fs::read(memo_path)
+                .map_err(|error| format!("read memo accounts {memo_path}: {error}"))?;
+            let memo_accounts: Value = serde_json::from_slice(&memo_bytes)
+                .map_err(|error| format!("parse memo accounts {memo_path}: {error}"))?;
+            let h_slot = boundary_block_slot(&value, &block_path.to_string_lossy())?;
+            let count = record_memo_accounts(&mut manifest, &memo_accounts, h_slot, memo_path)?;
+            eprintln!("recorded memo inclusion proof from {memo_path}: {count} accounts");
+        }
     } else if halt_state_path.is_some() {
         return Err("--halt-state without --declaration stages no cutover pair".to_string());
     }

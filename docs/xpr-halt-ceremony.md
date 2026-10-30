@@ -48,8 +48,10 @@ Votes are XPR transactions, so their inclusion height *is* XPR consensus —
 unlike off-chain signature timestamps, which are merely asserted. A
 commitment is only valid inside its window:
 
-- **Declaration votes: [H−K, H−1].** Strictly before H: H stays empty and
-  the commitment is a genuine pre-commitment. The floor K is the freshness
+- **Declaration votes: [H−K, H−1].** Strictly before H: the commitment
+  is a genuine pre-commitment. H itself is an ordinary source-chain block
+  and may carry traffic — the snapshot covers the state its transactions
+  produced; only H+1..P must be empty. The floor K is the freshness
   bound — ancient pre-signatures don't count, and K gives BPs real lead
   (votes land like H−J, well before the edge, not at H−1).
 - **Confirmation votes: [H+1, H+J].** Strictly after H: a confirmation
@@ -164,18 +166,18 @@ operator once the frozen set matches the coordinated parameters:
 - Refuses anything but the exact freeze: wrong height, wrong source
   chain, a digest that does not recompute locally, keys outside the frozen
   set, double votes, votes at or after H, a schedule version that is not
-  the coordinated one (frozen, live, and config must agree all three
-  ways), a staged producer schedule change (pending/proposed), and a
-  frozen set that no longer matches the live active schedule (member or
-  schedule-key drift since the freeze): a freeze taken under a rotating
-  or stale set signs nothing. Every refusal is logged.
+  the coordinated one, and a frozen set that no longer matches the
+  coordinated active schedule (member or schedule-key drift since the
+  freeze): a freeze taken under a rotating or stale set signs nothing.
+  Every refusal is logged.
 - Re-checks the schedule at confirmation time, not just at declaration
-  time: the voter re-reads the live schedule before signing the
-  confirmation and refuses on a staged change (pending or proposed), a
-  version mismatch, or member/key drift — so a rotation between the vote
-  and H+1 attests nothing. The confirmation carries the voter's own
-  observed pause head into the coordinator, where the highest attested
-  head becomes the `P` the proof must cover.
+  time: the voter re-reads the schedule before signing the confirmation
+  and refuses on a staged change (pending or proposed), a version
+  mismatch, or member/key drift — so a rotation between the vote and H+1
+  attests nothing. The confirmation carries the ceremony's agreed pause
+  head P — a fixed H+k set before the freeze — never the voter's own
+  observed tip, so divergent voters cannot split the quorum digest; a
+  coordinator publishing a different P is refused.
 - Keys come from owner-only files, never the command line, and are never
   logged. `--dry-run` evaluates and logs every decision without signing.
 - `--print-digest` prints the currently actionable signing digest as JSON
@@ -183,10 +185,13 @@ operator once the frozen set matches the coordinated parameters:
   exactly those bytes with its own key management and submits through its
   own path, so key custody never moves. The digest equals the voter's own
   signing digest by construction (unit-tested, live-tested).
-- After H is final it signs the confirmation and delivers it to the
-  coordinator (whose block id, checkpoint, successor id, and platform id
-  are cross-checked against the local node and config) or writes it to a
-  file. The version-2 confirmation always binds the platform chain id;
+- It signs the confirmation over the agreed P — no LIB wait: on a large
+  committee LIB(H) arrives hundreds of blocks after the agreed stop, and
+  the 15-of-21 confirmation quorum over H_ID stands in for Leap finality —
+  and delivers it to the coordinator (whose block id, checkpoint,
+  successor id, and platform id are cross-checked against the local node
+  and config) or writes it to a file. The version-2 confirmation always
+  binds the platform chain id;
   the field is mandatory and unbound evidence is rejected outright. The
   unsigned template is built by one shared library constructor, so the
   voter, the coordinator tool, and external `--print-digest` signers all
@@ -197,18 +202,17 @@ operator once the frozen set matches the coordinated parameters:
   parity, unattended live vote, platform-bound coordinator delivery,
   lying-coordinator and wrong-platform refusal).
 - Opt-in local halt: with `stop_producer.at_pause` set plus the local
-  `producer_api_url`, the voter pauses its own producer once its
-  confirmation for the agreed `pause_height` is delivered and the local
+  `producer_api_url`, the voter pauses its own producer once the local
   head has reached P (Leap `producer/pause`, then proves `paused`) and
-  keeps enforcing it. Every signer confirms the same agreed head P — a
-  fixed H+k set before the freeze — never its own observed tip, so
-  divergent voters cannot split the quorum digest; a coordinator
-  publishing a different P is refused. Only a voter that delivered its
-  own confirmation pauses, so an aborted ceremony never halts a live
-  chain by accident: the fleet pact must therefore ensure every
-  scheduled producer confirms. A contract cannot stop block production,
-  only the producer can, so this is the half of the halt that lives in
-  the binary. Off by default; half-configured (armed without a URL) or
+  keeps enforcing it — whether or not its own confirmation was
+  delivered, because a producer whose submission failed must still stop
+  or its tail runs past the proof window unstaged. Every signer confirms
+  the same agreed head P — a fixed H+k set before the freeze — never its
+  own observed tip, so divergent voters cannot split the quorum digest; a
+  coordinator publishing a different P is refused. A contract cannot stop
+  block production, only the producer can, so this is the half of the
+  halt that lives in the binary. Off by default; half-configured (armed
+  without a URL) or
   stale (`at_h`, which stopped at H) refuses to start; a pause that
   will not verify is retried in-loop and logged loudly instead of
   degrading to a warning. A node restart clears Leap's in-memory pause,
@@ -249,53 +253,81 @@ Submitting raw JSON executes but leaves nothing `get_abi` or
 
 ## Post-H window (what the exporter stages)
 
-The version pin does not stop at H. The rehearsal stages
-`schedule-H.json` (the live `get_producer_schedule` at the freeze),
-every header from H+1 to the pause head (`block-post-N.json`), and each
-header's `get_block_header_state` (`block-post-N.state.json`), and the
-attach tool records all three: the schedule at unit weight pinned to H's
-header version, each post-H header hash-linked from the trusted H id
-with an empty transaction root and signed by the recorded schedule key
-for its producer. The state supplies the two signature inputs the
-header cannot — the blockroot root and the pending schedule hash — so
-the signature is re-verified over Leap's true digest
-(`sha256(sha256(sha256(header) || root) || schedule_hash)`). The state's hash
-is bound by the signature itself: only the exact (root, hash) pair Leap
-signed recovers to the roster key, so there is no hash-to-roster
+The version pin does not stop at H. The authoritative schedule comes
+from H's own header state (`block-H.state.json`), captured by the
+coordinator's own synced node in the same poll iteration that first
+observes head == H — the only moment it is guaranteed servable. Header
+state is served only while a block is reversible: H goes irreversible as
+the chain builds toward P, and no export nodeos can serve it later,
+because a node hydrated from the H snapshot takes H as its irreversible
+base (verified: `get_block_header_state` for the snapshot head answers
+`unknown_block`). So the fetch cannot be deferred to the export, and it
+is never a live `get_producer_schedule` query (whose pending schedule
+may already have moved on) and never the producers table (whose active
+rows are a superset of the schedule). The state is bound to the
+snapshotted H id at capture, so a foreign state fails at the freeze, not
+at the gate. The rehearsal stages every header from H+1 to the agreed
+stop (`block-post-N.json`)
+plus each header's `get_block_header_state`
+(`block-post-N.state.json`), and the attach tool records all of it: the
+schedule at unit weight read from H's header state, each post-H
+header hash-linked from the trusted H id with an empty transaction root
+and signed by the recorded schedule key for its producer. The state
+supplies the two signature inputs the header cannot — the blockroot root
+and the pending schedule hash — so the signature is re-verified over
+Leap's true digest
+(`sha256(sha256(sha256(header) || root) || schedule_hash)`). The state's
+hash is bound by the signature itself: only the exact (root, hash) pair
+Leap signed recovers to the roster key, so there is no hash-to-roster
 comparison to fool — and none is attempted, because with no staged
 change Leap serves the EMPTY pending schedule, whose hash cannot equal
 the active roster's (proven against live header states on the first
-rehearsal run). `P` itself comes from the validators' own frozen-head
-observations (recorded per signer, required to agree — the ceremony tool
-refuses a split view of a supposedly frozen network) and is signed into
-the step-two confirmation, so the coverage bound is quorum-attested, not
-coordinator-typed. The restore gate re-verifies the packed proof,
-requires the recorded schedule to equal the declared set exactly, and
-requires the staged headers to cover exactly H+1 through the attested
-`P`, so the 330-block confirmation window Paul flagged cannot hide
-traffic the checkpoint is missing: a header carrying transactions, a
-rotation, or a signature from outside the frozen set fails the export, a
-proof that stops short of the quorum's own head fails the boot, and an
-unstaged window fails the boot.
+rehearsal run). `P` itself is the ceremony's agreed stop — a fixed H+k
+set before the freeze and signed into the step-two confirmation — so the
+coverage bound is quorum-attested, not coordinator-typed. The restore
+gate re-verifies the packed proof, requires the recorded schedule to
+equal the declared set exactly, and requires the staged headers to cover
+exactly H+1 through the agreed `P`, so no tail past P can hide traffic
+the checkpoint is missing: a header carrying transactions, a rotation,
+or a signature from outside the frozen set fails the export, a proof
+that stops short of the agreed stop fails the boot, and an unstaged
+window fails the boot.
 
 Capture ordering matters: Leap only serves `get_block_header_state` for
-still-reversible blocks, while the freeze protocol requires the
-validators' LIB to cover H (making H irreversible everywhere) before the
-producer pauses. The rehearsal therefore captures H's pair in the same
-poll iteration that first observes head == H (before snapshotting),
-captures each H+1.. tip the moment it appears during the LIB wait, and
-tops up only the fresh tip from a validator after the pause. Fetching any
-pair after finality has passed fails closed and supersedes the round.
+still-reversible blocks. The rehearsal therefore captures H's pair in
+the same poll iteration that first observes head == H (before
+snapshotting), streams each H+1..P tip the moment it appears while the
+producer still builds toward the agreed stop, and tops up only the fresh
+tip from a validator after the pause. Fetching any pair after finality
+has passed fails closed and supersedes the round.
+
+On trust: the fetcher is the coordinator's own infra, not the exporter —
+the same trust domain that selects H, computes digests, and runs the
+votes — and the fetch is cross-checked four ways. The state id must equal
+the snapshotted H id (which equals the checkpoint base); H's own producer
+signature must recover to a recorded schedule key; the recorded set must
+equal the 15-BP-attested declaration exactly; and every voter's
+live-schedule check refuses a roster that is not the real active
+schedule. A forged schedule would need the coordinator to fetch a lie,
+15 BPs to attest it, and the real producers' signatures to verify
+against it — outside any quorum threat model this design admits.
+
+There is deliberately no LIB wait. On a large committee LIB(H) arrives
+hundreds of blocks after the agreed stop, so waiting for it deadlocks
+the halt while the chain builds an unproven tail past the proof window.
+The 15-of-21 confirmation quorum over H_ID stands in for Leap finality,
+and every scheduled producer stops at the same agreed P — the voters
+enforce it locally, independent of confirmation delivery.
 
 Prevention is procedural, verification is cryptographic. On the source
-side, the fleet admission lock plus the edge freeze PREVENTS post-H
-traffic: nothing new is admitted, and the validators stop building. On
-our side, the staged proof VERIFIES the freeze held: the gate replays
-every header H+1 through the highest attested pause head rather than
-trusting the lock. The two halves belong to different parties — the fleet
-operates the freeze, the A-Chain checks it — so a broken freeze cannot
-strand users: the gate turns it into a refused boot, loudly, before H+1
-is ever produced, instead of promoting state the schedule never endorsed.
+side, the agreed stop PREVENTS post-P traffic: every producer pauses at
+P, and the voters re-assert the pause. On our side, the staged proof
+VERIFIES the stop held: the gate replays every header H+1 through the
+agreed stop rather than trusting the pause. The two halves belong to
+different parties — the fleet operates the freeze, the A-Chain checks
+it — so a broken freeze cannot strand users: the gate turns it into a
+refused boot, loudly, before H+1 is ever produced, instead of promoting
+state the schedule never endorsed.
 
 ## What XPR verifies vs what the A-Chain verifies
 

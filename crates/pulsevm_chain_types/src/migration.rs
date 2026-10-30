@@ -515,13 +515,14 @@ pub struct HaltDeclaration {
 
 /// Step two of the cutover: once block H exists, the same quorum confirms
 /// the handoff — declaration digest, terminal block id, migration
-/// checkpoint, successor chain id, and the highest pause head the quorum
-/// observed — in one digest. Either step alone is insufficient: the
-/// declaration commits to the future before the state exists, the
-/// confirmation commits to the state once it does. The pause head binds
-/// the post-H emptiness proof's coverage: the restore gate requires staged
-/// headers H+1 through exactly this head, so a proof that stops short of
-/// the quorum's own observation fails closed.
+/// checkpoint, successor chain id, and the agreed pause head — in one
+/// digest. Either step alone is insufficient: the declaration commits to
+/// the future before the state exists, the confirmation commits to the
+/// state once it does. The pause head binds the post-H emptiness proof's
+/// coverage: the restore gate requires staged headers H+1 through exactly
+/// the agreed head P, so a proof that stops short of the agreed stop fails
+/// closed. No signer waits for LIB: the quorum over H_ID attests the cutoff
+/// instead of Leap finality.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaltConfirmation {
     pub version: u16,
@@ -529,13 +530,13 @@ pub struct HaltConfirmation {
     pub declaration_digest: String,
     /// H: must equal the declaration's `last_height`.
     pub halt_height: u32,
-    /// P: the highest pause head attested by the confirming quorum — the
-    /// greatest source height any confirmer observed frozen. Every confirmer
-    /// signs the same unanimous value (a frozen network observes one head,
-    /// so disagreement means the network is not frozen and refuses). The
-    /// post-H emptiness proof must cover exactly H+1 through this head;
-    /// covering it subsumes the irreversibility block, because confirmation
-    /// only happens after LIB passes H. Required: confirmations minted
+    /// P: the agreed pause head every producer stops at — fixed up front
+    /// (H+k), never any signer's observed tip. Every confirmer signs the
+    /// same value; disagreement means the signers are not on the agreed
+    /// freeze and the tool refuses. The post-H emptiness proof must cover
+    /// exactly H+1 through P. The quorum over H_ID stands in for Leap
+    /// finality, so no signer waits for LIB — on a large committee LIB(H)
+    /// arrives after the agreed stop. Required: confirmations minted
     /// before this field existed fail closed at parse time.
     pub pause_height: u32,
     /// 64-hex id of the terminal block H.

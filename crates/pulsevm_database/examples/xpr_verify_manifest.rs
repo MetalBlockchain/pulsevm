@@ -1,9 +1,9 @@
 //! Offline migration-manifest verifier: the go/no-go gate's second pair of
 //! eyes. It runs every check the restore gate runs — manifest↔checkpoint
 //! binding, halt-commitment crypto (v1 single-key, v2 checkpoint-bound,
-//! weighted quorum with a roster), and roster↔checkpoint-state binding —
-//! without booting a node. The checkpoint is restored into a scratch Arena
-//! directory, so the node binary is never involved.
+//! weighted quorum with a roster), and declaration↔recorded-schedule
+//! membership — without booting a node. The checkpoint is restored into a
+//! scratch Arena directory, so the node binary is never involved.
 //!
 //! Structural source-block checks (exact consumption, transaction-root
 //! recomputation) still run at restore; this tool checks the commitment,
@@ -22,7 +22,6 @@ use std::{
 use pulsevm_database::{
     Database,
     MigrationManifest,
-    migration_state_producer_keys,
     verify_migration_halt_commitment,
     verify_migration_halt_pair,
 };
@@ -479,31 +478,22 @@ fn verify_roster_against_checkpoint(
             header.revision, manifest.checkpoint_revision
         ));
     }
-    let state_keys = migration_state_producer_keys(&database)?;
-    // The boot gate fails closed without the producers table — a
-    // checkpoint without it cannot prove the declared set is the on-chain
-    // schedule — so the offline verifier mirrors the refusal instead of
-    // skipping: PASS here always means the boot gate would see the same
-    // cross-check.
-    if state_keys.is_empty() {
-        return Err(
-            "checkpoint carries no producers table: cannot prove the declared set is the on-chain schedule"
-                .to_string(),
-        );
-    }
-    // The pair path enforces the light-client rule both ways: the declared
-    // set must equal the checkpoint's active producer set exactly, with
-    // matching schedule keys (weights are 1 by construction, so there is
-    // no H-state weight pin).
-    match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)? {
-        Some(matched) => {
-            println!("roster schedule match: ok ({matched} producers)");
-        }
-        None => {
-            return Err(
-                "checkpoint carries no producers table: cannot prove the declared set is the on-chain schedule"
-                    .to_string(),
-            );
+    // Committee membership is pinned by the pair step above (the declaration
+    // must equal the snapshot-bound recorded schedule exactly, both ways):
+    // the producers table carries every active row while the schedule names
+    // only the committee, so no membership check touches it here either.
+    // This step keeps the checkpoint-state bindings the boot gate enforces:
+    // the restored revision must match the manifest, every recorded memo
+    // account must exist in the restored state, and the restored deferred
+    // inventory must be empty over the pause window.
+    println!(
+        "roster schedule match: ok ({} producers, pinned by the halt pair)",
+        roster.len()
+    );
+    match pulsevm_database::verify_memo_accounts_exist(&database, manifest)? {
+        0 => {}
+        proven => {
+            println!("memo inclusion proof: ok ({proven} declaration accounts in checkpoint state)")
         }
     }
     // Pause-window deferred inventory over the rows actually restored: the
@@ -679,11 +669,11 @@ mod tests {
     /// Build a checkpoint whose producers table holds one producer, plus a
     /// matching manifest carrying the two-step pair and the on-chain
     /// ceremony (run with the matching successor chain id). When
-    /// `tamper_roster` is set the roster key is swapped so the state
-    /// binding must fail. When `with_producers` is unset the checkpoint
-    /// carries no producers table, so the roster cross-check must fail
-    /// closed. Legacy roster-less manifests are not built: the verifier
-    /// rejects them.
+    /// `tamper_roster` is set the roster key is swapped so the
+    /// declaration↔schedule match must fail. When `with_producers` is unset
+    /// the checkpoint carries no producers table: the table is not the
+    /// schedule, so verification must still pass. Legacy roster-less
+    /// manifests are not built: the verifier rejects them.
     fn fixture(tamper_roster: bool, with_producers: bool) -> Fixture {
         let dir = tempfile::TempDir::new().unwrap();
         let system = Name::from_str("eosio").unwrap().as_u64();
@@ -692,6 +682,39 @@ mod tests {
         let signing =
             pulsevm_crypto::k1::K1PrivateKey::from_seed_string("verifier-test-1").unwrap();
         let other = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("verifier-test-2").unwrap();
+
+        // The memo-vehicle declaration accounts commit to the declaration
+        // digest as on-chain names; they must exist in the checkpoint
+        // before the snapshot is taken, so derive the digest here.
+        let mut members = vec![HaltDeclarationMember {
+            producer: "prod.a".to_string(),
+            key: signing.public_key().to_string(),
+            weight: pulsevm_chain_types::HaltWeight::MEMBER,
+        }];
+        HaltDeclaration::sort_members(&mut members);
+        let unsigned = HaltDeclaration {
+            version: HaltDeclaration::VERSION,
+            source_chain_id: "41".repeat(32),
+            last_height: 7,
+            validator_set: members,
+            signatures: Vec::new(),
+        };
+        let fixture_digest = hex::encode(unsigned.digest().unwrap());
+        let memo_names = {
+            let letters: String = fixture_digest
+                .bytes()
+                .map(|b| {
+                    let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                    (b'a' + nibble) as char
+                })
+                .collect();
+            letters
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(10)
+                .map(|chunk| format!("ha{}", chunk.iter().collect::<String>()))
+                .collect::<Vec<_>>()
+        };
 
         let mut db =
             Database::new(dir.path().join("build").to_str().unwrap(), 64 * 1024 * 1024).unwrap();
@@ -720,6 +743,10 @@ mod tests {
             deltas,
         };
         hydrate_full_state(&mut db, &entry).unwrap();
+        for name in &memo_names {
+            let owner = Name::from_str(name).unwrap().as_u64();
+            db.create_account(owner, 7).unwrap();
+        }
         db.set_revision(7).unwrap();
         let checkpoint_bytes = db.snapshot_bytes().unwrap();
         drop(db);
@@ -763,19 +790,8 @@ mod tests {
             &signing.public_key().to_string(),
             &manifest.checkpoint_sha256,
         );
-        let mut members = vec![HaltDeclarationMember {
-            producer: "prod.a".to_string(),
-            key: signing.public_key().to_string(),
-            weight: pulsevm_chain_types::HaltWeight::MEMBER,
-        }];
-        HaltDeclaration::sort_members(&mut members);
-        let unsigned = HaltDeclaration {
-            version: HaltDeclaration::VERSION,
-            source_chain_id: "41".repeat(32),
-            last_height: 7,
-            validator_set: members,
-            signatures: Vec::new(),
-        };
+        // `members`/`unsigned` were built (and memo-staged) above so the
+        // checkpoint carries the declaration accounts before the snapshot.
         let decl_digest = unsigned.digest().unwrap();
         let vote_signature = signing.sign(&decl_digest).to_string();
         let declaration = HaltDeclaration {
@@ -806,6 +822,18 @@ mod tests {
         };
         let conf_digest = template.digest().unwrap();
         manifest.halt_declaration = Some(declaration);
+        // The fixture H header packs timestamp 0x01020304 (slot 67305985);
+        // the memo accounts were created (slot 1000) and staged above, so
+        // the inclusion proof verifies end to end.
+        manifest.halt_memo_accounts = Some(
+            memo_names
+                .iter()
+                .map(|name| pulsevm_database::MigrationMemoAccount {
+                    name: name.clone(),
+                    created_slot: 1000,
+                })
+                .collect(),
+        );
         manifest.halt_confirmation = Some(HaltConfirmation {
             signatures: vec![HaltSignature {
                 producer: "prod.a".to_string(),
@@ -908,12 +936,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fixture_without_producers_table() {
-        // The boot gate fails closed without the producers table, and the
-        // offline verifier mirrors it: a manifest that validates without
-        // the state binding would let an unattested roster boot.
+    fn accepts_fixture_without_producers_table() {
+        // The producers table carries every active row while the recorded
+        // schedule names only the committee, so the table is not a
+        // membership source: a checkpoint without it still verifies, with
+        // the committee pinned by the halt pair instead.
         let fixture = fixture(false, false);
-        assert_ne!(
+        assert_eq!(
             run(
                 &fixture.manifest,
                 &fixture.checkpoint,
@@ -965,6 +994,62 @@ mod tests {
                 &fixture.checkpoint,
                 None,
                 Some(wrong.to_str().expect("genesis path is UTF-8")),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    fn rewrite_manifest(fixture: &Fixture, mutate: impl FnOnce(&mut serde_json::Value)) {
+        let bytes = std::fs::read(&fixture.manifest).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        mutate(&mut manifest);
+        std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rejects_memo_account_missing_from_checkpoint_state() {
+        // Names that decode but name no account fail at the restore
+        // binding, not at the digest re-decode.
+        let fixture = fixture(false, true);
+        rewrite_manifest(&fixture, |manifest| {
+            manifest["halt_memo_accounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name": "haaaaaaaaaaa", "created_slot": 1000}));
+        });
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn rejects_memo_account_created_at_or_after_h() {
+        // Creation at H (slot 67305985, packed in the fixture header)
+        // proves nothing landed before the cutoff.
+        let fixture = fixture(false, true);
+        rewrite_manifest(&fixture, |manifest| {
+            for account in manifest["halt_memo_accounts"].as_array_mut().unwrap() {
+                account["created_slot"] = serde_json::json!(67305985u32);
+            }
+        });
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
                 Some(&FIXTURE_PLATFORM),
                 None,
             ),

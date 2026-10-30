@@ -98,24 +98,21 @@ leap_post() {
     curl --fail --silent --max-time 15 -X POST "$1$2" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$3"
 }
-# Fetch one (get_block, get_block_header_state) pair from one Leap node
-# ($2, default the producer) into the freeze work dir:
-# block-H.json/block-H.state.json for the cutover height ($H, global),
-# block-post-<n>.json/.state.json above it. Writes via .tmp+mv so a
+# Fetch one (get_block, get_block_header_state) pair for a post-H height
+# ($1) from one Leap node ($2, default the producer) into the freeze work
+# dir as block-post-<n>.json/.state.json. (H's own pair is staged
+# separately at the freeze instant.) Writes via .tmp+mv so a
 # failed fetch never leaves a half file. Returns nonzero WITHOUT failing
 # when the pair is not servable yet; the caller retries. Pre-pause
 # capture must use the producer (validators lag it); post-pause top-up
 # must use a validator (the producer is SIGSTOPped and answers nothing).
 # Either way every pair has to be captured while its block is still
-# reversible: the LIB gate makes H irreversible on every node.
+# reversible; a block that goes irreversible before its pair lands
+# supersedes the round.
 prefetch_pair() { # $1=height [$2=api]
     local n="$1" api block_file state_file
     api="${2:-$LEAP_API}"
-    if [[ "$n" == "$H" ]]; then
-        block_file="$WORK_DIR/block-H.json"; state_file="$WORK_DIR/block-H.state.json"
-    else
-        block_file="$WORK_DIR/block-post-$n.json"; state_file="$WORK_DIR/block-post-$n.state.json"
-    fi
+    block_file="$WORK_DIR/block-post-$n.json"; state_file="$WORK_DIR/block-post-$n.state.json"
     [[ -f "$block_file" && -f "$state_file" ]] && return 0
     curl --fail --silent --max-time 10 -X POST "$api/v1/chain/get_block" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
@@ -784,11 +781,13 @@ PYEOF
         K="$((H - MEMO_BLOCK))"
         echo "handover: round $round memo sealed in block $MEMO_BLOCK (K=$K); digest re-decodes from chain"
         # Capture the memo accounts so the equivalence gate proves they
-        # migrated too.
+        # migrated too, and so the inclusion proof can re-decode them. The
+        # file is a chunk-ordered list (JSON objects are unordered, and the
+        # chunk order is what the digest decodes from).
         python3 - "$LEAP_API" "$WORK_DIR/memo-accounts.json" $memo_names <<'PYEOF' || fail "memo account capture failed"
 import json, sys, time, urllib.request
 api, out, names = sys.argv[1], sys.argv[2], sys.argv[3:]
-accts = {}
+accts = []
 for name in names:
     for _ in range(30):
         try:
@@ -797,7 +796,7 @@ for name in names:
                                          headers={"Content-Type": "application/json",
                                                   "Host": "0.0.0.0:8888"})
             with urllib.request.urlopen(req, timeout=15) as r:
-                accts[name] = json.load(r)
+                accts.append({"name": name, "account": json.load(r)})
             break
         except Exception:
             time.sleep(2)
@@ -817,12 +816,10 @@ PYEOF
         # superseded history).
         #
         # The same instant also captures H's (block, header-state) pair:
-        # header state is only served while a block is still reversible,
-        # and on this network LIB trails the head by one block — so H goes
-        # irreversible the moment H+2 is produced, ~1s after H is first
-        # observable. Fetching here, in the same poll iteration that sees
-        # head==H, is the only reliable capture; anything later (even the
-        # capture loop below) races finality it usually loses.
+        # header state is only served while a block is still reversible, so
+        # fetching here, in the same poll iteration that first sees head==H,
+        # is the only reliable capture. The state is bound to the snapshotted
+        # head id below; a foreign state fails there, not at the gate.
         echo "handover: round $round snapshotting the running producer at H=$H..."
         local snap_info snap_code
         snap_code=0
@@ -858,6 +855,15 @@ with open(f"{workdir}/block-H.json", "w") as f:
     json.dump(block, f)
 with open(f"{workdir}/block-H.state.json", "w") as f:
     json.dump(state, f)
+# Header state is only served while a block is still reversible, and H is
+# the head in this exact poll iteration — the only moment its state is
+# guaranteed servable. (No export nodeos can serve it later: a node
+# hydrated from the H snapshot takes H as its irreversible base, and
+# Leap serves header state for reversible blocks only. So the authoritative
+# schedule the proof authenticates against is captured here, from this
+# synced node, bound below to the snapshotted H id — never from a live
+# get_producer_schedule query, whose pending schedule may already have
+# moved on, and never from the producers table.)
 snap = post("/v1/producer/create_snapshot", {})
 n, hid = snap.get("snapshot_name", ""), snap.get("head_block_id", "")
 if not n or not hid:
@@ -865,6 +871,9 @@ if not n or not hid:
     sys.exit(1)
 if hid != block.get("id"):
     print(f"snapshot slipped past H={H}: {hid} != {block.get('id')}", file=sys.stderr)
+    sys.exit(2)
+if state.get("id") != hid:
+    print(f"header state is not for H={H}: {state.get('id')} != {hid}", file=sys.stderr)
     sys.exit(2)
 print(f"{n} {hid}")
 PYEOF
@@ -879,64 +888,51 @@ PYEOF
         SNAP_HID="${snap_info##* }"
         [[ -n "$SNAP_NAME" && -n "$SNAP_HID" ]] || fail "producer snapshot returned no name/id"
         echo "handover: snapshot $SNAP_NAME at $SNAP_HID"
-        # Live-flip irreversibility gate, fused with pair capture: before
-        # pausing, require both validators to report
-        # last_irreversible_block_num >= H. The cutoff (votes, empty H)
-        # must be BFT-final on the source network, not merely present at
-        # its tip — the producer is about to stop, so a lagging LIB could
-        # never catch up afterwards. Fails closed.
+        # Agreed stop: P is fixed up front (H + STOP_LAG), never observed.
+        # Every producer stops at the same agreed P — the fleet pact and
+        # the voter enforce it — and the 15-of-21 confirmation quorum over
+        # H_ID stands in for Leap finality. So there is NO LIB wait: on a
+        # large committee LIB(H) arrives hundreds of blocks after the
+        # agreed stop, and waiting for it deadlocks the halt while the
+        # chain builds an unproven tail past the proof window.
         #
-        # The same wait doubles as the capture window for the (block,
-        # header-state) pairs the attach stage needs: header state is only
-        # served while a block is still reversible, and this very gate
-        # makes H irreversible on every node. So poll the still-running
-        # producer head each pass and fetch every unseen block H..H+5 the
-        # moment it appears; the pause below then fixes P, and only the
-        # tip blocks produced during pause latency can still be missing
-        # (topped up afterwards — the fresh tip is always reversible
-        # because LIB trails production). If the producer outruns H+5
-        # before LIB covers H, the round cannot land P in (H, H+5]:
-        # supersede it now while the producer still runs.
-        echo "handover: round $round capturing pairs + waiting for validator LIB to cover H=$H..."
-        local lib1 lib2 attempt next_fetch
-        next_fetch="$H"
-        lib1=""; lib2=""
+        # The loop below only streams post-H pairs while the producer still
+        # builds: header state is served while a block is reversible, so
+        # every H+1..P tip is fetched the moment it appears; H itself comes
+        # from the export nodeos (snapshot-bound, no race). The pause then
+        # lands exactly on P, and only tip blocks produced during pause
+        # latency can still be missing (topped up afterwards — the fresh tip
+        # is always reversible because LIB trails production).
+        CUTOVER_STOP_LAG="${CUTOVER_STOP_LAG:-5}"
+        P_AGREED=$((H + CUTOVER_STOP_LAG))
+        echo "handover: round $round capturing post-H pairs until the agreed stop P=$P_AGREED..."
+        local attempt next_fetch
+        next_fetch=$((H + 1))
         for attempt in $(seq 1 900); do
             local prod_head
             prod_head="$(leap_head_lib "$LEAP_API" 2>/dev/null | cut -d' ' -f1 || true)"
             if [[ -n "$prod_head" ]]; then
-                if [[ "$prod_head" -gt "$((H + 5))" ]]; then
-                    echo "handover: round $round producer outran H+5 ($prod_head) before LIB covered H; superseded, retrying..."
-                    H=""
-                    continue 2
-                fi
                 local n
                 n="$next_fetch"
-                while [[ "$n" -le "$prod_head" && "$n" -le "$((H + 5))" ]]; do
+                while [[ "$n" -le "$prod_head" && "$n" -le "$P_AGREED" ]]; do
                     prefetch_pair "$n" && next_fetch="$((n + 1))"
                     n="$((n + 1))"
                 done
+                if [[ "$prod_head" -ge "$P_AGREED" ]]; then
+                    break
+                fi
             fi
-            lib1="$(leap_head_lib "$LEAP_V1_API" 2>/dev/null | cut -d' ' -f2 || true)"
-            lib2="$(leap_head_lib "$LEAP_V2_API" 2>/dev/null | cut -d' ' -f2 || true)"
-            if [[ -n "${lib1:-}" && -n "${lib2:-}" && "$lib1" -ge "$H" && "$lib2" -ge "$H" ]]; then
-                echo "handover: LIB covers H on both validators [$lib1 $lib2]"
-                break
-            fi
-            [[ "$attempt" == 900 ]] && fail "validator LIB never reached H=$H ([${lib1:-?} ${lib2:-?}])"
+            [[ "$attempt" == 900 ]] && fail "producer head never reached the agreed stop P=$P_AGREED"
             sleep 0.2
         done
-        # Freeze: SIGSTOP-via-pause is instant. The exact-H anchor is the
-        # pre-pause snapshot above (create_snapshot costs ~0.36s of the 0.5s
-        # block interval, so the pause always lands a block or two past H).
-        # The pause just stops the network for the static tail: record the
-        # actual frozen head P, require P-H to be small (a large gap means
-        # the pause mechanism itself is broken), and require every validator
-        # to converge to P. All cutover proofs still reference H exactly.
-        echo "handover: round $round freezing the producer (snapshot holds H=$H)..."
+        # Freeze: SIGSTOP-via-pause is instant. Poll for the agreed P and
+        # pause the moment it is observed; the exact-P check below rejects
+        # any overshoot past P (an extra block would be an unstaged tail),
+        # superseding the round like any other miss.
+        echo "handover: round $round freezing the producer at the agreed stop P=$P_AGREED (snapshot holds H=$H)..."
         local freeze_code
         freeze_code=0
-        python3 - "$producer_cid" "$H" "$LEAP_API" <<'PYEOF' || freeze_code=$?
+        python3 - "$producer_cid" "$P_AGREED" "$LEAP_API" <<'PYEOF' || freeze_code=$?
 import json, subprocess, sys, time, urllib.request
 cid, target, api = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def head():
@@ -976,10 +972,11 @@ PYEOF
             fi
             sleep 1
         done
-        # The pause head must sit strictly past H: a pause exactly on H
-        # stages no proof, so the round is superseded like any overshoot.
-        if [[ -z "$P" || "$P" -le "$H" || "$((P - H))" -gt 5 ]]; then
-            echo "handover: round $round validators converged to [$v1] [$v2], not within (H, H+5] for H=$H; unpausing, retrying..."
+        # The pause head must sit exactly on the agreed stop: any block past
+        # P would be an unstaged tail outside the H+1..P proof window, so an
+        # overshoot supersedes the round like any other miss.
+        if [[ -z "$P" || "$P" != "$P_AGREED" ]]; then
+            echo "handover: round $round validators converged to [$v1] [$v2], not exactly P=$P_AGREED for H=$H; unpausing, retrying..."
             docker unpause "$producer_cid" >/dev/null 2>&1 || true
             H=""
             continue
@@ -994,10 +991,11 @@ PYEOF
         echo "$v2_head" >"$WORK_DIR/P_V2"
         # Top-up: blocks produced between the last capture poll and the
         # pause (at most the fresh tip) still lack pairs. The producer is
-        # paused, so query a validator: the tip is seconds old on a network
-        # whose LIB trails production. Anything still missing means
-        # finality outran capture: supersede the round like an overshoot.
-        if ! top_up_pairs "$H" "$P" "$LEAP_V1_API"; then
+        # paused, so query a validator: the tip is seconds old. Anything
+        # still missing means finality outran capture: supersede the round
+        # like an overshoot. (H's own pair is already staged from the freeze
+        # capture above, not here.)
+        if ! top_up_pairs "$((H + 1))" "$P" "$LEAP_V1_API"; then
             echo "handover: round $round pair capture lost to finality for H=$H..P=$P; unpausing, retrying..."
             docker unpause "$producer_cid" >/dev/null 2>&1 || true
             H=""
@@ -1009,36 +1007,18 @@ PYEOF
     echo "$MEMO_BLOCK" >"$WORK_DIR/memo-block"
     echo "$K" >"$WORK_DIR/cutover-K"
     echo "$DECL_DIGEST" >"$WORK_DIR/decl-digest"
+    echo "$P_AGREED" >"$WORK_DIR/P-agreed"
     [[ -f "$WORK_DIR/block-H.json" ]] || curl --fail --silent --max-time 15 -X POST "$LEAP_V1_API/v1/chain/get_block" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' \
         -d "{\"block_num_or_id\":\"$H\"}" >"$WORK_DIR/block-H.json" || fail "get_block H=$H failed"
     H_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK_DIR/block-H.json")"
     echo "$H_ID" >"$WORK_DIR/H_ID"
-    # The cutover block must be empty (no transactions, no schedule change):
-    # the memo landed strictly below H, so anything in H is foreign traffic.
-    python3 - "$WORK_DIR/block-H.json" <<'PYEOF' || fail "block H=$H is not an empty boundary"
-import json, sys
-b = json.load(open(sys.argv[1]))
-sys.exit(0 if (not b.get("transactions") and not b.get("new_producers")) else 1)
-PYEOF
     echo "handover: network frozen at P=$(cat "$WORK_DIR/P"), cutover H=$H id=$H_ID; memo block $MEMO_BLOCK (K=$K)"
-    # H's own header state: the attach tool records H as a gate entry from
-    # H's block plus this state, so the window opens on a signature-checked
-    # H rather than a bare anchor. Captured pre-pause above (header state
-    # is only served while reversible); the fetch below is a backup that
-    # can only succeed while H is still reversible.
-    [[ -f "$WORK_DIR/block-H.state.json" ]] || leap_post "$LEAP_V1_API" /v1/chain/get_block_header_state "{\"block_num_or_id\":\"$H\"}" \
-        >"$WORK_DIR/block-H.state.json" \
-        || fail "get_block_header_state H=$H failed"
-    # Post-H emptiness evidence (H+1..P, never empty now that P sits past H)
-    # and the frozen active schedule: the validators stay live while the
-    # producer is paused, so fetch every header past H from one of them.
-    # The attach tool authenticates each header against the recorded
-    # schedule key and packs the restore gate's proof; a header carrying
-    # traffic fails there, not here.
-    leap_post "$LEAP_V1_API" /v1/chain/get_producer_schedule '{}' >"$WORK_DIR/schedule-H.json" \
-        || fail "get_producer_schedule at H=$H failed"
-    echo "handover: frozen schedule staged: $WORK_DIR/schedule-H.json"
+    # H's own header state was captured at the freeze above (block-H.state.json):
+    # the attach tool records H as a gate entry from H's block plus this
+    # state, so the window opens on a signature-checked H rather than a bare
+    # anchor. No fetch here: header state is only served while reversible,
+    # and H went irreversible as the chain built to P.
     post_n=$((H + 1))
     while [[ "$post_n" -le "$P" ]]; do
         # Pairs arrive pre-captured from the running producer; the fetches
@@ -1060,7 +1040,7 @@ PYEOF
     # The snapshot was taken pre-pause on the running producer: bind it to
     # the cutover H (same id ⇒ same deterministic state) and stage it from
     # the root-owned producer volume, the legacy pattern. Blocks H+1..P are
-    # rehearsal stragglers past the declared cutoff, ignored by design.
+    # the agreed proof window up to the exact stop P, staged above.
     [[ "$SNAP_HID" == "$H_ID" ]] || fail "snapshot head $SNAP_HID != frozen H=$H $H_ID"
     docker run --rm -v pulsevm-handover_leap-data:/d:ro -v "$WORK_DIR:/out" ubuntu:24.04 \
         cp "/d/snapshots/$(basename "$SNAP_NAME")" /out/snapshot.bin \
@@ -1288,11 +1268,12 @@ PYEOF
 confirm_attach_verify() { # $1=platform-chain-id
     local platform_chain="$1"
     local confirm_out CONF_DIGEST NEW_CHAIN h_version vote_version
-    # Each validator reported its own frozen head while converging on P
-    # (saved as P_V1/P_V2): the agreed head is the quorum's pause
-    # attestation, and the gate requires the post-H proof to cover exactly
-    # it. The ceremony tool refuses unless every signer attests the same
-    # head, so a divergent freeze fails here, not at boot.
+    # P is the ceremony's agreed stop (fixed H+k before the freeze, saved
+    # at freeze time; the validators' converged heads in P_V1/P_V2 are the
+    # audit trail that the network actually stopped there). The gate
+    # requires the post-H proof to cover exactly it. The ceremony tool
+    # refuses unless every signer confirms the same agreed head, so a
+    # divergent freeze fails here, not at boot.
     P="$(cat "$WORK_DIR/P")" || fail "could not read frozen head P"
     confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
         || fail "confirmation failed"
@@ -1318,29 +1299,47 @@ confirm_attach_verify() { # $1=platform-chain-id
         echo "handover: schedule version $h_version unanimous across votes and H"
         attach_args+=(--contract-ceremony "$WORK_DIR/fragment.json" --schedule-version "$h_version")
     fi
-    # A checkpoint taken mid-rotation would boot the new chain with a pending
-    # proposal the ceremony never froze (global_property carries it, but the
-    # checkpoint cannot prove its absence later). Read the schedule staged
-    # from a live validator at the freeze and record the absence; anything
-    # staged fails closed here, not at boot. A live query is impossible here
-    # by design: the shared tail stops the XPR network after staging it, and
-    # the frozen network all reported the identical schedule anyway.
-    [[ -f "$WORK_DIR/schedule-H.json" ]] \
-        || fail "frozen schedule not staged (H+1..P collection runs before the stop)"
-    staged="$(python3 -c 'import json,sys; s = json.load(open(sys.argv[1])); print(" ".join(k for k in ("pending", "proposed") if (s.get(k) or {}).get("producers")))' "$WORK_DIR/schedule-H.json")" \
-        || fail "could not read staged producer schedule at H"
-    [[ -z "$staged" ]] \
-        || fail "schedule change staged at H ($staged): freeze the ceremony after it activates"
-    echo "handover: no proposed schedule at H"
-    # The absence is derived from this same file by the attach tool (never
-    # hand-typed): a staged pending or proposed schedule fails the record.
+    # The frozen schedule is read from H's header state, captured from the
+    # coordinator's own synced node in the same poll iteration that first
+    # observed head==H (header state is only served while reversible, and no
+    # export nodeos can serve H later: a node hydrated from the H snapshot
+    # takes H as its irreversible base). It is bound here to the
+    # snapshotted H id — id prefix bytes carry the block number — so a
+    # foreign state fails here with the heights attached. Never from a live
+    # get_producer_schedule query, whose pending schedule may already have
+    # moved on, and never from the producers table (which lists every
+    # active row, not the schedule).
+    # The attach tool derives both the roster's active schedule and the
+    # pending/proposed absence from this same file (never hand-typed).
     # The frozen schedule pins the roster the H and post-H signatures (and
-    # the declaration quorum) resolve against; the staged H block and
-    # H+1..P headers are the emptiness proof the restore gate re-verifies
-    # from the manifest.
-    attach_args+=(--schedule "$WORK_DIR/schedule-H.json")
-    [[ -f "$WORK_DIR/block-H.state.json" ]] || fail "H header state not staged"
-    attach_args+=(--halt-state "$WORK_DIR/block-H.state.json")
+    # the declaration quorum) resolve against.
+    H_STATE="$WORK_DIR/block-H.state.json"
+    [[ -f "$H_STATE" ]] \
+        || fail "H header state not captured at the freeze"
+    h_state_num="$(python3 -c 'import json,struct,sys; print(struct.unpack(">I", bytes.fromhex(json.load(open(sys.argv[1]))["id"])[:4])[0])' "$H_STATE")" \
+        || fail "could not read H header state block number"
+    h_state_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$H_STATE")" \
+        || fail "could not read H header state block id"
+    [[ "$h_state_num" == "$H" && "$h_state_id" == "$H_ID" ]] \
+        || fail "H header state is block $h_state_num $h_state_id, not H=$H $H_ID"
+    echo "handover: frozen schedule bound to H=$H $H_ID"
+    # A checkpoint taken mid-rotation would boot the new chain with a pending
+    # proposal the ceremony never froze. Read the pending producers out of
+    # H's header state and fail closed here, not at boot.
+    staged_pending="$(python3 -c 'import json,sys; s = json.load(open(sys.argv[1])); print(len(((s.get("pending_schedule") or {}).get("schedule") or {}).get("producers") or []))' "$H_STATE")" \
+        || fail "could not read staged pending schedule at H"
+    [[ "$staged_pending" == "0" ]] \
+        || fail "schedule change staged at H ($staged_pending pending producers): freeze the ceremony after it activates"
+    echo "handover: no proposed schedule at H"
+    attach_args+=(--halt-state "$H_STATE")
+    if [[ "${CUTOVER_VEHICLE:-memo}" == "memo" ]]; then
+        # The declaration-inclusion proof: the memo accounts captured at
+        # declaration time (chunk-ordered list) are recorded so the gate
+        # proves each name re-decodes to the declaration digest and existed
+        # before H. The contract vehicle has no memo accounts.
+        [[ -f "$WORK_DIR/memo-accounts.json" ]] || fail "memo accounts not captured at declaration"
+        attach_args+=(--memo-accounts "$WORK_DIR/memo-accounts.json")
+    fi
     post_n=$((H + 1))
     while [[ "$post_n" -le "$P" ]]; do
         [[ -f "$WORK_DIR/block-post-$post_n.json" ]] || fail "post-H header $post_n not staged"
@@ -1363,7 +1362,7 @@ confirm_attach_verify() { # $1=platform-chain-id
     "$ATTACH_BIN" \
         "$manifest" "$WORK_DIR/block-H.json" "$manifest.attached" \
         "${attach_args[@]}" \
-        || fail "source block attach failed (H must be an empty block)"
+        || fail "source block attach failed (H carries the cutoff state; only H+1..P must be empty)"
     mv "$manifest.attached" "$manifest"
     # Empty-array expansion under `set -u` aborts pre-4.4 bash (macOS):
     # branch on length instead of expanding a possibly-empty array.
@@ -1842,7 +1841,10 @@ old = json.load(open(pre))
 # migrated alongside the pre-halt traffic (absent on legacy runs).
 memo_path = os.path.join(os.path.dirname(pre), "memo-accounts.json")
 if os.path.exists(memo_path):
-    old.update(json.load(open(memo_path)))
+    memo_data = json.load(open(memo_path))
+    # Chunk-ordered list of name/account pairs (the inclusion proof needs
+    # the order; JSON objects would lose it).
+    old.update({e["name"]: e["account"] for e in memo_data})
 bad = 0
 for name, old_acct in sorted(old.items()):
     try:

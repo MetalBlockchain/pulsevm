@@ -152,7 +152,6 @@ use pulsevm_database::{
     TimePoint,
     TransactionDependencies,
     estimate_parallel_waves,
-    migration_state_producer_keys,
     seconds,
 };
 use pulsevm_error::ChainError;
@@ -1555,54 +1554,40 @@ impl Controller {
                     )));
                 }
             }
-            // Bind the transported roster to checkpoint content now that the
-            // state is restored. The declared set must MATCH the on-chain
-            // schedule exactly (the light-client rule: same set both ways,
-            // same keys), so a declaration naming only its signer fails
-            // closed. Weights are pinned by the frozen on-chain tally when
-            // contract evidence is attached; the memo path without a
-            // ceremony keeps the exact weight pin (tight window by
-            // construction). Real XPR checkpoints always carry the
-            // producers table; a checkpoint without one cannot prove the
-            // declared set is the on-chain schedule, so it fails closed
-            // instead of skipping the check.
+            // The producers table is NOT the schedule: on mainnet it carries
+            // every active row (standbys included) while the schedule names
+            // only the committee, so no membership check touches it — a
+            // correct 21-member declaration would fail against 37 rows, and
+            // a 37-member one would fail the voter's live-schedule check.
+            // Committee membership was already pinned above: the declaration
+            // must equal the recorded schedule exactly (both ways, same
+            // keys), and that recorded schedule comes from the snapshot's
+            // header state, bound by the confirmed checkpoint — not from a
+            // live schedule query and not from the table. Weights are 1 by
+            // construction, so there is no weight pin to re-check here.
             if let Some(roster) = migration_roster.as_ref() {
-                let state_keys = migration_state_producer_keys(&self.db).map_err(|error| {
+                info!(
+                    "migration halt roster verified against the snapshot-bound schedule: {} producers",
+                    roster.len()
+                );
+            }
+            // Memo-vehicle inclusion closes the other half of the timing
+            // proof: the pair verifier re-decoded the recorded memo names
+            // to the declaration digest with creation required before H,
+            // and here every recorded name must exist in the restored
+            // checkpoint state — names that decode but name no account fail
+            // here, so a bare asserted inclusion height can never boot.
+            match pulsevm_database::verify_memo_accounts_exist(&self.db, &manifest).map_err(
+                |error| {
                     ChainError::GenesisError(format!(
-                        "migration producers table unreadable: {error}"
+                        "migration memo inclusion proof rejected: {error}"
                     ))
-                })?;
-                if state_keys.is_empty() {
-                    return Err(ChainError::GenesisError(
-                        "migration roster state cross-check refused: no producers table in checkpoint state"
-                            .into(),
-                    ));
-                } else {
-                    // Key-anchored schedule check: every declared member must be
-                    // active in checkpoint state with the same schedule key.
-                    // Weights are 1 by construction, so there is no H-state
-                    // weight pin to re-check here.
-                    match pulsevm_database::check_halt_roster_matches_state(roster, &state_keys)
-                        .map_err(|error| {
-                            ChainError::GenesisError(format!(
-                                "migration halt roster rejected by checkpoint schedule: {error}"
-                            ))
-                        })? {
-                        Some(matched) => info!(
-                            "migration halt roster matches checkpoint schedule: {matched} producers"
-                        ),
-                        // Unreachable when the table is present (the check
-                        // only returns `None` for an empty table, which
-                        // fails closed above): fail closed defensively
-                        // rather than silently skipping the binding.
-                        None => {
-                            return Err(ChainError::GenesisError(
-                                "migration roster state cross-check refused: no producers table in checkpoint state"
-                                    .into(),
-                            ));
-                        }
-                    }
-                }
+                },
+            )? {
+                0 => {}
+                proven => info!(
+                    "migration memo inclusion proven: {proven} declaration accounts in checkpoint state"
+                ),
             }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
@@ -10593,13 +10578,12 @@ mod tests {
         Ok(())
     }
 
-    // A checkpoint without the XPR producers table cannot prove the
-    // declared set is the on-chain schedule: the restore fails closed
-    // instead of promoting state the schedule never endorsed. The pair
-    // itself verifies — the refusal names the missing table, not the
-    // cryptography.
+    // A checkpoint without the XPR producers table still boots: the table
+    // carries every active row while the schedule names only the
+    // committee, so it is not a membership source. The pair itself
+    // verifies — the committee is pinned by the snapshot-bound schedule.
     #[tokio::test]
-    async fn migration_restore_refuses_checkpoint_without_producers_table() -> Result<(), ChainError>
+    async fn migration_restore_boots_checkpoint_without_producers_table() -> Result<(), ChainError>
     {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -10616,8 +10600,9 @@ mod tests {
         checkpoint_db.add_indices()?;
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
-        // Deliberately no producers table: the fixture stages nothing the
-        // roster cross-check could bind against.
+        // Deliberately no producers table: the table carries every active
+        // row while the schedule names only the committee, so it is not a
+        // membership source and the restore must not need it.
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10679,6 +10664,140 @@ mod tests {
             &chain_id.0.0,
         )?;
         let target_path = temp.path().join("table-less-target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), 42);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        controller.shutdown()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_fictional_memo_accounts() -> Result<(), ChainError> {
+        // Names that decode but name no checkpoint account fail the
+        // inclusion proof at restore: a bare asserted inclusion height
+        // can never boot.
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let temp = get_temp_dir();
+        let checkpoint_dir = temp.path().join("fictional-memo-source");
+        let checkpoint_path = temp.path().join("fictional-memo.snapshot");
+        let mut checkpoint_db = Database::new(checkpoint_dir.to_str().unwrap(), 1024 * 1024)
+            .map_err(ChainError::InternalError)?;
+        checkpoint_db.add_indices()?;
+        checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
+        checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        checkpoint_db.set_revision(42)?;
+        let checkpoint = checkpoint_db.snapshot_bytes()?;
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("fictional-memo.manifest.json");
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        let mut manifest = MigrationManifest::new(
+            b"controller fictional memo migration test",
+            source_block_id.0.0,
+            &checkpoint,
+            42,
+            pulsevm_database::ImportSummary {
+                input_transactions: 1,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "migration_checkpoint": checkpoint_path,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        // Names that decode to the recorded declaration digest but name no
+        // checkpoint account: the pair verify passes the re-decode and the
+        // restore must fail at the existence binding.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let declaration: pulsevm_database::HaltDeclaration =
+            serde_json::from_value(manifest["halt_declaration"].clone()).map_err(|e| {
+                ChainError::InternalError(format!("fixture declaration unreadable: {e}"))
+            })?;
+        let digest_hex = hex::encode(declaration.digest().map_err(|e| {
+            ChainError::InternalError(format!("fixture declaration digest failed: {e:?}"))
+        })?);
+        let letters: String = digest_hex
+            .bytes()
+            .map(|b| {
+                let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                (b'a' + nibble) as char
+            })
+            .collect();
+        let names: Vec<String> = letters
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|chunk| format!("ha{}", chunk.iter().collect::<String>()))
+            .collect();
+        manifest["halt_memo_accounts"] = serde_json::Value::Array(
+            names
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "created_slot": 1u32}))
+                .collect(),
+        );
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).map_err(|e| {
+                ChainError::InternalError(format!("failed to encode manifest: {e}"))
+            })?,
+        )
+        .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        let target_path = temp.path().join("fictional-memo-target");
         let error = Controller::new()
             .initialize(
                 &chain_id,
@@ -10688,8 +10807,10 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("no producers table"),
-            "a table-less checkpoint must fail closed on the missing table, got: {error}"
+            error
+                .to_string()
+                .contains("does not exist in checkpoint state"),
+            "a fictional memo account must fail closed, got: {error}"
         );
         Ok(())
     }
@@ -10701,12 +10822,11 @@ mod tests {
     // an unverifiable block. These tests pin both sides with a
     // self-contained checkpoint.
     /// Seed the XPR `eosio/producers` schedule table into a fixture
-    /// database so the restore's roster↔state cross-check has checkpoint
-    /// state to bind against: every member is written active with exactly
-    /// the schedule key the declaration will name. Real XPR checkpoints
-    /// always carry this table; synthetic fixtures must stage it
-    /// explicitly — a checkpoint without it fails closed at restore, by
-    /// design, instead of skipping the check.
+    /// database so synthetic fixtures look like real XPR checkpoints
+    /// (which always carry this table): every member is written active
+    /// with exactly the schedule key the declaration names. The table is
+    /// not a membership source — the recorded schedule is — so the restore
+    /// no longer reads it; it stays staged here for fixture realism.
     fn seed_producers_table(
         db: &mut Database,
         members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],

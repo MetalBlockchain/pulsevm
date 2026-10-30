@@ -7,8 +7,9 @@
 //!
 //! * signs the frozen declaration digest with the block-signing key and submits the on-chain `vote`
 //!   once, inside the window;
-//! * after H is final, signs the confirmation digest and delivers it to the coordinator (or a file
-//!   when no coordinator is configured).
+//! * signs the confirmation digest over the agreed pause head P (fixed H+k, never a LIB wait — on a
+//!   large committee LIB(H) arrives long after the agreed stop) and delivers it to the coordinator
+//!   (or a file when no coordinator is configured).
 //!
 //! Guardrails (all enforced, all logged, never silent):
 //!
@@ -16,7 +17,8 @@
 //!   recomputed locally from the published roster. Anything else is refused, never signed.
 //! * The signing key must belong to the frozen member row, and the row must not already show a
 //!   vote. Outsider keys and double votes refuse.
-//! * No vote at or after H, no confirmation before H is irreversible.
+//! * No vote at or after H; the confirmation quorum over H_ID stands in for Leap finality instead
+//!   of waiting on LIB.
 //! * Keys come from files with owner-only permissions (refused otherwise) or the environment, never
 //!   from the command line, and are never logged.
 //! * `--dry-run` evaluates every decision and logs it without signing, submitting, or writing
@@ -102,25 +104,24 @@ struct Config {
     #[serde(default)]
     confirmation: ConfirmationConfig,
     /// Opt-in local producer stop. When `at_pause` is set with a
-    /// `producer_api_url`, the voter pauses its own producer once its
-    /// confirmation for the agreed pause head is delivered and the local
-    /// head has reached P (Leap `producer/pause`). A contract cannot halt
-    /// block production — only the producer can — so this is the half of
-    /// the halt that lives in the binary. Off by default: a surprise pause
-    /// is worse than a loud refusal to start.
+    /// `producer_api_url`, the voter pauses its own producer once the local
+    /// head has reached P (Leap `producer/pause`), whether or not its own
+    /// confirmation was delivered: a producer whose submission failed must
+    /// still stop, or its tail runs past the proof window unstaged. A
+    /// contract cannot halt block production — only the producer can — so
+    /// this is the half of the halt that lives in the binary. Off by
+    /// default: a surprise pause is worse than a loud refusal to start.
     #[serde(default)]
     stop_producer: StopConfig,
 }
 
 /// Local producer stop at the agreed pause head P. Both fields are required
 /// together: `at_pause` without a URL fails fast at startup instead of
-/// silently never pausing. Only a voter that delivered its own confirmation
-/// pauses (a voter that never confirmed keeps producing, so an aborted
-/// ceremony never halts a live chain by accident); the fleet pact must
-/// therefore ensure every scheduled producer confirms, and monitoring must
-/// catch the ones that do not. `at_h` is the removed predecessor that
-/// stopped at H: any config still carrying it is refused below instead of
-/// silently never pausing.
+/// silently never pausing. The stop is deliberately independent of
+/// confirmation delivery — a failed submission must still halt the
+/// producer, or its tail runs past the proof window. `at_h` is the removed
+/// predecessor that stopped at H: any config still carrying it is refused
+/// below instead of silently never pausing.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct StopConfig {
     #[serde(default)]
@@ -1229,13 +1230,17 @@ async fn unsigned_confirmation(
         ));
     }
     let local_block_id = fetch_block_id(client, &config.inner.nodeos_url, height).await?;
-    // No voter attests a head it has not seen: signing P requires the
-    // local head at or past P (overshoot is fine — blocks past P are
-    // simply never staged).
+    // No voter attests a head it has not seen: signing requires the local
+    // head at or past H, so H_ID is observed, not assumed. The agreed
+    // pause head P comes from config (cross-checked against the
+    // coordinator above), never from the local tip: it is the stop the
+    // quorum agreed, and the quorum over H_ID stands in for Leap finality,
+    // so no voter waits for LIB — on a large committee LIB(H) arrives
+    // after the agreed stop, and waiting for it would deadlock the halt.
     let (head_num, _, _) = get_info(client, &config.inner.nodeos_url).await?;
-    if head_num < pause_height {
+    if head_num < height {
         return Err(format!(
-            "local head {head_num} has not reached the agreed pause head {pause_height}: nothing to confirm yet"
+            "local head {head_num} has not reached H={height}: nothing to confirm yet"
         ));
     }
     // Checkpoint and successor id: explicit config wins; the coordinator may
@@ -1456,27 +1461,22 @@ async fn status(config: &LoadedConfig) -> ExitCode {
     let confirmation_ready = matches!(decide(config, &view), Decision::AlreadyVoted)
         || view.singleton.as_ref().is_some_and(|s| s.finalized);
     let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
+    // The quorum over H_ID stands in for Leap finality: confirmation is
+    // actionable once H is observed, without waiting for LIB (which on a
+    // large committee arrives after the agreed stop). The pause is
+    // independent of delivery — see should_pause_producer.
     let confirmation_state = if vote_state == "on-chain" || confirmation_ready {
-        if view.lib_num >= config.inner.height {
-            if view.head_num >= pause_height {
-                "actionable"
-            } else {
-                "waiting-head"
-            }
+        if view.head_num >= config.inner.height {
+            "actionable"
         } else {
-            "waiting-lib"
+            "waiting-head"
         }
     } else {
         "waiting-vote"
     };
     let pause_state = if !config.inner.stop_producer.at_pause {
         "off"
-    } else if should_pause_producer(
-        &config.inner.stop_producer,
-        view.head_num,
-        pause_height,
-        confirmation_state == "actionable",
-    ) {
+    } else if should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height) {
         "due"
     } else {
         "armed"
@@ -1735,10 +1735,10 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
         }
         Decision::Wait(_) | Decision::AlreadyVoted => {}
     }
-    if view.lib_num < config.inner.height {
+    if view.head_num < config.inner.height {
         return Err(format!(
-            "nothing to sign: H={} is not final yet (LIB {})",
-            config.inner.height, view.lib_num
+            "nothing to sign: H={} is not observed yet (head {})",
+            config.inner.height, view.head_num
         ));
     }
     let (template, digest) = unsigned_confirmation(&client, config).await?;
@@ -1775,25 +1775,29 @@ fn validate_stop_config(stop: &StopConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Pure pause predicate, unit-tested below. The pause fires only for the
-/// round whose confirmation this voter delivered, once the local head has
-/// reached the agreed pause head P: opt-in armed, confirmation done, head
-/// at or past P. Waiting for P (not stopping at H) lets the H+1..P window
-/// stay empty and provable; overshooting P before the pause lands is
-/// harmless — blocks past P are simply never staged. Only a voter that
-/// delivered its own confirmation pauses, so an aborted ceremony never
-/// halts a live chain by accident: the fleet pact must ensure every
-/// scheduled producer confirms.
-fn should_pause_producer(
-    stop: &StopConfig,
-    head_num: u32,
-    pause_height: u32,
-    confirmation_delivered: bool,
-) -> bool {
-    stop.at_pause
-        && stop.producer_api_url.is_some()
-        && confirmation_delivered
-        && head_num >= pause_height
+/// Pure signing predicate, unit-tested below. The confirmation is
+/// actionable once the voter is ready (voted, already voted, or singleton
+/// finalized) and H is observed locally. LIB is deliberately not an input:
+/// the quorum over H_ID stands in for Leap finality, and on a large
+/// committee LIB(H) arrives after the agreed stop — waiting for it would
+/// deadlock the halt.
+fn should_sign_confirmation(confirmed_ready: bool, head_num: u32, height: u32) -> bool {
+    confirmed_ready && head_num >= height
+}
+
+/// Pure pause predicate, unit-tested below. The pause fires once the local
+/// head has reached the agreed pause head P: opt-in armed, head at or past
+/// P. Delivery of this voter's own confirmation is deliberately NOT a
+/// precondition: a producer whose submission fails must still stop, or the
+/// chain keeps building past the agreed head (on a 21-producer network the
+/// LIB-gated signing the old predicate waited on arrives hundreds of
+/// blocks late, so gating the stop on delivery never stops at all).
+/// Delivery retries continue independently after the pause. Stopping at the
+/// agreed P (not at H) keeps the H+1..P window exactly the quorum
+/// attested; every scheduled producer stops at the same agreed P, so no
+/// producer builds an unproven tail past it.
+fn should_pause_producer(stop: &StopConfig, head_num: u32, pause_height: u32) -> bool {
+    stop.at_pause && stop.producer_api_url.is_some() && head_num >= pause_height
 }
 
 /// Pause the local producer via the Leap producer API, then prove it is
@@ -1846,7 +1850,6 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     })?;
     let client = build_client(config)?;
     let mut voted = false;
-    let mut confirmation_delivered = false;
     let mut pause_holding = false;
     let mut pause_note = String::new();
     let mut last_note = String::new();
@@ -1902,27 +1905,26 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 note_throttled(&mut last_note, &mut polls, &format!("refusing: {reason}"));
             }
         }
-        // Confirmation needs H irreversible on this node and the agreed
-        // pause head observed: it is independent of whether our vote
-        // landed (the confirmation quorum is over the declared set, so a
-        // late voter still signs), but no voter attests a head it has not
-        // seen. Waiting for P keeps every signer on the same digest.
+        // Confirmation needs H observed on this node: the quorum over the
+        // terminal id stands in for Leap finality, so no voter waits for
+        // LIB (on a 21-producer network LIB(H) arrives hundreds of blocks
+        // late — after the agreed stop). Signing is independent of whether
+        // our vote landed (the confirmation quorum is over the declared
+        // set, so a late voter still signs), but no voter attests a head
+        // it has not seen: H must be local. The agreed pause head P comes
+        // from config, cross-checked against the coordinator, never from
+        // the local tip, so every signer commits to the same digest.
         let confirmed_ready = voted
             || matches!(decide(config, &view), Decision::AlreadyVoted)
             || view.singleton.as_ref().is_some_and(|s| s.finalized);
-        if confirmed_ready && view.lib_num >= config.inner.height && view.head_num >= pause_height {
+        if should_sign_confirmation(confirmed_ready, view.head_num, config.inner.height) {
             if dry_run {
                 log_line!(
                     "DRY RUN: would sign and deliver the confirmation for H={} P={}",
                     config.inner.height,
                     pause_height
                 );
-                if should_pause_producer(
-                    &config.inner.stop_producer,
-                    view.head_num,
-                    pause_height,
-                    true,
-                ) {
+                if should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height) {
                     log_line!(
                         "DRY RUN: would pause the local producer at P={} via {}",
                         pause_height,
@@ -1936,33 +1938,35 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 }
                 return Ok(());
             }
+            // Delivery is not the stop precondition (the pause below fires
+            // on head >= P regardless), so a failed submission retries
+            // here on every poll until the coordinator has it — including
+            // after the local producer has paused, since the coordinator
+            // is off-chain.
             match submit_confirmation(&client, config).await {
                 Ok(line) => {
                     log_line!("{line}");
-                    confirmation_delivered = true;
                 }
                 Err(error) => {
                     log_line!("confirmation failed, retrying: {error}");
                 }
             }
         }
-        // The halt half of the binary: once this voter's confirmation is
-        // delivered and the local head has reached the agreed pause head,
-        // the local producer must stay paused. Stopping at P (not at H)
-        // keeps the H+1..P window exactly the quorum attested; overshoot
-        // past P before the pause lands is harmless and unstaged. This
-        // never exits over a pause failure — the process stays alive
-        // retrying, because a node restart clears Leap's in-memory pause
-        // and only a live enforcer re-pauses it. To resume production
-        // deliberately, stop this voter first: a manual resume while it
-        // runs gets re-paused on the next poll.
+        // The halt half of the binary: once the local head has reached the
+        // agreed pause head, the local producer must stay paused — whether
+        // or not this voter's confirmation has been delivered yet.
+        // Delivery retries continue above independently (the coordinator is
+        // off-chain, so a paused producer does not block them); the stop
+        // must never wait for delivery, or a failed submission keeps the
+        // chain building past the agreed head. Stopping at P (not at H)
+        // keeps the H+1..P window exactly the quorum attested. This never
+        // exits over a pause failure — the process stays alive retrying,
+        // because a node restart clears Leap's in-memory pause and only a
+        // live enforcer re-pauses it. To resume production deliberately,
+        // stop this voter first: a manual resume while it runs gets
+        // re-paused on the next poll.
         if !dry_run
-            && should_pause_producer(
-                &config.inner.stop_producer,
-                view.head_num,
-                pause_height,
-                confirmation_delivered,
-            )
+            && should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
         {
             if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
                 match pause_producer(&client, &api_url).await {
@@ -2811,24 +2815,44 @@ mod tests {
     }
 
     #[test]
-    fn pause_fires_only_for_a_delivered_confirmation_at_p() {
+    fn signs_once_h_is_observed_without_waiting_for_lib() {
+        // Not ready (no vote yet): never sign, even past H.
+        assert!(!should_sign_confirmation(false, 200, 100));
+        // Ready but H not observed: never attest an unseen head.
+        assert!(!should_sign_confirmation(true, 99, 100));
+        // Ready and H observed: sign. LIB is not an input — on a
+        // 21-producer network LIB(H) arrives hundreds of blocks after H,
+        // and waiting for it would deadlock the halt past the agreed stop.
+        assert!(should_sign_confirmation(true, 100, 100));
+        assert!(should_sign_confirmation(true, 150, 100));
+    }
+
+    #[test]
+    fn pause_fires_at_p_without_waiting_for_delivery() {
         // Off by default: an unconfigured voter never pauses, no matter
         // what the chain does.
         let off = StopConfig::default();
-        assert!(!should_pause_producer(&off, 100, 103, true));
-        assert!(!should_pause_producer(&off, 200, 103, true));
+        assert!(!should_pause_producer(&off, 100, 103));
+        assert!(!should_pause_producer(&off, 200, 103));
         // Armed but head short of P: the producer still has blocks to
-        // build, pausing now would fork it off early.
+        // build, pausing now would stop it early.
         let armed = armed_stop();
-        assert!(!should_pause_producer(&armed, 102, 103, true));
-        // Armed at P but the confirmation is not delivered: pausing on a
-        // round this voter never confirmed would halt the wrong freeze.
-        assert!(!should_pause_producer(&armed, 103, 103, false));
-        // Delivered at P: stop.
-        assert!(should_pause_producer(&armed, 103, 103, true));
-        // Delivered past P (late pause): still stop — blocks past P built
-        // by this producer are unstaged stragglers, never proof.
-        assert!(should_pause_producer(&armed, 105, 103, true));
+        assert!(!should_pause_producer(&armed, 102, 103));
+        // Armed at P: stop even when this voter's own confirmation has
+        // not been delivered — a failed submission must never keep the
+        // chain building past the agreed head. Delivery retries continue
+        // independently.
+        assert!(should_pause_producer(&armed, 103, 103));
+        // Past P (late pause): still stop.
+        assert!(should_pause_producer(&armed, 105, 103));
+        // No producer API configured: never pause — there is nothing to
+        // pause through, and a silent no-op halt is worse than none.
+        let no_api = StopConfig {
+            at_pause: true,
+            at_h: false,
+            producer_api_url: None,
+        };
+        assert!(!should_pause_producer(&no_api, 200, 103));
     }
 
     /// Minimal Leap producer-API stub: answers pause/paused with canned
