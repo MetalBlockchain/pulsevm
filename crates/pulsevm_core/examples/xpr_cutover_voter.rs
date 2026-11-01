@@ -1230,17 +1230,18 @@ async fn unsigned_confirmation(
         ));
     }
     let local_block_id = fetch_block_id(client, &config.inner.nodeos_url, height).await?;
-    // No voter attests a head it has not seen: signing requires the local
-    // head at or past H, so H_ID is observed, not assumed. The agreed
-    // pause head P comes from config (cross-checked against the
-    // coordinator above), never from the local tip: it is the stop the
-    // quorum agreed, and the quorum over H_ID stands in for Leap finality,
-    // so no voter waits for LIB — on a large committee LIB(H) arrives
-    // after the agreed stop, and waiting for it would deadlock the halt.
+    // No voter attests a freeze it has not seen land: signing requires the
+    // local head at or past the agreed pause head P. H_ID (fetched above)
+    // is then observed in ancestry, not assumed. P itself comes from config
+    // (cross-checked against the coordinator above), never from the local
+    // tip: it is the stop the quorum agreed, and the quorum over H_ID
+    // stands in for Leap finality, so no voter waits for LIB — on a large
+    // committee LIB(H) arrives after the agreed stop, and waiting for it
+    // would deadlock the halt.
     let (head_num, _, _) = get_info(client, &config.inner.nodeos_url).await?;
-    if head_num < height {
+    if head_num < pause_height {
         return Err(format!(
-            "local head {head_num} has not reached H={height}: nothing to confirm yet"
+            "local head {head_num} has not reached the agreed stop P={pause_height}: nothing to confirm yet"
         ));
     }
     // Checkpoint and successor id: explicit config wins; the coordinator may
@@ -1462,12 +1463,14 @@ async fn status(config: &LoadedConfig) -> ExitCode {
         || view.singleton.as_ref().is_some_and(|s| s.finalized);
     let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
     // The quorum over H_ID stands in for Leap finality: confirmation is
-    // actionable once H is observed, without waiting for LIB (which on a
-    // large committee arrives after the agreed stop). The pause is
-    // independent of delivery — see should_pause_producer.
+    // actionable once the agreed stop is locally observed, without waiting
+    // for LIB (which on a large committee arrives after the stop). The
+    // pause is independent of delivery — see should_pause_producer.
     let confirmation_state = if vote_state == "on-chain" || confirmation_ready {
-        if view.head_num >= config.inner.height {
+        if view.head_num >= pause_height {
             "actionable"
+        } else if view.head_num >= config.inner.height {
+            "waiting-stop"
         } else {
             "waiting-head"
         }
@@ -1735,10 +1738,11 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
         }
         Decision::Wait(_) | Decision::AlreadyVoted => {}
     }
-    if view.head_num < config.inner.height {
+    if view.head_num < config.inner.pause_height.unwrap_or(config.inner.height) {
         return Err(format!(
-            "nothing to sign: H={} is not observed yet (head {})",
-            config.inner.height, view.head_num
+            "nothing to sign: the agreed stop P={} is not observed yet (head {})",
+            config.inner.pause_height.unwrap_or(config.inner.height),
+            view.head_num
         ));
     }
     let (template, digest) = unsigned_confirmation(&client, config).await?;
@@ -1777,12 +1781,13 @@ fn validate_stop_config(stop: &StopConfig) -> Result<(), String> {
 
 /// Pure signing predicate, unit-tested below. The confirmation is
 /// actionable once the voter is ready (voted, already voted, or singleton
-/// finalized) and H is observed locally. LIB is deliberately not an input:
-/// the quorum over H_ID stands in for Leap finality, and on a large
-/// committee LIB(H) arrives after the agreed stop — waiting for it would
-/// deadlock the halt.
-fn should_sign_confirmation(confirmed_ready: bool, head_num: u32, height: u32) -> bool {
-    confirmed_ready && head_num >= height
+/// finalized) and the agreed stop is observed locally: no voter attests a
+/// freeze it has not seen land. LIB is deliberately not an input: the
+/// quorum over H_ID stands in for Leap finality, and on a large committee
+/// LIB(H) arrives after the agreed stop — waiting for it would deadlock
+/// the halt.
+fn should_sign_confirmation(confirmed_ready: bool, head_num: u32, pause_height: u32) -> bool {
+    confirmed_ready && head_num >= pause_height
 }
 
 /// Pure pause predicate, unit-tested below. The pause fires once the local
@@ -1905,19 +1910,20 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 note_throttled(&mut last_note, &mut polls, &format!("refusing: {reason}"));
             }
         }
-        // Confirmation needs H observed on this node: the quorum over the
-        // terminal id stands in for Leap finality, so no voter waits for
-        // LIB (on a 21-producer network LIB(H) arrives hundreds of blocks
-        // late — after the agreed stop). Signing is independent of whether
-        // our vote landed (the confirmation quorum is over the declared
-        // set, so a late voter still signs), but no voter attests a head
-        // it has not seen: H must be local. The agreed pause head P comes
-        // from config, cross-checked against the coordinator, never from
-        // the local tip, so every signer commits to the same digest.
+        // Confirmation needs the agreed stop observed on this node: the
+        // quorum over the terminal id stands in for Leap finality, so no
+        // voter waits for LIB (on a 21-producer network LIB(H) arrives
+        // hundreds of blocks late — after the agreed stop). Signing is
+        // independent of whether our vote landed (the confirmation quorum
+        // is over the declared set, so a late voter still signs), but no
+        // voter attests a freeze it has not seen land. The agreed pause
+        // head P comes from config, cross-checked against the coordinator,
+        // never from the local tip, so every signer commits to the same
+        // digest.
         let confirmed_ready = voted
             || matches!(decide(config, &view), Decision::AlreadyVoted)
             || view.singleton.as_ref().is_some_and(|s| s.finalized);
-        if should_sign_confirmation(confirmed_ready, view.head_num, config.inner.height) {
+        if should_sign_confirmation(confirmed_ready, view.head_num, pause_height) {
             if dry_run {
                 log_line!(
                     "DRY RUN: would sign and deliver the confirmation for H={} P={}",
@@ -2815,16 +2821,18 @@ mod tests {
     }
 
     #[test]
-    fn signs_once_h_is_observed_without_waiting_for_lib() {
-        // Not ready (no vote yet): never sign, even past H.
-        assert!(!should_sign_confirmation(false, 200, 100));
-        // Ready but H not observed: never attest an unseen head.
-        assert!(!should_sign_confirmation(true, 99, 100));
-        // Ready and H observed: sign. LIB is not an input — on a
+    fn signs_once_agreed_stop_is_observed_without_waiting_for_lib() {
+        // Not ready (no vote yet): never sign, even past P.
+        assert!(!should_sign_confirmation(false, 210, 105));
+        // Ready but the agreed stop not yet observed (only H seen): never
+        // attest a freeze that has not landed.
+        assert!(!should_sign_confirmation(true, 100, 105));
+        assert!(!should_sign_confirmation(true, 104, 105));
+        // Ready and the stop observed: sign. LIB is not an input — on a
         // 21-producer network LIB(H) arrives hundreds of blocks after H,
         // and waiting for it would deadlock the halt past the agreed stop.
-        assert!(should_sign_confirmation(true, 100, 100));
-        assert!(should_sign_confirmation(true, 150, 100));
+        assert!(should_sign_confirmation(true, 105, 105));
+        assert!(should_sign_confirmation(true, 150, 105));
     }
 
     #[test]

@@ -1201,10 +1201,12 @@ pub fn verify_migration_memo_accounts(
 }
 
 /// Checkpoint-state half of the memo inclusion proof: every recorded memo
-/// account must exist in the restored state. The digest re-decode (see
+/// account must exist in the restored state, and its checkpoint creation
+/// date must equal the recorded slot exactly. The digest re-decode (see
 /// [`verify_migration_memo_accounts`]) proves the names commit to the
-/// declaration; this proves the named accounts are really on-chain — a
-/// manifest that records fictional names fails here even when they decode.
+/// declaration and the recorded slot predates H; this binds that slot to
+/// state — an exporter-asserted slot, a fictional name, or an account
+/// created at/after H all fail here even when the names decode.
 /// Runs wherever restored state is available (restore gate, offline
 /// verifier); manifests without memo accounts verify nothing and return 0.
 pub fn verify_memo_accounts_exist(
@@ -1218,11 +1220,20 @@ pub fn verify_memo_accounts_exist(
     for memo in accounts {
         let owner = pulsevm_name::Name::from_str(&memo.name)
             .map_err(|e| format!("migration memo account {} invalid: {e}", memo.name))?;
-        if !database.arena_account_exists(owner.as_u64()) {
-            return Err(format!(
-                "migration memo account {} does not exist in checkpoint state: the declaration landing is unproven",
-                memo.name
-            ));
+        match database.arena_account_creation_date(owner.as_u64()) {
+            Some(actual) if actual == memo.created_slot => {}
+            Some(actual) => {
+                return Err(format!(
+                    "migration memo account {} was created at slot {actual} in checkpoint state, not the recorded {}: the declaration landing is unproven",
+                    memo.name, memo.created_slot
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "migration memo account {} does not exist in checkpoint state: the declaration landing is unproven",
+                    memo.name
+                ));
+            }
         }
     }
     Ok(accounts.len())
@@ -1512,12 +1523,20 @@ pub fn verify_migration_halt_pair(
         &declaration_digest,
         header_schedule_version,
     )?;
-    // Pre-commitment timing must be provable: either the on-chain ceremony
-    // replays the quorum's votes before H, or the declaration digest was
-    // recorded on-chain (memo / msig execution) before H. Off-chain
-    // signatures alone say nothing about when they were made.
-    if manifest.halt_contract_ceremony.is_none() && manifest.halt_declaration_inclusion.is_none() {
-        return Err("migration halt declaration has no pre-commitment timing evidence: attach the on-chain cutover ceremony or record the declaration inclusion block".to_string());
+    // Pre-commitment timing must be provable, not asserted: either the
+    // on-chain ceremony replays the quorum's votes before H, or the memo
+    // accounts carry the declaration digest on-chain before H (re-decoded
+    // above, existence proven at restore). A bare recorded inclusion
+    // height proves nothing — the number is exporter-asserted — so it no
+    // longer satisfies this check by itself; off-chain signatures alone
+    // say nothing about when they were made.
+    if manifest.halt_contract_ceremony.is_none()
+        && manifest
+            .halt_memo_accounts
+            .as_ref()
+            .is_none_or(|accounts| accounts.is_empty())
+    {
+        return Err("migration halt declaration has no proven pre-commitment timing evidence: attach the on-chain cutover ceremony or the declaration memo accounts".to_string());
     }
     Ok(roster)
 }
@@ -7335,13 +7354,46 @@ mod tests {
             )
             .is_err()
         );
-        // The memo vehicle records the digest on-chain instead: a recorded
-        // in-window inclusion with no ceremony still verifies. The schedule
-        // version pin still applies: unanimity must be on the record even
-        // without per-vote evidence.
+        // A bare recorded inclusion height proves nothing: the number is
+        // exporter-asserted, so a ceremony-less pair with only an inclusion
+        // number (and no memo accounts) fails closed. The memo vehicle must
+        // carry the proof, not the claim.
         let mut memo = manifest.clone();
         memo.halt_contract_ceremony = None;
         memo.halt_declaration_inclusion = Some(5);
+        assert!(
+            verify_migration_halt_pair(
+                &memo,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+            .is_err(),
+            "an unproven inclusion height must not prove pre-commitment timing"
+        );
+        // With the memo accounts attached, the digest re-decode plus the
+        // pre-H creation slots prove timing and the pair verifies. The
+        // schedule version pin still applies: unanimity must be on the
+        // record even without per-vote evidence. (Existence in checkpoint
+        // state is proven where the state is available.)
+        let declaration_digest = memo
+            .halt_declaration
+            .as_ref()
+            .expect("fixture declaration")
+            .digest()
+            .expect("fixture declaration digest");
+        memo.halt_memo_accounts = Some(
+            memo_names_for(&hex::encode(declaration_digest))
+                .iter()
+                .map(|name| MigrationMemoAccount {
+                    name: name.clone(),
+                    created_slot: 50,
+                })
+                .collect(),
+        );
         verify_migration_halt_pair(
             &memo,
             7,
@@ -7351,7 +7403,7 @@ mod tests {
             TEST_SCHEDULE_VERSION,
             Some(&TEST_PLATFORM_ID),
         )
-        .expect("recorded declaration inclusion proves pre-commitment timing");
+        .expect("memo accounts prove pre-commitment timing");
         // Contract evidence without the attested schedule version fails:
         // unanimity across the window must be on the record.
         let mut unversioned = manifest.clone();

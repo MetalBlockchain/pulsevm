@@ -258,9 +258,29 @@ rpc_call() {
         -H 'Content-Type: application/json' -d "$2"
 }
 
+# Both Leap's disk monitor and MetalGo's node health gate refuse below
+# 10% free — on a nearly-full workstation a healthy rehearsal dies minutes
+# in with a stall that looks like a code bug. Check the headroom first and
+# fail in one second with the real cause instead.
+require_disk_headroom() {
+    if ! python3 -c 'import os,sys
+for path in ("/System/Volumes/Data", "/tmp"):
+    try: st = os.statvfs(path)
+    except OSError: continue
+    free = st.f_bavail * st.f_frsize / 2**30
+    total = st.f_blocks * st.f_frsize / 2**30
+    pct = 100.0 * st.f_bavail / st.f_blocks if st.f_blocks else 0
+    print(f"handover: disk {path}: {free:.0f} GiB free of {total:.0f} GiB ({pct:.1f}%)")
+    if pct < 12: sys.exit(1)
+sys.exit(0)' 2>/dev/null; then
+        fail "insufficient free disk: keep at least 12% free (Leap resmon and MetalGo health both refuse below 10%). Free space, then re-run"
+    fi
+}
+
 cmd_start() {
     [[ ! -e "$WORK_DIR" ]] || fail "work directory exists: $WORK_DIR (run stop first)"
     mkdir -p "$WORK_DIR"
+    require_disk_headroom
     echo "handover: building the replay binary and the probe-tx tool on the host..."
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_blocklog_replay) || fail "replay build failed"
     [[ -x "$PULSEVM_REPLAY_BIN" ]] || fail "replay binary missing: $PULSEVM_REPLAY_BIN (run-handover.sh builds this first)"
@@ -896,10 +916,9 @@ PYEOF
         # agreed stop, and waiting for it deadlocks the halt while the
         # chain builds an unproven tail past the proof window.
         #
-        # The loop below only streams post-H pairs while the producer still
+        # The loop below streams post-H pairs while the producer still
         # builds: header state is served while a block is reversible, so
-        # every H+1..P tip is fetched the moment it appears; H itself comes
-        # from the export nodeos (snapshot-bound, no race). The pause then
+        # every H+1..P tip is fetched the moment it appears. The pause then
         # lands exactly on P, and only tip blocks produced during pause
         # latency can still be missing (topped up afterwards — the fresh tip
         # is always reversible because LIB trails production).
@@ -981,6 +1000,39 @@ PYEOF
             H=""
             continue
         fi
+        # Schedule cross-check: the producer capture of H's header state is
+        # authoritative only if independent synced nodes agree on the frozen
+        # committee. The chain is frozen at P, so both validators report the
+        # same active set H ran under (keys are bound separately by
+        # checkpoint state and the H signature; this checks membership and
+        # version). Validators cannot re-serve H's header state itself here
+        # — it went irreversible as they converged — so the active-set
+        # equality is the strongest cross-node agreement available. A missing
+        # or divergent report supersedes the round like any other miss.
+        xcheck_ok=1
+        for v_api in "$LEAP_V1_API" "$LEAP_V2_API"; do
+            if ! leap_post "$v_api" /v1/chain/get_producer_schedule '{}' > "$WORK_DIR/schedule-xcheck.tmp" 2>/dev/null; then
+                xcheck_ok=""
+                break
+            fi
+            python3 -c '
+import json, sys
+state = json.load(open(sys.argv[1]))
+live = json.load(open(sys.argv[2]))
+a = state.get("active_schedule") or {}
+b = live.get("active") or {}
+names = lambda sch: sorted(p.get("producer_name", "") for p in sch.get("producers") or [])
+sys.exit(0 if (a.get("version") == b.get("version") and names(a) == names(b)) else 1)
+' "$WORK_DIR/block-H.state.json" "$WORK_DIR/schedule-xcheck.tmp" || { xcheck_ok=""; break; }
+        done
+        rm -f "$WORK_DIR/schedule-xcheck.tmp"
+        if [[ -z "$xcheck_ok" ]]; then
+            echo "handover: round $round validator active schedule disagrees with the frozen H state; unpausing, retrying..."
+            docker unpause "$producer_cid" >/dev/null 2>&1 || true
+            H=""
+            continue
+        fi
+        echo "handover: frozen schedule cross-checked: both validators agree with the H state"
         echo "handover: producer paused; network frozen at P=$P (snapshot holds exact H=$H)"
         echo "$P" >"$WORK_DIR/P"
         # Converged frozen heads, kept for the audit trail: both validators
@@ -1486,6 +1538,7 @@ cmd_checkpoint() {
     # non-existing work dir.
     export_dir="$(mktemp -du /tmp/pulsevm-handover-export.XXXXXX)"
     echo "$export_dir" >"$WORK_DIR/export-dir"
+    require_disk_headroom
     (cd "$REPO_ROOT" && \
         XPR_NODEOS_IMAGE="${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}" \
         tools/xpr-chainbase-export/export.sh \
@@ -1620,11 +1673,16 @@ cmd_boot() {
     # tears the half-built network down with only "closed server" in the
     # log. Override down, never below the time a healthy start needs.
     # The fixture checkpoint's system account is eosio, not pulse: the new
-    # network must adopt the fixture identities, with the fixture dev key
-    # (disposable rehearsal only, never used on mainnet).
+    # network must adopt the fixture identities. The default key is the
+    # well-known fixture dev key: DISPOSABLE REHEARSAL ONLY, never mainnet.
+    # Anything beyond a disposable local rehearsal must set
+    # PULSEVM_PRODUCER_KEY explicitly (and should not use this harness).
+    if [[ -z "${PULSEVM_PRODUCER_KEY:-}" ]]; then
+        echo "handover: WARNING: using the fixture dev producer key (disposable rehearsal only); set PULSEVM_PRODUCER_KEY to use another"
+    fi
     export PULSEVM_SYSTEM_ACCOUNT="eosio"
     export PULSEVM_PRODUCER_NAME="eosio"
-    export PULSEVM_PRODUCER_KEY="5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3"
+    export PULSEVM_PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
     # The migration restore starts a new producer schedule seeded from the
     # migration genesis initial key, so the new chain must be seeded with a
     # key the nodes hold. Derive it from the same fixture genesis the Leap

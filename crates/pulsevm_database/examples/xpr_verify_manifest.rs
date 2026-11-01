@@ -745,7 +745,11 @@ mod tests {
         hydrate_full_state(&mut db, &entry).unwrap();
         for name in &memo_names {
             let owner = Name::from_str(name).unwrap().as_u64();
-            db.create_account(owner, 7).unwrap();
+            // Creation date must equal the slot the manifest records (1000):
+            // the existence check binds the recorded slot to checkpoint state
+            // exactly, so a fixture that records one slot and creates at
+            // another now fails — as a lying manifest must.
+            db.create_account(owner, 1000).unwrap();
         }
         db.set_revision(7).unwrap();
         let checkpoint_bytes = db.snapshot_bytes().unwrap();
@@ -1042,6 +1046,33 @@ mod tests {
         rewrite_manifest(&fixture, |manifest| {
             for account in manifest["halt_memo_accounts"].as_array_mut().unwrap() {
                 account["created_slot"] = serde_json::json!(67305985u32);
+            }
+        });
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
+        drop(fixture.dir);
+    }
+
+    #[test]
+    fn rejects_memo_account_with_unbound_created_slot() {
+        // The recorded slot is bound to checkpoint state exactly: state was
+        // created at slot 1000, so a manifest claiming an earlier slot (the
+        // exporter-asserted timing this proof exists to defeat) fails at the
+        // restore binding even though the names decode and the account
+        // exists.
+        let fixture = fixture(false, true);
+        rewrite_manifest(&fixture, |manifest| {
+            for account in manifest["halt_memo_accounts"].as_array_mut().unwrap() {
+                account["created_slot"] = serde_json::json!(999u32);
             }
         });
         assert_ne!(

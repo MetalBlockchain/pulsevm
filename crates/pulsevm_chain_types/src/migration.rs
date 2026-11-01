@@ -1250,7 +1250,6 @@ fn hex_nibble(byte: u8) -> u8 {
 mod tests {
     use super::*;
     use pulsevm_crypto::k1::K1PrivateKey;
-    use std::str::FromStr;
 
     const HEIGHT: u32 = 310;
     const WEIGHTS: [HaltWeight; 3] = [HaltWeight(50), HaltWeight(30), HaltWeight(20)];

@@ -63,8 +63,11 @@ Both bounds are enforced twice: the record step rejects out-of-window
 votes at attach time, and the A-Chain enforces exact inclusion heights from
 replay (restore gate) and offline (offline verifier). The declaration
 side must prove its timing one of two ways — on-chain ceremony votes,
-or a recorded declaration inclusion (memo / msig execution block); a
-pair with neither fails closed. The confirmation side has no such
+or the declaration memo accounts (names re-decoding to the digest,
+checkpoint creation dates bound to the recorded slots); a
+pair with neither fails closed. A bare recorded inclusion height
+proves nothing by itself — the number is exporter-asserted — so it no
+longer satisfies this requirement. The confirmation side has no such
 requirement (it is inherently post-H): when its inclusion is unrecorded
 the verifier says so in the output, so "timing not provable" is never
 silent there.
@@ -185,7 +188,8 @@ operator once the frozen set matches the coordinated parameters:
   exactly those bytes with its own key management and submits through its
   own path, so key custody never moves. The digest equals the voter's own
   signing digest by construction (unit-tested, live-tested).
-- It signs the confirmation over the agreed P — no LIB wait: on a large
+- It signs the confirmation over the agreed P once the stop is locally
+  observed (head at or past P) — no LIB wait: on a large
   committee LIB(H) arrives hundreds of blocks after the agreed stop, and
   the 15-of-21 confirmation quorum over H_ID stands in for Leap finality —
   and delivers it to the coordinator (whose block id, checkpoint,
@@ -303,7 +307,11 @@ has passed fails closed and supersedes the round.
 
 On trust: the fetcher is the coordinator's own infra, not the exporter —
 the same trust domain that selects H, computes digests, and runs the
-votes — and the fetch is cross-checked four ways. The state id must equal
+votes — and the fetch is cross-checked five ways. Both frozen-network
+validators must report the identical active committee (names and version;
+they cannot re-serve H's header state itself — it went irreversible as
+they converged — so active-set equality is the strongest cross-node
+agreement available); the state id must equal
 the snapshotted H id (which equals the checkpoint base); H's own producer
 signature must recover to a recorded schedule key; the recorded set must
 equal the 15-BP-attested declaration exactly; and every voter's
