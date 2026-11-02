@@ -43,8 +43,9 @@ docker run --detach --platform "$PLATFORM" --name "$NODE" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini:/config/config.ini:ro" \
     -p "127.0.0.1:${PORT}:8888" \
+    --entrypoint nodeos \
     "$IMG" \
-    nodeos --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json \
+    --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
     >/dev/null || fail "node start failed"
 for _ in $(seq 1 90); do
     HEAD_NOW="$(curl --fail --silent --max-time 5 -X POST "$API/v1/chain/get_info" \

@@ -1,7 +1,10 @@
 name: Security scans
 
 # Mirrors the pre-push gates: secrets, dependency CVEs, SBOM. Tool versions are
-# pinned to the ones the local gates were run with.
+# pinned to the ones the local gates were run with. SAST is the repository's
+# CodeQL default setup (the "Analyze (...)" checks); GitHub rejects a second,
+# advanced CodeQL configuration alongside it, so there is deliberately no
+# CodeQL job here.
 on:
   push:
     branches: [ main ]
@@ -76,23 +79,3 @@ jobs:
           name: sbom
           path: sbom.cdx.json
           retention-days: 90
-
-  sast_scans:
-    name: sast_scans
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [ rust, go ]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
-        with:
-          languages: ${{ matrix.language }}
-          build-mode: none
-      - uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
-        with:
-          category: "/language:${{ matrix.language }}"

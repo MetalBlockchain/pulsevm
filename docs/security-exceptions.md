@@ -55,4 +55,4 @@ cutover code, harness and workflows: two `run-shell-injection` errors fixed
 (workflow inputs now pass through `env`), 38 mutable-action-tag warnings
 fixed (every action pinned to a commit SHA). Remaining INFO notes are
 `std::env::args` in developer CLI examples and one temp dir in a unit test:
-not security findings, accepted. CodeQL (rust, go) runs in CI.
+not security findings, accepted. CodeQL runs through the repository's default setup (the `Analyze (...)` checks, which cover actions, c-cpp, go, javascript-typescript, python and rust); an extra advanced CodeQL workflow is rejected by GitHub while the default setup is on.

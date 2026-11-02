@@ -93,7 +93,7 @@ docker run --detach --platform "$PLATFORM" --name "${NODES[0]}" --network "$NET"
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
     -v "$WORK/cfg-eosio.ini:/config/config.ini:ro" \
     -p "127.0.0.1:${PORT}:8888" \
-    "$IMG" nodeos --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json \
+    --entrypoint nodeos "$IMG" --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
     >/dev/null || fail "genesis producer start failed"
 
 for i in 0 1 2 3; do
@@ -108,7 +108,7 @@ for i in 0 1 2 3; do
         -p "127.0.0.1:$((PORT + 10 + i)):8888" \
         -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
         -v "$cfg:/config/config.ini:ro" \
-        "$IMG" nodeos --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json \
+        --entrypoint nodeos "$IMG" --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
         >/dev/null || fail "producer ${BP_NAME[$i]} start failed"
 done
 
