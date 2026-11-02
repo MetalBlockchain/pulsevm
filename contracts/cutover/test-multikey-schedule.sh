@@ -105,6 +105,7 @@ for i in 0 1 2 3; do
         echo "p2p-peer-address = eosio-node:9876"
     } >"$cfg"
     docker run --detach --platform "$PLATFORM" --name "${NODES[$((i + 1))]}" --network "$NET" \
+        -p "127.0.0.1:$((PORT + 10 + i)):8888" \
         -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
         -v "$cfg:/config/config.ini:ro" \
         "$IMG" nodeos --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json \
@@ -310,10 +311,16 @@ echo "cutover-multikey: producers seen: $PRODUCERS_SEEN"
 check "all four members produced blocks"
 
 # LIB must advance under the 4-member schedule (3 of 4 confirmations).
+# LIB moves in bursts (12-block turns across four producers), so poll
+# for an increase instead of sampling one fixed window.
 LIB1="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_irreversible_block_num"])')"
-sleep 20
-LIB2="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_irreversible_block_num"])')"
-[[ "$LIB2" -gt "$LIB1" ]] || fail "LIB stalled under the 4-member schedule ($LIB1 -> $LIB2)"
+LIB2="$LIB1"
+for _ in $(seq 1 45); do
+    sleep 2
+    LIB2="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_irreversible_block_num"])')"
+    [[ "$LIB2" -gt "$LIB1" ]] && break
+done
+[[ "$LIB2" -gt "$LIB1" ]] || fail "LIB stalled under the 4-member schedule for 90s ($LIB1 -> $LIB2)"
 check "LIB advances ($LIB1 -> $LIB2)"
 
 # The header state is what the attach tool captures at H: its active
@@ -333,4 +340,19 @@ assert len(set(json.dumps(p["authority"], sort_keys=True) for p in prods)) == 4,
 print("header-state schedule version", hs["active_schedule"]["version"], "members", sorted(got))
 PYEOF
 check "header state lists four distinct member keys"
+# Snapshot probe: which nodes can complete create_snapshot once the schedule
+# has moved off the genesis producer?
+if [[ -n "${SNAPSHOT_PROBE:-}" ]]; then
+    for target in "$PORT" "$((PORT + 10))" "$((PORT + 11))" "$((PORT + 12))" "$((PORT + 13))"; do
+        code="$(curl --silent --max-time 40 -o "$WORK/snap-$target.json" -w '%{http_code}' -X POST "http://127.0.0.1:$target/v1/producer/create_snapshot" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d '{}' 2>/dev/null || true)"
+        echo "cutover-multikey: snapshot port $target -> http ${code:-none}: $(head -c 120 "$WORK/snap-$target.json" 2>/dev/null)"
+    done
+fi
+# Optional: keep the producer's block log for offline replay checks.
+if [[ -n "${KEEP_BLOCKS_DIR:-}" ]]; then
+    rm -rf "$KEEP_BLOCKS_DIR"
+    docker cp "${NODES[0]}:/data/blocks" "$KEEP_BLOCKS_DIR" >/dev/null || fail "block log copy failed"
+    echo "cutover-multikey: block log kept at $KEEP_BLOCKS_DIR"
+fi
 echo "cutover-multikey: PASS: $CHECKS checks green"

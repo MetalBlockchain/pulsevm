@@ -92,6 +92,110 @@ services:
     ports:
       - "127.0.0.1:${LEAP_V2_HTTP_PORT:-18882}:8888"
 
+  # Multi-key mode only (HANDOVER_PRODUCERS=4): block producer a, one of
+  # four schedule members with its own block-signing key. The config is
+  # generated per run into the work dir. Started by name, so the default
+  # single-producer rehearsal never launches it.
+  xpr-bp-a:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/bp-a.ini
+        target: /config/config.ini
+        read_only: true
+      - bp-a-data:/data
+    ports:
+      - "127.0.0.1:${BP_A_HTTP_PORT:-18890}:8888"
+
+  # Multi-key mode only (HANDOVER_PRODUCERS=4): block producer b, one of
+  # four schedule members with its own block-signing key. The config is
+  # generated per run into the work dir. Started by name, so the default
+  # single-producer rehearsal never launches it.
+  xpr-bp-b:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/bp-b.ini
+        target: /config/config.ini
+        read_only: true
+      - bp-b-data:/data
+    ports:
+      - "127.0.0.1:${BP_B_HTTP_PORT:-18891}:8888"
+
+  # Multi-key mode only (HANDOVER_PRODUCERS=4): block producer c, one of
+  # four schedule members with its own block-signing key. The config is
+  # generated per run into the work dir. Started by name, so the default
+  # single-producer rehearsal never launches it.
+  xpr-bp-c:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/bp-c.ini
+        target: /config/config.ini
+        read_only: true
+      - bp-c-data:/data
+    ports:
+      - "127.0.0.1:${BP_C_HTTP_PORT:-18892}:8888"
+
+  # Multi-key mode only (HANDOVER_PRODUCERS=4): block producer d, one of
+  # four schedule members with its own block-signing key. The config is
+  # generated per run into the work dir. Started by name, so the default
+  # single-producer rehearsal never launches it.
+  xpr-bp-d:
+    image: ${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}
+    environment:
+      XPR_SIDECAR_PATH: ${XPR_SIDECAR_PATH:-}
+    platform: ${XPR_PLATFORM:-linux/amd64}
+    command:
+      - --data-dir=/data
+      - --config-dir=/config
+      - --genesis-json=/config-env/genesis.json
+    volumes:
+      - type: bind
+        source: ../../tools/xpr-chainbase-export/localnet/genesis.json
+        target: /config-env/genesis.json
+        read_only: true
+      - type: bind
+        source: ${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/bp-d.ini
+        target: /config/config.ini
+        read_only: true
+      - bp-d-data:/data
+    ports:
+      - "127.0.0.1:${BP_D_HTTP_PORT:-18893}:8888"
+
   shadow:
     # Runs the host-built replay binary (built by run-handover.sh before
     # compose starts) in a slim runtime matching the host glibc.
@@ -122,3 +226,7 @@ volumes:
   validator1-data:
   validator2-data:
   shadow-arena:
+  bp-a-data:
+  bp-b-data:
+  bp-c-data:
+  bp-d-data:

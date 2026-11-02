@@ -46,6 +46,7 @@ runner_endpoint() {
 }
 
 # Set early so every compose invocation (including stop) interpolates.
+export HANDOVER_WORK_DIR="$WORK_DIR"
 export PULSEVM_REPLAY_BIN="${PULSEVM_REPLAY_BIN:-$REPO_ROOT/target/release/examples/xpr_blocklog_replay}"
 # Host Rust toolchain for the checkpoint importer and the replay build.
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -97,6 +98,210 @@ leap_head_lib() {
 leap_post() {
     curl --fail --silent --max-time 15 -X POST "$1$2" \
         -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d "$3"
+}
+
+# ---- Multi-key mode (HANDOVER_PRODUCERS=4) ----------------------------------
+# The default rehearsal runs one producer on one key, so the strict 2/3+1
+# roster quorum, distinct per-member keys, and a schedule with more than one
+# member are never exercised live. In this mode the genesis producer hands the
+# chain to four producers (bpatest..bpdtest) with four distinct keys through
+# eosio.bios setprods, exactly as a real chain installs a schedule; the
+# ceremony then signs with HANDOVER_SIGNERS (default 3, the minimum strict
+# 2/3+1 quorum of 4) of those keys and the restore gate verifies them against
+# the header-state schedule. Needs the eosio.bios build (BIOS_WASM/BIOS_ABI).
+MK_SUFFIXES="a b c d"
+multikey_enabled() { [[ "${HANDOVER_PRODUCERS:-1}" == "4" ]]; }
+multikey_port() { # $1=suffix
+    case "$1" in a) echo "${BP_A_HTTP_PORT:-18890}";; b) echo "${BP_B_HTTP_PORT:-18891}";;
+        c) echo "${BP_C_HTTP_PORT:-18892}";; d) echo "${BP_D_HTTP_PORT:-18893}";; esac
+}
+# One line per member in $WORK_DIR/bp-keys.txt: name wif pub-hex eos-key.
+multikey_prepare() {
+    [[ "${CUTOVER_VEHICLE:-memo}" == "memo" ]] || fail "HANDOVER_PRODUCERS=4 supports the memo vehicle only"
+    local sfx wif pubhex eos name
+    : >"$WORK_DIR/bp-keys.txt"
+    for sfx in $MK_SUFFIXES; do
+        read -r wif _ <<<"$("$PROBE_BIN" newkey)"
+        pubhex="$("$PROBE_BIN" pubkey "$wif")"
+        eos="$(python3 -I - "$pubhex" <<'PYEOF'
+import hashlib, sys
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+raw = bytes.fromhex(sys.argv[1])
+h = hashlib.new("ripemd160"); h.update(raw)
+n = int.from_bytes(raw + h.digest()[:4], "big")
+out = ""
+while n:
+    n, r = divmod(n, 58)
+    out = ALPHABET[r] + out
+print("EOS" + out)
+PYEOF
+)" || fail "schedule key encoding failed"
+        name="bp${sfx}test"
+        echo "$name $wif $pubhex $eos" >>"$WORK_DIR/bp-keys.txt"
+        {
+            echo "plugin = eosio::chain_api_plugin"
+            echo "plugin = eosio::net_plugin"
+            echo "plugin = eosio::producer_plugin"
+            echo "plugin = eosio::producer_api_plugin"
+            echo "http-server-address = 0.0.0.0:8888"
+            echo "p2p-listen-endpoint = 0.0.0.0:9876"
+            echo "p2p-peer-address = xpr-producer:9876"
+            echo "access-control-allow-origin = *"
+            echo "verbose-http-errors = true"
+            echo "resource-monitor-not-shutdown-on-threshold-exceeded = true"
+            echo "producer-name = $name"
+            echo "signature-provider = $eos=KEY:$wif"
+        } >"$WORK_DIR/bp-$sfx.ini"
+    done
+    chmod 600 "$WORK_DIR/bp-keys.txt" "$WORK_DIR"/bp-?.ini
+}
+# Comma-joined container ids of the four producers.
+multikey_cids() {
+    local sfx cid out=""
+    for sfx in $MK_SUFFIXES; do
+        cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q "xpr-bp-$sfx")"
+        [[ -n "$cid" ]] || fail "xpr-bp-$sfx container not found"
+        out="${out:+$out,}$cid"
+    done
+    printf '%s' "$out"
+}
+# Roster the ceremony declares: every member, unit weight, schedule key.
+multikey_write_roster() { # $1=out
+    python3 -I - "$WORK_DIR/bp-keys.txt" "$1" <<'PYEOF'
+import json, sys
+rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
+json.dump([{"producer": n, "key": eos, "weight": 1} for n, _w, _p, eos in rows], open(sys.argv[2], "w"))
+PYEOF
+}
+# Signing keys for declare/confirm into CEREMONY_KEY_ARGS: the single fixture
+# key by default, the first HANDOVER_SIGNERS member keys in multi-key mode.
+ceremony_key_args() { # $1=single-mode wif
+    CEREMONY_KEY_ARGS=(--key "$1")
+    multikey_enabled || return 0
+    local want="${HANDOVER_SIGNERS:-3}" got=0 name wif _rest
+    CEREMONY_KEY_ARGS=()
+    while read -r name wif _rest; do
+        [[ -n "$name" && "$got" -lt "$want" ]] || continue
+        CEREMONY_KEY_ARGS+=(--key "$wif")
+        got=$((got + 1))
+    done <"$WORK_DIR/bp-keys.txt"
+    [[ "$got" == "$want" ]] || fail "only $got member keys available for $want signers"
+}
+multikey_install_schedule() {
+    local dev_key="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
+    local bios_wasm="${BIOS_WASM:-$REPO_ROOT/../proton.contracts/build/contracts/eosio.bios/eosio.bios.wasm}"
+    local bios_abi="${BIOS_ABI:-$REPO_ROOT/../proton.contracts/build/contracts/eosio.bios/eosio.bios.abi}"
+    local boot_wasm="$REPO_ROOT/contracts/cutover/boot.wasm" boot_abi="$REPO_ROOT/contracts/cutover/boot.abi"
+    [[ -f "$bios_wasm" && -f "$bios_abi" ]] || fail "eosio.bios build not found (set BIOS_WASM / BIOS_ABI)"
+    [[ -f "$boot_wasm" && -f "$boot_abi" ]] || fail "boot contract not built (contracts/cutover/build.sh)"
+    multikey_prepare
+    echo "handover: multi-key mode: starting four producers with distinct keys..."
+    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml up --detach xpr-bp-a xpr-bp-b xpr-bp-c xpr-bp-d) \
+        || fail "producer containers failed to start"
+    local sfx
+    for sfx in $MK_SUFFIXES; do
+        for _ in $(seq 1 90); do leap_node_info "http://127.0.0.1:$(multikey_port "$sfx")" >/dev/null 2>&1 && break; sleep 1; done
+        leap_node_info "http://127.0.0.1:$(multikey_port "$sfx")" >/dev/null || fail "producer $sfx did not become ready"
+    done
+    # WTMSIG_BLOCK_SIGNATURES gates the bios's set_proposed_producers_ex.
+    # A fresh chain has only PREACTIVATE_FEATURE (scheduled through the
+    # producer API); the rest must be preactivated by a privileged contract.
+    local preact wtmsig
+    feature_digest() { # $1=name
+        leap_post "$LEAP_API" /v1/producer/get_supported_protocol_features '{}' | python3 -I -c '
+import json, sys
+for f in json.load(sys.stdin):
+    if f["specification"][0]["value"] == sys.argv[1]:
+        print(f["feature_digest"]); break
+else:
+    sys.exit(1)' "$1"
+    }
+    wait_feature() { # $1=name $2=digest
+        for _ in $(seq 1 60); do
+            leap_post "$LEAP_API" /v1/chain/get_activated_protocol_features '{"limit":100}' \
+                | python3 -I -c 'import sys; sys.exit(0 if sys.argv[1] in sys.stdin.read() else 1)' "$2" && return 0
+            sleep 1
+        done
+        fail "feature $1 never activated"
+    }
+    preact="$(feature_digest PREACTIVATE_FEATURE)" || fail "PREACTIVATE_FEATURE unsupported"
+    leap_post "$LEAP_API" /v1/producer/schedule_protocol_feature_activations "{\"protocol_features_to_activate\":[\"$preact\"]}" >/dev/null \
+        || fail "scheduling PREACTIVATE_FEATURE failed"
+    wait_feature PREACTIVATE_FEATURE "$preact"
+    leap_tapos_push "$dev_key" setcode eosio "$boot_wasm" || fail "boot setcode failed"
+    leap_tapos_push "$dev_key" setabi eosio "$boot_abi" || fail "boot setabi failed"
+    wtmsig="$(feature_digest WTMSIG_BLOCK_SIGNATURES)" || fail "WTMSIG_BLOCK_SIGNATURES unsupported"
+    leap_tapos_push "$dev_key" raw eosio activate eosio "$wtmsig" || fail "feature activation failed"
+    wait_feature WTMSIG_BLOCK_SIGNATURES "$wtmsig"
+    leap_tapos_push "$dev_key" setcode eosio "$bios_wasm" || fail "bios setcode failed"
+    leap_tapos_push "$dev_key" setabi eosio "$bios_abi" || fail "bios setabi failed"
+    local name wif pubhex _eos
+    while read -r name wif pubhex _eos; do
+        leap_tapos_push "$dev_key" newaccount "$name" || fail "producer account $name failed"
+    done <"$WORK_DIR/bp-keys.txt"
+    local setprods_hex
+    setprods_hex="$(python3 -I - "$WORK_DIR/bp-keys.txt" <<'PYEOF'
+import struct, sys
+rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
+def sym(c):
+    if "a" <= c <= "z":
+        return ord(c) - ord("a") + 6
+    if "1" <= c <= "5":
+        return ord(c) - ord("1") + 1
+    return 0
+def name_to_u64(s):
+    v = 0
+    for i in range(12):
+        v = (v << 5) | sym(s[i] if i < len(s) else ".")
+    return (v << 4) | (sym(s[12]) if len(s) == 13 else 0)
+out = bytearray([len(rows)])
+for name, _wif, pubhex, _eos in rows:
+    key = bytes.fromhex(pubhex)
+    assert len(key) == 33
+    out += struct.pack("<Q", name_to_u64(name)) + bytes([0]) + struct.pack("<I", 1)
+    out += bytes([1]) + bytes([0]) + key + struct.pack("<H", 1)
+print(bytes(out).hex())
+PYEOF
+)" || fail "setprods encoding failed"
+    leap_tapos_push "$dev_key" raw eosio setprods eosio "$setprods_hex" || fail "setprods failed"
+    echo "handover: schedule proposed; waiting for the four producers to take over..."
+    local active_n=0
+    for _ in $(seq 1 120); do
+        active_n="$(leap_post "$LEAP_API" /v1/chain/get_producer_schedule '{}' 2>/dev/null \
+            | python3 -I -c 'import json,sys; a=json.load(sys.stdin)["active"]; print(len(a["producers"]) if a["version"] >= 1 else 0)' 2>/dev/null || echo 0)"
+        [[ "$active_n" == "4" ]] && break
+        sleep 2
+    done
+    [[ "$active_n" == "4" ]] || fail "the four-producer schedule never activated"
+    # Every XPR node must follow the new producers: equal head and an
+    # advancing LIB on the genesis relay and both validators.
+    local lib1 lib2
+    lib1="$(leap_head_lib "$LEAP_API" | cut -d' ' -f2)"
+    for _ in $(seq 1 60); do
+        sleep 2
+        lib2="$(leap_head_lib "$LEAP_API" | cut -d' ' -f2)"
+        [[ "${lib2:-0}" -gt "${lib1:-0}" ]] && break
+    done
+    [[ "${lib2:-0}" -gt "${lib1:-0}" ]] || fail "LIB stalled under the four-producer schedule"
+    echo "handover: four producers active (schedule v1), LIB advancing ($lib1 -> $lib2)"
+}
+# Seed the fixture producers table with the four members (and no genesis
+# producer row): the gate requires the declared set to equal the checkpoint's
+# active producer set exactly, in both directions.
+multikey_plant_producers_table() { # $1=eosio wif
+    local wif="$1" name _w pubhex _eos votes_hex
+    local seed_wasm="$REPO_ROOT/contracts/cutover/seed.wasm" seed_abi="$REPO_ROOT/contracts/cutover/seed.abi"
+    [[ -f "$seed_wasm" && -f "$seed_abi" ]] || fail "seed contract not built (contracts/cutover)"
+    votes_hex="$(python3 -c 'import struct; print(struct.pack("<d", 1.0).hex())')"
+    leap_tapos_push "$wif" setcode eosio "$seed_wasm" || fail "seed setcode failed"
+    leap_tapos_push "$wif" setabi eosio "$seed_abi" || fail "seed setabi failed"
+    while read -r name _w pubhex _eos; do
+        leap_tapos_push "$wif" cseed eosio eosio "$name" "$votes_hex" "$pubhex" 1 || fail "seed setprod $name failed"
+    done <"$WORK_DIR/bp-keys.txt"
+    leap_wait_effect "seeded producers rows" /v1/chain/get_table_rows \
+        '{"json":true,"code":"eosio","scope":"eosio","table":"producers","limit":10}' \
+        'len(json.load(sys.stdin)["rows"])' "4"
+    echo "handover: fixture producers rows planted (four members, distinct keys)"
 }
 # Fetch one (get_block, get_block_header_state) pair for a post-H height
 # ($1) from one Leap node ($2, default the producer) into the freeze work
@@ -184,14 +389,20 @@ shadow_head() {
         -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])'
 }
-# Newest runner network dir wins: retries run minutes after boot, so the
-# current boot's dir is always the freshest. Portable across BSD/GNU
-# (no find -newermt, no stat flavors): plain -nt comparison only.
+# Newest runner network dir wins. The dir names embed their creation time
+# (network_YYYYMMDD_HHMMSS), so pick by name: directory mtimes are not
+# creation times (a dir touched at shutdown or by a resumed run looks newer
+# than the network that is actually live), and a stale dir made the relaunch
+# look for processes that no longer existed.
 newest_netdir() {
     local netdir="" cand
     for cand in "${TMPDIR:-/tmp}"/network-runner-root-data/network_* /tmp/network-runner-root-data/network_*; do
         [[ -d "$cand" ]] || continue
-        if [[ -z "$netdir" || "$cand" -nt "$netdir" ]]; then netdir="$cand"; fi
+        # Ignore networks from before this boot began: until the runner
+        # creates its dir, the "newest" one is the previous run's, and its
+        # refusals would be mistaken for this boot's.
+        if [[ -n "${NETDIR_FLOOR:-}" && "$(basename "$cand")" < "network_$NETDIR_FLOOR" ]]; then continue; fi
+        if [[ -z "$netdir" || "$(basename "$cand")" > "$(basename "$netdir")" ]]; then netdir="$cand"; fi
     done
     printf '%s' "$netdir"
 }
@@ -383,6 +594,12 @@ for name in ["eosio", "t1", "t2", "t3"]:
 json.dump(accts, open(out, "w"), indent=1)
 ' "$LEAP_API" "$WORK_DIR/pre-halt-accounts.json" || fail "pre-halt state capture failed"
     echo "handover: pre-halt state captured for eosio,t1,t2,t3"
+    # Multi-key mode hands the chain to four producers only after the traffic
+    # accounts and the t3 key rotation are in place, so the migrated
+    # equivalence gate sees the same pre-halt state as the single-key run.
+    if multikey_enabled; then
+        multikey_install_schedule
+    fi
     # Native shadow (Mac hosts): the host-built replay binary is Mach-O and
     # cannot run in the Linux shadow container, so it starts after the halt
     # on a staged static copy of the frozen block log instead of following
@@ -522,6 +739,26 @@ PYEOF
         'json.load(sys.stdin)["rows"][0]["owner"]' "eosio"
 }
 
+# Wait for a detached snapshot (multi-key mode) and fill SNAP_NAME/SNAP_HID.
+snapshot_resolve() {
+    [[ "${SNAP_PENDING:-0}" == "1" ]] || return 0
+    local f="$WORK_DIR/snap-result-$H.json" out
+    for _ in $(seq 1 180); do
+        [[ -s "$f" ]] && break
+        sleep 1
+    done
+    [[ -s "$f" ]] || fail "detached snapshot for H=$H never completed"
+    out="$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r.get("error") or "", r.get("snapshot_name",""), r.get("head_block_id",""))' "$f")" \
+        || fail "detached snapshot result unreadable"
+    [[ "$out" != " "* ]] || true
+    set -- $out
+    [[ "$#" == 2 ]] || fail "detached snapshot failed: $out"
+    SNAP_NAME="$1"
+    SNAP_HID="$2"
+    SNAP_PENDING=0
+    echo "handover: snapshot $SNAP_NAME at $SNAP_HID"
+}
+
 two_step_ceremony_and_freeze() {
     # Step one of the cutover while H is still in the future: choose H,
     # sign the declaration, record its digest on-chain, then freeze the
@@ -541,16 +778,28 @@ two_step_ceremony_and_freeze() {
     # The fixture schedule is one member: eosio on the fixture genesis key.
     local roster_key
     roster_key="$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")"
-    printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
+    if multikey_enabled; then
+        multikey_write_roster "$WORK_DIR/roster.json"
+    else
+        printf '[{"producer":"eosio","key":"%s","weight":1}]' "$roster_key" >"$WORK_DIR/roster.json"
+    fi
     # The restore gate binds the roster to the on-chain producers table
     # and fails closed when it is absent (real XPR always carries it).
     # The fixture chain runs no system contract, so plant the synthetic
     # row with the seed helper before H: code eosio / scope eosio, exact
     # producer_info layout, fixture producer active under the roster key.
     # The snapshot export then carries it and the boot cross-check runs.
-    plant_fixture_producers_table "$halt_key" "$roster_key"
+    if multikey_enabled; then
+        multikey_plant_producers_table "$halt_key"
+    else
+        plant_fixture_producers_table "$halt_key" "$roster_key"
+    fi
     local producer_cid
-    producer_cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)"
+    if multikey_enabled; then
+        producer_cid="$(multikey_cids)"
+    else
+        producer_cid="$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)"
+    fi
     [[ -n "$producer_cid" ]] || fail "xpr-producer container not found"
     # H, DECL_DIGEST, MEMO_BLOCK, K stay global (like the legacy loop's H):
     # the shared tail below and cmd_boot read them and their files.
@@ -559,7 +808,7 @@ two_step_ceremony_and_freeze() {
     H=""
     while [[ -z "$H" ]]; do
         round="$((round + 1))"
-        [[ "$round" -le 3 ]] || fail "freeze missed the declared H three times; aborting"
+        [[ "$round" -le "${CUTOVER_ROUNDS:-3}" ]] || fail "freeze missed the declared H ${CUTOVER_ROUNDS:-3} times; aborting"
         local x_chain x_head
         read -r x_chain x_head _ <<<"$(leap_chain_head "$LEAP_API")"
         # The declare->memo->scan phase takes ~10-16 blocks; the lag must
@@ -724,7 +973,8 @@ PYEOF
             echo "handover: round $round quorum completed in block $MEMO_BLOCK (K=$K); digest $DECL_DIGEST"
         else
         local decl_out
-        decl_out="$("$CEREMONY_BIN" declare --height "$H" --source-chain "$x_chain" --roster "$WORK_DIR/roster.json" --key "$halt_key" --out "$WORK_DIR/declaration.json")" \
+        ceremony_key_args "$halt_key"
+        decl_out="$("$CEREMONY_BIN" declare --height "$H" --source-chain "$x_chain" --roster "$WORK_DIR/roster.json" "${CEREMONY_KEY_ARGS[@]}" --out "$WORK_DIR/declaration.json")" \
             || fail "declaration failed"
         echo "handover: $decl_out"
         DECL_DIGEST="$(printf '%s' "$decl_out" | awk '{print $2}')"
@@ -857,9 +1107,10 @@ PYEOF
         echo "handover: round $round snapshotting the running producer at H=$H..."
         local snap_info snap_code
         snap_code=0
-        snap_info="$(python3 - "$LEAP_API" "$H" "$WORK_DIR" <<'PYEOF'
+        rm -f "$WORK_DIR/snap-result-$H.json"
+        snap_info="$(HANDOVER_ASYNC_SNAPSHOT="$(multikey_enabled && echo 1 || echo 0)" python3 - "$LEAP_API" "$H" "$WORK_DIR" <<'PYEOF'
 
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 api, H, workdir = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def post(path, payload):
     req = urllib.request.Request(api + path, data=json.dumps(payload).encode(),
@@ -898,6 +1149,32 @@ with open(f"{workdir}/block-H.state.json", "w") as f:
 # synced node, bound below to the snapshotted H id — never from a live
 # get_producer_schedule query, whose pending schedule may already have
 # moved on, and never from the producers table.)
+if state.get("id") != block.get("id"):
+    print(f"header state is not for H={H}: {state.get('id')} != {block.get('id')}", file=sys.stderr)
+    sys.exit(2)
+if os.environ.get("HANDOVER_ASYNC_SNAPSHOT") == "1":
+    # With several producers create_snapshot takes tens of blocks to return,
+    # and the agreed stop sits at most a few blocks past H. Fire it in a
+    # detached child and keep capturing post-H pairs; the caller resolves
+    # the result file before it is needed. The file is per-H so a child from
+    # a superseded round can never answer a later one.
+    if os.fork() == 0:
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        result = {}
+        try:
+            result = post("/v1/producer/create_snapshot", {})
+        except Exception as e:
+            result = {"error": str(e)}
+        tmp = f"{workdir}/snap-result-{H}.json.tmp"
+        with open(tmp, "w") as f:
+            json.dump(result, f)
+        os.rename(tmp, f"{workdir}/snap-result-{H}.json")
+        os._exit(0)
+    print(f"ASYNC {block['id']}")
+    sys.exit(0)
 snap = post("/v1/producer/create_snapshot", {})
 n, hid = snap.get("snapshot_name", ""), snap.get("head_block_id", "")
 if not n or not hid:
@@ -920,6 +1197,13 @@ PYEOF
         [[ "$snap_code" == 0 && -n "$snap_info" ]] || fail "producer snapshot failed"
         SNAP_NAME="${snap_info%% *}"
         SNAP_HID="${snap_info##* }"
+        # ASYNC: the snapshot is still being written by a detached child;
+        # snapshot_resolve fills SNAP_NAME/SNAP_HID after the freeze.
+        SNAP_PENDING=0
+        if [[ "$SNAP_NAME" == "ASYNC" ]]; then
+            SNAP_PENDING=1
+            SNAP_NAME="pending"
+        fi
         [[ -n "$SNAP_NAME" && -n "$SNAP_HID" ]] || fail "producer snapshot returned no name/id"
         echo "handover: snapshot $SNAP_NAME at $SNAP_HID"
         # Agreed stop: P is fixed up front (H + STOP_LAG), never observed.
@@ -967,7 +1251,7 @@ PYEOF
         freeze_code=0
         python3 - "$producer_cid" "$P_AGREED" "$LEAP_API" <<'PYEOF' || freeze_code=$?
 import json, subprocess, sys, time, urllib.request
-cid, target, api = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+cids, target, api = sys.argv[1].split(","), int(sys.argv[2]), sys.argv[3]
 def head():
     req = urllib.request.Request(api + "/v1/chain/get_info", data=b"{}",
                                  headers={"Content-Type": "application/json",
@@ -982,10 +1266,14 @@ while h < target:
         sys.exit(1)
     time.sleep(0.01)
     h = head()
-r = subprocess.run(["docker", "pause", cid], capture_output=True, text=True)
-if r.returncode != 0:
-    print(f"docker pause failed: {r.stderr}", file=sys.stderr)
-    sys.exit(1)
+# Every producer pauses at once: in multi-key mode the schedule has four
+# members and any one left running keeps building past P.
+procs = [subprocess.Popen(["docker", "pause", c], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for c in cids]
+for proc in procs:
+    _out, err = proc.communicate()
+    if proc.returncode != 0:
+        print(f"docker pause failed: {err}", file=sys.stderr)
+        sys.exit(1)
 PYEOF
         [[ "$freeze_code" == 0 ]] || fail "producer freeze failed"
         # The paused producer cannot report its own head, so P comes from
@@ -1010,7 +1298,7 @@ PYEOF
         # overshoot supersedes the round like any other miss.
         if [[ -z "$P" || "$P" != "$P_AGREED" ]]; then
             echo "handover: round $round validators converged to [$v1] [$v2], not exactly P=$P_AGREED for H=$H; unpausing, retrying..."
-            docker unpause "$producer_cid" >/dev/null 2>&1 || true
+            docker unpause ${producer_cid//,/ } >/dev/null 2>&1 || true
             H=""
             continue
         fi
@@ -1042,7 +1330,7 @@ sys.exit(0 if (a.get("version") == b.get("version") and names(a) == names(b)) el
         rm -f "$WORK_DIR/schedule-xcheck.tmp"
         if [[ -z "$xcheck_ok" ]]; then
             echo "handover: round $round validator active schedule disagrees with the frozen H state; unpausing, retrying..."
-            docker unpause "$producer_cid" >/dev/null 2>&1 || true
+            docker unpause ${producer_cid//,/ } >/dev/null 2>&1 || true
             H=""
             continue
         fi
@@ -1063,7 +1351,7 @@ sys.exit(0 if (a.get("version") == b.get("version") and names(a) == names(b)) el
         # capture above, not here.)
         if ! top_up_pairs "$((H + 1))" "$P" "$LEAP_V1_API"; then
             echo "handover: round $round pair capture lost to finality for H=$H..P=$P; unpausing, retrying..."
-            docker unpause "$producer_cid" >/dev/null 2>&1 || true
+            docker unpause ${producer_cid//,/ } >/dev/null 2>&1 || true
             H=""
             continue
         fi
@@ -1107,6 +1395,7 @@ sys.exit(0 if (a.get("version") == b.get("version") and names(a) == names(b)) el
     # the cutover H (same id ⇒ same deterministic state) and stage it from
     # the root-owned producer volume, the legacy pattern. Blocks H+1..P are
     # the agreed proof window up to the exact stop P, staged above.
+    snapshot_resolve
     [[ "$SNAP_HID" == "$H_ID" ]] || fail "snapshot head $SNAP_HID != frozen H=$H $H_ID"
     docker run --rm -v pulsevm-handover_leap-data:/d:ro -v "$WORK_DIR:/out" ubuntu:24.04 \
         cp "/d/snapshots/$(basename "$SNAP_NAME")" /out/snapshot.bin \
@@ -1269,8 +1558,14 @@ PYEOF
     # chain must freeze: no new blocks may appear in the shared block log
     # after the stop. A two-step freeze leaves the producer paused: unpause
     # first (the snapshot is staged, stragglers are ignored by design).
-    docker unpause "$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)" >/dev/null 2>&1 || true
-    (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer xpr-validator-1 xpr-validator-2)
+    if multikey_enabled; then
+        # shellcheck disable=SC2046
+        docker unpause $(multikey_cids | tr ',' ' ') >/dev/null 2>&1 || true
+        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-bp-a xpr-bp-b xpr-bp-c xpr-bp-d xpr-producer xpr-validator-1 xpr-validator-2)
+    else
+        docker unpause "$(cd "$SCRIPT_DIR" && docker compose -f compose.yaml ps -q xpr-producer)" >/dev/null 2>&1 || true
+        (cd "$SCRIPT_DIR" && docker compose -f compose.yaml stop xpr-producer xpr-validator-1 xpr-validator-2)
+    fi
     # The block log lives in a root-owned Docker volume: read its size from
     # a throwaway container rather than stat(1) on the host mountpoint.
     blocks_bytes() {
@@ -1341,7 +1636,8 @@ confirm_attach_verify() { # $1=platform-chain-id
     # refuses unless every signer confirms the same agreed head, so a
     # divergent freeze fails here, not at boot.
     P="$(cat "$WORK_DIR/P")" || fail "could not read frozen head P"
-    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" --key "$halt_key" --out "$WORK_DIR/confirmation.json")" \
+    ceremony_key_args "$halt_key"
+    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" "${CEREMONY_KEY_ARGS[@]}" --out "$WORK_DIR/confirmation.json")" \
         || fail "confirmation failed"
     echo "handover: $confirm_out"
     CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"
@@ -1508,7 +1804,11 @@ restart_five_nodes() { # $1=network dir
             [[ -n "$cmdline" ]] && break
             sleep 5
         done
-        [[ -n "$cmdline" ]] || fail "learn-then-bind: node$n process not found after retries"
+        if [[ -z "$cmdline" ]]; then
+            echo "handover: metalgo processes seen at capture time (looking for $NETBASE/node$n):" >&2
+            ps -eo pid,etime,args | grep "[m]etalgo" | cut -c1-240 >&2 || true
+            fail "learn-then-bind: node$n process not found after retries"
+        fi
         eval "CMDS_$n=\"\$cmdline\""
         pids="$pids $(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$n/configs" | head -1 | awk '{print $1}' || true)"
     done
@@ -1648,6 +1948,9 @@ cmd_checkpoint() {
 
 cmd_boot() {
     checkpoint="${1:?checkpoint required}"
+    # Runner dirs are named network_YYYYMMDD_HHMMSS in local time; record the
+    # boot start so newest_netdir only ever sees this boot's network.
+    NETDIR_FLOOR="$(date +%Y%m%d_%H%M%S)"
     H="$(cat "$WORK_DIR/H")"
     H_ID="$(cat "$WORK_DIR/H_ID")"
     if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then

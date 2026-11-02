@@ -197,15 +197,53 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   `pause_height`. All three fixtures pass (15, 14 and the voter checks) and
   now run in CI (`.github/workflows/cutover-fixtures.yml`).
 
-- Multi-key schedule fixture (`contracts/cutover/test-multikey-schedule.sh`,
-  Leap side only): four producers with four distinct block-signing keys,
-  installed through eosio.bios `setprods` after activating
-  WTMSIG_BLOCK_SIGNATURES with `boot.cpp` (fixture-only preactivation
-  contract). Proven: the schedule activates, every member produces under its
-  own key, LIB advances on the 4-member schedule, and the header state
-  lists four distinct keys. NOT yet wired into `run-handover.sh`: the
-  ceremony, attach, verifier and five-node boot still run a one-member
-  roster. Needs the proton.contracts bios build artifact, so it is not in CI.
+- Multi-key rehearsal PASS (Nov 2, 2026, `HANDOVER_PRODUCERS=4`): the
+  genesis producer hands the XPR chain to four producers with four distinct
+  block-signing keys (eosio.bios `setprods`, schedule v1), the ceremony signs
+  with 3 of 4 keys (the minimum strict 2/3+1 quorum), and the whole pair is
+  verified against the four-member header-state schedule: `roster schedule
+  match: ok (4 producers)`, schedule version 1 unanimous, learn-then-bind
+  rebind, state equivalence 11/11, boundary traffic 10/10 exactly-once (H=548,
+  stop P=648). This is the first live run with more than one key. Run:
+
+  ```sh
+  HANDOVER_PRODUCERS=4 CUTOVER_ROUNDS=6 CUTOVER_STOP_LAG=100 CONFIRM_LAG=250 \
+    TERMINAL_HEIGHT=450 ./docker/handover/run-handover.sh start
+  ```
+
+  It needs the eosio.bios build (`BIOS_WASM`/`BIOS_ABI`, default the sibling
+  `proton.contracts` checkout), so it is not in CI. The 4-producer-only
+  fixture `contracts/cutover/test-multikey-schedule.sh` proves the Leap side
+  alone (schedule activation, every member producing, LIB advancing, four
+  distinct keys in the header state) and its block log replays cleanly
+  through the PulseVM shadow.
+
+  Findings from this mode, none visible with one producer:
+
+  - **A Leap snapshot of H only completes once H is irreversible.** Leap
+    writes `.pending-snapshot-<H id>.bin` and finalizes it on irreversibility.
+    With one producer LIB trails head by a block, so the old "freeze at
+    P <= H+5" works. With four producers LIB(H) arrives ~25-50 blocks after H,
+    and with a real 21-producer committee hundreds of blocks after, so a
+    freeze at H+5 leaves H reversible and the snapshot never finishes
+    (the HTTP call times out; the pending file stays). The stop P must be
+    chosen past LIB(H), or H's state must come from somewhere other than a
+    Leap snapshot. The gate itself allows up to `MAX_POST_H_BLOCKS` (4096)
+    post-H blocks; only the harness default `CUTOVER_STOP_LAG=5` is wrong
+    for this case. Resolve this before sizing the real stop window.
+  - `create_snapshot` therefore blocks for tens of blocks; the harness fires
+    it in a detached child and keeps capturing post-H (block, header-state)
+    pairs, resolving the result after the freeze.
+  - **Possible PulseVM replay gap (unconfirmed cause):** with eosio.bios
+    deployed on `eosio`, an `updateauth` on another account (the t3 key
+    rotation) was applied by Leap but absent from the migrated PulseVM
+    state (11 accounts, 10 identical). With the traffic seeded before the
+    bios deployment the equivalence is 11/11, so multi-key mode seeds
+    traffic first. Needs its own reproduction and ticket before it is
+    treated as a replay bug; mainnet runs eosio.system, not bios.
+  - Harness: runner directories are now only considered if created after
+    this boot began (the early-exit refusal check used to read the previous
+    run's logs), and unpause handles the four comma-joined container ids.
 
 ## What this does NOT prove (do not merge as migration-complete)
 
