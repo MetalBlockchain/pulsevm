@@ -45,7 +45,7 @@ is allowed to report this single known finding.
 (grpc 1.83.2, x/crypto 0.57.0, x/net 0.60.0, x/text 0.42.0, x/mod 0.41.0,
 otel sdk 1.44.0, gnark-crypto 0.18.1, klauspost/compress 1.18.7, spdystream
 0.5.1, plus go-kzg-4844 1.1.0 which the patched gnark-crypto requires);
-`go vet` is clean and the module's tests compile. Re-run after any
+`go vet` is clean and the e2e suite passes 5/5 against a freshly built plugin and MetalGo v1.14.2-tahoe (the module now requires Go 1.26, so the e2e workflow uses it). Re-run after any
 dependency change; pins are reviewed at least monthly.
 
 ## SAST
