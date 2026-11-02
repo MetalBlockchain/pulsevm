@@ -141,7 +141,26 @@ against independently replayed XPR state:
   norm (no hash-to-roster comparison is attempted — a wrong pin failed an
   earlier run of the same rehearsal live and was removed).
 
+- Multi-key rehearsal PASS (`HANDOVER_PRODUCERS=4`, Nov 2, 2026): four
+  producers on four distinct block-signing keys, 3-of-4 signed declaration and
+  confirmation, restore gate verified against the four-member header-state
+  schedule (version 1), state equivalence 11/11, boundary 10/10
+  exactly-once — the first live run with more than one key. It also found
+  that a Leap snapshot of H only finalizes once H is irreversible, which
+  makes the stop window a measured quantity (see §4 and
+  [xpr-handover-rehearsal.md](./xpr-handover-rehearsal.md)). Contract fixtures
+  (4-member, 21-member, voter) and the multi-key schedule fixture pass and run
+  in CI. Scan results and the one open credential exposure:
+  [security-exceptions.md](./security-exceptions.md).
+
 ## 4. What mainnet still needs (inputs)
+
+- **Stop window.** `P - H >= 2 x finality_lag + 12`, measured as the live
+  head-minus-LIB gap on XPR at T-14. A Leap snapshot of H is written only once
+  H is irreversible; a shorter window leaves a pending snapshot that never
+  finalizes. The voter's `--preflight` refuses a short window. On a 21-producer
+  committee the lag is hundreds of blocks, so P sits hundreds of blocks past
+  H (the gate accepts up to 4096).
 
 - **Validator coordination.** BPs run the ceremony: freeze the contract (or
   record the memo) inside the window, sign the declaration before H, sign

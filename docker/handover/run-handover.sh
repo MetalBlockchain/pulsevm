@@ -361,8 +361,11 @@ leap_send() {
         # Pipe the body via stdin (@-), never argv: a setcode packed_trx
         # with inlined WASM exceeds Linux MAX_ARG_STRLEN (128 KiB per
         # string) and exec fails with "Argument list too long".
-        send_out="$(printf '%s' "$body" | curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
-            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d @- 2>&1)" && break
+        # `if` (not `&& break`) so a handled retry does not fire the ERR trap.
+        if send_out="$(printf '%s' "$body" | curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
+            -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d @- 2>&1)"; then
+            break
+        fi
         echo "handover: leap_send attempt $attempt failed: $send_out" >&2
         sleep 3
     done
@@ -554,6 +557,12 @@ cmd_start() {
         sleep 2
     done
     [[ "$converged" == true ]] || fail "XPR nodes never reached consensus"
+    # Multi-key mode installs the four-producer schedule first, so traffic
+    # (and its dependent key rotation) runs under real multi-producer
+    # production, microforks included.
+    if multikey_enabled; then
+        multikey_install_schedule
+    fi
     # Seed pre-halt traffic the equivalence gate re-checks after promotion:
     # three accounts (one born under a rotated key) plus a live key rotation.
     # These land hundreds of blocks before N, hence deep in irreversibility.
@@ -572,6 +581,12 @@ cmd_start() {
     echo "handover: traffic t1: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t1 "$TRAFFIC_PUB")"
     echo "handover: traffic t2: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t2)"
     echo "handover: traffic t3: $(submit_leap newaccount "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t3)"
+    # The rotation depends on t3 existing: wait for the account instead of
+    # leaning on send retries (the first attempt used to be a rejected 500).
+    for _ in $(seq 1 60); do
+        leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t3"}' >/dev/null 2>&1 && break
+        sleep 1
+    done
     echo "handover: traffic rotate t3: $(submit_leap updateauth "$leap_chain" "$DEV_KEY" "$leap_ref" "$leap_prefix" "$leap_exp" t3 active owner "$TRAFFIC_PUB")"
     echo "handover: waiting for the traffic accounts to exist..."
     for _ in $(seq 1 60); do
@@ -580,6 +595,32 @@ cmd_start() {
         && leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t3"}' >/dev/null 2>&1 && break
         sleep 2
     done
+    # The pre-halt reference state must be irreversible state. With several
+    # producers a microfork at a turn boundary can drop a transaction a node
+    # already applied (the dependent t3 key rotation was observed that way),
+    # so the head is not a safe thing to compare against: wait for LIB to pass
+    # the head, require the rotation to be in that state (t3 active key equals
+    # t1's, which was born under the traffic key), and resubmit it if it was
+    # dropped.
+    local rot_try cap_head cap_lib t1_key t3_key
+    for rot_try in 1 2 3 4 5; do
+        read -r cap_head cap_lib <<<"$(leap_head_lib "$LEAP_API")"
+        for _ in $(seq 1 180); do
+            read -r _h cap_lib <<<"$(leap_head_lib "$LEAP_API")"
+            [[ "${cap_lib:-0}" -ge "$cap_head" ]] && break
+            sleep 1
+        done
+        [[ "${cap_lib:-0}" -ge "$cap_head" ]] || fail "traffic never went irreversible (head $cap_head, LIB ${cap_lib:-?})"
+        t1_key="$(leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t1"}' | python3 -I -c 'import json,sys; print([p for p in json.load(sys.stdin)["permissions"] if p["perm_name"]=="active"][0]["required_auth"]["keys"][0]["key"])')" \
+            || fail "could not read t1 active key"
+        t3_key="$(leap_post "$LEAP_API" /v1/chain/get_account '{"account_name":"t3"}' | python3 -I -c 'import json,sys; print([p for p in json.load(sys.stdin)["permissions"] if p["perm_name"]=="active"][0]["required_auth"]["keys"][0]["key"])')" \
+            || fail "could not read t3 active key"
+        [[ "$t1_key" == "$t3_key" ]] && break
+        echo "handover: t3 key rotation is not in irreversible state (attempt $rot_try); resubmitting..."
+        leap_tapos_push "$DEV_KEY" updateauth t3 active owner "$TRAFFIC_PUB" || fail "t3 rotation resubmit failed"
+    done
+    [[ "$t1_key" == "$t3_key" ]] || fail "t3 key rotation never landed irreversibly"
+    echo "handover: traffic is irreversible and the t3 rotation is in state (LIB $cap_lib >= head $cap_head)"
     python3 -c '
 import json, subprocess, sys
 api, out = sys.argv[1], sys.argv[2]
@@ -594,12 +635,7 @@ for name in ["eosio", "t1", "t2", "t3"]:
 json.dump(accts, open(out, "w"), indent=1)
 ' "$LEAP_API" "$WORK_DIR/pre-halt-accounts.json" || fail "pre-halt state capture failed"
     echo "handover: pre-halt state captured for eosio,t1,t2,t3"
-    # Multi-key mode hands the chain to four producers only after the traffic
-    # accounts and the t3 key rotation are in place, so the migrated
-    # equivalence gate sees the same pre-halt state as the single-key run.
-    if multikey_enabled; then
-        multikey_install_schedule
-    fi
+
     # Native shadow (Mac hosts): the host-built replay binary is Mach-O and
     # cannot run in the Linux shadow container, so it starts after the halt
     # on a staged static copy of the frozen block log instead of following
@@ -808,7 +844,10 @@ two_step_ceremony_and_freeze() {
     H=""
     while [[ -z "$H" ]]; do
         round="$((round + 1))"
-        [[ "$round" -le "${CUTOVER_ROUNDS:-3}" ]] || fail "freeze missed the declared H ${CUTOVER_ROUNDS:-3} times; aborting"
+        # Pausing four containers lands a block or two late fairly often, and each
+        # miss just supersedes the round, so multi-key mode gets more rounds.
+        local max_rounds="${CUTOVER_ROUNDS:-$(multikey_enabled && echo 6 || echo 3)}"
+        [[ "$round" -le "$max_rounds" ]] || fail "freeze missed the declared H $max_rounds times; aborting"
         local x_chain x_head
         read -r x_chain x_head _ <<<"$(leap_chain_head "$LEAP_API")"
         # The declare->memo->scan phase takes ~10-16 blocks; the lag must
@@ -1220,8 +1259,22 @@ PYEOF
         # lands exactly on P, and only tip blocks produced during pause
         # latency can still be missing (topped up afterwards — the fresh tip
         # is always reversible because LIB trails production).
-        CUTOVER_STOP_LAG="${CUTOVER_STOP_LAG:-5}"
+        # A Leap snapshot of H only finalizes once H is irreversible, so the
+        # agreed stop must sit past the finality lag: P - H >= 2 x (head -
+        # LIB) + 12, the same rule the voter's preflight enforces. A single
+        # producer has a lag of ~1 and keeps the historical 5; several
+        # producers derive it from the live gap. CUTOVER_STOP_LAG overrides.
+        local fin_head fin_lib fin_lag fin_need
+        read -r fin_head fin_lib <<<"$(leap_head_lib "$LEAP_API")"
+        fin_lag="$((${fin_head:-0} - ${fin_lib:-0}))"
+        fin_need="$((2 * fin_lag + 12))"
+        if [[ "$fin_lag" -le 3 ]]; then fin_need=5; fi
+        CUTOVER_STOP_LAG="${CUTOVER_STOP_LAG:-$fin_need}"
+        if [[ "$CUTOVER_STOP_LAG" -lt "$fin_need" ]]; then
+            fail "CUTOVER_STOP_LAG=$CUTOVER_STOP_LAG is inside the finality lag (head-LIB $fin_lag, need >= $fin_need): the H snapshot would never finalize"
+        fi
         P_AGREED=$((H + CUTOVER_STOP_LAG))
+        echo "handover: finality lag $fin_lag; agreed stop P=$P_AGREED (H+$CUTOVER_STOP_LAG)"
         echo "handover: round $round capturing post-H pairs until the agreed stop P=$P_AGREED..."
         local attempt next_fetch
         next_fetch=$((H + 1))
@@ -1649,7 +1702,7 @@ confirm_attach_verify() { # $1=platform-chain-id
         --declaration "$WORK_DIR/declaration.json" --confirmation "$WORK_DIR/confirmation.json"
         --declaration-inclusion "$(cat "$WORK_DIR/memo-block")"
         --max-declaration-lag "${CUTOVER_LAG:-30}"
-        --max-confirmation-lag "${CONFIRM_LAG:-120}"
+        --max-confirmation-lag "${CONFIRM_LAG:-$((120 + ${CUTOVER_STOP_LAG:-5}))}"
     )
     if [[ "${CUTOVER_VEHICLE:-memo}" == "contract" ]]; then
         h_version="$(python3 -c 'import json; print(json.load(open("'"$WORK_DIR/block-H.json"'"))["schedule_version"])')" \

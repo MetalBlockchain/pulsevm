@@ -20,6 +20,7 @@ named owner; nothing ships "when ready".
 | Successor chain id, or the pinned `chain_id` (U-1) | Chain ops + MetalGo team | Without U-1: published at H, wallets flip at H+ε |
 | Platform chain id | MetalGo team | Bound into every confirmation; the gate refuses without it |
 | Wallet/exchange test vectors (pre-H and post-H) | Wallet + exchange leads | Sign/verify fixtures on both chains before the window |
+| Stop window P (agreed stop height, P - H) | Chain ops | Measure the live head-minus-LIB gap at T-14 and set `P - H >= 2 x gap + 12`; a Leap snapshot of H only finalizes once H is irreversible, so a shorter window leaves no snapshot. `--preflight` refuses a short window |
 | Voter config per producer (producer name, keys, producer API URL) | Each BP | `--preflight` must print GO before the freeze |
 | Schedule readiness: `check-schedule-readiness.py` PASS | Chain ops | Every active producer carries a valid K1 schedule key, weights sane, no pending/proposed rotation; a single bad row dooms init |
 

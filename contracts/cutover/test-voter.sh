@@ -175,7 +175,7 @@ table_rows cutover cutover members \
 PLATFORM="$(python3 -c 'print("ee" * 32)')"
 WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
 # Agreed pause head P = H + PAUSE_K, fixed before the freeze like on mainnet.
-PAUSE_K=3
+PAUSE_K=20
 mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty -> path
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
@@ -233,6 +233,23 @@ PREFLIGHT_CFG="$(mk_config "$H" true "" "$PLATFORM")"
 grep -q "PREFLIGHT: GO" "$WORK/preflight.log" || fail "no preflight GO: $(cat "$WORK/preflight.log")"
 grep -q "freeze on-chain" "$WORK/preflight.log" || fail "preflight skipped the freeze check"
 pass "preflight GO before the window"
+
+echo "cutover-voter-test: preflight refuses a stop window inside the finality lag..."
+SHORT_CFG="$WORK/voter-short-window.json"
+python3 -I - "$PREFLIGHT_CFG" "$SHORT_CFG" "$H" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["pause_height"] = int(sys.argv[3]) + 1
+json.dump(cfg, open(sys.argv[2], "w"))
+PYEOF
+if "$VOTER_BIN" --config "$SHORT_CFG" --preflight >"$WORK/preflight-short.log" 2>&1; then
+    fail "preflight accepted a stop window inside the finality lag: $(cat "$WORK/preflight-short.log")"
+fi
+grep -q "PREFLIGHT FAIL: stop window past finality" "$WORK/preflight-short.log" \
+    || fail "short stop window not named in the refusal: $(cat "$WORK/preflight-short.log")"
+grep -q "PREFLIGHT: NO-GO" "$WORK/preflight-short.log" || fail "short stop window did not produce NO-GO"
+grep -q "stop window past finality" "$WORK/preflight.log" || fail "GO preflight skipped the stop-window check"
+pass "preflight refuses a stop window shorter than the finality lag"
 
 echo "cutover-voter-test: status reports the loop state as JSON..."
 "$VOTER_BIN" --config "$PREFLIGHT_CFG" --status >"$WORK/status.json" 2>"$WORK/status.err" \
@@ -437,7 +454,7 @@ echo "cutover-voter-test: dry-run rehearses the producer pause..."
 PAST_CFG="$(mk_config 5 true "" "" "http://127.0.0.1:9")"
 "$VOTER_BIN" --config "$PAST_CFG" --dry-run --max-polls 3 >"$WORK/pausedry.log" 2>&1 \
     || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry.log")"
-grep -q "would pause the local producer at P=8" "$WORK/pausedry.log" \
+grep -q "would pause the local producer at P=25" "$WORK/pausedry.log" \
     || fail "no dry-run pause line: $(cat "$WORK/pausedry.log")"
 pass "dry-run rehearses the producer pause"
 

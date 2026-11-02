@@ -36,10 +36,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev python3
 
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: Install Protobuf (protoc)
         uses: ./.github/actions/setup-protoc
@@ -47,7 +49,7 @@ jobs:
           version: '27.1'
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry

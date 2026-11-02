@@ -235,6 +235,14 @@ mk_push raw "$CHAIN_ID" "$DEV_WIF" eosio activate eosio "$WTMSIG" >/dev/null
 wait_feature WTMSIG_BLOCK_SIGNATURES "$WTMSIG"
 check "WTMSIG_BLOCK_SIGNATURES active"
 
+# Auth-rotation control: one account rotated before the bios lands on eosio
+# and one after. Leap applies both; the PulseVM replay of the block log must
+# too (checked by the replay comparison below when KEEP_BLOCKS_DIR is set).
+read -r ROT_WIF ROT_PUB_UNUSED <<<"$("$PROBE" newkey)"
+ROT_PUB="$("$PROBE" pubkey "$ROT_WIF")"
+mk_push newaccount "$CHAIN_ID" "$DEV_WIF" rotapre >/dev/null
+mk_push updateauth "$CHAIN_ID" "$DEV_WIF" rotapre active owner "$ROT_PUB" >/dev/null
+
 echo "cutover-multikey: deploying eosio.bios on eosio..."
 mk_push setcode "$CHAIN_ID" "$DEV_WIF" eosio "$BIOS_WASM" >/dev/null
 mk_push setabi "$CHAIN_ID" "$DEV_WIF" eosio "$BIOS_ABI" >/dev/null
@@ -268,6 +276,18 @@ for name, key in zip(names, keys):
 print(bytes(out).hex())
 PYEOF
 }
+mk_push newaccount "$CHAIN_ID" "$DEV_WIF" rotapost >/dev/null
+mk_push updateauth "$CHAIN_ID" "$DEV_WIF" rotapost active owner "$ROT_PUB" >/dev/null
+for acct in rotapre rotapost; do
+    got="$(rpc /v1/chain/get_account "{\"account_name\":\"$acct\"}" | python3 -I -c '
+import json, sys
+a = json.load(sys.stdin)
+for p in a["permissions"]:
+    if p["perm_name"] == "active":
+        print(p["required_auth"]["keys"][0]["key"])')"
+    echo "cutover-multikey: $acct active key on Leap: $got"
+done
+check "rotations applied on Leap (pre- and post-bios)"
 # Leap refuses a schedule naming an account that does not exist.
 for i in 0 1 2 3; do
     mk_push newaccount "$CHAIN_ID" "$DEV_WIF" "${BP_NAME[$i]}" >/dev/null

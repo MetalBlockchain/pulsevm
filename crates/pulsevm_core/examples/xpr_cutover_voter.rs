@@ -1543,6 +1543,12 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
     };
     let base = config.inner.nodeos_url.clone();
     let info = get_info(&client, &base).await;
+    if let (Some(pause_height), Ok((head, lib, _))) = (config.inner.pause_height, info.as_ref()) {
+        check![
+            "stop window past finality",
+            stop_window_covers_finality(config.inner.height, pause_height, *head, *lib),
+        ];
+    }
     check![
         "node reachable, source chain matches",
         info.and_then(|(head, lib, chain_id)| {
@@ -1777,6 +1783,39 @@ fn validate_stop_config(stop: &StopConfig) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// One producer turn of slack on top of the finality estimate.
+const STOP_WINDOW_SAFETY_BLOCKS: u32 = 12;
+
+/// Whether the agreed stop P sits far enough past H for H to become
+/// irreversible before every producer stops. A Leap snapshot of H is only
+/// finalized once H is irreversible, so a stop inside the finality lag
+/// leaves a pending snapshot that never completes (found live with a
+/// four-producer schedule: LIB(H) arrives tens of blocks after H, and on a
+/// 21-producer committee hundreds). The live head-minus-LIB gap is the
+/// finality lag; require twice that plus one producer turn.
+fn stop_window_covers_finality(
+    height: u32,
+    pause_height: u32,
+    head: u32,
+    lib: u32,
+) -> Result<String, String> {
+    let lag = head.saturating_sub(lib);
+    let needed = lag
+        .saturating_mul(2)
+        .saturating_add(STOP_WINDOW_SAFETY_BLOCKS);
+    let window = pause_height.saturating_sub(height);
+    if window >= needed {
+        Ok(format!(
+            "P-H = {window} blocks covers the observed finality lag {lag} (need {needed})"
+        ))
+    } else {
+        Err(format!(
+            "agreed stop leaves only {window} blocks after H but the chain's finality lag is {lag} (head {head}, LIB {lib}): \
+             H would still be reversible at P and its snapshot would never finalize; agree P >= H + {needed}"
+        ))
+    }
 }
 
 /// Pure signing predicate, unit-tested below. The confirmation is
@@ -2861,6 +2900,21 @@ mod tests {
             producer_api_url: None,
         };
         assert!(!should_pause_producer(&no_api, 200, 103));
+    }
+
+    #[test]
+    fn stop_window_must_cover_the_finality_lag() {
+        // Single producer: LIB trails head by one, a short window is fine.
+        assert!(stop_window_covers_finality(100, 120, 90, 89).is_ok());
+        // Exactly the requirement (2 * lag + one producer turn) passes.
+        assert!(stop_window_covers_finality(100, 100 + 2 * 40 + 12, 90, 50).is_ok());
+        // One block short fails and names the needed P.
+        let error = stop_window_covers_finality(100, 100 + 2 * 40 + 11, 90, 50).unwrap_err();
+        assert!(error.contains("agree P >= H + 92"), "{error}");
+        // A 21-producer-sized lag (about 170 blocks) rejects the old H+5.
+        assert!(stop_window_covers_finality(1000, 1005, 5000, 4830).is_err());
+        // Garbage heights never panic: LIB ahead of head and P before H.
+        assert!(stop_window_covers_finality(100, 90, 10, 20).is_err());
     }
 
     /// Minimal Leap producer-API stub: answers pause/paused with canned

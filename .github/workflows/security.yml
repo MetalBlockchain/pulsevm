@@ -1,0 +1,98 @@
+name: Security scans
+
+# Mirrors the pre-push gates: secrets, dependency CVEs, SBOM. Tool versions are
+# pinned to the ones the local gates were run with.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  TRIVY_VERSION: 0.76.1
+  SYFT_VERSION: 1.55.0
+
+jobs:
+  gitleaks:
+    name: gitleaks_scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+      # Pull requests scan only their own commits: the repository history
+      # still carries one historical credential exposure (see
+      # docs/security-exceptions.md) that is tracked for rotation, not
+      # allowlisted. The weekly run and pushes scan the full history and are
+      # expected to report exactly that one finding until it is remediated.
+      - name: Scan the pull request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --exit-code 1 --log-opts "origin/${BASE_REF}..HEAD"
+      - name: Scan the full history
+        if: github.event_name != 'pull_request'
+        run: gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --exit-code 1
+        continue-on-error: ${{ github.event_name == 'schedule' }}
+
+  cve_scans:
+    name: cve_scans + package scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install trivy
+        run: |
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o /tmp/trivy.tgz
+          tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy
+      # Covers Cargo.lock and tests/e2e/go.sum (transitive included). The
+      # vendored C++ tree has no lockfile and is excluded.
+      - name: Scan dependencies (fail on HIGH/CRITICAL)
+        run: trivy fs . --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs target --skip-dirs crates/pulsevm_ffi/pulsevm
+
+  sbom_scans:
+    name: sbom_scans
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install syft
+        run: |
+          curl -sSfL "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" -o /tmp/syft.tgz
+          tar -xzf /tmp/syft.tgz -C /usr/local/bin syft
+      - name: Generate the SBOM
+        run: syft dir:. --exclude ./target --exclude ./crates/pulsevm_ffi/pulsevm -o cyclonedx-json=sbom.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+
+  sast_scans:
+    name: sast_scans
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ rust, go ]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+        with:
+          category: "/language:${{ matrix.language }}"

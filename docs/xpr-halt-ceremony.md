@@ -320,12 +320,27 @@ schedule. A forged schedule would need the coordinator to fetch a lie,
 15 BPs to attest it, and the real producers' signatures to verify
 against it — outside any quorum threat model this design admits.
 
-There is deliberately no LIB wait. On a large committee LIB(H) arrives
-hundreds of blocks after the agreed stop, so waiting for it deadlocks
-the halt while the chain builds an unproven tail past the proof window.
-The 15-of-21 confirmation quorum over H_ID stands in for Leap finality,
-and every scheduled producer stops at the same agreed P — the voters
-enforce it locally, independent of confirmation delivery.
+There is deliberately no LIB wait *for signing*. On a large committee
+LIB(H) arrives hundreds of blocks after H, so making the confirmation wait
+for it would deadlock the halt. The 15-of-21 confirmation quorum over H_ID
+stands in for Leap finality, and every scheduled producer stops at the same
+agreed P — the voters enforce it locally, independent of confirmation
+delivery.
+
+The stop window itself is not free, though: **a Leap snapshot of H is only
+finalized once H is irreversible.** Leap writes
+`.pending-snapshot-<H id>.bin` and renames it when H goes irreversible. If
+every producer stops before that, H stays reversible, the snapshot never
+completes, and the exporters have nothing to export (found live with a
+four-producer schedule, where LIB(H) arrives tens of blocks after H; on 21
+producers expect hundreds). So the agreed P must satisfy
+`P - H >= 2 x finality_lag + one producer turn`, where the lag is the
+chain's steady-state head-minus-LIB gap. The voter's `--preflight` enforces
+this against the live node (`stop window past finality`) and the rehearsal
+harness derives its stop lag from the observed gap. The gate accepts up to
+4096 post-H blocks, so a longer window costs staging (one block plus one
+header state per height, all captured while reversible), not validity.
+Choose P at T-14 from a measured lag on the live chain, not from a constant.
 
 Prevention is procedural, verification is cryptographic. On the source
 side, the agreed stop PREVENTS post-P traffic: every producer pauses at

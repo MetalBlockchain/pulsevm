@@ -230,17 +230,26 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
     chosen past LIB(H), or H's state must come from somewhere other than a
     Leap snapshot. The gate itself allows up to `MAX_POST_H_BLOCKS` (4096)
     post-H blocks; only the harness default `CUTOVER_STOP_LAG=5` is wrong
-    for this case. Resolve this before sizing the real stop window.
+    for this case. Fixed: the voter's `--preflight` refuses a stop window
+    shorter than `2 x finality lag + 12` (`stop_window_covers_finality`), the
+    harness derives its stop lag from the observed head-minus-LIB gap, and
+    the ceremony and operations docs now say P must be measured, not assumed.
   - `create_snapshot` therefore blocks for tens of blocks; the harness fires
     it in a detached child and keeps capturing post-H (block, header-state)
     pairs, resolving the result after the freeze.
-  - **Possible PulseVM replay gap (unconfirmed cause):** with eosio.bios
-    deployed on `eosio`, an `updateauth` on another account (the t3 key
-    rotation) was applied by Leap but absent from the migrated PulseVM
-    state (11 accounts, 10 identical). With the traffic seeded before the
-    bios deployment the equivalence is 11/11, so multi-key mode seeds
-    traffic first. Needs its own reproduction and ticket before it is
-    treated as a replay bug; mainnet runs eosio.system, not bios.
+  - **The "lost t3 rotation" was a harness capture artifact, not a PulseVM
+    replay bug.** With bios on `eosio` the t3 key rotation was present in the
+    reference state the harness read from the head but absent from the
+    migrated state (10 of 11 identical). A fixture that rotates one account
+    before and one after the bios deployment, replayed through the PulseVM
+    shadow, applies both identically to Leap, so the replay is correct. The
+    most likely cause is that with several producers the head is reversible:
+    a microfork can drop a transaction a node already applied (not
+    reproduced in the two later runs, where the rotation landed first time,
+    so this is the best explanation, not a proven one). The harness now captures
+    the pre-halt reference only after LIB passes the head, asserts the
+    dependent rotation is in that state (t3's active key equals t1's), and
+    resubmits it if it was dropped.
   - Harness: runner directories are now only considered if created after
     this boot began (the early-exit refusal check used to read the previous
     run's logs), and unpause handles the four comma-joined container ids.

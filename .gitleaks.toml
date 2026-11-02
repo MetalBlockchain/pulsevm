@@ -1,0 +1,30 @@
+title = "pulsevm gitleaks"
+
+[extend]
+useDefault = true
+
+# Documented exceptions only. Anything not listed here is a finding. Review
+# this file whenever the vendored libraries or the fixture keys change.
+
+[[allowlists]]
+description = "Vendored third-party crypto libraries: published known-answer and Wycheproof/CAVP test vectors, not credentials"
+paths = [
+  '''crates/pulsevm_ffi/pulsevm/''',
+]
+
+[[allowlists]]
+description = "Public keys and chain hashes. PUB_K1_/EOS... keys and 64-hex ids are public by construction and trip the generic-api-key rule"
+regexes = [
+  '''PUB_K1_[1-9A-HJ-NP-Za-km-z]{40,60}''',
+  '''EOS[1-9A-HJ-NP-Za-km-z]{48,52}''',
+  '''SIG_K1_[1-9A-HJ-NP-Za-km-z]{40,120}''',
+  '''[0-9a-f]{64}''',
+]
+
+[[allowlists]]
+description = "Disposable local-network fixture keys (committed dev genesis/producer keys, never used on a real network); owner: chain ops, review by 2027-02-01. Prefix-only so the full keys are not repeated here"
+regexes = [
+  '''PVT_K1_5G7JEG7C''',
+  '''PVT_K1_2pjSqJxT''',
+  '''5KQwrPbwdL6P''',
+]
