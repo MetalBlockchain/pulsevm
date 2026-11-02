@@ -16,6 +16,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMG="${XPR_NODEOS_IMAGE:-pulsevm-xpr-handover:local}"
+# The official Leap image uses ENTRYPOINT ["nodeos"]; the local handover image
+# wraps nodeos in /entrypoint.sh and expects it as the command. Pass the
+# `nodeos` word only when the image does not already run it.
+if [[ "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "$IMG" 2>/dev/null)" == "nodeos" ]]; then
+    NODEOS_CMD=""
+else
+    NODEOS_CMD="nodeos"
+fi
 PLATFORM="${XPR_PLATFORM:-linux/arm64}"
 PORT="${CUTOVER_TEST_PORT:-18895}"
 API="http://127.0.0.1:${PORT}"
@@ -93,7 +101,7 @@ docker run --detach --platform "$PLATFORM" --name "${NODES[0]}" --network "$NET"
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
     -v "$WORK/cfg-eosio.ini:/config/config.ini:ro" \
     -p "127.0.0.1:${PORT}:8888" \
-    --entrypoint nodeos "$IMG" --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
+    "$IMG" $NODEOS_CMD --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
     >/dev/null || fail "genesis producer start failed"
 
 for i in 0 1 2 3; do
@@ -108,7 +116,7 @@ for i in 0 1 2 3; do
         -p "127.0.0.1:$((PORT + 10 + i)):8888" \
         -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
         -v "$cfg:/config/config.ini:ro" \
-        --entrypoint nodeos "$IMG" --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
+        "$IMG" $NODEOS_CMD --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
         >/dev/null || fail "producer ${BP_NAME[$i]} start failed"
 done
 

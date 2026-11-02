@@ -19,6 +19,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 IMG="${XPR_NODEOS_IMAGE:-pulsevm-xpr-handover:local}"
+# The official Leap image uses ENTRYPOINT ["nodeos"]; the local handover image
+# wraps nodeos in /entrypoint.sh and expects it as the command. Pass the
+# `nodeos` word only when the image does not already run it.
+if [[ "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "$IMG" 2>/dev/null)" == "nodeos" ]]; then
+    NODEOS_CMD=""
+else
+    NODEOS_CMD="nodeos"
+fi
 PLATFORM="${XPR_PLATFORM:-linux/arm64}"
 PORT="${CUTOVER_TEST_PORT:-18893}"
 API="http://127.0.0.1:${PORT}"
@@ -56,9 +64,8 @@ docker run --detach --platform "$PLATFORM" --name "$NODE" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini:/config/config.ini:ro" \
     -p "127.0.0.1:${PORT}:8888" \
-    --entrypoint nodeos \
     "$IMG" \
-    --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
+    $NODEOS_CMD --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
     >/dev/null || fail "node start failed"
 # Leap validates the HTTP Host header against its listening address.
 for _ in $(seq 1 90); do
@@ -411,6 +418,21 @@ expect_fail "locked re-init" "freeze is locked" do_reinit_locked
 # cutover::vote actions, capture the singleton, and check the fragment
 # carries exactly the finalized on-chain tally as verifier evidence.
 echo "cutover-fixture: scanning contract votes into verifier evidence..."
+# Votes execute speculatively in the pending block and the scanner only sees
+# produced blocks. A fast node pushes several votes inside one block interval,
+# so let a few blocks land before scanning (found on a native CI runner).
+head_now() { rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])'; }
+wait_blocks() { # $1=count
+    local start now
+    start="$(head_now)"
+    for _ in $(seq 1 60); do
+        now="$(head_now)"
+        [[ "$now" -ge $((start + $1)) ]] && return 0
+        sleep 1
+    done
+    fail "chain did not advance $1 blocks"
+}
+wait_blocks 3
 SCAN_TO="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
 SCAN_LOG="$WORK/scan.log"
 "$SCANNER" --api "$API" --contract cutover --from 1 --to "$SCAN_TO" \

@@ -12,6 +12,14 @@ cd "$(dirname "$0")/../.."
 REPO_ROOT="$PWD"
 SCRIPT_DIR="$REPO_ROOT/contracts/cutover"
 IMG="${XPR_NODEOS_IMAGE:-pulsevm-xpr-handover:local}"
+# The official Leap image uses ENTRYPOINT ["nodeos"]; the local handover image
+# wraps nodeos in /entrypoint.sh and expects it as the command. Pass the
+# `nodeos` word only when the image does not already run it.
+if [[ "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "$IMG" 2>/dev/null)" == "nodeos" ]]; then
+    NODEOS_CMD=""
+else
+    NODEOS_CMD="nodeos"
+fi
 PLATFORM="${XPR_PLATFORM:-linux/arm64}"
 PORT="${VOTER_TEST_PORT:-18994}"
 NODE="cutover-voter-test-node"
@@ -43,9 +51,8 @@ docker run --detach --platform "$PLATFORM" --name "$NODE" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json:/config-env/genesis.json:ro" \
     -v "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini:/config/config.ini:ro" \
     -p "127.0.0.1:${PORT}:8888" \
-    --entrypoint nodeos \
     "$IMG" \
-    --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
+    $NODEOS_CMD --data-dir=/data --config-dir=/config --genesis-json=/config-env/genesis.json ${NODEOS_EXTRA_ARGS:-} \
     >/dev/null || fail "node start failed"
 for _ in $(seq 1 90); do
     HEAD_NOW="$(curl --fail --silent --max-time 5 -X POST "$API/v1/chain/get_info" \

@@ -64,10 +64,18 @@ cargo test -p pulsevm_arena -p pulsevm_contractdb -p pulsevm_chaindb -p pulsevm_
 
 Pull requests run the workspace tests, compile every target (including benches),
 and apply `-D warnings` Clippy to the pure-Rust database replacement stack on
-both amd64 and arm64. The consensus replay workflow uses the same two
-architectures. Set the repository variable `PULSEVM_REPLAY_FIXTURE_URL` to the
-published archive URL to make replay run on every push and pull request; it can
-also be supplied manually through `workflow_dispatch`.
+both amd64 and arm64.
+
+The consensus replay workflow (`.github/workflows/replay.yml`) was removed on
+2026-11-02: it downloaded the frozen corpus from a release asset on a personal
+fork, the asset no longer exists (HTTP 404), and the archive is pinned by
+SHA-256 so it cannot be regenerated. This is a deliberate, recorded loss of a
+CI consensus-regression gate, not a pass. `scripts/run-replay-regression.sh`
+still works locally against the archive. To restore the gate: re-host the
+archive (SHA-256 in the script) somewhere the repository owns, put the
+workflow back from git history (`git show 096df6f8:.github/workflows/replay.yml`)
+and set `PULSEVM_REPLAY_FIXTURE_URL` to the new location. Until then, run the
+script locally before any consensus change.
 
 ## Native dependencies that remain
 

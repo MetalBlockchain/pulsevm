@@ -19,6 +19,9 @@ on:
       - '.github/workflows/cutover-fixtures.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   fixtures:
     name: cutover-fixtures-linux-amd64

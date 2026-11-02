@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [ main ]
 
+# The release job below declares its own, wider permissions.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: linux-${{ matrix.arch }}
