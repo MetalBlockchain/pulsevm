@@ -31,11 +31,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "cutover-scale: building the probe tool..."
-(cd "$REPO_ROOT" && cargo build --offline -p pulsevm_core --example make_probe_tx) \
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example make_probe_tx) \
     || fail "probe tool build failed"
 PROBE="$REPO_ROOT/target/debug/examples/make_probe_tx"
 [[ -x "$PROBE" ]] || fail "probe tool missing"
-(cd "$REPO_ROOT" && cargo build --offline -p pulsevm_core --example xpr_scan_contract_votes) \
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example xpr_scan_contract_votes) \
     || fail "scanner build failed"
 SCANNER="$REPO_ROOT/target/debug/examples/xpr_scan_contract_votes"
 [[ -x "$SCANNER" ]] || fail "scanner missing"
@@ -151,7 +151,9 @@ for i in $(seq 0 20); do
     read -r wif _ <<<"$("$PROBE" newkey)"
     BP_WIF[$i]="$wif"
     BP_PUB[$i]="$("$PROBE" pubkey "$wif")"
-    BP_NAME[$i]="bp$(printf '%02d' "$i")test"
+    # Letters only: EOSIO names have no 0 or 6-9, which would collapse
+    # distinct digit names onto one value and trip the duplicate check.
+    BP_NAME[$i]="bp$(printf "\\$(printf '%03o' $((97 + i)))")test"
 done
 echo "cutover-scale: BPs ${BP_NAME[*]}"
 
@@ -203,7 +205,7 @@ PYEOF
 }
 
 SCHED_VERSION="$(rpc /v1/chain/get_producer_schedule '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["active"]["version"])')"
-echo "cutover-scale: freezing the 4-member schedule (version $SCHED_VERSION)..."
+echo "cutover-scale: freezing the 21-member schedule (version $SCHED_VERSION)..."
 H1=$(( $(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])') + 60 ))
 echo "cutover-scale: init H=$H1..."
 mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init cutover "$(init_hex "$H1")" >/dev/null

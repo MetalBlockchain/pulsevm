@@ -195,6 +195,20 @@ newest_netdir() {
     done
     printf '%s' "$netdir"
 }
+# True once ALL five node logs show the restore gate refusing the platform
+# binding. That refusal is final for this boot (the nodes never serve an
+# RPC), so the wait loop stops polling instead of burning its whole budget.
+# One node's refusal is not enough: the runner restarts the nodes one by
+# one to track the subnet, and a restart in flight leaves no process to
+# capture for the in-place relaunch.
+boot_refused_platform_binding() {
+    local netdir n
+    netdir="$(newest_netdir)"
+    [[ -n "$netdir" ]] || return 1
+    for n in 1 2 3 4 5; do
+        grep -q "halt confirmation platform chain id does not match" "$netdir/node$n/logs/main.log" 2>/dev/null || return 1
+    done
+}
 # Direct chain-RPC discovery that does not depend on the runner server:
 # the runner's control API can wedge behind a pending `control start`
 # (a first boot refused at the restore gate never returns, so list-rpcs
@@ -1489,7 +1503,7 @@ restart_five_nodes() { # $1=network dir
         # The supervisor may be restarting a failed node exactly as we
         # look: retry the capture instead of dying on a restart gap.
         cmdline=""
-        for _ in $(seq 1 6); do
+        for _ in $(seq 1 24); do
             cmdline="$(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$n/configs" | head -1 | sed -E 's/^ *[0-9]+ //' || true)"
             [[ -n "$cmdline" ]] && break
             sleep 5
@@ -1764,6 +1778,7 @@ EOF
     HEARTBEAT_PID=$!
     rpc_url=""
     for _wait_iter in $(seq 1 60); do
+        boot_refused_platform_binding && break
         rpc_url="$(chain_rpc_url || true)"
         [[ -n "$rpc_url" ]] || { sleep 5; continue; }
         rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' >/dev/null 2>&1 && break
@@ -1921,7 +1936,7 @@ for name, old_acct in sorted(old.items()):
 print(f"equivalence: {len(old) - bad}/{len(old)} accounts identical")
 sys.exit(1 if bad else 0)
 PYEOF
-    old_chain="$(shadow_head >/dev/null 2>&1; curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])' 2>/dev/null || echo stopped)"
+    old_chain="$(shadow_head >/dev/null 2>&1 || true; curl --fail --silent --max-time 10 -X POST "$SHADOW_RPC/" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])' 2>/dev/null || echo stopped)"
     new_chain="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["chain_id"])')"
     # Boundary audit: from the customer's seat the network never stops, it
     # swaps. Every phase-1 tx must sit at or below H on the old chain, every

@@ -64,6 +64,26 @@ data disagreeing with the local node, tally short of 2/3 at H, or a
 confirmation that will not verify. A failed ceremony is a new governance
 decision, not a same-H retry.
 
+## Platform chain id ordering (testnet and mainnet)
+
+The platform id (MetalGo blockchain id) is a hash of the CreateChain
+transaction, whose genesis commits to the checkpoint hash. Both exist only
+after H is exported, so the id cannot be published at T-14 and cannot be
+pinned by U-1 (`chain_id_override` only names the PulseVM chain id for
+wallets). The real order is therefore the one the rehearsal harness calls
+learn-then-bind:
+
+1. After H: export the checkpoint, build the migration genesis, register the
+   chain on the MetalGo subnet. The first boot refuses at the restore gate
+   (no confirmation binds this platform id yet) and serves no RPC.
+2. Chain ops publishes the registered platform id; each BP confirms against
+   it (the coordinator cross-checks the id against the local node).
+3. A-Chain nodes restart with the confirmation set and pass the gate.
+
+Plan the confirmation window (H..H+J) to include steps 1-2 end to end, and
+do not treat the step-1 refusal as an incident. A refusal for any other
+reason is a stop-and-diagnose.
+
 ## Coordinator status contract (agent side)
 
 The voter reports its own state via `--status` (one JSON line: head vs H,

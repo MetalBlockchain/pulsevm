@@ -1,0 +1,69 @@
+name: Cutover fixtures
+
+# The ceremony contract and voter fixtures run against a throwaway Leap node.
+# They are the only automated check of the contract vote paths, the 21-member
+# count quorum, and the unattended voter, so any change touching the cutover
+# code or the fixtures themselves has to run them.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'contracts/cutover/**'
+      - 'crates/pulsevm_chain_types/src/migration.rs'
+      - 'crates/pulsevm_core/examples/xpr_cutover_voter.rs'
+      - 'crates/pulsevm_core/examples/xpr_scan_contract_votes.rs'
+      - 'crates/pulsevm_core/examples/make_probe_tx.rs'
+      - 'tools/xpr-chainbase-export/localnet/**'
+      - '.github/workflows/cutover-fixtures.yml'
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    name: cutover-fixtures-linux-amd64
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      XPR_NODEOS_IMAGE: pulsevm-leap:5.0.3-amd64
+      XPR_PLATFORM: linux/amd64
+
+    steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev python3
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protobuf (protoc)
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-amd64-cutover-fixtures-${{ hashFiles('**/Cargo.lock') }}
+
+      # The Leap binary is the checksum-pinned official 5.0.3 release.
+      - name: Build the pinned Leap image
+        run: docker build -t "$XPR_NODEOS_IMAGE" -f tools/xpr-chainbase-export/localnet/Dockerfile.leap-amd64 tools/xpr-chainbase-export/localnet
+
+      - name: Contract fixture (4-member count quorum)
+        run: bash contracts/cutover/test-local.sh
+
+      - name: Scale fixture (21 members, 15-of-21)
+        run: bash contracts/cutover/test-scale.sh
+
+      - name: Voter fixture (unattended vote, coordinator, agreed-P pause)
+        run: bash contracts/cutover/test-voter.sh

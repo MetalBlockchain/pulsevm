@@ -174,21 +174,23 @@ table_rows cutover cutover members \
     >"$WORK/roster.json"
 PLATFORM="$(python3 -c 'print("ee" * 32)')"
 WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
+# Agreed pause head P = H + PAUSE_K, fixed before the freeze like on mainnet.
+PAUSE_K=3
 mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty -> path
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
     [[ -n "${3:-}" ]] && coord="\"$3\""
     local plat="null"
     [[ -n "${4:-}" ]] && plat="\"$4\""
-    local stop='"stop_producer":{"at_h":false}'
+    local stop='"stop_producer":{"at_pause":false}'
     if [[ "${5:-}" == "HALF" ]]; then
-        stop='"stop_producer":{"at_h":true}'
+        stop='"stop_producer":{"at_pause":true}'
     elif [[ -n "${5:-}" ]]; then
-        stop="\"stop_producer\":{\"at_h\":true,\"producer_api_url\":\"$5\"}"
+        stop="\"stop_producer\":{\"at_pause\":true,\"producer_api_url\":\"$5\"}"
     fi
     cat >"$out" <<EOF
 {"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"eosio",
- "source_chain_id":"$CHAIN_ID","height":$1,"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
+ "source_chain_id":"$CHAIN_ID","height":$1,"pause_height":$(($1 + PAUSE_K)),"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
@@ -435,7 +437,7 @@ echo "cutover-voter-test: dry-run rehearses the producer pause..."
 PAST_CFG="$(mk_config 5 true "" "" "http://127.0.0.1:9")"
 "$VOTER_BIN" --config "$PAST_CFG" --dry-run --max-polls 3 >"$WORK/pausedry.log" 2>&1 \
     || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry.log")"
-grep -q "would pause the local producer at H=5" "$WORK/pausedry.log" \
+grep -q "would pause the local producer at P=8" "$WORK/pausedry.log" \
     || fail "no dry-run pause line: $(cat "$WORK/pausedry.log")"
 pass "dry-run rehearses the producer pause"
 
@@ -455,7 +457,7 @@ PAUSE_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PAUSE_PORT}" "$PLATF
 PAUSE_PID=$!
 PAUSED=""
 for _ in $(seq 1 90); do
-    grep -q "local producer paused at H=" "$WORK/pause.log" 2>/dev/null && { PAUSED=1; break; }
+    grep -q "local producer paused at P=" "$WORK/pause.log" 2>/dev/null && { PAUSED=1; break; }
     kill -0 "$PAUSE_PID" 2>/dev/null || break
     sleep 2
 done

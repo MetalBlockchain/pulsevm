@@ -36,11 +36,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "cutover-fixture: building the probe tool..."
-(cd "$REPO_ROOT" && cargo build --offline -p pulsevm_core --example make_probe_tx) \
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example make_probe_tx) \
     || fail "probe tool build failed"
 PROBE="$REPO_ROOT/target/debug/examples/make_probe_tx"
 [[ -x "$PROBE" ]] || fail "probe tool missing"
-(cd "$REPO_ROOT" && cargo build --offline -p pulsevm_core --example xpr_scan_contract_votes) \
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example xpr_scan_contract_votes) \
     || fail "scanner build failed"
 SCANNER="$REPO_ROOT/target/debug/examples/xpr_scan_contract_votes"
 [[ -x "$SCANNER" ]] || fail "scanner missing"

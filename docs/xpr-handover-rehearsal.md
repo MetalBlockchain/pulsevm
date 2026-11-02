@@ -181,6 +181,32 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   (the runner can escape the group via reparenting); never `pkill` by bare
   name on a shared host.
 
+- Record: fresh-chain two-step rehearsal PASS on HEAD at H=250 (Nov 2,
+  2026, Mac, `TERMINAL_HEIGHT=150` fixture): declared at memo block 222
+  (K=28), offline verifier PASS, learn-then-bind rebind, state equivalence
+  11/11, boundary traffic 10/10 exactly-once. Harness fixes from that run:
+  the RPC wait now exits once all five node logs show the platform-binding
+  refusal (it used to poll for about 20 minutes; one node's refusal is not
+  enough, the runner is still restarting nodes to track the subnet and an
+  early relaunch finds no process to capture), and the old-chain lookup
+  no longer trips the ERR trap when the shadow is already stopped.
+- Contract fixtures were stale after the agreed-P redesign and are fixed:
+  `test-scale.sh` used digit names (`bp00test`) that collapse onto one
+  EOSIO name (no 0 or 6-9), which the duplicate-producer check rejects;
+  `test-voter.sh` still configured the removed `at_h` stop and no
+  `pause_height`. All three fixtures pass (15, 14 and the voter checks) and
+  now run in CI (`.github/workflows/cutover-fixtures.yml`).
+
+- Multi-key schedule fixture (`contracts/cutover/test-multikey-schedule.sh`,
+  Leap side only): four producers with four distinct block-signing keys,
+  installed through eosio.bios `setprods` after activating
+  WTMSIG_BLOCK_SIGNATURES with `boot.cpp` (fixture-only preactivation
+  contract). Proven: the schedule activates, every member produces under its
+  own key, LIB advances on the 4-member schedule, and the header state
+  lists four distinct keys. NOT yet wired into `run-handover.sh`: the
+  ceremony, attach, verifier and five-node boot still run a one-member
+  roster. Needs the proton.contracts bios build artifact, so it is not in CI.
+
 ## What this does NOT prove (do not merge as migration-complete)
 
 - Promotion re-identifies the chain; same-ID in-process promotion is unmodeled.
