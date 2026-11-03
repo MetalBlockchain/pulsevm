@@ -141,6 +141,18 @@ against independently replayed XPR state:
   norm (no hash-to-roster comparison is attempted — a wrong pin failed an
   earlier run of the same rehearsal live and was removed).
 
+- Round-3 review changes, all exercised live (Nov 3, 2026): the committee is
+  read from the Leap snapshot of H and bound into the checkpoint (four-producer
+  run: `source schedule: 4 producers, version 1, bound into the checkpoint`,
+  binding verified before boot and after rebind); the confirmation signs the
+  id of block P; every H..P block is checked against the schedule's slot rule
+  across real 12-block producer rotations; the ceremony contract's account is
+  bound into the declaration digest (contract-vehicle run: votes on
+  `cutover1`, tally 1/1); and conversion determinism is proven on a real
+  export, not a hand-built entry: the harness converts the same Leap export
+  twice in separate processes (different working directory, timezone, locale
+  and thread count) and requires byte-identical checkpoints. Details:
+  [xpr-halt-ceremony.md](./xpr-halt-ceremony.md).
 - Multi-key rehearsal PASS (`HANDOVER_PRODUCERS=4`, Nov 2, 2026): four
   producers on four distinct block-signing keys, 3-of-4 signed declaration and
   confirmation, restore gate verified against the four-member header-state

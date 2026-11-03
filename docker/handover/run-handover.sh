@@ -1945,6 +1945,28 @@ cmd_checkpoint() {
         "$export_dir/arena" \
         "$export_dir/migration.snapshot" \
         --leap-snapshot "$(cat "$WORK_DIR/snapshot")") || fail "checkpoint import failed"
+    # Determinism on a REAL export: every BP converts its own export and the
+    # fleet has to land on one checkpoint hash. Convert the same export a
+    # second time in a separate process with a different working directory,
+    # timezone, locale and thread count, and require byte-identical output.
+    # (The in-repo unit test converts one hand-built entry twice in a single
+    # process; this is the real-data, cross-process proof.)
+    det_dir="$export_dir/determinism"
+    mkdir -p "$det_dir/cwd"
+    (cd "$det_dir/cwd" && \
+        TZ=Pacific/Auckland LC_ALL=C RAYON_NUM_THREADS=1 \
+        "$REPO_ROOT/target/debug/examples/xpr_import_check" \
+        "$export_dir/state-history/chain_state_history.log" \
+        "$det_dir/arena" \
+        "$det_dir/migration.snapshot" \
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" >"$det_dir/convert.log" 2>&1) \
+        || fail "second conversion failed (see $det_dir/convert.log)"
+    first_sum="$(shasum -a 256 "$export_dir/migration.snapshot" | cut -d' ' -f1)"
+    second_sum="$(shasum -a 256 "$det_dir/migration.snapshot" | cut -d' ' -f1)"
+    [[ "$first_sum" == "$second_sum" ]] \
+        || fail "conversion is not deterministic: $first_sum vs $second_sum"
+    echo "handover: determinism: two independent conversions of the real export are byte-identical ($first_sum)"
+    rm -rf "$det_dir"
     # Anchor the id-exact source block so new nodes adopt H as their tip
     # instead of failing on an empty block log.
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
