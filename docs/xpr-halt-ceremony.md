@@ -293,6 +293,28 @@ producer for its timestamp slot (`(slot % (n * 12)) / 12`, with slots
 strictly advancing), and the confirmation signs the id of block P so the
 quorum attests one specific branch.
 
+## Contract evidence is bound to its account
+
+With the contract vehicle the declaration signatures are the on-chain votes,
+so the evidence is only as good as the tie between a vote and the contract it
+was cast on. The declaration digest therefore carries the ceremony contract's
+**account** (domain `PULSEVM-XPR-HALT-DECLARATION-v2`, the account
+length-prefixed after the member set): `init` appends its own account when it
+freezes the digest, the voter and the scanner build the same bytes from the
+configured contract, and the ceremony tool takes `--contract`. A vote is
+therefore a vote for that contract and no other. Evidence scraped from a
+look-alike contract on another account, or from one an attacker deployed with
+its own `init`, signs a different digest and cannot be presented as the
+fleet's; at restore the evidence's contract must equal the account the
+declaration binds, and evidence on a declaration that binds none is refused.
+Memo-vehicle declarations bind no contract and keep the v1 digest byte for
+byte.
+
+What this does not cover is the timing the scanner reports (vote and
+finalization heights are exporter-scanned numbers): the votes' signatures are
+the real quorum's, and the declaration's pre-commitment timing for a contract
+declaration still rests on those scanned heights.
+
 ## Post-H window (what the exporter stages)
 
 The version pin does not stop at H. The authoritative schedule comes

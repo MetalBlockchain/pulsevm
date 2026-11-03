@@ -759,11 +759,36 @@ pub fn verify_migration_contract_evidence(
     height: u32,
     roster: &[pulsevm_chain_types::HaltRosterEntry],
     declaration_digest: &[u8; 32],
+    declared_contract: Option<&str>,
     expected_schedule_version: u32,
 ) -> Result<(), String> {
     let Some(ceremony) = manifest.halt_contract_ceremony.as_ref() else {
+        // No contract evidence: the timing proof is the memo accounts'
+        // existence in checkpoint state, checked by the caller. A declaration
+        // that still names a contract is fine here: its signatures are the
+        // real quorum's either way.
         return Ok(());
     };
+    // The contract the votes ran on is part of what the BPs signed (v2
+    // declaration digest). Evidence from any other account, including a
+    // look-alike an attacker deployed with its own `init`, is refused even
+    // before its signatures are looked at: the digest it froze is a
+    // different statement.
+    match declared_contract {
+        Some(contract) if contract == ceremony.contract => {}
+        Some(contract) => {
+            return Err(format!(
+                "contract evidence is for account {} but the declaration binds ceremony contract {contract}",
+                ceremony.contract
+            ));
+        }
+        None => {
+            return Err(
+                "contract evidence is attached but the declaration binds no ceremony contract: the votes would not be tied to any account"
+                    .to_string(),
+            );
+        }
+    }
     if manifest.halt_schedule_version != Some(expected_schedule_version) {
         return Err(format!(
             "migration cutover contract evidence attests schedule version {:?} (expected H's version {expected_schedule_version})",
@@ -1587,6 +1612,7 @@ pub fn verify_migration_halt_pair(
         height,
         &roster,
         &declaration_digest,
+        declaration.ceremony_contract.as_deref(),
         header_schedule_version,
     )?;
     // Pre-commitment timing must be provable, not asserted: either the
@@ -5987,6 +6013,7 @@ mod tests {
                     weight: pulsevm_chain_types::HaltWeight(1),
                 })
                 .collect(),
+            ceremony_contract: None,
             signatures: Vec::new(),
         }
     }
@@ -6046,6 +6073,7 @@ mod tests {
             source_chain_id: "00".repeat(32),
             last_height: 8,
             validator_set: Vec::new(),
+            ceremony_contract: None,
             signatures: Vec::new(),
         });
         manifest.halt_memo_names = Some(
@@ -6749,6 +6777,9 @@ mod tests {
             source_chain_id: "41".repeat(32),
             last_height: 7,
             validator_set: members,
+            // The pair fixture carries the on-chain ceremony (contract
+            // "cutover"), so the declaration binds that account.
+            ceremony_contract: Some("cutover".to_string()),
             signatures: Vec::new(),
         };
         let decl_digest = unsigned.digest().unwrap();
@@ -7103,6 +7134,55 @@ mod tests {
             Some(&TEST_PLATFORM_ID),
         )
         .unwrap_err()
+    }
+
+    #[test]
+    fn contract_evidence_must_be_for_the_account_the_declaration_binds() {
+        // The BPs signed a declaration that names the ceremony contract
+        // ("cutover"). Evidence scraped from a look-alike contract on
+        // another account, or an attacker's own deployment, is refused even
+        // though its structure is perfect.
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let pair = |manifest: &MigrationManifest| {
+            verify_migration_halt_pair(
+                manifest,
+                7,
+                &id,
+                &checkpoint,
+                &new_chain,
+                TEST_SCHEDULE_VERSION,
+                Some(&TEST_PLATFORM_ID),
+            )
+        };
+        pair(&manifest).expect("the honest pair verifies");
+
+        let mut impostor = manifest.clone();
+        impostor.halt_contract_ceremony.as_mut().unwrap().contract = "evilcutover".to_string();
+        let error = pair(&impostor).unwrap_err();
+        assert!(
+            error.contains("evilcutover") && error.contains("binds ceremony contract cutover"),
+            "evidence from another account must be refused, got: {error}"
+        );
+    }
+
+    #[test]
+    fn contract_evidence_needs_a_declaration_that_binds_a_contract() {
+        // Evidence attached to a declaration that names no contract would tie
+        // the votes to no account at all.
+        let (manifest, _, _, _) = halt_test_pair();
+        let error = verify_migration_contract_evidence(
+            &manifest,
+            7,
+            &[],
+            &[0u8; 32],
+            None,
+            TEST_SCHEDULE_VERSION,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("binds no ceremony contract"),
+            "unbound evidence must fail, got: {error}"
+        );
     }
 
     #[test]

@@ -472,6 +472,10 @@ pub struct HaltRosterEntry {
 /// signed statement, made while block H is still in the future, that H is
 /// the last block its validator set will author on this source chain id.
 pub const HALT_DECLARATION_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-DECLARATION-v1";
+/// Contract-vehicle declarations bind the ceremony contract's account into the
+/// digest, under this domain. Memo-vehicle declarations (no contract) keep the
+/// v1 layout byte for byte.
+pub const HALT_DECLARATION_DOMAIN_V2: &[u8] = b"PULSEVM-XPR-HALT-DECLARATION-v2";
 /// Domain separator for a step-two halt confirmation: the quorum's signed
 /// statement, made once block H exists, binding the declaration to the
 /// terminal block id, the migration checkpoint, the successor chain id, and
@@ -510,6 +514,14 @@ pub struct HaltDeclaration {
     pub last_height: u32,
     /// V: the declaring validator set, sorted by producer name.
     pub validator_set: Vec<HaltDeclarationMember>,
+    /// The account of the on-chain ceremony contract that froze this set,
+    /// bound into the signed digest (v2 domain) so a vote is a vote for that
+    /// contract and no other: evidence from a look-alike contract on another
+    /// account, or one an attacker deployed with its own `init`, cannot be
+    /// presented as the fleet's. `None` for the memo vehicle, whose digest
+    /// keeps the v1 layout unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_contract: Option<String>,
     pub signatures: Vec<HaltSignature>,
 }
 
@@ -600,10 +612,15 @@ impl HaltDeclaration {
         source_chain_id: &[u8; 32],
         last_height: u32,
         members: &[HaltDeclarationMember],
+        ceremony_contract: Option<&str>,
     ) -> Result<Vec<u8>, ChainError> {
         let mut message =
-            Vec::with_capacity(HALT_DECLARATION_DOMAIN.len() + 32 + 4 + 4 + members.len() * 64);
-        message.extend_from_slice(HALT_DECLARATION_DOMAIN);
+            Vec::with_capacity(HALT_DECLARATION_DOMAIN_V2.len() + 32 + 4 + 4 + members.len() * 64);
+        message.extend_from_slice(if ceremony_contract.is_some() {
+            HALT_DECLARATION_DOMAIN_V2
+        } else {
+            HALT_DECLARATION_DOMAIN
+        });
         message.extend_from_slice(source_chain_id);
         message.extend_from_slice(&last_height.to_be_bytes());
         message.extend_from_slice(
@@ -628,7 +645,35 @@ impl HaltDeclaration {
             message.extend_from_slice(&key.compressed());
             message.extend_from_slice(&member.weight.0.to_be_bytes());
         }
+        // The ceremony contract's account, length-prefixed, after the set:
+        // the on-chain `init` appends the same bytes for its own account.
+        if let Some(contract) = ceremony_contract {
+            Self::check_contract_name(contract)?;
+            message.extend_from_slice(
+                &(u32::try_from(contract.len()).map_err(|_| {
+                    ChainError::InternalError("ceremony contract name too long".into())
+                })?)
+                .to_be_bytes(),
+            );
+            message.extend_from_slice(contract.as_bytes());
+        }
         Ok(message)
+    }
+
+    /// A ceremony contract account must be a canonical, non-empty Antelope
+    /// name: whatever string reaches the digest is exactly the on-chain
+    /// account string, never a free-form label.
+    pub fn check_contract_name(contract: &str) -> Result<(), ChainError> {
+        use std::str::FromStr;
+        let parsed = pulsevm_name::Name::from_str(contract).map_err(|e| {
+            ChainError::InternalError(format!("ceremony contract {contract:?} is not a name: {e}"))
+        })?;
+        if contract.is_empty() || parsed.to_string() != contract {
+            return Err(ChainError::InternalError(format!(
+                "ceremony contract {contract:?} is not a canonical account name"
+            )));
+        }
+        Ok(())
     }
 
     /// Signing digest for this declaration.
@@ -640,6 +685,7 @@ impl HaltDeclaration {
             &source_chain_id,
             self.last_height,
             &self.validator_set,
+            self.ceremony_contract.as_deref(),
         )?)
         .as_bytes())
     }
@@ -655,6 +701,7 @@ impl HaltDeclaration {
         source_chain_id: &str,
         last_height: u32,
         members: Vec<HaltDeclarationMember>,
+        ceremony_contract: &str,
         votes: &[HaltContractVote],
     ) -> Result<Self, ChainError> {
         let mut validator_set = members;
@@ -674,6 +721,7 @@ impl HaltDeclaration {
             &source_bytes,
             last_height,
             &validator_set,
+            Some(ceremony_contract),
         )?)
         .as_bytes();
         let mut signatures = Vec::with_capacity(votes.len());
@@ -720,6 +768,7 @@ impl HaltDeclaration {
             source_chain_id: source_chain_id.to_string(),
             last_height,
             validator_set,
+            ceremony_contract: Some(ceremony_contract.to_string()),
             signatures,
         })
     }
@@ -1284,6 +1333,8 @@ mod tests {
     use pulsevm_crypto::k1::K1PrivateKey;
 
     const HEIGHT: u32 = 310;
+    /// The ceremony contract account the contract-vehicle tests bind.
+    const TEST_CONTRACT: &str = "cutover";
     const WEIGHTS: [HaltWeight; 3] = [HaltWeight(50), HaltWeight(30), HaltWeight(20)];
 
     fn block_id() -> [u8; 32] {
@@ -1667,6 +1718,7 @@ mod tests {
             source_chain_id: source_chain_hex(),
             last_height: HEIGHT,
             validator_set: members,
+            ceremony_contract: None,
             signatures,
         }
     }
@@ -1847,7 +1899,7 @@ mod tests {
         assert!(declared(forged).verify(HEIGHT).is_err());
         // A signature over another digest does not verify either.
         let wrong_digest =
-            HaltDeclaration::message_bytes(&[0x99; 32], HEIGHT, &unsigned.validator_set)
+            HaltDeclaration::message_bytes(&[0x99; 32], HEIGHT, &unsigned.validator_set, None)
                 .map(|message| *pulsevm_crypto::Digest::hash(&message).as_bytes())
                 .expect("message must build");
         let mismatched = vec![sign_declaration(&keys[0], "prod.a", &wrong_digest)];
@@ -2112,7 +2164,10 @@ mod tests {
     fn ceremony_inputs() -> (Vec<K1PrivateKey>, Vec<HaltRosterEntry>, [u8; 32]) {
         let (keys, _) = roster();
         let roster = unit_roster(&keys);
-        let unsigned = declared(Vec::new());
+        // The ceremony tests are contract-vehicle tests: the declaration
+        // (and so every vote's digest) binds the ceremony contract account.
+        let mut unsigned = declared(Vec::new());
+        unsigned.ceremony_contract = Some(TEST_CONTRACT.to_string());
         let digest = declared_digest(&unsigned);
         (keys, roster, digest)
     }
@@ -2133,8 +2188,14 @@ mod tests {
             })
             .collect();
         let votes = ceremony_votes(keys, digest, blocks);
-        HaltDeclaration::from_contract_votes(&source_chain_hex(), HEIGHT, members, &votes)
-            .expect("contract votes must build a declaration")
+        HaltDeclaration::from_contract_votes(
+            &source_chain_hex(),
+            HEIGHT,
+            members,
+            TEST_CONTRACT,
+            &votes,
+        )
+        .expect("contract votes must build a declaration")
     }
 
     #[test]
@@ -2157,6 +2218,7 @@ mod tests {
             source_chain_id: source_chain_hex(),
             last_height: HEIGHT,
             validator_set: members,
+            ceremony_contract: Some(TEST_CONTRACT.to_string()),
             signatures: Vec::new(),
         };
         HaltDeclaration::sort_members(&mut unsigned.validator_set);
@@ -2190,6 +2252,7 @@ mod tests {
             source_chain_id: source_chain_hex(),
             last_height: HEIGHT,
             validator_set: members.clone(),
+            ceremony_contract: Some(TEST_CONTRACT.to_string()),
             signatures: Vec::new(),
         };
         HaltDeclaration::sort_members(&mut unsigned.validator_set);
@@ -2201,9 +2264,14 @@ mod tests {
             key: legacy.to_string(),
             signature: dev.sign(&digest).to_string(),
         }];
-        let built =
-            HaltDeclaration::from_contract_votes(&source_chain_hex(), HEIGHT, members, &votes)
-                .expect("legacy-form vote must build");
+        let built = HaltDeclaration::from_contract_votes(
+            &source_chain_hex(),
+            HEIGHT,
+            members,
+            TEST_CONTRACT,
+            &votes,
+        )
+        .expect("legacy-form vote must build");
         built
             .verify(HEIGHT)
             .expect("legacy-form declaration must verify");
@@ -2237,6 +2305,7 @@ mod tests {
                 &source_chain_hex(),
                 HEIGHT,
                 members.clone(),
+                TEST_CONTRACT,
                 &bad_votes
             )
             .is_err()
@@ -2258,6 +2327,7 @@ mod tests {
                 &source_chain_hex(),
                 HEIGHT,
                 members,
+                TEST_CONTRACT,
                 &wrong_votes
             )
             .is_err()
@@ -2506,6 +2576,62 @@ mod tests {
                 .verify(HEIGHT, Some(30), &roster, &digest, CEREMONY_VERSION)
                 .is_err(),
             "stale finalization must fail"
+        );
+    }
+
+    #[test]
+    fn contract_account_is_bound_into_the_declaration_digest() {
+        let members = declared(Vec::new()).validator_set;
+        let chain = [0x41u8; 32];
+        let memo = HaltDeclaration::message_bytes(&chain, HEIGHT, &members, None).expect("memo");
+        let bound = HaltDeclaration::message_bytes(&chain, HEIGHT, &members, Some("cutover"))
+            .expect("bound");
+        let other = HaltDeclaration::message_bytes(&chain, HEIGHT, &members, Some("cutover2"))
+            .expect("other");
+        // The memo vehicle keeps the v1 layout: domain v1, no trailing name.
+        assert!(memo.starts_with(HALT_DECLARATION_DOMAIN));
+        assert!(bound.starts_with(HALT_DECLARATION_DOMAIN_V2));
+        assert!(bound.ends_with(b"cutover"));
+        // A different contract account is a different signed statement.
+        assert_ne!(bound, other);
+        assert_ne!(
+            pulsevm_crypto::Digest::hash(&bound).0,
+            pulsevm_crypto::Digest::hash(&other).0
+        );
+    }
+
+    #[test]
+    fn contract_account_must_be_a_canonical_name() {
+        let members = declared(Vec::new()).validator_set;
+        for bad in ["", "Cutover", "cut over", "toolongaccountnamex", "cutover."] {
+            assert!(
+                HaltDeclaration::message_bytes(&[0x41; 32], HEIGHT, &members, Some(bad)).is_err(),
+                "{bad:?} must not reach a digest"
+            );
+        }
+    }
+
+    #[test]
+    fn votes_for_another_ceremony_contract_do_not_build_a_declaration() {
+        // A look-alike contract on another account froze the same set at the
+        // same height: its votes sign a different digest, so they cannot be
+        // presented as the real ceremony's votes.
+        let (keys, _, _) = ceremony_inputs();
+        let mut impostor = declared(Vec::new());
+        impostor.ceremony_contract = Some("evilcutover".to_string());
+        let impostor_digest = declared_digest(&impostor);
+        let members = impostor.validator_set.clone();
+        let votes = ceremony_votes(&keys, &impostor_digest, &[5, 6, 7]);
+        assert!(
+            HaltDeclaration::from_contract_votes(
+                &source_chain_hex(),
+                HEIGHT,
+                members,
+                TEST_CONTRACT,
+                &votes
+            )
+            .is_err(),
+            "votes signed for another contract account must be refused"
         );
     }
 }

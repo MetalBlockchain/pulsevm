@@ -1002,6 +1002,7 @@ mod tests {
             source_chain_id: "00".repeat(32),
             last_height: HEIGHT,
             validator_set,
+            ceremony_contract: None,
             signatures: Vec::new(),
         }
     }

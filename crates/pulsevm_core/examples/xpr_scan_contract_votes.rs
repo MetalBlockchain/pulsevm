@@ -370,6 +370,7 @@ async fn run(
             &ceremony.source_chain_id,
             ceremony.h,
             members,
+            contract,
             &fragment.votes,
         )
         .map_err(|e| format!("declaration build rejected: {e}"))?;

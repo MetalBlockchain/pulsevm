@@ -32,7 +32,7 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json --key WIF [--key WIF...] --out declaration.json"
+        "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json [--contract ACCOUNT] --key WIF [--key WIF...] --out declaration.json"
     );
     eprintln!(
         "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --pause-block-id HEX --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] [--pause-height P...] --out confirmation.json"
@@ -104,6 +104,10 @@ struct DeclareRequest {
     height: u32,
     source_chain: String,
     roster: String,
+    /// Account of the on-chain ceremony contract, for contract-vehicle
+    /// declarations: bound into the digest the BPs sign. Unset for the memo
+    /// vehicle.
+    contract: Option<String>,
     keys: Vec<String>,
     out: String,
 }
@@ -139,6 +143,7 @@ impl DeclareRequest {
         let mut height = None;
         let mut source_chain = None;
         let mut roster = None;
+        let mut contract = None;
         let mut keys = Vec::new();
         let mut out = None;
         while let Some(arg) = args.next() {
@@ -148,6 +153,8 @@ impl DeclareRequest {
                 source_chain = Some(take_value(&mut args, "--source-chain")?);
             } else if arg == "--roster" {
                 roster = Some(take_value(&mut args, "--roster")?);
+            } else if arg == "--contract" {
+                contract = Some(take_value(&mut args, "--contract")?);
             } else if arg == "--key" {
                 keys.push(take_value(&mut args, "--key")?);
             } else if arg == "--out" {
@@ -160,6 +167,7 @@ impl DeclareRequest {
             height: height.ok_or_else(|| "declare needs --height".to_string())?,
             source_chain: source_chain.ok_or_else(|| "declare needs --source-chain".to_string())?,
             roster: roster.ok_or_else(|| "declare needs --roster".to_string())?,
+            contract,
             keys,
             out: out.ok_or_else(|| "declare needs --out".to_string())?,
         })
@@ -286,6 +294,7 @@ fn declare(request: &DeclareRequest) -> Result<String, String> {
         source_chain_id: request.source_chain.clone(),
         last_height: request.height,
         validator_set: members,
+        ceremony_contract: request.contract.clone(),
         signatures: Vec::new(),
     };
     let digest = unsigned

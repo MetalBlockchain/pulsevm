@@ -11248,6 +11248,9 @@ mod tests {
             source_chain_id: hex::encode(source_chain_id),
             last_height: source_block_num,
             validator_set: members,
+            // The fixture pair carries the on-chain ceremony (contract
+            // "cutover"), so the declaration binds that account.
+            ceremony_contract: Some("cutover".to_string()),
             signatures: Vec::new(),
         };
         let decl_digest = unsigned.digest()?;

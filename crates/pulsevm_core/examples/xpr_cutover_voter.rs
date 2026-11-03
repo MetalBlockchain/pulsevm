@@ -244,12 +244,16 @@ fn expected_declaration_digest(
     source_chain_id: &str,
     height: u32,
     members: &[HaltDeclarationMember],
+    contract: &str,
 ) -> Result<[u8; 32], String> {
+    // The digest the BPs sign binds the ceremony contract's account: a vote
+    // is a vote for that contract only.
     let unsigned = HaltDeclaration {
         version: HaltDeclaration::VERSION,
         source_chain_id: source_chain_id.to_string(),
         last_height: height,
         validator_set: members.to_vec(),
+        ceremony_contract: Some(contract.to_string()),
         signatures: Vec::new(),
     };
     unsigned
@@ -305,8 +309,12 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
         PrivateKey::from_str(&payer_wif).map_err(|_| "payer key invalid".to_string())?;
     let payer_account = inner.payer_account.clone();
     let members = read_roster(&inner.roster_file)?;
-    let expected_digest =
-        expected_declaration_digest(&inner.source_chain_id, inner.height, &members)?;
+    let expected_digest = expected_declaration_digest(
+        &inner.source_chain_id,
+        inner.height,
+        &members,
+        &inner.contract,
+    )?;
     Ok(LoadedConfig {
         inner,
         vote_key,
@@ -2188,6 +2196,7 @@ mod tests {
             source_chain_id: "41".repeat(32),
             last_height: height,
             validator_set: vec![member],
+            ceremony_contract: Some("cutover".to_string()),
             signatures: Vec::new(),
         }
         .digest()

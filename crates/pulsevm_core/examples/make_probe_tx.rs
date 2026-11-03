@@ -313,6 +313,8 @@ fn main() {
                 source_chain_id: source_chain_hex,
                 last_height: height,
                 validator_set: members,
+                // The vote binds the contract account it runs on.
+                ceremony_contract: Some(contract.clone()),
                 signatures: Vec::new(),
             };
             let digest32 = unsigned.digest().expect("digest builds");

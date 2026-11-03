@@ -723,6 +723,8 @@ mod tests {
             source_chain_id: "41".repeat(32),
             last_height: 7,
             validator_set: members,
+            // The fixture carries the on-chain ceremony (contract "cutover").
+            ceremony_contract: Some("cutover".to_string()),
             signatures: Vec::new(),
         };
         let fixture_digest = hex::encode(unsigned.digest().unwrap());

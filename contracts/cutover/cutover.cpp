@@ -44,9 +44,11 @@
 
 namespace cutover {
 
-// PULSEVM-XPR-HALT-DECLARATION-v1: must match HALT_DECLARATION_DOMAIN in
-// pulsevm_chain_types::migration.
-static constexpr char declaration_domain[] = "PULSEVM-XPR-HALT-DECLARATION-v1";
+// PULSEVM-XPR-HALT-DECLARATION-v2: must match HALT_DECLARATION_DOMAIN_V2 in
+// pulsevm_chain_types::migration. The v2 digest binds this contract's own
+// account after the member set, so a vote is a vote for this contract only:
+// votes from a look-alike deployed on another account sign a different digest.
+static constexpr char declaration_domain[] = "PULSEVM-XPR-HALT-DECLARATION-v2";
 
 // Ceremony liveness bound: votes land within vote_window_us of the freeze
 // (init instant below). Afterwards the freeze expires: votes are refused
@@ -229,6 +231,10 @@ CONTRACT cutover : public eosio::contract {
             message.insert(message.end(), key_bytes.begin(), key_bytes.end());
             append_be128(message, 1);
         }
+        // The contract's own account, length-prefixed, after the member set.
+        const std::string self_account = get_self().to_string();
+        append_be32(message, static_cast<uint32_t>(self_account.size()));
+        message.insert(message.end(), self_account.begin(), self_account.end());
         eosio::checksum256 digest =
             eosio::sha256(message.data(), static_cast<uint32_t>(message.size()));
         unsigned __int128 total = static_cast<unsigned __int128>(set.size());

@@ -274,7 +274,7 @@ H1=$H2
 python3 - "$WORK/members.json" "$CHAIN_ID" "$H1" "$DIGEST" "$TOTAL" <<'PYEOF'
 import hashlib, json, struct, sys
 
-DOMAIN = b"PULSEVM-XPR-HALT-DECLARATION-v1"
+DOMAIN = b"PULSEVM-XPR-HALT-DECLARATION-v2"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 def b58decode(s):
@@ -311,6 +311,10 @@ for m in members:
     msg += struct.pack(">I", len(name)) + name
     msg += eos_key_to_bytes(m["key"])
     msg += int(m["weight"]).to_bytes(16, "big")
+# The ceremony contract's own account is part of what the BPs sign: the
+# contract appends it (length-prefixed) after the set.
+contract = b"cutover"
+msg += struct.pack(">I", len(contract)) + contract
 digest = hashlib.sha256(bytes(msg)).hexdigest()
 assert digest == sys.argv[4], f"digest mismatch:\n contract {sys.argv[4]}\n python   {digest}"
 print(f"digest match: {digest[:16]}...")
