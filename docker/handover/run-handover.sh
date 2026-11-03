@@ -1275,7 +1275,14 @@ PYEOF
         fi
         P_AGREED=$((H + CUTOVER_STOP_LAG))
         echo "handover: finality lag $fin_lag; agreed stop P=$P_AGREED (H+$CUTOVER_STOP_LAG)"
-        echo "handover: round $round capturing post-H pairs until the agreed stop P=$P_AGREED..."
+        # How many blocks before P to start freezing (learned from misses;
+        # see the freeze step). The capture loop must stop at the same point,
+        # or the freeze only starts after head has already reached P and the
+        # lead changes nothing. Pairs for the last few blocks are fetched
+        # from a validator after the pause (top_up_pairs), as they always
+        # were for blocks produced during the pause latency.
+        PAUSE_LEAD="${PAUSE_LEAD:-${CUTOVER_PAUSE_LEAD:-0}}"
+        echo "handover: round $round capturing post-H pairs until the agreed stop P=$P_AGREED (pause lead $PAUSE_LEAD)..."
         local attempt next_fetch
         next_fetch=$((H + 1))
         for attempt in $(seq 1 900); do
@@ -1288,7 +1295,7 @@ PYEOF
                     prefetch_pair "$n" && next_fetch="$((n + 1))"
                     n="$((n + 1))"
                 done
-                if [[ "$prod_head" -ge "$P_AGREED" ]]; then
+                if [[ "$prod_head" -ge "$((P_AGREED - PAUSE_LEAD))" ]]; then
                     break
                 fi
             fi
@@ -1302,9 +1309,16 @@ PYEOF
         echo "handover: round $round freezing the producer at the agreed stop P=$P_AGREED (snapshot holds H=$H)..."
         local freeze_code
         freeze_code=0
-        python3 - "$producer_cid" "$P_AGREED" "$LEAP_API" <<'PYEOF' || freeze_code=$?
+        # Pausing the containers takes a block or so to land, and with four
+        # producers that latency is steady, so a pause triggered at P always
+        # lands past it. The lead is how many blocks early to trigger; it
+        # starts at CUTOVER_PAUSE_LEAD (default 0) and is learned from each
+        # missed round (see below), since the right value depends on the host.
+        PAUSE_LEAD="${PAUSE_LEAD:-${CUTOVER_PAUSE_LEAD:-0}}"
+        python3 - "$producer_cid" "$P_AGREED" "$LEAP_API" "$PAUSE_LEAD" <<'PYEOF' || freeze_code=$?
 import json, subprocess, sys, time, urllib.request
 cids, target, api = sys.argv[1].split(","), int(sys.argv[2]), sys.argv[3]
+lead = int(sys.argv[4])
 def head():
     req = urllib.request.Request(api + "/v1/chain/get_info", data=b"{}",
                                  headers={"Content-Type": "application/json",
@@ -1313,7 +1327,7 @@ def head():
         return json.load(r)["head_block_num"]
 deadline = time.time() + 120
 h = head()
-while h < target:
+while h < target - lead:
     if time.time() > deadline:
         print(f"head never reached H={target}", file=sys.stderr)
         sys.exit(1)
@@ -1351,6 +1365,14 @@ PYEOF
         # overshoot supersedes the round like any other miss.
         if [[ -z "$P" || "$P" != "$P_AGREED" ]]; then
             echo "handover: round $round validators converged to [$v1] [$v2], not exactly P=$P_AGREED for H=$H; unpausing, retrying..."
+            # Learn the pause latency: trigger earlier by however many
+            # blocks the freeze overshot (or later by the undershoot).
+            if [[ "$P" =~ ^[0-9]+$ ]]; then
+                PAUSE_LEAD=$((PAUSE_LEAD + P - P_AGREED))
+                [[ "$PAUSE_LEAD" -ge 0 ]] || PAUSE_LEAD=0
+                [[ "$PAUSE_LEAD" -le 10 ]] || PAUSE_LEAD=10
+                echo "handover: pause lead is now $PAUSE_LEAD block(s)"
+            fi
             docker unpause ${producer_cid//,/ } >/dev/null 2>&1 || true
             H=""
             continue
