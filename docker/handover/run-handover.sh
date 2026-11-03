@@ -1689,8 +1689,13 @@ confirm_attach_verify() { # $1=platform-chain-id
     # refuses unless every signer confirms the same agreed head, so a
     # divergent freeze fails here, not at boot.
     P="$(cat "$WORK_DIR/P")" || fail "could not read frozen head P"
+    # The confirmation commits to the id of block P itself (not just its
+    # height), read from the staged P header: the quorum attests this branch.
+    P_ID="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK_DIR/block-post-$P.json")" \
+        || fail "could not read the id of block P from block-post-$P.json"
+    [[ "${#P_ID}" == 64 ]] || fail "block P id is malformed: $P_ID"
     ceremony_key_args "$halt_key"
-    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" "${CEREMONY_KEY_ARGS[@]}" --out "$WORK_DIR/confirmation.json")" \
+    confirm_out="$("$CEREMONY_BIN" confirm --declaration "$WORK_DIR/declaration.json" --height "$H" --pause-height "$P" --pause-block-id "$P_ID" --block-id "$H_ID" --checkpoint "$CHECKPOINT_SHA256" --genesis "$WORK_DIR/migration.genesis.json" --platform-chain-id "$platform_chain" "${CEREMONY_KEY_ARGS[@]}" --out "$WORK_DIR/confirmation.json")" \
         || fail "confirmation failed"
     echo "handover: $confirm_out"
     CONF_DIGEST="$(printf '%s' "$confirm_out" | awk '{print $2}')"

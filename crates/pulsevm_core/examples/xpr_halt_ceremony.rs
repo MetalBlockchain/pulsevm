@@ -35,7 +35,7 @@ fn usage() {
         "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json --key WIF [--key WIF...] --out declaration.json"
     );
     eprintln!(
-        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] [--pause-height P...] --out confirmation.json"
+        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --pause-block-id HEX --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] [--pause-height P...] --out confirmation.json"
     );
     eprintln!(
         "  --pause-height is each signer's observed frozen head (repeat once per --key, or pass once"
@@ -112,6 +112,8 @@ struct ConfirmRequest {
     declaration: String,
     height: u32,
     pause_heads: Vec<u32>,
+    /// Id of block P itself: the quorum attests one specific branch.
+    pause_block_id: String,
     block_id: String,
     checkpoint: String,
     genesis: String,
@@ -169,6 +171,7 @@ impl ConfirmRequest {
         let mut declaration = None;
         let mut height = None;
         let mut pause_heads = Vec::new();
+        let mut pause_block_id = None;
         let mut block_id = None;
         let mut checkpoint = None;
         let mut genesis = None;
@@ -182,6 +185,8 @@ impl ConfirmRequest {
                 height = Some(parse_height(&take_value(&mut args, "--height")?)?);
             } else if arg == "--pause-height" {
                 pause_heads.push(parse_height(&take_value(&mut args, "--pause-height")?)?);
+            } else if arg == "--pause-block-id" {
+                pause_block_id = Some(take_value(&mut args, "--pause-block-id")?);
             } else if arg == "--block-id" {
                 block_id = Some(take_value(&mut args, "--block-id")?);
             } else if arg == "--checkpoint" {
@@ -207,6 +212,8 @@ impl ConfirmRequest {
             declaration: declaration.ok_or_else(|| "confirm needs --declaration".to_string())?,
             height: height.ok_or_else(|| "confirm needs --height".to_string())?,
             pause_heads,
+            pause_block_id: pause_block_id
+                .ok_or_else(|| "confirm needs --pause-block-id: the id of block P".to_string())?,
             block_id: block_id.ok_or_else(|| "confirm needs --block-id".to_string())?,
             checkpoint: checkpoint.ok_or_else(|| "confirm needs --checkpoint".to_string())?,
             genesis: genesis.ok_or_else(|| "confirm needs --genesis".to_string())?,
@@ -394,6 +401,7 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
         &hex::encode(declaration_digest),
         request.height,
         pause_height,
+        &request.pause_block_id,
         &request.block_id,
         &request.checkpoint,
         &new_chain_id,

@@ -621,6 +621,7 @@ mod tests {
     fn pack_post_block(
         previous: &[u8; 32],
         producer: u64,
+        slot: u32,
         signing: &pulsevm_crypto::k1::K1PrivateKey,
         schedule_hash: [u8; 32],
         // Post-H entries carry the two zero counts the gate requires; the
@@ -628,7 +629,7 @@ mod tests {
         with_counts: bool,
     ) -> (String, [u8; 32]) {
         let mut header = Vec::new();
-        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&slot.to_le_bytes());
         header.extend_from_slice(&producer.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(previous);
@@ -763,7 +764,8 @@ mod tests {
         // chains from a parent embedding 6.
         let mut parent6 = [6u8; 32];
         parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
-        let (h_block, hid) = pack_post_block(&parent6, owner, &signing, [0x5E; 32], false);
+        let (h_block, hid) =
+            pack_post_block(&parent6, owner, 0x01020304, &signing, [0x5E; 32], false);
         let mut manifest = MigrationManifest::new(
             b"fixture log",
             hid,
@@ -811,6 +813,11 @@ mod tests {
             pulsevm_database::GenesisState::from_bytes(&std::fs::read(&genesis).unwrap())
                 .unwrap()
                 .compute_chain_id();
+        // The staged header names a fixed schedule hash: the gate binds the
+        // exact (root, hash) pair through the producer signature, so any
+        // consistent value exercises the real check. It is built first
+        // because the confirmation commits to its id (block P).
+        let (post8, id8) = pack_post_block(&hid, owner, 0x01020305, &signing, [0x5E; 32], true);
         let template = HaltConfirmation {
             version: HaltConfirmation::VERSION,
             declaration_digest: hex::encode(declaration.digest().unwrap()),
@@ -818,6 +825,7 @@ mod tests {
             // The fixture stages one post-H header (block 8): the attested
             // pause head is exactly 8.
             pause_height: 8,
+            pause_block_id: hex::encode(id8),
             halt_block_id: hex::encode(hid),
             checkpoint_sha256: manifest.checkpoint_sha256.clone(),
             new_chain_id: hex::encode(genesis_id),
@@ -878,10 +886,6 @@ mod tests {
             weight: pulsevm_chain_types::HaltWeight::MEMBER,
         }]);
         manifest.halt_h_block = Some(h_block);
-        // The staged header names a fixed schedule hash: the gate binds the
-        // exact (root, hash) pair through the producer signature, so any
-        // consistent value exercises the real check.
-        let (post8, _) = pack_post_block(&hid, owner, &signing, [0x5E; 32], true);
         manifest.halt_post_blocks = Some(vec![post8]);
         let manifest_path = dir.path().join("migration.manifest.json");
         std::fs::write(
@@ -1160,10 +1164,10 @@ mod tests {
     fn accepts_a_sidecar_with_nothing_due_in_the_window() {
         let fixture = fixture(false, true);
         // The zero-slot source block opens the window at the Antelope
-        // epoch (946684800000000); block 8 closes it later. A row due
+        // epoch (946684800000000); block 8 (slot 0x01020305) closes it later. A row due
         // after the pause head and an empty inventory both pass.
         let start = pulsevm_database::antelope_slot_to_unix_micros(0);
-        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020304);
+        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020305);
         assert!(end > start);
         for transactions in [
             serde_json::json!([]),
@@ -1190,7 +1194,7 @@ mod tests {
     fn rejects_a_sidecar_with_a_row_due_in_the_window() {
         let fixture = fixture(false, true);
         let start = pulsevm_database::antelope_slot_to_unix_micros(0);
-        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020304);
+        let end = pulsevm_database::antelope_slot_to_unix_micros(0x01020305);
         let sidecar = write_sidecar(
             fixture.dir.path(),
             serde_json::json!([deferred_row(start + 1, end)]),

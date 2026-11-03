@@ -1124,7 +1124,9 @@ mod tests {
         let mut posts = Vec::new();
         let mut post_states = Vec::new();
         for (num, (slot, (key, name, root))) in (HEIGHT + 1..).zip(
-            [101u32, 102]
+            // Slots 101 (alice) and 108 (bob): in the [alice, bob] schedule the
+            // producer is `(slot % 24) / 12`, so bob's turn starts at 108.
+            [101u32, 108]
                 .into_iter()
                 .zip([(&key_a, "alice", TEST_ROOT_A), (&key_b, "bob", TEST_ROOT_B)]),
         ) {
@@ -1400,11 +1402,12 @@ mod tests {
         // The two staged headers (HEIGHT+1, HEIGHT+2) cover exactly the
         // attested pause head.
         let declaration = declaration_for(&[(&key_a, "alice"), (&key_b, "bob")]);
-        let attested = verify_migration_post_chain(
+        let (attested, _pause_id) = verify_migration_post_chain(
             &manifest,
             &declaration,
             HEIGHT,
             &halt_id,
+            100,
             VERSION,
             HEIGHT + 2,
         )

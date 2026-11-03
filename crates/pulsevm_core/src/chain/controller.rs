@@ -11101,7 +11101,8 @@ mod tests {
             .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
         let checkpoint_hex = manifest["checkpoint_sha256"]
             .as_str()
-            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?;
+            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?
+            .to_string();
         let new_chain_id =
             pulsevm_database::GenesisState::from_bytes(migration_genesis)?.compute_chain_id();
         // H's real schedule version, read from the attached packed header
@@ -11147,6 +11148,89 @@ mod tests {
             signatures: signatures.clone(),
             ..unsigned
         };
+        // Slot-derived production: in Antelope's DPoS schedule the producer
+        // for a slot is `recorded[(slot % (n * 12)) / 12]`, and the gate checks
+        // exactly that for H and every post-H block. The recorded schedule is
+        // the declared set (unit weights) ordered so H's own producer holds
+        // the slot H was produced in; the post-H producers then fall out of
+        // the same rule.
+        let source_bytes = hex::decode(manifest["source_block"].as_str().ok_or_else(|| {
+            ChainError::InternalError("manifest has no attached source block".into())
+        })?)
+        .map_err(|e| {
+            ChainError::InternalError(format!("fixture source block is not hexadecimal: {e}"))
+        })?;
+        let halt_slot = u32::from_le_bytes(source_bytes[0..4].try_into().map_err(|_| {
+            ChainError::InternalError("fixture source block shorter than its timestamp slot".into())
+        })?);
+        let halt_producer = u64::from_le_bytes(source_bytes[4..12].try_into().map_err(|_| {
+            ChainError::InternalError("fixture source block shorter than its producer".into())
+        })?);
+        let members = producers.len().max(1);
+        let slot_position = |slot: u32| ((u64::from(slot) % (members as u64 * 12)) / 12) as usize;
+        let mut order: Vec<usize> = (0..producers.len()).collect();
+        let halt_member = producers
+            .iter()
+            .position(|producer| {
+                crate::chain::name::Name::from_str(producer)
+                    .map(|name| name.as_u64() == halt_producer)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                ChainError::InternalError("fixture H producer is not a schedule member".into())
+            })?;
+        let held = order
+            .iter()
+            .position(|&member| member == halt_member)
+            .ok_or_else(|| ChainError::InternalError("fixture H member lost".into()))?;
+        order.swap(slot_position(halt_slot), held);
+        manifest["halt_schedule"] = json!(
+            order
+                .iter()
+                .map(|&member| {
+                    json!({
+                        "producer": producers[member],
+                        "key": keys[member].public_key().to_string(),
+                        "weight": "1",
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        // Post-H emptiness window: two signed empty blocks hash-linked from
+        // H (pause head P = H + 2 in the fixture), proving nothing landed
+        // after the freeze. Slots advance past H's slot so the staged window
+        // is time-ordered like a real freeze (the restore gate derives the
+        // deferred inventory bounds from these slots).
+        let post_producer = |index: usize| {
+            crate::chain::name::Name::from_str(producers[index])
+                .map(|name| name.as_u64())
+                .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))
+        };
+        // The staged headers name a fixed schedule hash: the gate binds
+        // the exact (root, hash) pair through the producer signature, so
+        // any consistent value exercises the real check.
+        const FIXTURE_SCHED_HASH: [u8; 32] = [0x5E; 32];
+        let first = order[slot_position(halt_slot + 1)];
+        let (post_next, next_id) = pack_post_block(
+            &source_block_id.0.0,
+            halt_slot + 1,
+            post_producer(first)?,
+            &keys[first],
+            header_schedule_version,
+            [0xA1; 32],
+            FIXTURE_SCHED_HASH,
+        )?;
+        let second = order[slot_position(halt_slot + 2)];
+        let (post_last, pause_block_id) = pack_post_block(
+            &next_id,
+            halt_slot + 2,
+            post_producer(second)?,
+            &keys[second],
+            header_schedule_version,
+            [0xB2; 32],
+            FIXTURE_SCHED_HASH,
+        )?;
+        manifest["halt_post_blocks"] = json!([post_next, post_last]);
         let template = pulsevm_database::HaltConfirmation {
             version: pulsevm_database::HaltConfirmation::VERSION,
             declaration_digest: hex::encode(declaration.digest()?),
@@ -11156,6 +11240,7 @@ mod tests {
             pause_height: source_block_num
                 .checked_add(2)
                 .ok_or_else(|| ChainError::InternalError("fixture pause head overflows".into()))?,
+            pause_block_id: hex::encode(pause_block_id),
             halt_block_id: hex::encode(source_block_id.as_bytes()),
             checkpoint_sha256: checkpoint_hex.to_string(),
             new_chain_id: hex::encode(new_chain_id),
@@ -11209,64 +11294,6 @@ mod tests {
         // The fixture checkpoint carries no proposed schedule (synthetic
         // state never stages one): attest the absence the gate requires.
         manifest["halt_proposed_schedule"] = json!(false);
-        // The recorded schedule is the declared set, unit weights.
-        manifest["halt_schedule"] = json!(
-            producers
-                .iter()
-                .zip(keys.iter())
-                .map(|(producer, key)| {
-                    json!({
-                        "producer": producer,
-                        "key": key.public_key().to_string(),
-                        "weight": "1",
-                    })
-                })
-                .collect::<Vec<_>>()
-        );
-        // Post-H emptiness window: two signed empty blocks hash-linked from
-        // H (pause head P = H + 2 in the fixture), proving nothing landed
-        // after the freeze. Producers sign in fixture order. Slots advance
-        // past H's slot so the staged window is time-ordered like a real
-        // freeze (the restore gate derives the deferred inventory bounds
-        // from these slots).
-        let post_producer = |index: usize| {
-            crate::chain::name::Name::from_str(producers[index])
-                .map(|name| name.as_u64())
-                .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))
-        };
-        let source_bytes = hex::decode(manifest["source_block"].as_str().ok_or_else(|| {
-            ChainError::InternalError("manifest has no attached source block".into())
-        })?)
-        .map_err(|e| {
-            ChainError::InternalError(format!("fixture source block is not hexadecimal: {e}"))
-        })?;
-        let halt_slot = u32::from_le_bytes(source_bytes[0..4].try_into().map_err(|_| {
-            ChainError::InternalError("fixture source block shorter than its timestamp slot".into())
-        })?);
-        // The staged headers name a fixed schedule hash: the gate binds
-        // the exact (root, hash) pair through the producer signature, so
-        // any consistent value exercises the real check.
-        const FIXTURE_SCHED_HASH: [u8; 32] = [0x5E; 32];
-        let (post_next, next_id) = pack_post_block(
-            &source_block_id.0.0,
-            halt_slot + 1,
-            post_producer(0)?,
-            &keys[0],
-            header_schedule_version,
-            [0xA1; 32],
-            FIXTURE_SCHED_HASH,
-        )?;
-        let second = (1 % producers.len().max(1)) as usize;
-        let (post_last, _) = pack_post_block(
-            &next_id,
-            halt_slot + 2,
-            post_producer(second)?,
-            &keys[second],
-            header_schedule_version,
-            [0xB2; 32],
-            FIXTURE_SCHED_HASH,
-        )?;
-        manifest["halt_post_blocks"] = json!([post_next, post_last]);
         // The cutover block entry: H's real header bytes (decoded from the
         // staged source block), signed over Leap's true digest with H's own
         // header-state inputs by the schedule key for H's producer. The

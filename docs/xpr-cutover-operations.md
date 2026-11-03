@@ -85,6 +85,65 @@ Plan the confirmation window (H..H+J) to include steps 1-2 end to end, and
 do not treat the step-1 refusal as an incident. A refusal for any other
 reason is a stop-and-diagnose.
 
+## Admission lock and edge freeze (ceremony requirement)
+
+Everything between H and the agreed stop P must have an empty
+`transaction_mroot`, and nothing in the producer binary keeps it empty:
+with P hundreds of blocks past H, ordinary traffic lands in that window and
+the restore gate correctly refuses every attempt. The lock is therefore part
+of the ceremony, not an optimization, on every producer at H:
+
+1. **Admission lock.** The producer stops admitting new transactions into
+   blocks it builds (the fleet agent does this on every producer).
+2. **Edge freeze.** The API ingress that accepts transactions is closed, and
+   p2p transaction relay is severed, so a transaction submitted anywhere
+   cannot reach a producer that has not yet locked.
+3. **Proof.** The gate verifies the result, never the procedure: every header
+   H+1..P must carry an empty transaction root, hash-link from H, sit in the
+   scheduled producer's slot, and end on the block id the quorum signed.
+
+This repository does not implement the lock or the freeze. The rehearsal
+harness sends traffic only before H, so a green rehearsal says nothing about
+them; the gate's refusal of a non-empty window is covered by unit tests
+(`post_chain_rejects_non_empty_blocks`). Treat "lock and freeze confirmed on
+all 21 producers" as a go/no-go item before H.
+
+## Abort and resume
+
+A round can die after the freeze: the stop P landed before H became
+irreversible (the snapshot of H never finalizes and its
+`.pending-snapshot-<H id>` file stays), a producer overshot P, H+1 slipped in
+before the pause, or a coordinator went dark. The contract state makes this
+sharper than a normal retry: once any vote has landed the freeze is locked
+(`init` refuses) until the 7-day vote window expires, and voters keep
+retrying a delivery that can never complete.
+
+Written procedure, in order, decided by chain ops and announced on the
+governance channel before anyone acts:
+
+1. **Declare the round dead.** Name H and the reason. A dead round is never
+   retried with the same H, never confirmed, and no manifest is hand-edited
+   to fit.
+2. **Stop the voters** on every producer (`systemctl stop`). While a voter
+   runs it re-pauses its producer on every poll, so resuming first is futile.
+3. **Release the admission lock and edge freeze**, then resume production on
+   each producer (`producer/resume`). XPR was only ever paused, never halted:
+   it continues from where it stopped, and blocks past P are valid XPR blocks
+   that the A-Chain simply never honors.
+4. **Discard the round's artifacts.** The pending snapshot, staged post-H
+   headers, and any exported checkpoint belong to a superseded H.
+5. **Start the next round on a clean slate.** Either wait out the 7-day vote
+   window and call `init` again, or deploy the ceremony contract to a fresh
+   account (deployments are fresh accounts with empty tables, so this is
+   always available and is the faster path when votes already landed). Pick
+   a new H, new K, and a new P measured from the live finality lag.
+6. **Record it.** The dead round's declaration stays on-chain as superseded
+   history; note H, the cause and the new parameters in the ops log.
+
+Prevention is cheaper than abort: the voter now refuses to run when
+`P - H < 2 x finality_lag + 12`, so the common cause (a stop inside the
+finality lag) cannot start.
+
 ## Coordinator status contract (agent side)
 
 The voter reports its own state via `--status` (one JSON line: head vs H,

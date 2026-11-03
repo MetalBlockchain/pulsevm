@@ -1177,6 +1177,10 @@ struct CoordinatorParams {
     /// signing a coordinator-typed number.
     #[serde(default)]
     pause_height: Option<u32>,
+    /// Id of block P, when the coordinator publishes it: it must equal this
+    /// node's own block P, so the voter attests the branch it actually saw.
+    #[serde(default)]
+    pause_block_id: Option<String>,
 }
 
 async fn fetch_coordinator_params(
@@ -1244,6 +1248,11 @@ async fn unsigned_confirmation(
             "local head {head_num} has not reached the agreed stop P={pause_height}: nothing to confirm yet"
         ));
     }
+    // The confirmation commits to the id of block P, read from this node:
+    // the quorum attests one specific branch, so a fabricated empty fork
+    // under the real height cannot match what the producers signed.
+    let local_pause_block_id =
+        fetch_block_id(client, &config.inner.nodeos_url, pause_height).await?;
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
     // what the local node reports for H.
@@ -1267,6 +1276,14 @@ async fn unsigned_confirmation(
             return Err(format!(
                 "coordinator pause head {coordinated_p} does not match the agreed pause head {pause_height}: refusing to sign"
             ));
+        }
+        if let Some(coordinated_id) = params.pause_block_id.as_deref()
+            && coordinated_id != local_pause_block_id
+        {
+            return Err(
+                "coordinator block id for P does not match this node's block P: refusing to sign"
+                    .to_string(),
+            );
         }
         if params.source_chain_id != config.inner.source_chain_id {
             return Err("coordinator params source chain does not match config".to_string());
@@ -1353,6 +1370,7 @@ async fn unsigned_confirmation(
         &hex::encode(config.expected_digest),
         height,
         pause_height,
+        &local_pause_block_id,
         &local_block_id,
         &checkpoint,
         &new_chain,
@@ -1368,6 +1386,7 @@ async fn submit_confirmation(
     let height = config.inner.height;
     let (template, digest) = unsigned_confirmation(client, config).await?;
     let local_block_id = template.halt_block_id.clone();
+    let pause_block_id = template.pause_block_id.clone();
     let checkpoint = template.checkpoint_sha256.clone();
     let new_chain = template.new_chain_id.clone();
     let platform = template.platform_chain_id.clone();
@@ -1405,6 +1424,7 @@ async fn submit_confirmation(
                 "producer": member_producer,
                 "halt_height": height,
                 "pause_height": template.pause_height,
+                "pause_block_id": pause_block_id,
                 "halt_block_id": local_block_id,
                 "checkpoint_sha256": checkpoint,
                 "new_chain_id": new_chain,
@@ -1712,6 +1732,7 @@ fn confirmation_digest_json(
         "producer": producer,
         "height": template.halt_height,
         "pause_height": template.pause_height,
+        "pause_block_id": template.pause_block_id,
         "halt_block_id": template.halt_block_id,
         "checkpoint_sha256": template.checkpoint_sha256,
         "new_chain_id": template.new_chain_id,
@@ -1895,6 +1916,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let client = build_client(config)?;
     let mut voted = false;
     let mut pause_holding = false;
+    let mut window_checked = false;
     let mut pause_note = String::new();
     let mut last_note = String::new();
     let mut polls = 0u64;
@@ -1917,6 +1939,23 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 continue;
             }
         };
+        // The stop window must clear the finality lag, or H would still be
+        // reversible when every producer stops and its snapshot would never
+        // finalize. Enforced on the first successful read before H (not only
+        // under --preflight, which an operator can skip). After H the window
+        // is already spent and refusing to run would stop the pause being
+        // re-asserted, so the check never fires then.
+        if !window_checked && view.head_num < config.inner.height {
+            window_checked = true;
+            if let Err(error) = stop_window_covers_finality(
+                config.inner.height,
+                pause_height,
+                view.head_num,
+                view.lib_num,
+            ) {
+                return Err(error);
+            }
+        }
         match decide(config, &view) {
             Decision::Vote => {
                 if dry_run {
@@ -1947,6 +1986,46 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             }
             Decision::Refuse(reason) => {
                 note_throttled(&mut last_note, &mut polls, &format!("refusing: {reason}"));
+            }
+        }
+        // The pause comes first. It is awaited before anything that talks to
+        // the coordinator: a dead or slow coordinator costs 15 s per call
+        // and several calls per poll, which used to push the pause tens of
+        // seconds past P. Stopping the producer must never queue behind
+        // network I/O to an off-chain service.
+        // The halt half of the binary: once the local head has reached the
+        // agreed pause head, the local producer must stay paused — whether
+        // or not this voter's confirmation has been delivered yet.
+        // Delivery retries continue above independently (the coordinator is
+        // off-chain, so a paused producer does not block them); the stop
+        // must never wait for delivery, or a failed submission keeps the
+        // chain building past the agreed head. Stopping at P (not at H)
+        // keeps the H+1..P window exactly the quorum attested. This never
+        // exits over a pause failure — the process stays alive retrying,
+        // because a node restart clears Leap's in-memory pause and only a
+        // live enforcer re-pauses it. To resume production deliberately,
+        // stop this voter first: a manual resume while it runs gets
+        // re-paused on the next poll.
+        if !dry_run
+            && should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
+        {
+            if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
+                match pause_producer(&client, &api_url).await {
+                    Ok(()) => {
+                        if !pause_holding {
+                            log_line!("local producer paused at P={}, enforcing", pause_height);
+                        }
+                        pause_holding = true;
+                    }
+                    Err(error) => {
+                        pause_holding = false;
+                        note_throttled(
+                            &mut pause_note,
+                            &mut polls,
+                            &format!("producer pause failed, retrying: {error}"),
+                        );
+                    }
+                }
             }
         }
         // Confirmation needs the agreed stop observed on this node: the
@@ -1994,41 +2073,6 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 }
                 Err(error) => {
                     log_line!("confirmation failed, retrying: {error}");
-                }
-            }
-        }
-        // The halt half of the binary: once the local head has reached the
-        // agreed pause head, the local producer must stay paused — whether
-        // or not this voter's confirmation has been delivered yet.
-        // Delivery retries continue above independently (the coordinator is
-        // off-chain, so a paused producer does not block them); the stop
-        // must never wait for delivery, or a failed submission keeps the
-        // chain building past the agreed head. Stopping at P (not at H)
-        // keeps the H+1..P window exactly the quorum attested. This never
-        // exits over a pause failure — the process stays alive retrying,
-        // because a node restart clears Leap's in-memory pause and only a
-        // live enforcer re-pauses it. To resume production deliberately,
-        // stop this voter first: a manual resume while it runs gets
-        // re-paused on the next poll.
-        if !dry_run
-            && should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
-        {
-            if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
-                match pause_producer(&client, &api_url).await {
-                    Ok(()) => {
-                        if !pause_holding {
-                            log_line!("local producer paused at P={}, enforcing", pause_height);
-                        }
-                        pause_holding = true;
-                    }
-                    Err(error) => {
-                        pause_holding = false;
-                        note_throttled(
-                            &mut pause_note,
-                            &mut polls,
-                            &format!("producer pause failed, retrying: {error}"),
-                        );
-                    }
                 }
             }
         }
@@ -2611,6 +2655,7 @@ mod tests {
             declaration_digest: hex::encode(config.expected_digest),
             halt_height: 100,
             pause_height: 103,
+            pause_block_id: "08".repeat(32),
             halt_block_id: "09".repeat(32),
             checkpoint_sha256: "10".repeat(32),
             new_chain_id: "11".repeat(32),

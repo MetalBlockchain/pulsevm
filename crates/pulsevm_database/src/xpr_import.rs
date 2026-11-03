@@ -789,6 +789,10 @@ pub const MAX_POST_H_BLOCKS: usize = 4096;
 /// Anything else in a post-H block fails closed, so the reader stays
 /// minimal on purpose — extend it only with a matching fixture.
 struct PostHeader {
+    /// Leap block-timestamp slot (half-seconds since the Antelope epoch).
+    /// The scheduled producer is a pure function of this and the active
+    /// schedule's order, so it is checked per block, not just as membership.
+    timestamp: u32,
     producer: u64,
     previous: [u8; 32],
     transaction_mroot: [u8; 32],
@@ -864,7 +868,7 @@ fn read_entry_prefix(packed: &[u8], label: &str) -> Result<(PostHeader, usize), 
         .try_into()
         .map_err(|_| format!("{label} ends mid-schedule-hash (truncated hash)"))?;
     let header_start = pos;
-    let _timestamp = read_u32_le(packed, &mut pos, label)?;
+    let timestamp = read_u32_le(packed, &mut pos, label)?;
     let producer = {
         let raw = read_exact(packed, &mut pos, 8)?;
         u64::from_le_bytes(
@@ -912,6 +916,7 @@ fn read_entry_prefix(packed: &[u8], label: &str) -> Result<(PostHeader, usize), 
         .map_err(|_| format!("{label} ends mid-signature (truncated compact)"))?;
     Ok((
         PostHeader {
+            timestamp,
             producer,
             previous,
             transaction_mroot,
@@ -923,6 +928,26 @@ fn read_entry_prefix(packed: &[u8], label: &str) -> Result<(PostHeader, usize), 
         },
         pos,
     ))
+}
+
+/// Producers repeat for a full round of 12 consecutive slots in Antelope's
+/// DPoS schedule (`config::producer_repetitions`).
+const PRODUCER_REPETITIONS: u64 = 12;
+
+/// The producer Leap's `get_scheduled_producer` selects for a block
+/// timestamp slot: schedule order, 12 consecutive slots each. Pure function
+/// of the recorded schedule, so a block signed by a real member key but
+/// produced outside its slot (a fabricated fork, a key signing out of turn)
+/// is rejected even though its signature recovers to a rostered key.
+fn scheduled_producer_for_slot(recorded: &[MigrationHaltRosterEntry], slot: u32) -> Option<&str> {
+    let members = recorded.len() as u64;
+    if members == 0 {
+        return None;
+    }
+    let index = (u64::from(slot) % (members * PRODUCER_REPETITIONS)) / PRODUCER_REPETITIONS;
+    recorded
+        .get(index as usize)
+        .map(|entry| entry.producer.as_str())
 }
 
 fn read_post_block(packed: &[u8]) -> Result<(PostHeader, [u8; 32], usize), String> {
@@ -1070,6 +1095,14 @@ pub fn verify_migration_halt_block(
     let scheduled_key = schedule_keys.get(&producer_name).ok_or_else(|| {
         format!("cutover block producer {producer_name} is not in the recorded schedule")
     })?;
+    let expected_producer = scheduled_producer_for_slot(recorded, header.timestamp)
+        .ok_or_else(|| "cutover block cannot be checked against an empty schedule".to_string())?;
+    if expected_producer != producer_name {
+        return Err(format!(
+            "cutover block producer {producer_name} is not the scheduled producer for slot {} (expected {expected_producer})",
+            header.timestamp
+        ));
+    }
     let signature = pulsevm_crypto::k1::K1Signature::from_compact65(&header.signature_compact);
     let recovered = signature
         .recover(&digest)
@@ -1266,9 +1299,10 @@ pub fn verify_migration_post_chain(
     declaration: &pulsevm_chain_types::HaltDeclaration,
     height: u32,
     block_id: &[u8; 32],
+    h_slot: u32,
     schedule_version: u32,
     pause_height: u32,
-) -> Result<usize, String> {
+) -> Result<(usize, [u8; 32]), String> {
     if pause_height <= height {
         return Err(format!(
             "migration cutover pair attests pause head {pause_height} at or below cutover height {height}: the pause head must sit strictly past H"
@@ -1318,6 +1352,7 @@ pub fn verify_migration_post_chain(
         .checked_add(1)
         .ok_or_else(|| "migration cutover height overflows u32".to_string())?;
     let mut expected_previous = *block_id;
+    let mut previous_slot = h_slot;
     for packed_hex in blocks {
         let packed =
             hex::decode(packed_hex).map_err(|e| format!("post-H block is not hexadecimal: {e}"))?;
@@ -1361,6 +1396,27 @@ pub fn verify_migration_post_chain(
         let scheduled_key = schedule_keys.get(&producer_name).ok_or_else(|| {
             format!("post-H block {expected_num} producer {producer_name} is not in the recorded schedule")
         })?;
+        // Timestamps are consensus facts, not decoration: slots must climb
+        // strictly, and the producer must be exactly the one the schedule
+        // names for that slot. Without this one key could sign a fabricated
+        // H+1..P chain from the real H id and still pass as "some member".
+        if header.timestamp <= previous_slot {
+            return Err(format!(
+                "post-H block {expected_num} slot {} does not advance past slot {previous_slot}",
+                header.timestamp
+            ));
+        }
+        let expected_producer = scheduled_producer_for_slot(recorded, header.timestamp)
+            .ok_or_else(|| {
+                "post-H blocks cannot be checked against an empty schedule".to_string()
+            })?;
+        if expected_producer != producer_name {
+            return Err(format!(
+                "post-H block {expected_num} producer {producer_name} is not the scheduled producer for slot {} (expected {expected_producer})",
+                header.timestamp
+            ));
+        }
+        previous_slot = header.timestamp;
         let header_bytes = &packed[header.header_span.0..header.header_span.1];
         let (header_digest, digest) = leap_entry_digest(&header, header_bytes);
         let signature = pulsevm_crypto::k1::K1Signature::from_compact65(&header.signature_compact);
@@ -1390,7 +1446,7 @@ pub fn verify_migration_post_chain(
             .checked_add(1)
             .ok_or_else(|| "post-H block height overflows u32".to_string())?;
     }
-    Ok(blocks.len())
+    Ok((blocks.len(), expected_previous))
 }
 
 /// Verify the two-step cutover pair: the declaration must carry a quorum
@@ -1454,12 +1510,28 @@ pub fn verify_migration_halt_pair(
     let confirmation = manifest.halt_confirmation.as_ref().ok_or_else(|| {
         "two-step cutover requires a halt confirmation chaining the declaration".to_string()
     })?;
+    // The terminal block and the post-H window are walked first because the
+    // confirmation commits to the id of block P: the quorum must have
+    // attested the exact block the recorded chain ends on, not just its
+    // height. Both walks use only the manifest and H's trusted id, so their
+    // results are independent of the confirmation's own claims.
+    let h_slot = verify_migration_halt_block(manifest, height, block_id, header_schedule_version)?;
+    let (_, recorded_pause_id) = verify_migration_post_chain(
+        manifest,
+        declaration,
+        height,
+        block_id,
+        h_slot,
+        header_schedule_version,
+        confirmation.pause_height,
+    )?;
     confirmation
         .verify(
             &declaration_digest,
             &roster,
             height,
             block_id,
+            &recorded_pause_id,
             checkpoint_sha256,
             new_chain_id,
             platform_chain_id,
@@ -1484,10 +1556,6 @@ pub fn verify_migration_halt_pair(
             manifest.halt_proposed_schedule
         ));
     }
-    // The cutover block itself is signature-checked first: the window must
-    // open on exactly the block the confirmation binds, with an empty root
-    // and a producer signature from the recorded schedule.
-    let h_slot = verify_migration_halt_block(manifest, height, block_id, header_schedule_version)?;
     // Memo-vehicle inclusion proof: the digest re-decodes from the recorded
     // memo names and every recorded account predates H — the declaration
     // provably landed on-chain before the cutoff, not as an asserted
@@ -1501,14 +1569,6 @@ pub fn verify_migration_halt_pair(
     // the highest head the quorum attested, strictly past H. A fleet that
     // did not keep the window empty cannot produce this evidence, and a
     // proof that stops short of the quorum's own observation fails closed.
-    verify_migration_post_chain(
-        manifest,
-        declaration,
-        height,
-        block_id,
-        header_schedule_version,
-        confirmation.pause_height,
-    )?;
     check_halt_inclusion_window(
         height,
         manifest.halt_declaration_inclusion,
@@ -6428,12 +6488,54 @@ mod tests {
     /// consistent value exercises the real check.
     const FIXTURE_SCHEDULE_HASH: [u8; 32] = [0x5E; 32];
 
+    /// Default timestamp slot for a fixture block: `24 * num + 12 * idx`
+    /// puts the block inside its producer's round for the two-member
+    /// fixture schedule `[prod.a, prod.b]` (12 slots each) and keeps slots
+    /// strictly increasing with the block number, so honest fixtures
+    /// satisfy the per-slot producer rule without every call spelling a slot.
+    fn fixture_slot(num: u32, producer: u64) -> u32 {
+        let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
+        24 * num + if producer == prod_b { 12 } else { 0 }
+    }
+
     // Ten arguments because the fixture packs every byte the gate walks:
     // header shape knobs plus the recorded root and schedule hash.
     #[allow(clippy::too_many_arguments)]
     fn pack_post_block(
         previous: &[u8; 32],
         producer: u64,
+        signing: &pulsevm_crypto::k1::K1PrivateKey,
+        schedule_version: u32,
+        tx_count: u32,
+        transaction_mroot: [u8; 32],
+        schedule_change: bool,
+        trailer: &[u8],
+        root: [u8; 32],
+        schedule_hash: [u8; 32],
+        with_counts: bool,
+    ) -> (String, [u8; 32]) {
+        let num = u32::from_be_bytes(previous[0..4].try_into().unwrap()) + 1;
+        pack_post_block_at(
+            previous,
+            producer,
+            fixture_slot(num, producer),
+            signing,
+            schedule_version,
+            tx_count,
+            transaction_mroot,
+            schedule_change,
+            trailer,
+            root,
+            schedule_hash,
+            with_counts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pack_post_block_at(
+        previous: &[u8; 32],
+        producer: u64,
+        slot: u32,
         signing: &pulsevm_crypto::k1::K1PrivateKey,
         schedule_version: u32,
         tx_count: u32,
@@ -6458,7 +6560,7 @@ mod tests {
             }
         }
         let mut header = Vec::new();
-        header.extend_from_slice(&0x01020304u32.to_le_bytes());
+        header.extend_from_slice(&slot.to_le_bytes());
         header.extend_from_slice(&producer.to_le_bytes());
         header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(previous);
@@ -6658,6 +6760,34 @@ mod tests {
             signatures: vec![sign_decl(&k1, "prod.a"), sign_decl(&k2, "prod.b")],
             ..unsigned
         };
+        // The post-H window is built first: the confirmation commits to the
+        // id of its last block (P), so the quorum attests this exact branch.
+        let (post8, id8) = pack_post_block(
+            &hid,
+            prod_a,
+            &k1,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [8u8; 32],
+            sched,
+            true,
+        );
+        let (post9, id9) = pack_post_block(
+            &id8,
+            prod_b,
+            &k2,
+            TEST_SCHEDULE_VERSION,
+            0,
+            [0u8; 32],
+            false,
+            &[],
+            [9u8; 32],
+            sched,
+            true,
+        );
         let new_chain = [0x31; 32];
         let template = pulsevm_chain_types::HaltConfirmation {
             version: pulsevm_chain_types::HaltConfirmation::VERSION,
@@ -6667,6 +6797,7 @@ mod tests {
             // 9 below), so the attested pause head is exactly 9. The H id
             // is derived from the staged H entry above, never synthetic.
             pause_height: 9,
+            pause_block_id: hex::encode(id9),
             halt_block_id: hex::encode(hid),
             checkpoint_sha256: hex::encode(checkpoint),
             new_chain_id: hex::encode(new_chain),
@@ -6748,32 +6879,6 @@ mod tests {
                 weight: pulsevm_chain_types::HaltWeight::MEMBER,
             },
         ]);
-        let (post8, id8) = pack_post_block(
-            &hid,
-            prod_a,
-            &k1,
-            TEST_SCHEDULE_VERSION,
-            0,
-            [0u8; 32],
-            false,
-            &[],
-            [8u8; 32],
-            sched,
-            true,
-        );
-        let (post9, _) = pack_post_block(
-            &id8,
-            prod_b,
-            &k2,
-            TEST_SCHEDULE_VERSION,
-            0,
-            [0u8; 32],
-            false,
-            &[],
-            [9u8; 32],
-            sched,
-            true,
-        );
         manifest.halt_post_blocks = Some(vec![post8, post9]);
         manifest.halt_h_block = Some(h_block);
         (manifest, hid, checkpoint, new_chain)
@@ -6919,6 +7024,7 @@ mod tests {
             declaration_digest: hex::encode(decl_digest),
             halt_height: 7,
             pause_height: 7,
+            pause_block_id: hex::encode(id),
             halt_block_id: hex::encode(id),
             checkpoint_sha256: hex::encode(checkpoint),
             new_chain_id: hex::encode(new_chain),
@@ -6943,6 +7049,114 @@ mod tests {
         assert!(
             err.contains("strictly past H") || err.contains("pause head"),
             "a pause exactly on H must fail closed, got: {err}"
+        );
+    }
+
+    /// Re-pack the pair fixture's post-H window with explicit producers and
+    /// slots (signed by the matching schedule key), returning the manifest
+    /// with the window swapped in. The confirmation is left untouched, so
+    /// the chain walk (which runs before the confirmation is verified)
+    /// is what each case exercises first.
+    fn pair_with_window(
+        window: &[(&str, u32)],
+    ) -> (MigrationManifest, [u8; 32], [u8; 32], [u8; 32]) {
+        let (mut manifest, id, checkpoint, new_chain) = halt_test_pair();
+        let k1 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-1").unwrap();
+        let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
+        let mut previous = id;
+        let mut packed = Vec::new();
+        for (index, (producer, slot)) in window.iter().enumerate() {
+            let name = pulsevm_name::Name::from_str(producer).unwrap().as_u64();
+            let key = if *producer == "prod.a" { &k1 } else { &k2 };
+            let (hex, block_id) = pack_post_block_at(
+                &previous,
+                name,
+                *slot,
+                key,
+                TEST_SCHEDULE_VERSION,
+                0,
+                [0u8; 32],
+                false,
+                &[],
+                [(8 + index) as u8; 32],
+                FIXTURE_SCHEDULE_HASH,
+                true,
+            );
+            packed.push(hex);
+            previous = block_id;
+        }
+        manifest.halt_post_blocks = Some(packed);
+        (manifest, id, checkpoint, new_chain)
+    }
+
+    fn pair_error(parts: &(MigrationManifest, [u8; 32], [u8; 32], [u8; 32])) -> String {
+        verify_migration_halt_pair(
+            &parts.0,
+            7,
+            &parts.1,
+            &parts.2,
+            &parts.3,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn post_chain_enforces_the_scheduled_producer_for_each_slot() {
+        // H (prod.a) sits at slot 168 = 24 * 7. Slots 168..179 are prod.a's
+        // round and 180..191 are prod.b's in the [prod.a, prod.b] schedule.
+        // Baseline: the honest window the fixture stages passes.
+        let (manifest, id, checkpoint, new_chain) = halt_test_pair();
+        verify_migration_halt_pair(
+            &manifest,
+            7,
+            &id,
+            &checkpoint,
+            &new_chain,
+            TEST_SCHEDULE_VERSION,
+            Some(&TEST_PLATFORM_ID),
+        )
+        .expect("the honest window verifies");
+
+        // prod.b producing inside prod.a's round: its key signs validly, the
+        // set-membership rule would accept it, the slot rule must not.
+        let wrong_turn = pair_with_window(&[("prod.b", 170), ("prod.b", 192)]);
+        let error = pair_error(&wrong_turn);
+        assert!(
+            error.contains("not the scheduled producer for slot 170"),
+            "a member producing out of its slot must fail, got: {error}"
+        );
+
+        // The first block after H must advance past H's slot.
+        let stalled = pair_with_window(&[("prod.a", 168), ("prod.a", 169)]);
+        let error = pair_error(&stalled);
+        assert!(
+            error.contains("does not advance"),
+            "a slot that does not advance past H must fail, got: {error}"
+        );
+
+        // Slots must keep climbing inside the window.
+        let backwards = pair_with_window(&[("prod.a", 175), ("prod.a", 174)]);
+        let error = pair_error(&backwards);
+        assert!(
+            error.contains("does not advance"),
+            "a slot that goes backwards must fail, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_fabricated_empty_fork_cannot_match_the_confirmed_pause_block() {
+        // One key (prod.a) signs an empty H+1..P entirely inside its own
+        // round: every slot rule passes, because it genuinely is prod.a's
+        // turn. The quorum, though, attested the id of the real block P
+        // (signed by prod.b). The fork derives a different id at P, so the
+        // confirmation no longer binds the recorded chain.
+        let fork = pair_with_window(&[("prod.a", 169), ("prod.a", 170)]);
+        let error = pair_error(&fork);
+        assert!(
+            error.contains("pause block id"),
+            "a fork under the real height must not match the confirmed P id, got: {error}"
         );
     }
 

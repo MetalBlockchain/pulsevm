@@ -357,6 +357,7 @@ conf = [json.loads(line) for line in open(sys.argv[1]) if line.strip()][-1]
 assert conf["producer"] == "eosio", conf
 assert conf["platform_chain_id"] == sys.argv[2], conf
 assert isinstance(conf["pause_height"], int) and conf["pause_height"] >= int(sys.argv[3]), conf
+assert len(conf["pause_block_id"]) == 64 and int(conf["pause_block_id"], 16) >= 0, conf
 PYEOF
 pass "vote landed and platform-bound confirmation delivered unattended"
 
@@ -524,5 +525,51 @@ kill "$COORD_PID" 2>/dev/null || true
 wait "$COORD_PID" 2>/dev/null || true
 grep -q "producer pause failed" "$WORK/pausebad.log" || fail "pause failure went unlogged: $(tail -5 "$WORK/pausebad.log")"
 pass "unverified pause fails loud, never silent"
+
+echo "cutover-voter-test: the pause lands before a hung coordinator is even tried..."
+start_stub true "$WORK/pause-hang-hits" "$WORK/stub-hang.port"
+HANG_STUB_PID="$STUB_PID"
+HANG_STUB_PORT="$(cat "$WORK/stub-hang.port")"
+# A coordinator that accepts connections and never answers: every call costs
+# the voter's full HTTP timeout. The pause must not queue behind it.
+python3 -I - "$WORK/hang.port" <<'PYEOF' &
+import socket, sys
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+open(sys.argv[1], "w").write(str(srv.getsockname()[1]))
+held = []
+while True:
+    conn, _ = srv.accept()
+    held.append(conn)
+PYEOF
+HANG_SRV_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/hang.port" ]] && break
+    sleep 1
+done
+HANG_PORT="$(cat "$WORK/hang.port")"
+HANG_CFG="$(mk_config "$H" false "http://127.0.0.1:${HANG_PORT}" "$PLATFORM" "http://127.0.0.1:${HANG_STUB_PORT}")"
+"$VOTER_BIN" --config "$HANG_CFG" >"$WORK/hang.log" 2>&1 &
+HANG_VOTER_PID=$!
+HANG_PAUSED=""
+for _ in $(seq 1 60); do
+    grep -q "local producer paused at P=" "$WORK/hang.log" 2>/dev/null && { HANG_PAUSED=1; break; }
+    kill -0 "$HANG_VOTER_PID" 2>/dev/null || break
+    sleep 1
+done
+# Give the confirmation attempt time to time out so its line exists to compare.
+for _ in $(seq 1 40); do
+    grep -q "confirmation failed" "$WORK/hang.log" 2>/dev/null && break
+    sleep 1
+done
+kill "$HANG_VOTER_PID" "$HANG_SRV_PID" "$HANG_STUB_PID" 2>/dev/null || true
+wait "$HANG_VOTER_PID" "$HANG_SRV_PID" "$HANG_STUB_PID" 2>/dev/null || true
+[[ -n "$HANG_PAUSED" ]] || fail "producer never paused behind a hung coordinator: $(tail -5 "$WORK/hang.log")"
+PAUSE_LINE="$(grep -n "local producer paused at P=" "$WORK/hang.log" | head -1 | cut -d: -f1)"
+FAIL_LINE="$(grep -n "confirmation failed" "$WORK/hang.log" | head -1 | cut -d: -f1 || true)"
+[[ -z "$FAIL_LINE" || "$PAUSE_LINE" -lt "$FAIL_LINE" ]] \
+    || fail "pause (line $PAUSE_LINE) came after the hung confirmation (line $FAIL_LINE)"
+pass "pause fires before the coordinator, which never answered"
 
 echo "cutover-voter-test: PASS"

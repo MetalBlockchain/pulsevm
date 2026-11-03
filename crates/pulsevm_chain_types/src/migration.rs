@@ -479,7 +479,7 @@ pub const HALT_DECLARATION_DOMAIN: &[u8] = b"PULSEVM-XPR-HALT-DECLARATION-v1";
 /// the platform binding positional and mandatory: a confirmation that names
 /// no platform cannot commit its signers to the id wallets sign under, so
 /// version 1 confirmations are rejected outright.
-pub const HALT_CONFIRMATION_DOMAIN_V2: &[u8] = b"PULSEVM-XPR-HALT-CONFIRMATION-v2";
+pub const HALT_CONFIRMATION_DOMAIN_V3: &[u8] = b"PULSEVM-XPR-HALT-CONFIRMATION-v3";
 
 /// One validator-set member as carried inside a halt declaration. The shape
 /// mirrors the transport roster entry; parsing it yields a
@@ -539,6 +539,11 @@ pub struct HaltConfirmation {
     /// arrives after the agreed stop. Required: confirmations minted
     /// before this field existed fail closed at parse time.
     pub pause_height: u32,
+    /// 64-hex id of block P itself. Binding the id and not just the height
+    /// makes the quorum attest one specific branch: a fabricated empty
+    /// H+1..P chain, even one signed by real schedule keys, derives a
+    /// different id at P and cannot satisfy this commitment.
+    pub pause_block_id: String,
     /// 64-hex id of the terminal block H.
     pub halt_block_id: String,
     /// 64-hex SHA-256 of the migration checkpoint exported at H.
@@ -784,28 +789,34 @@ impl HaltDeclaration {
 }
 
 impl HaltConfirmation {
-    pub const VERSION: u16 = 2;
+    pub const VERSION: u16 = 3;
 
-    /// Canonical confirmation message: v2 domain || declaration-digest ||
-    /// height-be32 || pause-height-be32 || block-id || checkpoint ||
-    /// new-chain-id || platform-id. The pause head and platform id are
+    /// Canonical confirmation message: v3 domain || declaration-digest ||
+    /// height-be32 || pause-height-be32 || pause-block-id || block-id ||
+    /// checkpoint || new-chain-id || platform-id. The pause head and platform id are
     /// positional, not appended conditionally, so the domain tag pins the
     /// full binding set: a confirmation minted before the pause head
     /// existed signs a different digest and fails closed.
+    // Eight positional fields because the digest layout is positional: a
+    // builder would let two 32-byte ids be swapped without the compiler
+    // noticing, which is exactly the mistake the domain tag cannot catch.
+    #[allow(clippy::too_many_arguments)]
     pub fn message_bytes(
         declaration_digest: &[u8; 32],
         halt_height: u32,
         pause_height: u32,
+        pause_block_id: &[u8; 32],
         halt_block_id: &[u8; 32],
         checkpoint_sha256: &[u8; 32],
         new_chain_id: &[u8; 32],
         platform_chain_id: &[u8; 32],
     ) -> Vec<u8> {
-        let mut message = Vec::with_capacity(HALT_CONFIRMATION_DOMAIN_V2.len() + 32 * 5 + 8);
-        message.extend_from_slice(HALT_CONFIRMATION_DOMAIN_V2);
+        let mut message = Vec::with_capacity(HALT_CONFIRMATION_DOMAIN_V3.len() + 32 * 6 + 8);
+        message.extend_from_slice(HALT_CONFIRMATION_DOMAIN_V3);
         message.extend_from_slice(declaration_digest);
         message.extend_from_slice(&halt_height.to_be_bytes());
         message.extend_from_slice(&pause_height.to_be_bytes());
+        message.extend_from_slice(pause_block_id);
         message.extend_from_slice(halt_block_id);
         message.extend_from_slice(checkpoint_sha256);
         message.extend_from_slice(new_chain_id);
@@ -819,10 +830,13 @@ impl HaltConfirmation {
     /// signers) builds the same template from the same fields, so one BP
     /// signature serves every tally and no agent shells out to another
     /// binary for the digest.
+    // Positional for the same reason as `message_bytes`.
+    #[allow(clippy::too_many_arguments)]
     pub fn unsigned(
         declaration_digest_hex: &str,
         halt_height: u32,
         pause_height: u32,
+        pause_block_id_hex: &str,
         halt_block_id_hex: &str,
         checkpoint_sha256_hex: &str,
         new_chain_id_hex: &str,
@@ -833,6 +847,7 @@ impl HaltConfirmation {
             declaration_digest: declaration_digest_hex.to_string(),
             halt_height,
             pause_height,
+            pause_block_id: pause_block_id_hex.to_string(),
             halt_block_id: halt_block_id_hex.to_string(),
             checkpoint_sha256: checkpoint_sha256_hex.to_string(),
             new_chain_id: new_chain_id_hex.to_string(),
@@ -855,6 +870,9 @@ impl HaltConfirmation {
         let halt_block_id = decode_hex_32(&self.halt_block_id).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation block id invalid: {e}"))
         })?;
+        let pause_block_id = decode_hex_32(&self.pause_block_id).map_err(|e| {
+            ChainError::InternalError(format!("halt confirmation pause block id invalid: {e}"))
+        })?;
         let checkpoint_sha256 = decode_hex_32(&self.checkpoint_sha256).map_err(|e| {
             ChainError::InternalError(format!("halt confirmation checkpoint binding invalid: {e}"))
         })?;
@@ -875,6 +893,7 @@ impl HaltConfirmation {
             &declaration_digest,
             self.halt_height,
             self.pause_height,
+            &pause_block_id,
             &halt_block_id,
             &checkpoint_sha256,
             &new_chain_id,
@@ -901,6 +920,7 @@ impl HaltConfirmation {
         roster: &[HaltRosterEntry],
         expected_height: u32,
         expected_block_id: &[u8; 32],
+        expected_pause_block_id: &[u8; 32],
         expected_checkpoint: &[u8; 32],
         expected_new_chain_id: &[u8; 32],
         expected_platform: Option<&[u8; 32]>,
@@ -942,6 +962,18 @@ impl HaltConfirmation {
         if committed_id != *expected_block_id {
             return Err(ChainError::InternalError(
                 "halt confirmation block id does not match the terminal block".into(),
+            ));
+        }
+        // The quorum attests one specific P: the recorded post-H chain must
+        // end on exactly this id, so a fabricated empty fork cannot pass
+        // under the real height.
+        let committed_pause = decode_hex_32(&self.pause_block_id).map_err(|e| {
+            ChainError::InternalError(format!("halt confirmation pause block id invalid: {e}"))
+        })?;
+        if committed_pause != *expected_pause_block_id {
+            return Err(ChainError::InternalError(
+                "halt confirmation pause block id does not match the recorded block at the agreed stop"
+                    .into(),
             ));
         }
         let committed_checkpoint = decode_hex_32(&self.checkpoint_sha256).map_err(|e| {
@@ -1260,6 +1292,16 @@ mod tests {
 
     fn block_id_hex() -> String {
         "ab".repeat(32)
+    }
+
+    /// Id of block P in the confirmation tests (distinct from H's id so a
+    /// swapped binding cannot pass by accident).
+    fn pause_block_id() -> [u8; 32] {
+        [0xcd; 32]
+    }
+
+    fn pause_block_id_hex() -> String {
+        "cd".repeat(32)
     }
 
     fn platform() -> [u8; 32] {
@@ -1654,12 +1696,23 @@ mod tests {
             declaration_digest: hex32(declaration_digest),
             halt_height: HEIGHT,
             pause_height,
+            pause_block_id: pause_block_id_hex(),
             halt_block_id: block_id_hex(),
             checkpoint_sha256: hex32(&checkpoint()),
             new_chain_id: new_chain_hex(),
             platform_chain_id: platform_hex(),
             signatures,
         }
+    }
+
+    fn confirmed_pause_block(
+        signatures: Vec<HaltSignature>,
+        declaration_digest: &[u8; 32],
+        pause_block_id: String,
+    ) -> HaltConfirmation {
+        let mut confirmation = confirmed(signatures, declaration_digest);
+        confirmation.pause_block_id = pause_block_id;
+        confirmation
     }
 
     fn sign_confirmation(
@@ -1829,6 +1882,7 @@ mod tests {
                 &roster,
                 HEIGHT,
                 &block_id(),
+                &pause_block_id(),
                 &checkpoint(),
                 &NEW_CHAIN,
                 Some(&platform()),
@@ -1850,6 +1904,7 @@ mod tests {
             .collect::<Vec<_>>();
         let good = confirmed(quorum, &decl_digest);
         let id = block_id();
+        let pause_id = pause_block_id();
         let checkpoint_bytes = checkpoint();
         let expect_ok = |confirmation: &HaltConfirmation| {
             confirmation.verify(
@@ -1857,6 +1912,7 @@ mod tests {
                 &roster,
                 HEIGHT,
                 &id,
+                &pause_id,
                 &checkpoint_bytes,
                 &NEW_CHAIN,
                 Some(&platform()),
@@ -1877,6 +1933,7 @@ mod tests {
                     &roster,
                     HEIGHT,
                     &id,
+                    &pause_id,
                     &checkpoint_bytes,
                     &NEW_CHAIN,
                     Some(&platform()),
@@ -1887,6 +1944,31 @@ mod tests {
         let mut wrong_block = good.clone();
         wrong_block.halt_block_id = "55".repeat(32);
         assert!(expect_ok(&wrong_block).is_err());
+
+        // The quorum attests one specific block at P. A confirmation naming
+        // a different P id fails twice over: the expected (recorded) id no
+        // longer matches, and the signatures no longer cover the digest.
+        let mut wrong_pause_block = good.clone();
+        wrong_pause_block.pause_block_id = "77".repeat(32);
+        assert!(expect_ok(&wrong_pause_block).is_err());
+        assert_ne!(
+            wrong_pause_block.digest().expect("digest"),
+            good.digest().expect("digest"),
+            "the pause block id must be bound into the signing digest"
+        );
+        // Even with a quorum that signed the swapped id, the verifier is
+        // checking against the recorded chain's P, not the confirmation's
+        // own claim.
+        let swapped_template = confirmed_pause_block(Vec::new(), &decl_digest, "77".repeat(32));
+        let swapped_quorum = [0, 1, 2]
+            .iter()
+            .map(|&i| sign_confirmation(&keys[i], names[i], &swapped_template))
+            .collect::<Vec<_>>();
+        let swapped = confirmed_pause_block(swapped_quorum, &decl_digest, "77".repeat(32));
+        assert!(
+            expect_ok(&swapped).is_err(),
+            "a real quorum over a fabricated P id must not verify against the recorded P"
+        );
 
         let mut wrong_checkpoint = good.clone();
         wrong_checkpoint.checkpoint_sha256 = "66".repeat(32);
@@ -1918,6 +2000,7 @@ mod tests {
         let unsigned = declared(Vec::new());
         let decl_digest = declared_digest(&unsigned);
         let id = block_id();
+        let pause_id = pause_block_id();
         let checkpoint_bytes = checkpoint();
         let verify_as = |confirmation: &HaltConfirmation, platform: Option<&[u8; 32]>| {
             confirmation.verify(
@@ -1925,6 +2008,7 @@ mod tests {
                 &roster,
                 HEIGHT,
                 &id,
+                &pause_id,
                 &checkpoint_bytes,
                 &NEW_CHAIN,
                 platform,
@@ -1953,6 +2037,7 @@ mod tests {
                 &hex32(&decl_digest),
                 HEIGHT,
                 PAUSE,
+                &pause_block_id_hex(),
                 &block_id_hex(),
                 &hex32(&checkpoint()),
                 &new_chain_hex(),
@@ -2295,6 +2380,7 @@ mod tests {
         let unsigned = declared(Vec::new());
         let decl_digest = declared_digest(&unsigned);
         let id = block_id();
+        let pause_id = pause_block_id();
         let checkpoint_bytes = checkpoint();
         let verify_as = |confirmation: &HaltConfirmation| {
             confirmation.verify(
@@ -2302,6 +2388,7 @@ mod tests {
                 &roster,
                 HEIGHT,
                 &id,
+                &pause_id,
                 &checkpoint_bytes,
                 &NEW_CHAIN,
                 Some(&platform()),
@@ -2350,6 +2437,7 @@ mod tests {
             &hex32(&decl_digest),
             HEIGHT,
             PAUSE,
+            &pause_block_id_hex(),
             &block_id_hex(),
             &hex32(&checkpoint()),
             &new_chain_hex(),
