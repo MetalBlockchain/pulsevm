@@ -190,8 +190,14 @@ Pass it as the fourth optional argument to the importer:
 ```bash
 cargo run -p pulsevm_database --example xpr_import_check -- \
   /data/xpr-export/chain_state_history.log /data/pulsevm-arena \
-  /data/xpr-migration.snapshot /data/xpr-export/deferred-transactions.json
+  /data/xpr-migration.snapshot /data/xpr-export/deferred-transactions.json \
+  --leap-snapshot /data/xpr-export/snapshot.bin
 ```
+
+`--leap-snapshot` is required for any checkpoint a cutover restores from: it
+reads H's active producer schedule from the Leap snapshot the export was made
+from and writes it into the checkpoint, so the checkpoint hash binds the
+committee. A checkpoint without it is refused by the restore gate.
 
 The full-state importer verifies the block and source-chain IDs, requires each
 supplied sidecar table to cover the corresponding SHiP rows exactly, and checks

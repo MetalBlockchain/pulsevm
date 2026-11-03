@@ -255,6 +255,44 @@ One deployment gotcha the fixture proved: Leap `setabi` carries the
 Submitting raw JSON executes but leaves nothing `get_abi` or
 `get_table_rows` can unpack. The probe tool packs for cleos parity.
 
+## Committee authentication (where the schedule comes from)
+
+The committee the gate trusts is the one the **Leap snapshot of H** states,
+not anything an exporter types or fetches. The snapshot's
+`eosio::chain::block_state` section is H's `block_header_state`: the active
+producer schedule (names and single K1 signing keys, in schedule order), the
+pending schedule, and the header that re-derives the snapshot's own block id.
+The converter (`xpr_import_check --leap-snapshot snapshot.bin`) reads that
+section, checks it against itself (number matches the id, the header
+re-derives the id exactly, the header's schedule version is the schedule's,
+every member holds exactly one weight-one K1 key), and writes the schedule
+into the checkpoint as ordinary contract rows (`eosio`/`eosio`/`migsrcsched`:
+a header row plus one row per producer, in order). The checkpoint hash the
+ceremony confirms therefore covers the committee.
+
+At restore (and in `xpr_verify_manifest`) the checkpoint's schedule must be
+for exactly the terminal block H, carry H's schedule version, attest no
+pending schedule, and equal the schedule the manifest records entry for entry
+and in order. The recorded copy only transports it; the gate walks H and the
+post-H window against the recorded copy, and this binding is what makes that
+copy the real one. A checkpoint converted without `--leap-snapshot` carries no
+schedule and is refused outright.
+
+Trust comes from the fleet, not the exporter: each BP takes the snapshot from
+its own node, runs the same converter, and the fleet agrees on the checkpoint
+hash (published at T-30 and signed into the confirmation). An exporter that
+invents a committee produces a different checkpoint hash that the fleet will
+not have agreed to. What the gate cannot do alone is know which hash the
+fleet agreed to; that remains the out-of-band T-30 publication and the
+confirmation's checkpoint binding.
+
+Two further checks close the rest of the attack that earlier versions
+allowed (a recorded set the attacker controls, one key signing a fabricated
+empty window): every block H..P must be produced by the schedule's own
+producer for its timestamp slot (`(slot % (n * 12)) / 12`, with slots
+strictly advancing), and the confirmation signs the id of block P so the
+quorum attests one specific branch.
+
 ## Post-H window (what the exporter stages)
 
 The version pin does not stop at H. The authoritative schedule comes

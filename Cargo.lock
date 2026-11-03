@@ -3938,6 +3938,7 @@ dependencies = [
  "pulsevm_proc_macros",
  "pulsevm_rpc",
  "pulsevm_serialization",
+ "pulsevm_snapshot",
  "pulsevm_softfloat",
  "secp256k1",
  "serde",

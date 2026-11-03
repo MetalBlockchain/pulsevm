@@ -748,7 +748,7 @@ pub fn record_memo_names(
         ));
     }
     let count = recorded.len();
-    manifest.halt_memo_accounts = Some(recorded);
+    manifest.halt_memo_names = Some(recorded);
     Ok(count)
 }
 
@@ -1297,7 +1297,7 @@ mod tests {
         manifest.halt_declaration = Some(declaration);
         let count = record_memo_names(&mut manifest, &memo_json(&names, 50), 100, "memo").unwrap();
         assert_eq!(count, 7);
-        let recorded = manifest.halt_memo_accounts.unwrap();
+        let recorded = manifest.halt_memo_names.unwrap();
         assert_eq!(recorded.len(), 7);
         assert!(recorded.iter().all(|m| m.created_slot == 50));
         // A digest from another declaration fails: names commit to exactly

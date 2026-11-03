@@ -5,7 +5,16 @@ mod objects;
 mod pod;
 mod ram_monitor;
 mod snapshot;
+mod source_schedule;
 mod xpr_import;
+
+pub use crate::source_schedule::{
+    SourceSchedule,
+    SourceScheduleMember,
+    read_source_schedule,
+    verify_source_schedule_binding,
+    write_source_schedule,
+};
 
 pub use crate::pod::{
     CpuLimitResult,

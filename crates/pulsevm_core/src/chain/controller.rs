@@ -1556,19 +1556,40 @@ impl Controller {
             }
             // The producers table is NOT the schedule: on mainnet it carries
             // every active row (standbys included) while the schedule names
-            // only the committee, so no membership check touches it — a
-            // correct 21-member declaration would fail against 37 rows, and
-            // a 37-member one would fail the voter's live-schedule check.
-            // Committee membership was already pinned above: the declaration
-            // must equal the recorded schedule exactly (both ways, same
-            // keys), and that recorded schedule comes from the snapshot's
-            // header state, bound by the confirmed checkpoint — not from a
-            // live schedule query and not from the table. Weights are 1 by
-            // construction, so there is no weight pin to re-check here.
+            // only the committee, so no membership check touches it.
+            // The committee is the one the Leap snapshot states for H: the
+            // converter wrote its `block_state` schedule into the checkpoint
+            // rows, so the checkpoint hash the ceremony confirmed covers it
+            // and each BP derives it from its own snapshot. The schedule the
+            // manifest records (which the pair verification above walked H
+            // and the post-H window against, and matched to the declaration)
+            // must equal it entry for entry and in order, and it must be for
+            // exactly H with H's schedule version and no pending change.
+            // An exporter-supplied schedule that the checkpoint does not
+            // contain fails here.
             if let Some(roster) = migration_roster.as_ref() {
+                let source_block = migration_source_block.as_ref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration schedule binding requires an attached source block".into(),
+                    )
+                })?;
+                let source_id = source_block.id()?;
+                let schedule = pulsevm_database::verify_source_schedule_binding(
+                    &self.db,
+                    manifest.halt_schedule.as_deref(),
+                    &source_id.0.0,
+                    source_block.signed_block_header.header.schedule_version,
+                )
+                .map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "migration schedule is not bound by the checkpoint: {error}"
+                    ))
+                })?;
                 info!(
-                    "migration halt roster verified against the snapshot-bound schedule: {} producers",
-                    roster.len()
+                    "migration halt roster verified against the checkpoint-bound schedule: {} declared, {} scheduled (version {})",
+                    roster.len(),
+                    schedule.producers.len(),
+                    schedule.schedule_version
                 );
             }
             // Memo-vehicle inclusion closes the other half of the timing
@@ -10430,6 +10451,16 @@ mod tests {
         // restore fails closed without it, so the fixture stages the row
         // for the pair's single member.
         seed_producers_table(&mut checkpoint_db, &[("pulse", &pair_key)])?;
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10439,17 +10470,6 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("migration.manifest.json");
-        let mut previous = [0u8; 32];
-        previous[..4].copy_from_slice(&41u32.to_be_bytes());
-        let source_block = SignedBlock::new(
-            Id::new(previous),
-            BlockTimestamp::new(1_700_000_000),
-            PULSE_NAME,
-            VecDeque::new(),
-            Digest::default(),
-            Digest::default(),
-        );
-        let source_block_id = source_block.id()?;
         let mut manifest = MigrationManifest::new(
             b"controller migration test source",
             source_block_id.0.0,
@@ -10603,6 +10623,16 @@ mod tests {
         // Deliberately no producers table: the table carries every active
         // row while the schedule names only the committee, so it is not a
         // membership source and the restore must not need it.
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10612,17 +10642,6 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("table-less.manifest.json");
-        let mut previous = [0u8; 32];
-        previous[..4].copy_from_slice(&41u32.to_be_bytes());
-        let source_block = SignedBlock::new(
-            Id::new(previous),
-            BlockTimestamp::new(1_700_000_000),
-            PULSE_NAME,
-            VecDeque::new(),
-            Digest::default(),
-            Digest::default(),
-        );
-        let source_block_id = source_block.id()?;
         let mut manifest = MigrationManifest::new(
             b"controller table-less migration test",
             source_block_id.0.0,
@@ -10697,6 +10716,16 @@ mod tests {
         checkpoint_db.add_indices()?;
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10706,17 +10735,6 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("fictional-memo.manifest.json");
-        let mut previous = [0u8; 32];
-        previous[..4].copy_from_slice(&41u32.to_be_bytes());
-        let source_block = SignedBlock::new(
-            Id::new(previous),
-            BlockTimestamp::new(1_700_000_000),
-            PULSE_NAME,
-            VecDeque::new(),
-            Digest::default(),
-            Digest::default(),
-        );
-        let source_block_id = source_block.id()?;
         let mut manifest = MigrationManifest::new(
             b"controller fictional memo migration test",
             source_block_id.0.0,
@@ -10827,6 +10845,88 @@ mod tests {
     /// with exactly the schedule key the declaration names. The table is
     /// not a membership source — the recorded schedule is — so the restore
     /// no longer reads it; it stays staged here for fixture realism.
+    /// Canonical fixture schedule order: names sorted, then the producer that
+    /// authored H swapped into the position Antelope's slot rule assigns to
+    /// H's timestamp (`(slot % (n * 12)) / 12`). The checkpoint's source
+    /// schedule and the manifest's recorded schedule are both built from this
+    /// one function, so the gate's slot checks and the checkpoint binding
+    /// agree by construction.
+    fn fixture_schedule_order(
+        names: &[&str],
+        halt_slot: u32,
+        halt_producer: u64,
+    ) -> Result<Vec<String>, ChainError> {
+        let mut ordered: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        ordered.sort();
+        let members = ordered.len().max(1) as u64;
+        let position = ((u64::from(halt_slot) % (members * 12)) / 12) as usize;
+        let halt_member = ordered
+            .iter()
+            .position(|name| {
+                Name::from_str(name)
+                    .map(|parsed| parsed.as_u64() == halt_producer)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                ChainError::InternalError("fixture H producer is not a schedule member".into())
+            })?;
+        ordered.swap(position, halt_member);
+        Ok(ordered)
+    }
+
+    /// The synthetic source block H the inline migration fixtures share.
+    fn fixture_source_block() -> Result<(SignedBlock, Id), ChainError> {
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        Ok((source_block, source_block_id))
+    }
+
+    /// Write H's committee into the checkpoint the way the converter does
+    /// from the Leap snapshot: for exactly H, at H's schedule version,
+    /// nothing pending, in slot-consistent schedule order.
+    fn seed_source_schedule(
+        db: &Database,
+        members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+        source_block: &SignedBlock,
+        source_block_id: &Id,
+    ) -> Result<(), ChainError> {
+        let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+        let header = &source_block.signed_block_header.header;
+        let order =
+            fixture_schedule_order(&names, header.timestamp.slot(), header.producer.as_u64())?;
+        let mut producers = Vec::with_capacity(order.len());
+        for name in &order {
+            let (_, key) = members
+                .iter()
+                .find(|(member, _)| member == name)
+                .ok_or_else(|| ChainError::InternalError("fixture member lost".into()))?;
+            producers.push(pulsevm_database::SourceScheduleMember {
+                producer: Name::from_str(name)?.as_u64(),
+                key: key.public_key().compressed(),
+            });
+        }
+        pulsevm_database::write_source_schedule(
+            db,
+            &pulsevm_database::SourceSchedule {
+                head_block_id: source_block_id.0.0,
+                head_block_num: source_block.block_num(),
+                schedule_version: header.schedule_version,
+                pending_schedule_staged: false,
+                producers,
+            },
+        )
+        .map_err(ChainError::InternalError)
+    }
+
     fn seed_producers_table(
         db: &mut Database,
         members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
@@ -10925,6 +11025,18 @@ mod tests {
         schedule_key: &PrivateKey,
         extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
     ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
+        migration_checkpoint_with_options(temp, schedule_key, extra_producers, true).await
+    }
+
+    /// As above, with control over whether the checkpoint carries the source
+    /// schedule the converter writes from the Leap snapshot (`false` models a
+    /// checkpoint converted without `--leap-snapshot`).
+    async fn migration_checkpoint_with_options(
+        temp: &TempDir,
+        schedule_key: &PrivateKey,
+        extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+        carry_source_schedule: bool,
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
         // Build a real source chain so the checkpoint carries complete state
         // (accounts, permissions, resources, chain config): fresh genesis,
         // one accepted block, then a portable snapshot of that state.
@@ -10971,6 +11083,9 @@ mod tests {
         members.extend_from_slice(extra_producers);
         let mut seed_db = source.database();
         seed_producers_table(&mut seed_db, &members)?;
+        if carry_source_schedule {
+            seed_source_schedule(&seed_db, &members, &source_block, &source_block_id)?;
+        }
         let checkpoint = seed_db.snapshot_bytes()?;
         source.shutdown()?;
         drop(source);
@@ -11168,22 +11283,17 @@ mod tests {
         })?);
         let members = producers.len().max(1);
         let slot_position = |slot: u32| ((u64::from(slot) % (members as u64 * 12)) / 12) as usize;
-        let mut order: Vec<usize> = (0..producers.len()).collect();
-        let halt_member = producers
+        // The same canonical order the checkpoint's source schedule carries.
+        let order_names = fixture_schedule_order(producers, halt_slot, halt_producer)?;
+        let order: Vec<usize> = order_names
             .iter()
-            .position(|producer| {
-                crate::chain::name::Name::from_str(producer)
-                    .map(|name| name.as_u64() == halt_producer)
-                    .unwrap_or(false)
+            .map(|name| {
+                producers
+                    .iter()
+                    .position(|producer| producer == name)
+                    .ok_or_else(|| ChainError::InternalError("fixture member lost".into()))
             })
-            .ok_or_else(|| {
-                ChainError::InternalError("fixture H producer is not a schedule member".into())
-            })?;
-        let held = order
-            .iter()
-            .position(|&member| member == halt_member)
-            .ok_or_else(|| ChainError::InternalError("fixture H member lost".into()))?;
-        order.swap(slot_position(halt_slot), held);
+            .collect::<Result<_, _>>()?;
         manifest["halt_schedule"] = json!(
             order
                 .iter()
@@ -11805,6 +11915,147 @@ mod tests {
         )?;
         assert_eq!(controller.database().revision(), source_revision);
         assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        Ok(())
+    }
+
+    // Paul's attack on the committee: the exporter records and declares a set
+    // it controls (H's real producer plus two outsiders), the outsiders sign
+    // three of three, and the staged window is a plausible empty chain. Every
+    // link the pair verifier walks is internally consistent. The checkpoint,
+    // though, carries the real committee the Leap snapshot stated for H, and
+    // the checkpoint hash is what the fleet agreed on, so the recorded set is
+    // refused at restore.
+    #[tokio::test]
+    async fn migration_restore_refuses_a_forged_committee_the_checkpoint_does_not_carry()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let real = halt_v2_keys()?;
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &real[0]), ("prod.b", &real[1])],
+        )
+        .await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let forged = [
+            pulse_k1,
+            pulsevm_crypto::K1PrivateKey::random(),
+            pulsevm_crypto::K1PrivateKey::random(),
+        ];
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &forged,
+            &["pulse", "mal.a", "mal.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("forged-target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a committee the checkpoint does not carry must not boot");
+        assert!(
+            error.to_string().contains("not bound by the checkpoint"),
+            "expected the checkpoint binding to refuse the forged committee, got: {error}"
+        );
+        let _ = source_revision;
+        Ok(())
+    }
+
+    // A checkpoint converted without the Leap snapshot carries no committee, so
+    // there is nothing for the recorded schedule to be bound to: it refuses.
+    #[tokio::test]
+    async fn migration_restore_refuses_a_checkpoint_without_the_source_schedule()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            false,
+        )
+        .await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("unbound-target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a checkpoint with no source schedule must not boot");
+        assert!(
+            error.to_string().contains("no source schedule"),
+            "expected the missing-schedule refusal, got: {error}"
+        );
         Ok(())
     }
 

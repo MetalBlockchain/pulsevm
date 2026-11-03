@@ -1921,7 +1921,8 @@ cmd_checkpoint() {
     (cd "$REPO_ROOT" && cargo run --locked -p pulsevm_database --example xpr_import_check -- \
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
-        "$export_dir/migration.snapshot") || fail "checkpoint import failed"
+        "$export_dir/migration.snapshot" \
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")") || fail "checkpoint import failed"
     # Anchor the id-exact source block so new nodes adopt H as their tip
     # instead of failing on an empty block log.
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \

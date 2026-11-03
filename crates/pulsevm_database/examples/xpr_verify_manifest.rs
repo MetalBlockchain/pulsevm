@@ -490,6 +490,31 @@ fn verify_roster_against_checkpoint(
         "roster schedule match: ok ({} producers, pinned by the halt pair)",
         roster.len()
     );
+    // The recorded schedule the pair walked must be the one the checkpoint
+    // itself carries (written by the converter from the Leap snapshot of H),
+    // for exactly H, at H's version, with nothing pending. The checkpoint
+    // hash covers that copy, so this is what ties the committee to the
+    // hash every BP agrees on rather than to the exporter's JSON.
+    let source_id: [u8; 32] = hex::decode(&manifest.source_block_id)
+        .map_err(|e| format!("manifest source block id is not hexadecimal: {e}"))?
+        .try_into()
+        .map_err(|_| "manifest source block id is not 32 bytes".to_string())?;
+    let source_version = manifest
+        .source_block
+        .as_deref()
+        .ok_or_else(|| "schedule binding requires an attached source block".to_string())
+        .and_then(pulsevm_database::packed_source_block_schedule_version)?;
+    let bound = pulsevm_database::verify_source_schedule_binding(
+        &database,
+        manifest.halt_schedule.as_deref(),
+        &source_id,
+        source_version,
+    )?;
+    println!(
+        "source schedule binding: ok ({} producers, version {}, carried by the checkpoint)",
+        bound.producers.len(),
+        bound.schedule_version
+    );
     match pulsevm_database::verify_memo_names_exist(&database, manifest)? {
         0 => {}
         proven => {
@@ -717,6 +742,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        // The cutover block is a gate entry too: its header derives the H
+        // id, so the window opens on a signature-checked H. The post-chain
+        // walk derives each height as parent-num + 1, so the H header
+        // chains from a parent embedding 6.
+        let mut parent6 = [6u8; 32];
+        parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
+        let (h_block, hid) =
+            pack_post_block(&parent6, owner, 0x01020304, &signing, [0x5E; 32], false);
+
         let mut db =
             Database::new(dir.path().join("build").to_str().unwrap(), 64 * 1024 * 1024).unwrap();
         let deltas = if with_producers {
@@ -752,20 +786,29 @@ mod tests {
             // another now fails — as a lying manifest must.
             db.create_account(owner, 1000).unwrap();
         }
+        // The committee at H rides inside the checkpoint, exactly as the
+        // converter writes it from the Leap snapshot: for H, at H's version,
+        // nothing pending, in schedule order.
+        pulsevm_database::write_source_schedule(
+            &db,
+            &pulsevm_database::SourceSchedule {
+                head_block_id: hid,
+                head_block_num: 7,
+                schedule_version: 1,
+                pending_schedule_staged: false,
+                producers: vec![pulsevm_database::SourceScheduleMember {
+                    producer: owner,
+                    key: signing.public_key().compressed(),
+                }],
+            },
+        )
+        .unwrap();
         db.set_revision(7).unwrap();
         let checkpoint_bytes = db.snapshot_bytes().unwrap();
         drop(db);
         let checkpoint = dir.path().join("migration.snapshot");
         std::fs::write(&checkpoint, &checkpoint_bytes).unwrap();
 
-        // The cutover block is a gate entry too: its header derives the H
-        // id, so the window opens on a signature-checked H. The post-chain
-        // walk derives each height as parent-num + 1, so the H header
-        // chains from a parent embedding 6.
-        let mut parent6 = [6u8; 32];
-        parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
-        let (h_block, hid) =
-            pack_post_block(&parent6, owner, 0x01020304, &signing, [0x5E; 32], false);
         let mut manifest = MigrationManifest::new(
             b"fixture log",
             hid,
@@ -837,7 +880,7 @@ mod tests {
         // The fixture H header packs timestamp 0x01020304 (slot 67305985);
         // the memo accounts were created (slot 1000) and staged above, so
         // the inclusion proof verifies end to end.
-        manifest.halt_memo_accounts = Some(
+        manifest.halt_memo_names = Some(
             memo_names
                 .iter()
                 .map(|name| pulsevm_database::MigrationMemoAccount {
