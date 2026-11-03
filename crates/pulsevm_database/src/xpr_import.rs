@@ -1173,9 +1173,9 @@ pub fn check_declaration_matches_recorded_schedule(
 /// commitments) verifies nothing here: the contract fragment carries its
 /// own vote heights, and legacy paths carry no declaration. Returns the
 /// account count. Existence in checkpoint state is checked separately by
-/// [`verify_memo_accounts_exist`], where the state is available: names that
+/// [`verify_memo_names_exist`], where the state is available: names that
 /// decode but name no account fail there, not here.
-pub fn verify_migration_memo_accounts(
+pub fn verify_migration_memo_names(
     manifest: &MigrationManifest,
     declaration_digest: &[u8; 32],
     h_slot: u32,
@@ -1236,13 +1236,13 @@ pub fn verify_migration_memo_accounts(
 /// Checkpoint-state half of the memo inclusion proof: every recorded memo
 /// account must exist in the restored state, and its checkpoint creation
 /// date must equal the recorded slot exactly. The digest re-decode (see
-/// [`verify_migration_memo_accounts`]) proves the names commit to the
+/// [`verify_migration_memo_names`]) proves the names commit to the
 /// declaration and the recorded slot predates H; this binds that slot to
 /// state — an exporter-asserted slot, a fictional name, or an account
 /// created at/after H all fail here even when the names decode.
 /// Runs wherever restored state is available (restore gate, offline
 /// verifier); manifests without memo accounts verify nothing and return 0.
-pub fn verify_memo_accounts_exist(
+pub fn verify_memo_names_exist(
     database: &Database,
     manifest: &MigrationManifest,
 ) -> Result<usize, String> {
@@ -1561,7 +1561,7 @@ pub fn verify_migration_halt_pair(
     // provably landed on-chain before the cutoff, not as an asserted
     // number. (Existence in checkpoint state is checked at restore, where
     // the state is available.)
-    verify_migration_memo_accounts(manifest, &declaration_digest, h_slot)?;
+    verify_migration_memo_names(manifest, &declaration_digest, h_slot)?;
     // Post-H emptiness plus the recorded schedule: every header hash-links
     // from H, carries an empty root, and is signed by a recorded schedule
     // key, the recorded schedule equals the declared set, and the staged
@@ -3261,8 +3261,8 @@ fn decode_portable_row(name: &str, data: &[u8]) -> Result<PortableRow, XprImport
         "resource_usage" => decode_resource_usage(data),
         "resource_limits_state" => decode_resource_state(data),
         "resource_limits_config" => decode_resource_config(data),
-        "account" => decode_account(data),
-        "account_metadata" => decode_account_metadata(data),
+        "account" => decode_acct_object(data),
+        "account_metadata" => decode_acct_metadata(data),
         "code" => decode_code(data),
         "generated_transaction" => decode_generated_transaction(data),
         "permission" => decode_permission(data),
@@ -4012,7 +4012,7 @@ fn decode_resource_ratio(row: &mut RowCursor<'_>) -> Result<(u64, u64), XprImpor
     Ok((row.u64()?, row.u64()?))
 }
 
-fn decode_account(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+fn decode_acct_object(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     let mut row = RowCursor::new(bytes);
     row.version()?;
     let name = row.u64()?;
@@ -4026,7 +4026,7 @@ fn decode_account(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     })
 }
 
-fn decode_account_metadata(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
+fn decode_acct_metadata(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
     let mut row = RowCursor::new(bytes);
     row.version()?;
     let name = row.u64()?;
@@ -6081,24 +6081,24 @@ mod tests {
         // Valid proof: names decode to the digest, all created before H.
         let manifest = memo_manifest(&names, 50);
         assert_eq!(
-            verify_migration_memo_accounts(&manifest, &digest, 100).unwrap(),
+            verify_migration_memo_names(&manifest, &digest, 100).unwrap(),
             7
         );
         // Wrong digest fails: the names commit to exactly one digest.
         let other = [0xCDu8; 32];
-        let err = verify_migration_memo_accounts(&manifest, &other, 100).unwrap_err();
+        let err = verify_migration_memo_names(&manifest, &other, 100).unwrap_err();
         assert!(err.contains("do not decode"), "{err}");
         // Created at or after H fails: the declaration must land before H.
         for slot in [100, 101] {
             let late = memo_manifest(&names, slot);
-            let err = verify_migration_memo_accounts(&late, &digest, 100).unwrap_err();
+            let err = verify_migration_memo_names(&late, &digest, 100).unwrap_err();
             assert!(err.contains("must land before H"), "{err}");
         }
         // Malformed names fail.
         let mut broken = names.clone();
         broken[0] = "xyz".to_string();
         let broken_manifest = memo_manifest(&broken, 50);
-        let err = verify_migration_memo_accounts(&broken_manifest, &digest, 100).unwrap_err();
+        let err = verify_migration_memo_names(&broken_manifest, &digest, 100).unwrap_err();
         assert!(
             err.contains("does not carry the declaration digest"),
             "{err}"
@@ -6106,14 +6106,11 @@ mod tests {
         // No memo record: the contract vehicle and legacy paths skip.
         let mut bare = memo_manifest(&names, 50);
         bare.halt_memo_accounts = None;
-        assert_eq!(
-            verify_migration_memo_accounts(&bare, &digest, 100).unwrap(),
-            0
-        );
+        assert_eq!(verify_migration_memo_names(&bare, &digest, 100).unwrap(), 0);
         // An empty record fails closed instead of vacuously passing.
         let mut empty = memo_manifest(&names, 50);
         empty.halt_memo_accounts = Some(Vec::new());
-        assert!(verify_migration_memo_accounts(&empty, &digest, 100).is_err());
+        assert!(verify_migration_memo_names(&empty, &digest, 100).is_err());
     }
 
     #[test]

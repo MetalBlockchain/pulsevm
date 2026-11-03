@@ -1577,7 +1577,7 @@ impl Controller {
             // and here every recorded name must exist in the restored
             // checkpoint state — names that decode but name no account fail
             // here, so a bare asserted inclusion height can never boot.
-            match pulsevm_database::verify_memo_accounts_exist(&self.db, &manifest).map_err(
+            match pulsevm_database::verify_memo_names_exist(&self.db, &manifest).map_err(
                 |error| {
                     ChainError::GenesisError(format!(
                         "migration memo inclusion proof rejected: {error}"

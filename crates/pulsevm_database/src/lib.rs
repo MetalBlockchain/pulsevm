@@ -99,11 +99,11 @@ pub use crate::{
         migration_state_producer_keys,
         packed_source_block_schedule_version,
         parse_initial_state_history_log,
-        verify_memo_accounts_exist,
+        verify_memo_names_exist,
         verify_migration_halt_block,
         verify_migration_halt_commitment,
         verify_migration_halt_pair,
-        verify_migration_memo_accounts,
+        verify_migration_memo_names,
         verify_migration_post_chain,
     },
 };

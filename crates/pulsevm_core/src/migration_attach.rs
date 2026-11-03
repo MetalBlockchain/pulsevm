@@ -675,7 +675,7 @@ pub fn record_post_blocks(
 /// of trusting it. Returns the recorded account count. Existence in
 /// checkpoint state is checked at restore (and by the offline verifier),
 /// where the state is available.
-pub fn record_memo_accounts(
+pub fn record_memo_names(
     manifest: &mut MigrationManifest,
     memo_accounts: &Value,
     h_slot: u32,
@@ -1295,8 +1295,7 @@ mod tests {
         assert_eq!(names.len(), 7);
         let mut manifest = manifest_for([7u8; 32]);
         manifest.halt_declaration = Some(declaration);
-        let count =
-            record_memo_accounts(&mut manifest, &memo_json(&names, 50), 100, "memo").unwrap();
+        let count = record_memo_names(&mut manifest, &memo_json(&names, 50), 100, "memo").unwrap();
         assert_eq!(count, 7);
         let recorded = manifest.halt_memo_accounts.unwrap();
         assert_eq!(recorded.len(), 7);
@@ -1306,15 +1305,15 @@ mod tests {
         let other = declaration_for(&[(&key, "bob")]);
         let mut bad_manifest = manifest_for([7u8; 32]);
         bad_manifest.halt_declaration = Some(other);
-        let error = record_memo_accounts(&mut bad_manifest, &memo_json(&names, 50), 100, "memo")
-            .unwrap_err();
+        let error =
+            record_memo_names(&mut bad_manifest, &memo_json(&names, 50), 100, "memo").unwrap_err();
         assert!(error.contains("do not decode"), "{error}");
         // Created at or after H fails: the declaration must land before H.
         for slot in [100, 101] {
             let mut late_manifest = manifest_for([7u8; 32]);
             late_manifest.halt_declaration = manifest.halt_declaration.clone();
             let error =
-                record_memo_accounts(&mut late_manifest, &memo_json(&names, slot), 100, "memo")
+                record_memo_names(&mut late_manifest, &memo_json(&names, slot), 100, "memo")
                     .unwrap_err();
             assert!(error.contains("must land before H"), "{error}");
         }
@@ -1327,15 +1326,14 @@ mod tests {
             .push(serde_json::json!({"name": "xyz", "account": {"created": slot_iso(50)}}));
         let mut broken_manifest = manifest_for([7u8; 32]);
         broken_manifest.halt_declaration = manifest.halt_declaration.clone();
-        let error = record_memo_accounts(&mut broken_manifest, &broken, 100, "memo").unwrap_err();
+        let error = record_memo_names(&mut broken_manifest, &broken, 100, "memo").unwrap_err();
         assert!(
             error.contains("does not carry the declaration digest"),
             "{error}"
         );
         // No declaration recorded: nothing to decode against.
         let mut bare = manifest_for([7u8; 32]);
-        let error =
-            record_memo_accounts(&mut bare, &memo_json(&names, 50), 100, "memo").unwrap_err();
+        let error = record_memo_names(&mut bare, &memo_json(&names, 50), 100, "memo").unwrap_err();
         assert!(error.contains("recorded declaration"), "{error}");
     }
 

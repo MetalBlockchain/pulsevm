@@ -24,7 +24,7 @@ use pulsevm_core::{
         post_window_unix_micros,
         record_halt_block,
         record_halt_schedule,
-        record_memo_accounts,
+        record_memo_names,
         record_post_blocks,
     },
 };
@@ -573,7 +573,7 @@ fn attach(
             let memo_accounts: Value = serde_json::from_slice(&memo_bytes)
                 .map_err(|error| format!("parse memo accounts {memo_path}: {error}"))?;
             let h_slot = boundary_block_slot(&value, &block_path.to_string_lossy())?;
-            let count = record_memo_accounts(&mut manifest, &memo_accounts, h_slot, memo_path)?;
+            let count = record_memo_names(&mut manifest, &memo_accounts, h_slot, memo_path)?;
             eprintln!("recorded memo inclusion proof from {memo_path}: {count} accounts");
         }
     } else if halt_state_path.is_some() {

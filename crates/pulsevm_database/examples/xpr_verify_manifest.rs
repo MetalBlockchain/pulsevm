@@ -490,7 +490,7 @@ fn verify_roster_against_checkpoint(
         "roster schedule match: ok ({} producers, pinned by the halt pair)",
         roster.len()
     );
-    match pulsevm_database::verify_memo_accounts_exist(&database, manifest)? {
+    match pulsevm_database::verify_memo_names_exist(&database, manifest)? {
         0 => {}
         proven => {
             println!("memo inclusion proof: ok ({proven} declaration accounts in checkpoint state)")
