@@ -10,7 +10,10 @@
 #     plugin handshake.
 #   * PULSEVM_MIGRATION_CHECKPOINT (optional) — an Arena checkpoint emitted by
 #     `xpr_import_check`. When set, every VM node restores this state instead
-#     of authoring normal Arena genesis state.
+#     of authoring normal Arena genesis state. Also set
+#     PULSEVM_LOCAL_CHECKPOINT_SHA256 to the checkpoint hash you derived
+#     yourself (from your own Leap snapshot at H); the node refuses to
+#     restore otherwise.
 #   * PULSEVM_GENESIS_PATH (optional) — genesis JSON to use. Set this to
 #     tools/xpr-chainbase-export/xpr-mainnet-genesis.json for XPR Mainnet.
 #   * PULSEVM_GENESIS_INITIAL_KEY (optional) — overrides the migration
@@ -145,6 +148,13 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     echo "error: migration manifest does not exist: $MIGRATION_MANIFEST" >&2
     exit 1
   fi
+  # The node refuses a migration restore unless the operator supplies the
+  # checkpoint hash it derived itself (from its own Leap snapshot at H, via
+  # xpr_import_check --leap-snapshot), independent of the delivered bundle.
+  if [[ -z "${PULSEVM_LOCAL_CHECKPOINT_SHA256:-}" ]]; then
+    echo "error: PULSEVM_LOCAL_CHECKPOINT_SHA256 is required: the checkpoint hash you derived yourself" >&2
+    exit 1
+  fi
   CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256 | select(type == "string" and test("^[[:xdigit:]]{64}$"))' "$MIGRATION_MANIFEST")"
   MIGRATION_GENESIS="$(mktemp "${TMPDIR:-/tmp}/pulsevm-xpr-migration-genesis.XXXXXX")"
   # A migration restore starts a new producer schedule seeded from the
@@ -168,11 +178,12 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   CHAIN_CONFIG="$(jq -cn \
     --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
     --arg manifest "$MIGRATION_MANIFEST" \
+    --arg local_sha "$PULSEVM_LOCAL_CHECKPOINT_SHA256" \
     --arg producer_key "$PRODUCER_KEY" \
     --arg producer_name "$PRODUCER_NAME" \
     --arg system_account "$SYSTEM_ACCOUNT" \
     --argjson native_system_contract "$NATIVE_SYSTEM_CONTRACT" \
-    '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
+    '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest, migration_local_checkpoint_sha256: $local_sha}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \

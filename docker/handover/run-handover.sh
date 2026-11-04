@@ -1968,6 +1968,10 @@ cmd_checkpoint() {
     [[ "$first_sum" == "$second_sum" ]] \
         || fail "conversion is not deterministic: $first_sum vs $second_sum"
     echo "handover: determinism: two independent conversions of the real export are byte-identical ($first_sum)"
+    # The booting nodes take their own derived hash from the SECOND,
+    # independent conversion (the node refuses a checkpoint whose hash this
+    # operator did not derive), never from the delivered manifest.
+    printf '%s\n' "$second_sum" >"$WORK_DIR/local-checkpoint.sha256"
     rm -rf "$det_dir"
     # Anchor the id-exact source block so new nodes adopt H as their tip
     # instead of failing on an empty block log.
@@ -2140,6 +2144,9 @@ cmd_boot() {
     # Linux and macOS (which ships no `setsid` binary, hence python3).
     export METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}"
     export PULSEVM_MIGRATION_CHECKPOINT="$checkpoint"
+    PULSEVM_LOCAL_CHECKPOINT_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/local-checkpoint.sha256")" \
+        || fail "no locally derived checkpoint hash recorded"
+    export PULSEVM_LOCAL_CHECKPOINT_SHA256
     export PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins"
     export PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node"
     export PULSEVM_VERIFY_FIVE_NODE=false

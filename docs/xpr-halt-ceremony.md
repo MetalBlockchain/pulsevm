@@ -294,8 +294,11 @@ party deriving it themselves, not from anyone handing it over:
   and runs `xpr_verify_manifest --genesis` on it. The verifier requires the
   genesis `migration_checkpoint_sha256` to equal the hash of the checkpoint it
   was given, so a downloaded checkpoint is only as trusted as the validator's
-  own derivation agreeing with it. Installers must not boot from a
-  checkpoint the operator did not derive.
+  own derivation agreeing with it. The node enforces this at boot: a
+  migration restore requires `migration_local_checkpoint_sha256` (the hash the
+  operator derived) and refuses to start unless it equals the genesis pin and
+  the manifest hash (see `docs/xpr-cutover-operations.md`, "Self-derived
+  checkpoint at boot").
 
 **The schedule is anchored in H's own signature.** The id and signature of H
 do not directly commit to the active schedule, which would let an attacker

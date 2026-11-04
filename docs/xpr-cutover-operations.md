@@ -144,6 +144,35 @@ Prevention is cheaper than abort: the voter now refuses to run when
 `P - H < 2 x finality_lag + 12`, so the common cause (a stop inside the
 finality lag) cannot start.
 
+## Self-derived checkpoint at boot (agent side)
+
+A validator must never boot from a checkpoint it only received. The node
+enforces its half: a migration restore needs the config field
+`migration_local_checkpoint_sha256` and refuses to start unless it equals the
+migration genesis pin (`migration_checkpoint_sha256`) and the manifest hash.
+The agent supplies the value, per validator, from its own work:
+
+1. Schedule a Leap snapshot of the local XPR node at exactly H
+   (`schedule_snapshot` works on non-producing nodes) and export its state
+   history.
+2. Run `xpr_import_check <state-history> <arena-dir> <checkpoint>
+   --leap-snapshot <snapshot.bin>` and take the sha256 of the checkpoint it
+   writes. Conversion is deterministic, so the fleet lands on one hash (the
+   rehearsal converts twice in separate processes and requires identical
+   bytes).
+3. Put that hash in the node's chain config as
+   `migration_local_checkpoint_sha256`, and use the same hash when
+   configuring the voter's `confirmation.checkpoint_sha256`.
+4. Before the node starts, run `xpr_verify_manifest <manifest> <checkpoint>
+   --genesis <genesis>` on the delivered bundle; it fails if the genesis
+   pins a different checkpoint.
+
+Do not read the value from the delivered manifest or genesis: that makes the
+check circular. If a validator cannot take a snapshot at H, it fetches a
+checkpoint from a peer and may only boot after that peer's hash matches a
+hash it derived itself or that a quorum of independently deriving BPs
+published.
+
 ## Coordinator status contract (agent side)
 
 The voter reports its own state via `--status` (one JSON line: head vs H,

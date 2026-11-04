@@ -1372,6 +1372,28 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
+            // Self-derivation: the checkpoint this node restores must be the
+            // one this operator derived from its own snapshot. The genesis
+            // pin and the manifest only say what the delivered bundle
+            // claims; the locally derived hash is the independent fact.
+            let local_checkpoint_sha256 = self
+                .node_config
+                .as_ref()
+                .and_then(|config| config.migration_local_checkpoint_sha256.as_deref())
+                .ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration restore requires migration_local_checkpoint_sha256: derive the checkpoint from your own Leap snapshot at H and configure its hash"
+                            .into(),
+                    )
+                })?;
+            if !local_checkpoint_sha256
+                .eq_ignore_ascii_case(&hex::encode(expected_checkpoint_sha256))
+            {
+                return Err(ChainError::GenesisError(format!(
+                    "locally derived checkpoint hash {local_checkpoint_sha256} does not match the migration genesis {}: refusing a checkpoint this operator did not derive",
+                    hex::encode(expected_checkpoint_sha256)
+                )));
+            }
             migration_source_block = Self::migration_source_block(&manifest)?;
             // The new network only promotes state the old network agreed to
             // freeze: when the manifest carries the producers' signed halt
@@ -10492,6 +10514,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
             "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -10663,6 +10686,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
             "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -10756,6 +10780,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
             "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11012,6 +11037,15 @@ mod tests {
         pulsevm_database::hydrate_full_state(db, &entry)
             .map_err(|e| ChainError::InternalError(format!("seed producers table: {e}")))?;
         Ok(())
+    }
+
+    /// The hash an operator would derive independently: here, the hash of
+    /// the checkpoint file the fixture just built.
+    fn local_checkpoint_sha256(path: impl AsRef<std::path::Path>) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(
+            std::fs::read(path).expect("fixture checkpoint readable"),
+        ))
     }
 
     // Build a real source chain so the checkpoint carries complete state
@@ -11548,6 +11582,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11614,6 +11649,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": foreign_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11671,6 +11707,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11753,6 +11790,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11917,6 +11955,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -11987,6 +12026,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -12007,6 +12047,98 @@ mod tests {
         );
         let _ = source_revision;
         Ok(())
+    }
+
+    /// Boot a fully valid migration with the locally derived hash replaced by
+    /// `edit`, returning the refusal.
+    async fn migration_boot_refusal(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let mut config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        });
+        edit(&mut config);
+        let target_path = temp.path().join("self-derivation-target");
+        let mut controller = Controller::new();
+        controller
+            .initialize(
+                &chain_id,
+                &config.to_string().into_bytes(),
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("the boot must be refused")
+            .to_string()
+    }
+
+    // Self-derivation: a delivered checkpoint is only restored when this
+    // operator's own derived hash is configured and equal.
+    #[tokio::test]
+    async fn migration_restore_requires_the_operators_own_checkpoint_hash() {
+        let error = migration_boot_refusal(|config| {
+            config
+                .as_object_mut()
+                .unwrap()
+                .remove("migration_local_checkpoint_sha256");
+        })
+        .await;
+        assert!(
+            error.contains("requires migration_local_checkpoint_sha256"),
+            "expected the missing-local-hash refusal, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_a_checkpoint_the_operator_did_not_derive() {
+        let error = migration_boot_refusal(|config| {
+            config["migration_local_checkpoint_sha256"] = json!("ab".repeat(32));
+        })
+        .await;
+        assert!(
+            error.contains("did not derive"),
+            "expected the mismatch refusal, got: {error}"
+        );
     }
 
     // A checkpoint converted without the Leap snapshot carries no committee, so
@@ -12054,6 +12186,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -12130,6 +12263,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -12197,6 +12331,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -12246,6 +12381,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": schedule_key.to_string(),
             "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
             "migration_manifest": manifest_path,
         })
         .to_string()
