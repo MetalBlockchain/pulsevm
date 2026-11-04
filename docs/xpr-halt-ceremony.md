@@ -265,7 +265,8 @@ pending schedule, and the header that re-derives the snapshot's own block id.
 The converter (`xpr_import_check --leap-snapshot snapshot.bin`) reads that
 section, checks it against itself (number matches the id, the header
 re-derives the id exactly, the header's schedule version is the schedule's,
-every member holds exactly one weight-one K1 key), and writes the schedule
+every member holds exactly one weight-one K1 key, H's producer signature
+verifies, and the schedule hashes to the signed pending hash), and writes the schedule
 into the checkpoint as ordinary contract rows (`eosio`/`eosio`/`migsrcsched`:
 a header row plus one row per producer, in order). The checkpoint hash the
 ceremony confirms therefore covers the committee.
@@ -278,13 +279,51 @@ post-H window against the recorded copy, and this binding is what makes that
 copy the real one. A checkpoint converted without `--leap-snapshot` carries no
 schedule and is refused outright.
 
-Trust comes from the fleet, not the exporter: each BP takes the snapshot from
-its own node, runs the same converter, and the fleet agrees on the checkpoint
-hash (published at T-30 and signed into the confirmation). An exporter that
-invents a committee produces a different checkpoint hash that the fleet will
-not have agreed to. What the gate cannot do alone is know which hash the
-fleet agreed to; that remains the out-of-band T-30 publication and the
-confirmation's checkpoint binding.
+What the checkpoint hash can and cannot prove. It exists only after H, so it
+can never be published in advance (what can be published at T-30 is the
+schedule: its version and hash are readable from any XPR node, and the BPs
+compare it before the ceremony). Trust in the checkpoint comes from every
+party deriving it themselves, not from anyone handing it over:
+
+- **Signers.** Each BP's voter signs only the checkpoint hash configured from
+  that BP's own conversion of its own Leap snapshot at H
+  (`xpr_import_check --leap-snapshot`). The voter refuses to adopt the
+  coordinator's hash, and refuses to sign if the coordinator's differs from
+  the configured one.
+- **Validators.** Each validator derives the checkpoint from its own snapshot
+  and runs `xpr_verify_manifest --genesis` on it. The verifier requires the
+  genesis `migration_checkpoint_sha256` to equal the hash of the checkpoint it
+  was given, so a downloaded checkpoint is only as trusted as the validator's
+  own derivation agreeing with it. Installers must not boot from a
+  checkpoint the operator did not derive.
+
+**The schedule is anchored in H's own signature.** The id and signature of H
+do not directly commit to the active schedule, which would let an attacker
+holding a real H snapshot keep H's header and producer entry and swap the
+other 20 entries for their own keys. They do commit to something equivalent:
+Leap keeps the hash of the last proposed schedule in
+`pending_schedule.schedule_hash` after it activates, and every block
+signature covers that hash (`sig_digest = sha256(sha256(header_digest ||
+blockroot) || pending_schedule_hash)`). With nothing pending, that hash is
+`sha256(pack(active_schedule))`. Confirmed on a real four-producer snapshot
+(schedule v1): the two hashes are identical. Therefore, for any chain whose
+schedule has ever changed (version > 0, which XPR's has):
+
+- the converter refuses a snapshot whose active schedule does not hash to the
+  pending hash, and verifies H's signature over that digest against the
+  producer's scheduled key;
+- the restore gate and `xpr_verify_manifest` require the recorded schedule to
+  hash to the schedule hash in the signature-verified H entry.
+
+Substituting any schedule entry now requires H's producer key. Version 0 (a
+chain that never changed schedule, i.e. rehearsal fixtures) has only the
+genesis schedule, which no hash covers; the block id binds the schedule
+version, so a real chain with a changed schedule cannot be presented as
+version 0.
+
+What this does not remove: the id of H itself is still a fact from outside
+the bundle. Anyone can check it on any XPR node, and each BP's voter compares
+it with its own node before signing.
 
 Two further checks close the rest of the attack that earlier versions
 allowed (a recorded set the attacker controls, one key signing a fabricated

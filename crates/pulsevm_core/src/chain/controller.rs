@@ -11322,7 +11322,20 @@ mod tests {
         // The staged headers name a fixed schedule hash: the gate binds
         // the exact (root, hash) pair through the producer signature, so
         // any consistent value exercises the real check.
-        const FIXTURE_SCHED_HASH: [u8; 32] = [0x5E; 32];
+        // For a changed schedule it is the hash of the recorded set (H's
+        // signature commits to it, and the gate requires it).
+        let fixture_sched_hash = pulsevm_database::pack_schedule_hash(
+            header_schedule_version,
+            &order
+                .iter()
+                .map(|&member| {
+                    Ok((
+                        post_producer(member)?,
+                        keys[member].public_key().compressed(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ChainError>>()?,
+        );
         let first = order[slot_position(halt_slot + 1)];
         let (post_next, next_id) = pack_post_block(
             &source_block_id.0.0,
@@ -11331,7 +11344,7 @@ mod tests {
             &keys[first],
             header_schedule_version,
             [0xA1; 32],
-            FIXTURE_SCHED_HASH,
+            fixture_sched_hash,
         )?;
         let second = order[slot_position(halt_slot + 2)];
         let (post_last, pause_block_id) = pack_post_block(
@@ -11341,7 +11354,7 @@ mod tests {
             &keys[second],
             header_schedule_version,
             [0xB2; 32],
-            FIXTURE_SCHED_HASH,
+            fixture_sched_hash,
         )?;
         manifest["halt_post_blocks"] = json!([post_next, post_last]);
         let template = pulsevm_database::HaltConfirmation {
@@ -11435,7 +11448,7 @@ mod tests {
         };
         let mut bound_and_schedule = Vec::with_capacity(64);
         bound_and_schedule.extend_from_slice(&halt_bound);
-        bound_and_schedule.extend_from_slice(&FIXTURE_SCHED_HASH);
+        bound_and_schedule.extend_from_slice(&fixture_sched_hash);
         let halt_digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
         let halt_producer = halt_header.producer.to_string();
         let halt_key_index = producers
@@ -11450,7 +11463,7 @@ mod tests {
         // H entry does not stage — it proves the anchor, not emptiness.
         let mut halt_entry = Vec::with_capacity(64 + halt_header_bytes.len() + 98);
         halt_entry.extend_from_slice(&FIXTURE_H_ROOT);
-        halt_entry.extend_from_slice(&FIXTURE_SCHED_HASH);
+        halt_entry.extend_from_slice(&fixture_sched_hash);
         halt_entry.extend_from_slice(&halt_header_bytes);
         halt_entry.push(0); // K1 tag
         halt_entry.extend_from_slice(&keys[halt_key_index].sign(&halt_digest).compact65());

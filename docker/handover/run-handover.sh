@@ -353,6 +353,8 @@ top_up_pairs() { # $1=H $2=P [$3=api]
 # via a bare set -e exit with no diagnosis (stale chain data from a reused
 # compose volume made every rerun hit "account already exists"). Retries
 # cover transient connection stalls; a persistent rejection aborts here.
+# curl runs without --fail so a 4xx/5xx keeps its JSON body (the node's
+# reason for rejecting) instead of collapsing to "error: 500".
 leap_send() {
     local body send_out attempt
     body="$(printf '%s' "$1" | python3 -c 'import json,sys; p=json.load(sys.stdin)["params"]; print(json.dumps({"signatures":p["signatures"],"compression":"none","packed_context_free_data":p["packed_context_free_data"],"packed_trx":p["packed_trx"]}))')" \
@@ -362,7 +364,7 @@ leap_send() {
         # with inlined WASM exceeds Linux MAX_ARG_STRLEN (128 KiB per
         # string) and exec fails with "Argument list too long".
         # `if` (not `&& break`) so a handled retry does not fire the ERR trap.
-        if send_out="$(printf '%s' "$body" | curl --fail --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
+        if send_out="$(printf '%s' "$body" | curl --silent --show-error --max-time 15 -X POST "$LEAP_API/v1/chain/send_transaction" \
             -H 'Content-Type: application/json' -H 'Host: 0.0.0.0:8888' -d @- 2>&1)"; then
             break
         fi

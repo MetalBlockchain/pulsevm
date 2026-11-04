@@ -27,6 +27,7 @@ use pulsevm_snapshot::{
     BlockSigningAuthority,
     SnapshotPublicKey,
     SnapshotReader,
+    SnapshotSignature,
 };
 
 use crate::{
@@ -43,6 +44,67 @@ const HEADER_ROW_LEN: usize = 32 + 4 + 4 + 1 + 4;
 const PRODUCER_ROW_LEN: usize = 8 + 33;
 /// A real committee is 21; this only bounds a hostile snapshot.
 const MAX_PRODUCERS: u32 = 1024;
+
+fn push_varuint(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Leap's hash of a `producer_authority_schedule` made of single-key,
+/// weight-one producers: sha256 of its `fc::raw::pack` form (version, then
+/// per producer the name, the authority variant tag, threshold, one key
+/// entry with its K1 tag and weight). Leap keeps the hash of the last
+/// proposed schedule in `pending_schedule.schedule_hash` after it activates
+/// and every block signature covers it, so for any chain that has ever
+/// changed its schedule this hash is committed by H's own producer
+/// signature. That commits the active schedule to H, closing the swap that
+/// the block id alone leaves open.
+pub fn pack_schedule_hash(version: u32, members: &[(u64, [u8; 33])]) -> [u8; 32] {
+    let mut packed = Vec::with_capacity(8 + members.len() * 48);
+    packed.extend_from_slice(&version.to_le_bytes());
+    push_varuint(members.len() as u32, &mut packed);
+    for (producer, key) in members {
+        packed.extend_from_slice(&producer.to_le_bytes());
+        packed.push(0); // block_signing_authority_v0
+        packed.extend_from_slice(&1u32.to_le_bytes()); // threshold
+        push_varuint(1, &mut packed);
+        packed.push(0); // K1 key tag
+        packed.extend_from_slice(key);
+        packed.extend_from_slice(&1u16.to_le_bytes()); // key weight
+    }
+    Digest::hash(&packed).0
+}
+
+/// The same hash for a recorded roster (manifest form).
+pub fn roster_schedule_hash(
+    version: u32,
+    roster: &[MigrationHaltRosterEntry],
+) -> Result<[u8; 32], String> {
+    let mut members = Vec::with_capacity(roster.len());
+    for entry in roster {
+        let key = K1PublicKey::from_string(&entry.key).map_err(|error| {
+            format!(
+                "recorded schedule key for {} invalid: {error:?}",
+                entry.producer
+            )
+        })?;
+        let name = pulsevm_name::Name::from_str(&entry.producer).map_err(|_| {
+            format!(
+                "recorded schedule producer {} is not a name",
+                entry.producer
+            )
+        })?;
+        members.push((name.as_u64(), key.compressed()));
+    }
+    Ok(pack_schedule_hash(version, &members))
+}
 
 /// One scheduled producer: its name and its single K1 block-signing key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +319,8 @@ impl SourceSchedule {
             varuint(payload.len() as u32, &mut packed);
             packed.extend_from_slice(payload.as_ref());
         }
-        let mut derived = Digest::hash(&packed).0;
+        let header_digest = Digest::hash(&packed).0;
+        let mut derived = header_digest;
         derived[0..4].copy_from_slice(&state.block_num.to_be_bytes());
         if derived != *state.id.as_bytes() {
             return Err(
@@ -294,6 +357,64 @@ impl SourceSchedule {
                 producer,
                 key: *point,
             });
+        }
+        // H's own producer signature, over Leap's sig_digest
+        // (sha256(sha256(header_digest || blockroot) || pending_schedule_hash)),
+        // must recover to that producer's key in the schedule. Cheap, and it
+        // rejects a snapshot whose schedule was swapped after H was signed
+        // (the signature does not cover the active schedule, so this does
+        // not authenticate the other entries: that is what the checkpoint
+        // sha agreed across the fleet is for).
+        let SnapshotSignature::K1(signature) = &header.producer_signature else {
+            return Err("snapshot head block is not K1-signed".to_string());
+        };
+        let blockroot = state
+            .blockroot_merkle
+            .active_nodes
+            .last()
+            .map(|node| *node.as_bytes())
+            .unwrap_or([0u8; 32]);
+        let mut bound = Vec::with_capacity(64);
+        bound.extend_from_slice(&header_digest);
+        bound.extend_from_slice(&blockroot);
+        let mut with_schedule = Vec::with_capacity(64);
+        with_schedule.extend_from_slice(&Digest::hash(&bound).0);
+        with_schedule.extend_from_slice(state.pending_schedule.schedule_hash.as_bytes());
+        let sig_digest = Digest::hash(&with_schedule).0;
+        // The schedule itself must be the one H's signature commits to. A
+        // chain that never changed its schedule (version 0) has only the
+        // genesis schedule, which no hash covers; the id binds the version,
+        // so a real chain with a changed schedule cannot be passed off as
+        // version 0.
+        if header.schedule_version > 0 {
+            let members: Vec<(u64, [u8; 33])> = producers
+                .iter()
+                .map(|member| (member.producer, member.key))
+                .collect();
+            let committed = pack_schedule_hash(header.schedule_version, &members);
+            if committed != *state.pending_schedule.schedule_hash.as_bytes() {
+                return Err(
+                    "snapshot active schedule is not the schedule H's signature commits to (pending schedule hash mismatch): the schedule was altered"
+                        .to_string(),
+                );
+            }
+        }
+        let signer = producers
+            .iter()
+            .find(|member| member.producer == header.producer.as_u64())
+            .ok_or_else(|| {
+                format!(
+                    "snapshot head producer {} is not in its own schedule",
+                    pulsevm_name::Name::new(header.producer.as_u64())
+                )
+            })?;
+        let recovered = pulsevm_crypto::k1::K1Signature::from_compact65(signature)
+            .recover(&sig_digest)
+            .map_err(|error| format!("snapshot head signature unrecoverable: {error:?}"))?;
+        if recovered.compressed() != signer.key {
+            return Err(
+                "snapshot head block is not signed by its producer's scheduled key".to_string(),
+            );
         }
         Ok(Self {
             head_block_id: *state.id.as_bytes(),

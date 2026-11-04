@@ -28,6 +28,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -57,6 +60,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -79,6 +85,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -105,6 +114,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -131,6 +143,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -157,6 +172,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json
@@ -183,6 +201,9 @@ services:
       - --data-dir=/data
       - --config-dir=/config
       - --genesis-json=/config-env/genesis.json
+      # The amd64 image runs under emulation on Apple silicon, where the
+      # default JIT runtime hits access violations; set eos-vm there.
+      - --wasm-runtime=${XPR_WASM_RUNTIME:-eos-vm-jit}
     volumes:
       - type: bind
         source: ../../tools/xpr-chainbase-export/localnet/genesis.json

@@ -256,9 +256,10 @@ pub struct MigrationManifest {
     /// at the freeze instant (header state is served only while reversible,
     /// and no export nodeos can serve H later) — never from a live
     /// `get_producer_schedule` query, which an exporter could point
-    /// anywhere; publication of the schedule hash weeks ahead (T-30) is
-    /// what lets every party check the recorded set is the coordinated one
-    /// rather than an exporter invention — the gate binds it to the
+    /// anywhere. The schedule (version and hash) is what can be published
+    /// weeks ahead (T-30) so every party checks the recorded set is the
+    /// coordinated one; the checkpoint hash only exists after H and is
+    /// derived independently by each party. The gate binds the set to the
     /// declaration, the checkpoint (via the confirmed sha), and H's
     /// version, but the coordinated set itself is a governance fact, not a
     /// derivable one.
@@ -1142,6 +1143,23 @@ pub fn verify_migration_halt_block(
         return Err(format!(
             "cutover block is not signed by the scheduled key for {producer_name}"
         ));
+    }
+    // The recorded schedule must be the one H's signature commits to: the
+    // signed pending-schedule hash is the hash of the last proposed
+    // schedule, which is the active one once nothing is pending. Without
+    // this, the 20 entries other than H's producer could be swapped for
+    // attacker keys and every other check would still pass. Version 0 has
+    // only the genesis schedule, which no hash covers (the id binds the
+    // version, so a changed-schedule chain cannot claim it).
+    if header.schedule_version > 0 {
+        let committed =
+            crate::source_schedule::roster_schedule_hash(header.schedule_version, recorded)?;
+        if committed != header.schedule_hash {
+            return Err(
+                "recorded schedule is not the schedule the cutover block's signature commits to"
+                    .to_string(),
+            );
+        }
     }
     // The entry's header bytes lead with the Leap timestamp slot (pack
     // order timestamp[4] | producer[8] | ...): return it so the memo
@@ -6739,7 +6757,14 @@ mod tests {
         let k2 = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("pair-2").unwrap();
         let prod_a = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
         let prod_b = pulsevm_name::Name::from_str("prod.b").unwrap().as_u64();
-        let sched = FIXTURE_SCHEDULE_HASH;
+        // H's signed pending-schedule hash is the hash of the recorded set.
+        let sched = crate::source_schedule::pack_schedule_hash(
+            TEST_SCHEDULE_VERSION,
+            &[
+                (prod_a, k1.public_key().compressed()),
+                (prod_b, k2.public_key().compressed()),
+            ],
+        );
         // The cutover block itself is a gate entry: its header derives the
         // H id, so the window opens on a signature-checked H. The template
         // and the posts below all bind this derived id.
@@ -6916,6 +6941,22 @@ mod tests {
         manifest.halt_post_blocks = Some(vec![post8, post9]);
         manifest.halt_h_block = Some(h_block);
         (manifest, hid, checkpoint, new_chain)
+    }
+
+    #[test]
+    fn halt_block_refuses_a_schedule_the_signature_does_not_commit_to() {
+        let (mut manifest, id, _checkpoint, _new_chain) = halt_test_pair();
+        let attacker = pulsevm_crypto::k1::K1PrivateKey::from_seed_string("attacker").unwrap();
+        // Swap prod.b's key for an attacker key: H's id and signature are
+        // untouched, but the recorded set no longer hashes to what H signed.
+        let recorded = manifest.halt_schedule.as_mut().unwrap();
+        recorded[1].key = attacker.public_key().to_string();
+        let error = verify_migration_halt_block(&manifest, 7, &id, TEST_SCHEDULE_VERSION)
+            .expect_err("a swapped schedule entry must be refused");
+        assert!(
+            error.contains("signature commits to"),
+            "unexpected refusal: {error}"
+        );
     }
 
     #[test]

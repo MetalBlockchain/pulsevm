@@ -11,7 +11,9 @@ mod xpr_import;
 pub use crate::source_schedule::{
     SourceSchedule,
     SourceScheduleMember,
+    pack_schedule_hash,
     read_source_schedule,
+    roster_schedule_hash,
     verify_source_schedule_binding,
     write_source_schedule,
 };

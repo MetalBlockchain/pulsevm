@@ -238,8 +238,18 @@ fn run(
             Ok(genesis) => genesis,
             Err(error) => return fail(format!("migration genesis rejected: {error}")),
         };
-        if genesis.migration_checkpoint_sha256.is_none() {
+        let Some(pinned) = genesis.migration_checkpoint_sha256.as_ref() else {
             return fail("migration genesis carries no migration checkpoint binding".into());
+        };
+        // The genesis must pin the very checkpoint this bundle ships: a
+        // mismatched pair passes every other offline check and only fails
+        // at boot.
+        if *pinned != checkpoint_sha256 {
+            return fail(format!(
+                "migration genesis pins checkpoint {} but the checkpoint given hashes to {}",
+                hex::encode(pinned),
+                hex::encode(checkpoint_sha256)
+            ));
         }
         let new_chain_id = genesis.compute_chain_id();
         let header_schedule_version = match manifest
@@ -750,8 +760,12 @@ mod tests {
         // chains from a parent embedding 6.
         let mut parent6 = [6u8; 32];
         parent6[0..4].copy_from_slice(&6u32.to_be_bytes());
+        // H's signed schedule hash is the hash of the one-member recorded
+        // set at the version the declaration binds.
+        let sched_hash =
+            pulsevm_database::pack_schedule_hash(1, &[(owner, signing.public_key().compressed())]);
         let (h_block, hid) =
-            pack_post_block(&parent6, owner, 0x01020304, &signing, [0x5E; 32], false);
+            pack_post_block(&parent6, owner, 0x01020304, &signing, sched_hash, false);
 
         let mut db =
             Database::new(dir.path().join("build").to_str().unwrap(), 64 * 1024 * 1024).unwrap();

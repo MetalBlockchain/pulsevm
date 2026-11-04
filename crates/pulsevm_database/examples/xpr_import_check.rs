@@ -165,9 +165,13 @@ fn main() -> ExitCode {
                         schedule.schedule_version
                     );
                 } else {
+                    // A schedule-less checkpoint can be hashed and pinned
+                    // into a genesis, burning a ceremony round before the
+                    // restore gate refuses it. Refuse to produce one.
                     eprintln!(
-                        "WARNING: no --leap-snapshot: this checkpoint carries no source schedule and the restore gate will refuse it"
+                        "refusing to write a migration checkpoint without --leap-snapshot: it would carry no source schedule and the restore gate would refuse it"
                     );
+                    return ExitCode::from(1);
                 }
                 let checkpoint = match database.snapshot_bytes() {
                     Ok(checkpoint) => checkpoint,

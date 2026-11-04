@@ -1081,7 +1081,15 @@ mod tests {
         // The header states name a fixed schedule hash: the record path
         // binds the exact (root, hash) pair through the producer
         // signature, so any consistent value exercises the real check.
-        let schedule_hash = FIXTURE_SCHEDULE_HASH;
+        // H's signed schedule hash is the hash of the recorded set, which
+        // the gate now requires for any chain that changed its schedule.
+        let schedule_hash = pulsevm_database::pack_schedule_hash(
+            VERSION,
+            &[
+                (name_u64("alice"), key_a.public_key().compressed()),
+                (name_u64("bob"), key_b.public_key().compressed()),
+            ],
+        );
 
         let mut halt_previous = [0u8; 32];
         halt_previous[0..4].copy_from_slice(&7u32.to_be_bytes());
@@ -1393,7 +1401,14 @@ mod tests {
         assert_eq!(packed.len(), 2);
         let first = hex::decode(&packed[0]).unwrap();
         assert_eq!(&first[0..32], &TEST_ROOT_A);
-        assert_eq!(&first[32..64], &FIXTURE_SCHEDULE_HASH);
+        let expected_hash = pulsevm_database::pack_schedule_hash(
+            VERSION,
+            &[
+                (name_u64("alice"), key_a.public_key().compressed()),
+                (name_u64("bob"), key_b.public_key().compressed()),
+            ],
+        );
+        assert_eq!(&first[32..64], &expected_hash);
         assert_eq!(&first[78..110], &halt_id);
         assert_eq!(&first[110..142], &[0u8; 32]);
         // The real restore gate is the oracle: it parses the recorded hex

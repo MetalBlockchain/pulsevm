@@ -1264,7 +1264,7 @@ async fn unsigned_confirmation(
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
     // what the local node reports for H.
-    let mut checkpoint = config.inner.confirmation.checkpoint_sha256.clone();
+    let checkpoint = config.inner.confirmation.checkpoint_sha256.clone();
     let mut new_chain = match &config.inner.confirmation.migration_genesis {
         Some(path) => Some(successor_from_genesis(path)?),
         None => None,
@@ -1302,14 +1302,24 @@ async fn unsigned_confirmation(
                     .to_string(),
             );
         }
-        if let Some(explicit) = checkpoint.as_deref() {
-            if explicit != params.checkpoint_sha256 {
+        // The checkpoint hash must come from this operator's own
+        // conversion of its own snapshot, never from the coordinator: a
+        // signer that adopts the coordinator's hash attests a state it never
+        // derived, and a bad coordinator could get the quorum to sign
+        // altered balances.
+        match checkpoint.as_deref() {
+            Some(explicit) if explicit == params.checkpoint_sha256 => {}
+            Some(_) => {
                 return Err(
                     "coordinator checkpoint does not match configured checkpoint".to_string(),
                 );
             }
-        } else {
-            checkpoint = Some(params.checkpoint_sha256);
+            None => {
+                return Err(
+                    "confirmation.checkpoint_sha256 is not set: derive the checkpoint from your own Leap snapshot at H (xpr_import_check --leap-snapshot) and configure its sha; refusing to adopt the coordinator's"
+                        .to_string(),
+                );
+            }
         }
         if let Some(explicit) = new_chain.as_deref() {
             if explicit != params.new_chain_id {
@@ -1347,7 +1357,7 @@ async fn unsigned_confirmation(
         }
     }
     let checkpoint = checkpoint.ok_or_else(|| {
-        "no checkpoint: set confirmation.checkpoint_sha256 or coordinator_url".to_string()
+        "no checkpoint: set confirmation.checkpoint_sha256 from your own conversion".to_string()
     })?;
     let new_chain = new_chain.ok_or_else(|| {
         "no successor chain id: set confirmation.migration_genesis or coordinator_url".to_string()
@@ -1854,8 +1864,17 @@ fn stop_window_covers_finality(
 /// quorum over H_ID stands in for Leap finality, and on a large committee
 /// LIB(H) arrives after the agreed stop — waiting for it would deadlock
 /// the halt.
-fn should_sign_confirmation(confirmed_ready: bool, head_num: u32, pause_height: u32) -> bool {
-    confirmed_ready && head_num >= pause_height
+///
+/// When this voter manages the producer pause, signing also waits until the
+/// pause is confirmed held: a failed pause must not coexist with a signed
+/// confirmation, or production can continue past the P the quorum attested.
+fn should_sign_confirmation(
+    confirmed_ready: bool,
+    head_num: u32,
+    pause_height: u32,
+    pause_ok: bool,
+) -> bool {
+    confirmed_ready && head_num >= pause_height && pause_ok
 }
 
 /// Pure pause predicate, unit-tested below. The pause fires once the local
@@ -1950,10 +1969,11 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // The stop window must clear the finality lag, or H would still be
         // reversible when every producer stops and its snapshot would never
         // finalize. Enforced on the first successful read before H (not only
-        // under --preflight, which an operator can skip). After H the window
-        // is already spent and refusing to run would stop the pause being
-        // re-asserted, so the check never fires then.
-        if !window_checked && view.head_num < config.inner.height {
+        // under --preflight, which an operator can skip). It runs on any
+        // start before P, including a restart after H, so a voter that comes
+        // back mid-window still checks. At or past P the window is spent and
+        // refusing to run would stop the pause being re-asserted.
+        if !window_checked && view.head_num < pause_height {
             window_checked = true;
             if let Err(error) = stop_window_covers_finality(
                 config.inner.height,
@@ -2049,7 +2069,11 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         let confirmed_ready = voted
             || matches!(decide(config, &view), Decision::AlreadyVoted)
             || view.singleton.as_ref().is_some_and(|s| s.finalized);
-        if should_sign_confirmation(confirmed_ready, view.head_num, pause_height) {
+        let pause_ok =
+            !should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
+                || pause_holding
+                || dry_run;
+        if should_sign_confirmation(confirmed_ready, view.head_num, pause_height, pause_ok) {
             if dry_run {
                 log_line!(
                     "DRY RUN: would sign and deliver the confirmation for H={} P={}",
@@ -2916,16 +2940,23 @@ mod tests {
     #[test]
     fn signs_once_agreed_stop_is_observed_without_waiting_for_lib() {
         // Not ready (no vote yet): never sign, even past P.
-        assert!(!should_sign_confirmation(false, 210, 105));
+        assert!(!should_sign_confirmation(false, 210, 105, true));
         // Ready but the agreed stop not yet observed (only H seen): never
         // attest a freeze that has not landed.
-        assert!(!should_sign_confirmation(true, 100, 105));
-        assert!(!should_sign_confirmation(true, 104, 105));
+        assert!(!should_sign_confirmation(true, 100, 105, true));
+        assert!(!should_sign_confirmation(true, 104, 105, true));
         // Ready and the stop observed: sign. LIB is not an input — on a
         // 21-producer network LIB(H) arrives hundreds of blocks after H,
         // and waiting for it would deadlock the halt past the agreed stop.
-        assert!(should_sign_confirmation(true, 105, 105));
-        assert!(should_sign_confirmation(true, 150, 105));
+        assert!(should_sign_confirmation(true, 105, 105, true));
+        assert!(should_sign_confirmation(true, 150, 105, true));
+    }
+
+    #[test]
+    fn never_signs_while_the_pause_is_not_held() {
+        // A pause error must not coexist with a signed confirmation.
+        assert!(!should_sign_confirmation(true, 150, 105, false));
+        assert!(should_sign_confirmation(true, 150, 105, true));
     }
 
     #[test]

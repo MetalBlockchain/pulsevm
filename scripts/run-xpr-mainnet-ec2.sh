@@ -241,7 +241,8 @@ prepare_canonical_checkpoint() {
       "$EXPORT_DIR/state-history/chain_state_history.log" \
       "$ARENA_DIR" \
       "$CANONICAL_CHECKPOINT" \
-      "$EXPORT_DIR/deferred-transactions.json"
+      "$EXPORT_DIR/deferred-transactions.json" \
+      --leap-snapshot "$snapshot"
 
   echo "==> Running the Mainnet manifest, 21-table, code-object, and sidecar gates"
   validate_canonical_checkpoint "$snapshot"

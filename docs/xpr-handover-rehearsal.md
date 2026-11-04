@@ -218,6 +218,18 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   distinct keys in the header state) and its block log replays cleanly
   through the PulseVM shadow.
 
+- Round-4 re-run PASS (Nov 4, 2026, `HANDOVER_PRODUCERS=4`, H=700, P=830):
+  the first live run with the schedule anchored in H's signature. The
+  converter verified H's producer signature and that the snapshot's active
+  schedule hashes to the signed pending-schedule hash; the restore gate
+  checked the same against the signature-verified H entry. Source schedule
+  bound (4 producers, v1), two independent conversions byte-identical,
+  equivalence 11/11. On Apple silicon the amd64 Leap image crashes in the JIT
+  and stalls under emulation, so this ran on a native arm64 image:
+  `XPR_NODEOS_IMAGE=<arm64 image with ENTRYPOINT nodeos> XPR_PLATFORM=linux/arm64
+  XPR_WASM_RUNTIME=eos-vm XPR_SHADOW_NATIVE=1 CUTOVER_STOP_LAG=130`
+  (stop lag must be at least 2 x (head-LIB) + 12; here LIB lag was 48).
+
   Findings from this mode, none visible with one producer:
 
   - **A Leap snapshot of H only completes once H is irreversible.** Leap

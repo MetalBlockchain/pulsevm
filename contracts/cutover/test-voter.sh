@@ -202,7 +202,7 @@ mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=s
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
-  "migration_genesis":null,"checkpoint_sha256":null,"platform_chain_id":$plat},
+  "migration_genesis":null,"checkpoint_sha256":"abababababababababababababababababababababababababababababababab","platform_chain_id":$plat},
  $stop}
 EOF
     printf '%s' "$out"
