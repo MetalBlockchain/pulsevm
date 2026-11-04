@@ -1,0 +1,157 @@
+{
+    "____comment": "This file was generated with eosio-abigen. DO NOT EDIT ",
+    "version": "eosio::abi/1.2",
+    "types": [],
+    "structs": [
+        {
+            "name": "init",
+            "base": "",
+            "fields": [
+                {
+                    "name": "h",
+                    "type": "uint32"
+                },
+                {
+                    "name": "source_chain_id",
+                    "type": "checksum256"
+                },
+                {
+                    "name": "schedule_version",
+                    "type": "uint32"
+                },
+                {
+                    "name": "schedule",
+                    "type": "schedule_member[]"
+                }
+            ]
+        },
+        {
+            "name": "schedule_member",
+            "base": "",
+            "fields": [
+                {
+                    "name": "producer",
+                    "type": "name"
+                },
+                {
+                    "name": "key",
+                    "type": "public_key"
+                }
+            ]
+        },
+        {
+            "name": "vote",
+            "base": "",
+            "fields": [
+                {
+                    "name": "producer",
+                    "type": "name"
+                },
+                {
+                    "name": "sig",
+                    "type": "signature"
+                }
+            ]
+        },
+        {
+            "name": "ceremony",
+            "base": "",
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "uint64"
+                },
+                {
+                    "name": "h",
+                    "type": "uint32"
+                },
+                {
+                    "name": "source_chain_id",
+                    "type": "checksum256"
+                },
+                {
+                    "name": "schedule_version",
+                    "type": "uint32"
+                },
+                {
+                    "name": "total_weight",
+                    "type": "uint128"
+                },
+                {
+                    "name": "voted_weight",
+                    "type": "uint128"
+                },
+                {
+                    "name": "finalized",
+                    "type": "bool"
+                },
+                {
+                    "name": "declaration_digest",
+                    "type": "checksum256"
+                },
+                {
+                    "name": "init_time",
+                    "type": "uint64"
+                }
+            ]
+        },
+        {
+            "name": "member",
+            "base": "",
+            "fields": [
+                {
+                    "name": "producer",
+                    "type": "name"
+                },
+                {
+                    "name": "key",
+                    "type": "public_key"
+                },
+                {
+                    "name": "weight",
+                    "type": "uint128"
+                },
+                {
+                    "name": "voted",
+                    "type": "bool"
+                }
+            ]
+        }
+    ],
+    "actions": [
+        {
+            "name": "init",
+            "type": "init",
+            "ricardian_contract": ""
+        },
+        {
+            "name": "vote",
+            "type": "vote",
+            "ricardian_contract": ""
+        }
+    ],
+    "tables": [
+        {
+            "name": "ceremony",
+            "index_type": "i64",
+            "key_names": [],
+            "key_types": [],
+            "type": "ceremony"
+        },
+        {
+            "name": "members",
+            "index_type": "i64",
+            "key_names": [
+                "producer"
+            ],
+            "key_types": [
+                "name"
+            ],
+            "type": "member"
+        }
+    ],
+    "kv_tables": {},
+    "ricardian_clauses": [],
+    "variants": [],
+    "action_results": []
+}

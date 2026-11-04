@@ -14,6 +14,12 @@ pub use merkle_tree::{
 };
 
 mod authority_key;
+mod chain_id;
+pub use chain_id::{
+    ChainIdError,
+    chain_id_hex,
+    parse_chain_id,
+};
 pub mod k1;
 pub use authority_key::{
     AuthorityKeyError,

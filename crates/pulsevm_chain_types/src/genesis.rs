@@ -42,6 +42,13 @@ pub struct GenesisState {
     /// checkpoint committed by a migration manifest. Normal XPR-compatible
     /// genesis files omit it and retain their original packed chain-id layout.
     pub migration_checkpoint_sha256: Option<[u8; 32]>,
+    /// Optional operator-pinned chain id (U-1). When present, nodes use it
+    /// instead of the computed hash, so wallets and exchanges can ship the
+    /// successor id at T-14, before the checkpoint it names exists. The
+    /// confirmation still binds the checkpoint unconditionally, so a pinned
+    /// id never lets a wrong state through the gate. Absent by default:
+    /// derivation is bit-for-bit unchanged.
+    pub chain_id_override: Option<[u8; 32]>,
 }
 
 impl GenesisState {
@@ -70,7 +77,12 @@ impl GenesisState {
         let migration_checkpoint_sha256 = raw
             .migration_checkpoint_sha256
             .as_deref()
-            .map(decode_hex_32)
+            .map(|value| decode_hex_32("migration_checkpoint_sha256", value))
+            .transpose()?;
+        let chain_id_override = raw
+            .chain_id
+            .as_deref()
+            .map(|value| decode_hex_32("chain_id", value))
             .transpose()?;
 
         Ok(GenesisState {
@@ -80,6 +92,7 @@ impl GenesisState {
             max_action_return_value_size,
             chain_id_includes_max_action_return_value_size,
             migration_checkpoint_sha256,
+            chain_id_override,
         })
     }
 
@@ -88,7 +101,8 @@ impl GenesisState {
         self.initial_key.to_packed()
     }
 
-    /// The chain id: `sha256(fc::raw::pack(genesis_state))`, reproducing
+    /// The chain id: the operator-pinned `chain_id` override when present
+    /// (U-1), else `sha256(fc::raw::pack(genesis_state))`, reproducing
     /// `genesis_state::compute_chain_id`. fc packs the reflected members in
     /// declaration order — the timestamp as an i64 microsecond count, the key in
     /// its 34-byte form, then each `chain_config` field as its little-endian
@@ -96,6 +110,9 @@ impl GenesisState {
     /// `max_action_return_value_size`; EOSIO 2.0-era files use the historical
     /// 17-field layout and omit it.
     pub fn compute_chain_id(&self) -> [u8; 32] {
+        if let Some(pinned) = self.chain_id_override {
+            return pinned;
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
 
@@ -141,13 +158,17 @@ struct RawGenesis {
     initial_configuration: RawConfig,
     #[serde(default)]
     migration_checkpoint_sha256: Option<String>,
+    /// U-1 operator-pinned chain id. Independent of the checkpoint: the
+    /// pin names the chain early, the checkpoint still binds the state.
+    #[serde(default)]
+    chain_id: Option<String>,
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32], ChainError> {
+fn decode_hex_32(field: &str, value: &str) -> Result<[u8; 32], ChainError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ChainError::GenesisError(
-            "migration_checkpoint_sha256 must be 64 hexadecimal characters".into(),
-        ));
+        return Err(ChainError::GenesisError(format!(
+            "{field} must be 64 hexadecimal characters"
+        )));
     }
     let mut bytes = [0u8; 32];
     for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -400,6 +421,125 @@ mod tests {
         let migrated = GenesisState::from_json(&migrated.to_string()).unwrap();
         assert_ne!(base.compute_chain_id(), migrated.compute_chain_id());
         assert_eq!(migrated.migration_checkpoint_sha256, Some([0xaa; 32]));
+    }
+
+    #[test]
+    fn chain_id_override_pins_the_id_alongside_the_checkpoint() {
+        // The U-1 combination: a checkpoint (binds the state) plus a pinned
+        // id (names the chain early for wallets). The pin wins for the id;
+        // the checkpoint is still parsed and enforced downstream.
+        let mut pinned: serde_json::Value = serde_json::from_str(
+            r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#,
+        )
+        .unwrap();
+        pinned["migration_checkpoint_sha256"] = serde_json::Value::String(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        pinned["chain_id"] = serde_json::Value::String(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        let pinned = GenesisState::from_json(&pinned.to_string()).unwrap();
+        assert_eq!(pinned.compute_chain_id(), [0xbb; 32]);
+        assert_eq!(pinned.migration_checkpoint_sha256, Some([0xaa; 32]));
+        assert_eq!(pinned.chain_id_override, Some([0xbb; 32]));
+    }
+
+    #[test]
+    fn chain_id_override_absent_keeps_derivation_bit_for_bit() {
+        // The frozen oracle value must survive the new field: absent pin
+        // means the historical derivation, byte for byte.
+        let json = r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#;
+        let plain = GenesisState::from_json(json).unwrap();
+        assert_eq!(plain.chain_id_override, None);
+        let hex: String = plain
+            .compute_chain_id()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_chain_id_override() {
+        let mut bad: serde_json::Value = serde_json::from_str(
+            r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#,
+        )
+        .unwrap();
+        bad["chain_id"] = serde_json::Value::String("not-hex".into());
+        let error = GenesisState::from_json(&bad.to_string()).unwrap_err();
+        assert!(format!("{error:?}").contains("chain_id"), "{error:?}");
     }
 
     #[test]

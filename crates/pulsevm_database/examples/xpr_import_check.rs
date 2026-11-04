@@ -8,18 +8,35 @@ use pulsevm_database::{
     Database,
     DeferredTransactionSidecar,
     MigrationManifest,
+    SourceSchedule,
     hydrate_full_state_with_deferred_transactions,
     parse_initial_state_history_log,
+    write_source_schedule,
 };
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json]"
+        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin]\n\
+         --leap-snapshot reads H's active producer schedule from the Leap snapshot the state history was exported from and\n\
+         writes it into the checkpoint, so the checkpoint hash binds the committee. Required for any checkpoint a cutover\n\
+         restores from."
     );
 }
 
 fn main() -> ExitCode {
-    let mut args = env::args_os();
+    // `--leap-snapshot PATH` may appear anywhere; everything else is
+    // positional, as before.
+    let mut raw: Vec<std::ffi::OsString> = env::args_os().collect();
+    let mut leap_snapshot_path = None;
+    if let Some(position) = raw.iter().position(|arg| arg == "--leap-snapshot") {
+        if position + 1 >= raw.len() {
+            usage();
+            return ExitCode::from(2);
+        }
+        leap_snapshot_path = Some(raw.remove(position + 1));
+        raw.remove(position);
+    }
+    let mut args = raw.into_iter();
     let _program = args.next();
     let Some(log_path) = args.next() else {
         usage();
@@ -109,6 +126,51 @@ fn main() -> ExitCode {
                 }
                 if let Err(error) = database.set_revision(i64::from(source_block)) {
                     eprintln!("cannot set migration checkpoint revision: {error}");
+                    return ExitCode::from(1);
+                }
+                // The committee at H, read from the Leap snapshot (never from
+                // an API capture) and written into the state the checkpoint
+                // hash covers. It must be for the very block the state
+                // history was anchored at.
+                if let Some(path) = &leap_snapshot_path {
+                    let snapshot = match fs::read(path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            eprintln!("cannot read {}: {error}", path.to_string_lossy());
+                            return ExitCode::from(1);
+                        }
+                    };
+                    let schedule = match SourceSchedule::from_snapshot_bytes(&snapshot) {
+                        Ok(schedule) => schedule,
+                        Err(error) => {
+                            eprintln!("cannot read the source schedule from the snapshot: {error}");
+                            return ExitCode::from(1);
+                        }
+                    };
+                    if schedule.head_block_id != entry.block_id {
+                        eprintln!(
+                            "the Leap snapshot head {} is not the state-history block {}: wrong snapshot for this export",
+                            hex::encode(schedule.head_block_id),
+                            hex::encode(entry.block_id)
+                        );
+                        return ExitCode::from(1);
+                    }
+                    if let Err(error) = write_source_schedule(&database, &schedule) {
+                        eprintln!("cannot write the source schedule into the checkpoint: {error}");
+                        return ExitCode::from(1);
+                    }
+                    println!(
+                        "source schedule: {} producers, version {}, bound into the checkpoint",
+                        schedule.producers.len(),
+                        schedule.schedule_version
+                    );
+                } else {
+                    // A schedule-less checkpoint can be hashed and pinned
+                    // into a genesis, burning a ceremony round before the
+                    // restore gate refuses it. Refuse to produce one.
+                    eprintln!(
+                        "refusing to write a migration checkpoint without --leap-snapshot: it would carry no source schedule and the restore gate would refuse it"
+                    );
                     return ExitCode::from(1);
                 }
                 let checkpoint = match database.snapshot_bytes() {
