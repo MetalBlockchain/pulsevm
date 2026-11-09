@@ -298,6 +298,12 @@ impl SourceSchedule {
             ));
         }
         let header = &state.header;
+        if !state.pending_schedule.schedule.producers.is_empty() {
+            return Err(
+                "a schedule change is staged at H (the snapshot's pending schedule is not empty): freeze the ceremony after it activates"
+                    .to_string(),
+            );
+        }
         if header.new_producers.is_some() {
             return Err(
                 "snapshot head block carries a legacy schedule change: freeze the ceremony after it activates"
@@ -360,11 +366,15 @@ impl SourceSchedule {
         }
         // H's own producer signature, over Leap's sig_digest
         // (sha256(sha256(header_digest || blockroot) || pending_schedule_hash)),
-        // must recover to that producer's key in the schedule. Cheap, and it
-        // rejects a snapshot whose schedule was swapped after H was signed
-        // (the signature does not cover the active schedule, so this does
-        // not authenticate the other entries: that is what the checkpoint
-        // sha agreed across the fleet is for).
+        // must recover to that producer's key in the schedule. This is a
+        // consistency check on the snapshot, not an authentication of the
+        // committee: H's id covers only the unsigned header, so a forger can
+        // keep the header and producer order, substitute their own keys, set
+        // the pending hash to the substituted schedule's hash and re-sign H
+        // with the substituted key. What authenticates the committee is the
+        // published schedule hash pinned in the genesis (compared by the
+        // converter, the gate, the verifier and every voter) and each
+        // operator's own derived checkpoint hash.
         let SnapshotSignature::K1(signature) = &header.producer_signature else {
             return Err("snapshot head block is not K1-signed".to_string());
         };
@@ -381,11 +391,12 @@ impl SourceSchedule {
         with_schedule.extend_from_slice(&Digest::hash(&bound).0);
         with_schedule.extend_from_slice(state.pending_schedule.schedule_hash.as_bytes());
         let sig_digest = Digest::hash(&with_schedule).0;
-        // The schedule itself must be the one H's signature commits to. A
-        // chain that never changed its schedule (version 0) has only the
-        // genesis schedule, which no hash covers; the id binds the version,
-        // so a real chain with a changed schedule cannot be passed off as
-        // version 0.
+        // The schedule must be consistent with the pending-schedule hash in
+        // H's signed digest (a consistency check, not authentication: see
+        // above). A chain that never changed its schedule (version 0) has
+        // only the genesis schedule, which no hash covers; the id binds the
+        // version, so a real chain with a changed schedule cannot be passed
+        // off as version 0.
         if header.schedule_version > 0 {
             let members: Vec<(u64, [u8; 33])> = producers
                 .iter()
@@ -394,7 +405,7 @@ impl SourceSchedule {
             let committed = pack_schedule_hash(header.schedule_version, &members);
             if committed != *state.pending_schedule.schedule_hash.as_bytes() {
                 return Err(
-                    "snapshot active schedule is not the schedule H's signature commits to (pending schedule hash mismatch): the schedule was altered"
+                    "snapshot active schedule does not hash to the pending-schedule hash in H's signed digest: the snapshot is inconsistent"
                         .to_string(),
                 );
             }
@@ -424,6 +435,44 @@ impl SourceSchedule {
             producers,
         })
     }
+}
+
+impl SourceSchedule {
+    /// `pack_schedule_hash` of this schedule: the value operators publish
+    /// ahead of the ceremony and pin in the genesis.
+    pub fn schedule_sha256(&self) -> [u8; 32] {
+        let members: Vec<(u64, [u8; 33])> = self
+            .producers
+            .iter()
+            .map(|member| (member.producer, member.key))
+            .collect();
+        pack_schedule_hash(self.schedule_version, &members)
+    }
+}
+
+/// The recorded committee must hash to the schedule hash pinned in the
+/// genesis. The pin is a fact from outside the bundle (the published XPR
+/// schedule, readable from any node weeks ahead), so a substituted committee
+/// cannot pass however consistently it was forged. A migration genesis
+/// without the pin is refused.
+pub fn verify_schedule_pin(
+    version: u32,
+    recorded: &[MigrationHaltRosterEntry],
+    pin: Option<&[u8; 32]>,
+) -> Result<(), String> {
+    let pin = pin.ok_or_else(|| {
+        "migration genesis carries no migration_schedule_sha256: pin the published source schedule hash"
+            .to_string()
+    })?;
+    let actual = roster_schedule_hash(version, recorded)?;
+    if &actual != pin {
+        return Err(format!(
+            "the recorded committee (schedule v{version}) hashes to {} but the migration genesis pins {}: not the published schedule",
+            hex::encode(actual),
+            hex::encode(pin)
+        ));
+    }
+    Ok(())
 }
 
 /// Write the schedule into the checkpoint state. Called once by the

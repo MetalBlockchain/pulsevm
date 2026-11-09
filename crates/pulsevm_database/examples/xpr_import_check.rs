@@ -16,10 +16,13 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin] [--no-deferred-sidecar]\n\
+        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin --schedule-sha256 HEX] [--no-deferred-sidecar]\n\
          --leap-snapshot reads H's active producer schedule from the Leap snapshot the state history was exported from and\n\
          writes it into the checkpoint, so the checkpoint hash binds the committee. Required for any checkpoint a cutover\n\
          restores from.\n\
+         --schedule-sha256 is the published hash of the source chain's active schedule (print it with xpr_snapshot_schedule\n\
+         from any current snapshot, publish it ahead, and pin it in the genesis); the conversion refuses a snapshot whose\n\
+         committee hashes to anything else.\n\
          A checkpoint also needs the complete deferred-transaction sidecar (v2, with source_chain_id): without it the\n\
          replay-protection set and action sequences are lost and the hash differs from every BP that had it.\n\
          --no-deferred-sidecar waives that for rehearsal fixtures only."
@@ -37,6 +40,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         leap_snapshot_path = Some(raw.remove(position + 1));
+        raw.remove(position);
+    }
+    let mut schedule_sha256_arg: Option<String> = None;
+    if let Some(position) = raw.iter().position(|arg| arg == "--schedule-sha256") {
+        if position + 1 >= raw.len() {
+            usage();
+            return ExitCode::from(2);
+        }
+        schedule_sha256_arg = raw.remove(position + 1).into_string().ok();
         raw.remove(position);
     }
     let mut no_deferred_sidecar = false;
@@ -190,6 +202,23 @@ fn main() -> ExitCode {
                             return ExitCode::from(1);
                         }
                     };
+                    // The committee must be the published one: a fact from
+                    // outside this bundle, not something the snapshot (or an
+                    // exporter) can state for itself.
+                    let Some(expected_schedule) = schedule_sha256_arg.as_deref() else {
+                        eprintln!(
+                            "refusing to write a migration checkpoint without --schedule-sha256: pin the published source schedule hash (xpr_snapshot_schedule prints it)"
+                        );
+                        return ExitCode::from(1);
+                    };
+                    let actual_schedule = hex::encode(schedule.schedule_sha256());
+                    if !expected_schedule.eq_ignore_ascii_case(&actual_schedule) {
+                        eprintln!(
+                            "the snapshot's committee (schedule v{}) hashes to {actual_schedule}, not the published {expected_schedule}: refusing",
+                            schedule.schedule_version
+                        );
+                        return ExitCode::from(1);
+                    }
                     if schedule.head_block_id != entry.block_id {
                         eprintln!(
                             "the Leap snapshot head {} is not the state-history block {}: wrong snapshot for this export",

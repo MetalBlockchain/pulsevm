@@ -1443,6 +1443,30 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
+            // The recorded committee must be the published source schedule:
+            // a fact pinned in the genesis from outside the bundle. Free to
+            // check, so it runs before the whole-file hash.
+            // A manifest with no declaration at all is refused for that
+            // reason just below; the pin is checked once a pair is present.
+            if manifest.halt_declaration.is_some() {
+                let recorded_committee = manifest.halt_schedule.as_deref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration manifest records no source committee to compare with the published schedule"
+                            .into(),
+                    )
+                })?;
+                let recorded_version = manifest.halt_schedule_version.ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration manifest records no schedule version".into(),
+                    )
+                })?;
+                pulsevm_database::verify_schedule_pin(
+                    recorded_version,
+                    recorded_committee,
+                    rust_genesis.migration_schedule_sha256.as_ref(),
+                )
+                .map_err(ChainError::GenesisError)?;
+            }
             // The free comparisons above run first; this hashes the whole
             // (multi-gigabyte) checkpoint, so it only runs once they pass.
             manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
@@ -1631,6 +1655,27 @@ impl Controller {
                     manifest.checkpoint_revision
                 )));
             } else {
+                // An arena already on disk at exactly the checkpoint's
+                // revision has built nothing since the restore, so it must
+                // still serialize to the checkpoint the pin names: re-derive
+                // its hash instead of trusting a file that was there before
+                // this boot. Past that revision the chain has advanced and the
+                // local state is the node's own.
+                if self.db.revision() == manifest.checkpoint_revision {
+                    let existing = self.db.snapshot_bytes()?;
+                    let existing_sha256: [u8; 32] = {
+                        use sha2::Digest as _;
+                        sha2::Sha256::digest(&existing).into()
+                    };
+                    if existing_sha256 != expected_checkpoint_sha256 {
+                        return Err(ChainError::GenesisError(format!(
+                            "the existing arena at revision {} hashes to {} but the migration genesis pins {}: refusing to reuse a database that is not the checkpoint",
+                            self.db.revision(),
+                            hex::encode(existing_sha256),
+                            hex::encode(expected_checkpoint_sha256)
+                        )));
+                    }
+                }
                 info!(
                     "reusing migration Arena at revision {} without restoring checkpoint {}",
                     self.db.revision(),
@@ -10568,12 +10613,12 @@ mod tests {
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
-        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         // The pair key was built up front so the checkpoint could stage
         // the producers table row it binds against.
         attach_halt_pair(
             manifest_path.to_str().unwrap(),
-            &migration_genesis,
+            &mut migration_genesis,
             &chain_id.0.0,
             source_block.block_num(),
             &source_block_id,
@@ -10740,10 +10785,10 @@ mod tests {
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
-        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         attach_halt_pair(
             manifest_path.to_str().unwrap(),
-            &migration_genesis,
+            &mut migration_genesis,
             &chain_id.0.0,
             source_block.block_num(),
             &source_block_id,
@@ -10834,10 +10879,10 @@ mod tests {
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
-        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         attach_halt_pair(
             manifest_path.to_str().unwrap(),
-            &migration_genesis,
+            &mut migration_genesis,
             &chain_id.0.0,
             source_block.block_num(),
             &source_block_id,
@@ -11281,7 +11326,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn attach_halt_pair(
         manifest_path: &str,
-        migration_genesis: &[u8],
+        migration_genesis: &mut Vec<u8>,
         source_chain_id: &[u8; 32],
         source_block_num: u32,
         source_block_id: &Id,
@@ -11298,8 +11343,6 @@ mod tests {
             .as_str()
             .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?
             .to_string();
-        let new_chain_id =
-            pulsevm_database::GenesisState::from_bytes(migration_genesis)?.compute_chain_id();
         // H's real schedule version, read from the attached packed header
         // with the same prefix parser the offline verifier uses: the
         // attested version and every vote pin to exactly this, which also
@@ -11389,6 +11432,27 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
+        // The published schedule hash pinned in the genesis: the recorded
+        // committee in schedule order. The genesis (and with it the ceremony
+        // chain id the confirmation binds) is updated here, before the
+        // confirmation is built.
+        let pin_members = order
+            .iter()
+            .map(|&member| {
+                let name = crate::chain::name::Name::from_str(producers[member])
+                    .map(|name| name.as_u64())
+                    .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))?;
+                Ok((name, keys[member].public_key().compressed()))
+            })
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        let schedule_pin =
+            pulsevm_database::pack_schedule_hash(header_schedule_version, &pin_members);
+        let mut genesis_json: serde_json::Value = serde_json::from_slice(migration_genesis)
+            .map_err(|e| ChainError::InternalError(format!("fixture genesis unreadable: {e}")))?;
+        genesis_json["migration_schedule_sha256"] = json!(hex::encode(schedule_pin));
+        *migration_genesis = serde_json::to_vec(&genesis_json).unwrap();
+        let new_chain_id = pulsevm_database::GenesisState::from_bytes(migration_genesis)?
+            .compute_ceremony_chain_id();
         // Post-H emptiness window: two signed empty blocks hash-linked from
         // H (pause head P = H + 2 in the fixture), proving nothing landed
         // after the freeze. Slots advance past H's slot so the staged window
@@ -11602,7 +11666,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -11615,7 +11679,7 @@ mod tests {
         .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -11669,7 +11733,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -11682,7 +11746,7 @@ mod tests {
         .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -11735,7 +11799,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -11785,7 +11849,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -11799,7 +11863,7 @@ mod tests {
         let pair_keys = [pulse_k1];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -11958,7 +12022,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -11979,7 +12043,7 @@ mod tests {
         let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12036,7 +12100,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -12059,7 +12123,7 @@ mod tests {
         ];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12098,6 +12162,14 @@ mod tests {
     /// Boot a fully valid migration with the locally derived hash replaced by
     /// `edit`, returning the refusal.
     async fn migration_boot_refusal(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        migration_boot_refusal_with(edit, |_| {}).await
+    }
+
+    /// As [`migration_boot_refusal`], also editing the migration genesis.
+    async fn migration_boot_refusal_with(
+        edit: impl FnOnce(&mut serde_json::Value),
+        edit_genesis: impl FnOnce(&mut serde_json::Value),
+    ) -> String {
         let schedule_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
                 .unwrap();
@@ -12106,7 +12178,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -12127,7 +12199,7 @@ mod tests {
         let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12145,6 +12217,10 @@ mod tests {
             "migration_manifest": manifest_path,
         });
         edit(&mut config);
+        let mut genesis_json: serde_json::Value =
+            serde_json::from_slice(&migration_genesis).unwrap();
+        edit_genesis(&mut genesis_json);
+        let migration_genesis = serde_json::to_vec(&genesis_json).unwrap();
         let target_path = temp.path().join("self-derivation-target");
         let mut controller = Controller::new();
         controller
@@ -12156,6 +12232,83 @@ mod tests {
             )
             .expect_err("the boot must be refused")
             .to_string()
+    }
+
+    // A node restarted before it built its first block finds an arena exactly
+    // at the checkpoint revision; it is reused only after re-deriving the
+    // checkpoint hash from it, and a legitimate restart must pass that.
+    #[tokio::test]
+    async fn migration_restart_at_the_checkpoint_revision_reuses_the_verified_arena() {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("restart-target");
+        let mut first = Controller::new();
+        first
+            .initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect("first boot restores the checkpoint");
+        assert_eq!(first.database().revision(), source_revision);
+        drop(first);
+        let mut again = Controller::new();
+        again
+            .initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect("a restart at the checkpoint revision reuses the verified arena");
+        assert_eq!(again.database().revision(), source_revision);
     }
 
     // Self-derivation: a delivered checkpoint is only restored when this
@@ -12172,6 +12325,37 @@ mod tests {
         assert!(
             error.contains("requires migration_local_checkpoint_sha256"),
             "expected the missing-local-hash refusal, got: {error}"
+        );
+    }
+
+    // The committee is pinned by a published schedule hash in the genesis: a
+    // genesis without it, or with another, is refused before anything heavy.
+    #[tokio::test]
+    async fn migration_restore_requires_the_published_schedule_pin() {
+        let missing = migration_boot_refusal_with(
+            |_| {},
+            |genesis| {
+                genesis
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("migration_schedule_sha256");
+            },
+        )
+        .await;
+        assert!(
+            missing.contains("carries no migration_schedule_sha256"),
+            "expected the missing-pin refusal, got: {missing}"
+        );
+        let wrong = migration_boot_refusal_with(
+            |_| {},
+            |genesis| {
+                genesis["migration_schedule_sha256"] = json!("cd".repeat(32));
+            },
+        )
+        .await;
+        assert!(
+            wrong.contains("not the published schedule"),
+            "expected the wrong-pin refusal, got: {wrong}"
         );
     }
 
@@ -12199,7 +12383,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -12219,7 +12403,7 @@ mod tests {
         let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12288,7 +12472,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -12306,7 +12490,7 @@ mod tests {
         let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12360,7 +12544,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -12374,7 +12558,7 @@ mod tests {
         let pair_keys = [pulse_k1];
         attach_halt_pair(
             &manifest_path,
-            &migration_genesis,
+            &mut migration_genesis,
             &source_chain_id,
             source_block_num,
             &source_block_id,
@@ -12428,7 +12612,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            migration_genesis,
+            mut migration_genesis,
             chain_id,
             _source_block_id,
             _source_block_num,

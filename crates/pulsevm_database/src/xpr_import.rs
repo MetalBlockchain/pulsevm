@@ -1144,19 +1144,22 @@ pub fn verify_migration_halt_block(
             "cutover block is not signed by the scheduled key for {producer_name}"
         ));
     }
-    // The recorded schedule must be the one H's signature commits to: the
-    // signed pending-schedule hash is the hash of the last proposed
-    // schedule, which is the active one once nothing is pending. Without
-    // this, the 20 entries other than H's producer could be swapped for
-    // attacker keys and every other check would still pass. Version 0 has
-    // only the genesis schedule, which no hash covers (the id binds the
-    // version, so a changed-schedule chain cannot claim it).
+    // The recorded schedule must be consistent with H's signed digest: the
+    // signed pending-schedule hash is the hash of the last proposed schedule,
+    // which is the active one once nothing is pending. This is a consistency
+    // check, not an authentication of the committee: H's id covers only the
+    // unsigned header, so a forger can substitute their own keys, set this
+    // hash to match and re-sign H with the substituted key. The committee is
+    // authenticated by the published schedule hash pinned in the genesis
+    // (`verify_schedule_pin`, run by the restore gate and the offline
+    // verifier) and by each operator's own derived checkpoint hash. Version 0
+    // has only the genesis schedule, which no hash covers.
     if header.schedule_version > 0 {
         let committed =
             crate::source_schedule::roster_schedule_hash(header.schedule_version, recorded)?;
         if committed != header.schedule_hash {
             return Err(
-                "recorded schedule is not the schedule the cutover block's signature commits to"
+                "recorded schedule is not consistent with the cutover block's signed schedule hash"
                     .to_string(),
             );
         }
@@ -3305,11 +3308,9 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
     // otherwise depend on the order each BP's state history happened to emit
     // rows. Tables keep the order they first appear in. Sorting makes the
     // conversion a function of the set of rows.
-    let mut table_rank: HashMap<&str, usize> = HashMap::new();
     let mut ordered: Vec<(usize, &str, &TableDeltaRow)> = Vec::new();
     for delta in &entry.deltas {
-        let next = table_rank.len();
-        let rank = *table_rank.entry(delta.name.as_str()).or_insert(next);
+        let rank = canonical_table_rank(&delta.name);
         for row in &delta.rows {
             ordered.push((rank, delta.name.as_str(), row));
         }
@@ -3326,6 +3327,41 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
     }
     order_permissions_parent_first(&mut result);
     Ok(result)
+}
+
+/// Fixed table order for the importer, independent of the order tables
+/// appear in a state-history stream. It matters where one table's rows take
+/// something from another's: a contract table takes its payer from the first
+/// row that creates it, so the `contract_table` delta must be inserted before
+/// any `contract_row` or index row, or the same rows could produce different
+/// checkpoint bytes depending on arrival order. Unknown names sort last and
+/// are rejected when decoded.
+fn canonical_table_rank(name: &str) -> usize {
+    const ORDER: &[&str] = &[
+        "global_property",
+        "protocol_state",
+        "account",
+        "account_metadata",
+        "code",
+        "permission",
+        "permission_link",
+        "resource_limits",
+        "resource_usage",
+        "resource_limits_state",
+        "resource_limits_config",
+        "generated_transaction",
+        "contract_table",
+        "contract_row",
+        "contract_index64",
+        "contract_index128",
+        "contract_index256",
+        "contract_index_double",
+        "contract_index_long_double",
+    ];
+    ORDER
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(ORDER.len())
 }
 
 /// Permissions are inserted with their parent's arena id, so a parent must be
@@ -7074,7 +7110,7 @@ mod tests {
         let error = verify_migration_halt_block(&manifest, 7, &id, TEST_SCHEDULE_VERSION)
             .expect_err("a swapped schedule entry must be refused");
         assert!(
-            error.contains("signature commits to"),
+            error.contains("not consistent with the cutover block"),
             "unexpected refusal: {error}"
         );
     }
@@ -8410,6 +8446,53 @@ mod tests {
             first,
             convert(&shuffled),
             "row order changed the checkpoint bytes"
+        );
+    }
+
+    // A contract table takes its payer from the first row that creates it, so
+    // a stream that delivers contract_row before contract_table must still
+    // give the same checkpoint bytes as the usual order.
+    #[test]
+    fn checkpoint_does_not_depend_on_table_order() {
+        fn convert(entry: &StateHistoryEntry) -> Vec<u8> {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state(&mut db, entry).unwrap();
+            db.set_revision(7).unwrap();
+            db.snapshot_bytes().unwrap()
+        }
+        let system = pulsevm_name::Name::from_str("eosio").unwrap().as_u64();
+        let producers = pulsevm_name::Name::from_str("producers").unwrap().as_u64();
+        let table_payer = 55u64;
+        let row_payer = 66u64;
+        let mut table_row = vec![0];
+        for value in [system, system, producers, table_payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let key = test_key("order-a");
+        let owner = pulsevm_name::Name::from_str("prod.a").unwrap().as_u64();
+        let mut kv_row = secondary_prefix(system, system, producers, owner, row_payer);
+        bytes(
+            &mut kv_row,
+            &pack_producer_info(owner, &key.compressed(), 0, true, 100.0),
+        );
+        let entry = |tables_first: bool| {
+            let table = delta("contract_table", table_row.clone());
+            let row = delta("contract_row", kv_row.clone());
+            StateHistoryEntry {
+                magic: 0,
+                block_id: [0; 32],
+                deltas: if tables_first {
+                    vec![table, row]
+                } else {
+                    vec![row, table]
+                },
+            }
+        };
+        assert_eq!(
+            convert(&entry(true)),
+            convert(&entry(false)),
+            "table order changed the checkpoint bytes"
         );
     }
 }

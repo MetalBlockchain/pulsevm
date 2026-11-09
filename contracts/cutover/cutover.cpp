@@ -174,6 +174,12 @@ CONTRACT cutover : public eosio::contract {
                const eosio::checksum256 &source_chain_id,
                uint32_t schedule_version,
                const std::vector<schedule_member> &schedule) {
+        // Only the ceremony contract's own authority may freeze a schedule.
+        // Without this, anyone could re-init while no vote has landed with a
+        // one-member schedule of their own, vote once, and present a
+        // finalized ceremony that every honest voter refuses but that must
+        // not be able to arm anything.
+        eosio::require_auth(get_self());
         ceremony_singleton state(get_self(), get_self().value);
         if (state.exists()) {
             auto current = state.get();

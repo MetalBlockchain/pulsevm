@@ -251,6 +251,18 @@ fn run(
                 hex::encode(checkpoint_sha256)
             ));
         }
+        // The recorded committee must be the published schedule pinned in
+        // the genesis.
+        if let (Some(recorded), Some(version)) = (
+            manifest.halt_schedule.as_deref(),
+            manifest.halt_schedule_version,
+        ) && let Err(error) = pulsevm_database::verify_schedule_pin(
+            version,
+            recorded,
+            genesis.migration_schedule_sha256.as_ref(),
+        ) {
+            return fail(error);
+        }
         let new_chain_id = genesis.compute_ceremony_chain_id();
         let header_schedule_version = match manifest
             .source_block
@@ -606,7 +618,11 @@ mod tests {
     /// config the voter/agent would carry into production).
     const FIXTURE_PLATFORM: [u8; 32] = [0x51; 32];
 
-    fn migration_genesis_json(checkpoint_sha256: &str, initial_key: &str) -> serde_json::Value {
+    fn migration_genesis_json(
+        checkpoint_sha256: &str,
+        initial_key: &str,
+        schedule_sha256: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "initial_timestamp": "2023-01-01T00:00:00",
             "initial_key": initial_key,
@@ -631,6 +647,7 @@ mod tests {
                 "max_action_return_value_size": 256
             },
             "migration_checkpoint_sha256": checkpoint_sha256,
+            "migration_schedule_sha256": schedule_sha256,
         })
     }
 
@@ -639,11 +656,17 @@ mod tests {
         name: &str,
         initial_key: &str,
         checkpoint: &str,
+        schedule_sha256: &str,
     ) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(
             &path,
-            serde_json::to_vec_pretty(&migration_genesis_json(checkpoint, initial_key)).unwrap(),
+            serde_json::to_vec_pretty(&migration_genesis_json(
+                checkpoint,
+                initial_key,
+                schedule_sha256,
+            ))
+            .unwrap(),
         )
         .unwrap();
         path
@@ -854,6 +877,17 @@ mod tests {
             "migration.genesis.json",
             &signing.public_key().to_string(),
             &manifest.checkpoint_sha256,
+            &hex::encode(
+                pulsevm_database::roster_schedule_hash(
+                    1,
+                    &[MigrationHaltRosterEntry {
+                        producer: "prod.a".to_string(),
+                        key: roster_key.to_string(),
+                        weight: pulsevm_chain_types::HaltWeight::MEMBER,
+                    }],
+                )
+                .unwrap(),
+            ),
         );
         // `members`/`unsigned` were built (and memo-staged) above so the
         // checkpoint carries the declaration accounts before the snapshot.
@@ -1054,6 +1088,19 @@ mod tests {
             )
             .unwrap()
             .checkpoint_sha256,
+            &hex::encode(
+                pulsevm_database::roster_schedule_hash(
+                    1,
+                    serde_json::from_slice::<MigrationManifest>(
+                        &std::fs::read(&fixture.manifest).unwrap(),
+                    )
+                    .unwrap()
+                    .halt_schedule
+                    .as_ref()
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         );
         assert_ne!(
             run(

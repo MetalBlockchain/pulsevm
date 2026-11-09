@@ -219,7 +219,7 @@ Ops detail (traffic seeding, snapshot flow, chaos mode): [handover README](../do
   through the PulseVM shadow.
 
 - Round-4 re-run PASS (Nov 4, 2026, `HANDOVER_PRODUCERS=4`, H=700, P=830):
-  the first live run with the schedule anchored in H's signature. The
+  the first live run with the schedule consistency checks (since corrected: the committee is authenticated by the published schedule hash, not H's signature). The
   converter verified H's producer signature and that the snapshot's active
   schedule hashes to the signed pending-schedule hash; the restore gate
   checked the same against the signature-verified H entry. Source schedule

@@ -1109,14 +1109,15 @@ fn window_block_is_empty(block: &serde_json::Value, number: u32) -> Result<(), S
     Ok(())
 }
 
-/// Walk H+1..=P on the local node and require every block to be empty.
+/// Walk the blocks after `after` through `through` on the local node and
+/// require every one to be empty.
 async fn verify_window_empty(
     client: &reqwest::Client,
     base: &str,
-    height: u32,
-    pause_height: u32,
+    after: u32,
+    through: u32,
 ) -> Result<(), String> {
-    for number in height.saturating_add(1)..=pause_height {
+    for number in after.saturating_add(1)..=through {
         let block = post_json(
             client,
             &format!("{base}/v1/chain/get_block"),
@@ -1250,15 +1251,45 @@ async fn fetch_coordinator_params(
         .map_err(|error| format!("coordinator params bad JSON: {error}"))
 }
 
-fn successor_from_genesis(genesis_path: &str) -> Result<String, String> {
+/// Read the migration genesis this voter is about to sign and return the
+/// successor (ceremony) chain id it commits to plus the published schedule
+/// hash it pins. The voter signs only a genesis it has read itself: the
+/// checkpoint pin must equal the voter's own checkpoint hash (from its own
+/// conversion) and the schedule pin must be present.
+fn genesis_binding(genesis_path: &str, own_checkpoint: &str) -> Result<(String, [u8; 32]), String> {
     let bytes = std::fs::read(genesis_path)
         .map_err(|error| format!("read migration genesis {genesis_path}: {error}"))?;
     let genesis = pulsevm_database::GenesisState::from_bytes(&bytes)
         .map_err(|error| format!("parse migration genesis: {error}"))?;
-    if genesis.migration_checkpoint_sha256.is_none() {
-        return Err("migration genesis carries no checkpoint binding".to_string());
+    let pinned_checkpoint = genesis
+        .migration_checkpoint_sha256
+        .ok_or_else(|| "migration genesis carries no checkpoint binding".to_string())?;
+    if !hex::encode(pinned_checkpoint).eq_ignore_ascii_case(own_checkpoint) {
+        return Err(format!(
+            "migration genesis pins checkpoint {} but this voter derived {own_checkpoint}: refusing to sign a genesis for a checkpoint it did not derive",
+            hex::encode(pinned_checkpoint)
+        ));
     }
-    Ok(hex::encode(genesis.compute_ceremony_chain_id()))
+    let schedule_pin = genesis.migration_schedule_sha256.ok_or_else(|| {
+        "migration genesis carries no migration_schedule_sha256: the published source schedule hash must be pinned"
+            .to_string()
+    })?;
+    Ok((
+        hex::encode(genesis.compute_ceremony_chain_id()),
+        schedule_pin,
+    ))
+}
+
+/// The hash of the live active schedule in the form operators publish and the
+/// genesis pins (`pack_schedule_hash`).
+fn live_schedule_hash(live: &LiveSchedule) -> Result<[u8; 32], String> {
+    let mut members = Vec::with_capacity(live.active.len());
+    for (name, key) in &live.active {
+        let producer = pulsevm_name::Name::from_str(name)
+            .map_err(|_| format!("live schedule producer {name} is not a name"))?;
+        members.push((producer.as_u64(), key.compressed()));
+    }
+    Ok(pulsevm_database::pack_schedule_hash(live.version, &members))
 }
 
 /// The unsigned confirmation template plus its signing digest, without
@@ -1269,6 +1300,7 @@ fn successor_from_genesis(genesis_path: &str) -> Result<String, String> {
 async fn unsigned_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
+    expected_pause_id: Option<&str>,
 ) -> Result<(HaltConfirmation, [u8; 32]), String> {
     let height = config.inner.height;
     // The agreed pause head P: the ceremony fixes P (a strict H+k) before
@@ -1305,14 +1337,30 @@ async fn unsigned_confirmation(
     // under the real height cannot match what the producers signed.
     let local_pause_block_id =
         fetch_block_id(client, &config.inner.nodeos_url, pause_height).await?;
+    // The id that was settled and scanned is the id that gets signed: a
+    // reorg of P since then refuses instead of signing a branch nobody
+    // verified.
+    if let Some(expected) = expected_pause_id
+        && expected != local_pause_block_id
+    {
+        return Err(format!(
+            "block P={pause_height} changed from {expected} to {local_pause_block_id} since it was verified: refusing to sign"
+        ));
+    }
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
     // what the local node reports for H.
     let checkpoint = config.inner.confirmation.checkpoint_sha256.clone();
-    let mut new_chain = match &config.inner.confirmation.migration_genesis {
-        Some(path) => Some(successor_from_genesis(path)?),
-        None => None,
-    };
+    // The voter signs only a genesis it has read: the successor id is
+    // derived from the configured genesis, never adopted from a coordinator.
+    let own_checkpoint = checkpoint.as_deref().ok_or_else(|| {
+        "no checkpoint: set confirmation.checkpoint_sha256 from your own conversion".to_string()
+    })?;
+    let genesis_path = config.inner.confirmation.migration_genesis.as_deref().ok_or_else(|| {
+        "confirmation.migration_genesis is required: the voter signs only a genesis it has read, not a successor id a coordinator supplies"
+            .to_string()
+    })?;
+    let (new_chain, schedule_pin) = genesis_binding(genesis_path, own_checkpoint)?;
     let mut platform = config.inner.confirmation.platform_chain_id.clone();
     if let Some(url) = config.inner.confirmation.coordinator_url.as_deref() {
         let params = fetch_coordinator_params(client, url).await?;
@@ -1365,14 +1413,8 @@ async fn unsigned_confirmation(
                 );
             }
         }
-        if let Some(explicit) = new_chain.as_deref() {
-            if explicit != params.new_chain_id {
-                return Err(
-                    "coordinator successor chain does not match migration genesis".to_string(),
-                );
-            }
-        } else {
-            new_chain = Some(params.new_chain_id);
+        if new_chain != params.new_chain_id {
+            return Err("coordinator successor chain does not match migration genesis".to_string());
         }
         // The platform id is the one value that must agree three ways
         // (config, coordinator, boot): wallets sign under it while the
@@ -1403,9 +1445,6 @@ async fn unsigned_confirmation(
     let checkpoint = checkpoint.ok_or_else(|| {
         "no checkpoint: set confirmation.checkpoint_sha256 from your own conversion".to_string()
     })?;
-    let new_chain = new_chain.ok_or_else(|| {
-        "no successor chain id: set confirmation.migration_genesis or coordinator_url".to_string()
-    })?;
     // The platform id is mandatory: a confirmation that does not bind the
     // id wallets sign under is refused by the restore gate, so shipping one
     // is never useful. Fail here, loudly, instead of signing evidence the
@@ -1425,6 +1464,15 @@ async fn unsigned_confirmation(
     let live = read_live_schedule(client, &config.inner.nodeos_url).await?;
     let expected_members = read_roster(&config.inner.roster_file)?;
     verify_confirmation_schedule(config.inner.schedule_version, &expected_members, &live)?;
+    // The committee this voter attests must be the published schedule the
+    // genesis pins: a fact from outside the bundle that a forged committee,
+    // however consistent, cannot match.
+    if live_schedule_hash(&live)? != schedule_pin {
+        return Err(
+            "the live active schedule does not hash to the migration genesis's migration_schedule_sha256: refusing to sign"
+                .to_string(),
+        );
+    }
     // One shared library constructor builds every agent's template, so an
     // external signer over --print-digest bytes and a locally signed vote
     // are the same commitment by construction.
@@ -1444,9 +1492,10 @@ async fn unsigned_confirmation(
 async fn submit_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
+    expected_pause_id: &str,
 ) -> Result<String, String> {
     let height = config.inner.height;
-    let (template, digest) = unsigned_confirmation(client, config).await?;
+    let (template, digest) = unsigned_confirmation(client, config, Some(expected_pause_id)).await?;
     let local_block_id = template.halt_block_id.clone();
     let pause_block_id = template.pause_block_id.clone();
     let checkpoint = template.checkpoint_sha256.clone();
@@ -1541,8 +1590,8 @@ async fn status(config: &LoadedConfig) -> ExitCode {
         .singleton
         .as_ref()
         .map(|row| row.digest == hex::encode(config.expected_digest));
-    let confirmation_ready = matches!(decide(config, &view), Decision::AlreadyVoted)
-        || view.singleton.as_ref().is_some_and(|s| s.finalized);
+    let confirmation_ready =
+        matches!(decide(config, &view), Decision::AlreadyVoted) || own_finalized(config, &view);
     let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
     // The quorum over H_ID stands in for Leap finality: confirmation is
     // actionable once the agreed stop is locally observed, without waiting
@@ -1562,7 +1611,7 @@ async fn status(config: &LoadedConfig) -> ExitCode {
     let pause_state = if !config.inner.stop_producer.at_pause {
         "off"
     } else if should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
-        && view.singleton.as_ref().is_some_and(|s| s.finalized)
+        && own_finalized(config, &view)
     {
         "due"
     } else {
@@ -1815,28 +1864,65 @@ fn confirmation_digest_json(
 async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
     let client = build_client(config)?;
     let view = read_view(&client, config).await?;
-    match decide(config, &view) {
-        Decision::Vote => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&declaration_digest_json(config))
-                    .map_err(|error| format!("serialize: {error}"))?
-            );
-            return Ok(());
-        }
-        Decision::Refuse(reason) => {
-            return Err(format!("nothing to sign: refusing ({reason})"));
-        }
-        Decision::Wait(_) | Decision::AlreadyVoted => {}
+    let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
+    // Before the ceremony finalizes there is only the declaration to sign.
+    if !own_finalized(config, &view) {
+        return match decide(config, &view) {
+            Decision::Vote => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&declaration_digest_json(config))
+                        .map_err(|error| format!("serialize: {error}"))?
+                );
+                Ok(())
+            }
+            Decision::Refuse(reason) => Err(format!("nothing to sign: refusing ({reason})")),
+            Decision::Wait(_) | Decision::AlreadyVoted => Err(
+                "nothing to sign: the ceremony is not finalized on-chain yet, so there is no confirmation to sign"
+                    .to_string(),
+            ),
+        };
     }
-    if view.head_num < config.inner.pause_height.unwrap_or(config.inner.height) {
+    // Finalized: the confirmation digest, under the same policy the signing
+    // loop applies, so an external signer cannot be handed a digest the loop
+    // itself would refuse.
+    if view.head_num < pause_height {
         return Err(format!(
-            "nothing to sign: the agreed stop P={} is not observed yet (head {})",
-            config.inner.pause_height.unwrap_or(config.inner.height),
+            "nothing to sign: the agreed stop P={pause_height} is not observed yet (head {})",
             view.head_num
         ));
     }
-    let (template, digest) = unsigned_confirmation(&client, config).await?;
+    if config.inner.stop_producer.at_pause
+        && let Some(api_url) = config.inner.stop_producer.producer_api_url.as_deref()
+    {
+        let state = post_json(
+            &client,
+            &format!("{api_url}/v1/producer/paused"),
+            &serde_json::json!({}),
+        )
+        .await?;
+        if state.get("paused").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("nothing to sign: the local producer is not paused".to_string());
+        }
+    }
+    let mut settle: (Option<String>, u32) = (None, 0);
+    let settled_id = loop {
+        let id = fetch_block_id(&client, &config.inner.nodeos_url, pause_height).await?;
+        if settle_step(&mut settle, &id) >= SETTLE_POLLS {
+            break id;
+        }
+        tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+    };
+    let (head_now, _, _) = get_info(&client, &config.inner.nodeos_url).await?;
+    verify_window_empty(
+        &client,
+        &config.inner.nodeos_url,
+        config.inner.height,
+        pause_height.max(head_now),
+    )
+    .await
+    .map_err(|error| format!("nothing to sign: {error}"))?;
+    let (template, digest) = unsigned_confirmation(&client, config, Some(&settled_id)).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&confirmation_digest_json(
@@ -1938,6 +2024,21 @@ fn should_pause_producer(stop: &StopConfig, head_num: u32, pause_height: u32) ->
     stop.at_pause && stop.producer_api_url.is_some() && head_num >= pause_height
 }
 
+/// The ceremony counts as finalized for this voter only when the on-chain
+/// singleton is the declaration this voter itself expects: same digest, same
+/// H, same source chain. Anyone could otherwise stand up a ceremony of their
+/// own (a one-member schedule, one vote) that finalizes but that every honest
+/// voter refuses, and arm every voter's pause for a round that can never
+/// restore.
+fn own_finalized(config: &LoadedConfig, view: &CeremonyView) -> bool {
+    view.singleton.as_ref().is_some_and(|singleton| {
+        singleton.finalized
+            && singleton.digest == hex::encode(config.expected_digest)
+            && singleton.h == config.inner.height
+            && singleton.source_chain_id == config.inner.source_chain_id
+    })
+}
+
 /// Consecutive identical reads of P's block id required before signing: the
 /// confirmation commits to P's id, and P is still reversible (LIB sits far
 /// behind it), so a microfork around P would split the signers across two
@@ -2007,7 +2108,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut voted = false;
     let mut pause_holding = false;
     let mut window_checked = false;
-    let mut window_verified = false;
+    let mut window_verified: Option<(String, u32)> = None;
     let mut finalized_seen = false;
     let mut settle: (Option<String>, u32) = (None, 0);
     let mut pause_note = String::new();
@@ -2132,7 +2233,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // chain for a round that cannot restore, so it waits for the
         // contract to show the ceremony finalized (remembered, so a later
         // read failure does not lose it).
-        if view.singleton.as_ref().is_some_and(|s| s.finalized) {
+        if own_finalized(config, &view) {
             finalized_seen = true;
         }
         if !dry_run
@@ -2170,7 +2271,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // digest.
         let confirmed_ready = voted
             || matches!(decide(config, &view), Decision::AlreadyVoted)
-            || view.singleton.as_ref().is_some_and(|s| s.finalized);
+            || own_finalized(config, &view);
         let pause_ok =
             !should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
                 || pause_holding
@@ -2210,7 +2311,9 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // violation refuses to sign and is logged every poll so the
             // operator sees it.
             // P must hold still before it is signed: see SETTLE_POLLS.
-            match fetch_block_id(&client, &config.inner.nodeos_url, pause_height).await {
+            let settled_id = match fetch_block_id(&client, &config.inner.nodeos_url, pause_height)
+                .await
+            {
                 Ok(id) => {
                     let steady = settle_step(&mut settle, &id);
                     if steady < SETTLE_POLLS {
@@ -2224,6 +2327,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                         tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
                         continue;
                     }
+                    id
                 }
                 Err(error) => {
                     settle = (None, 0);
@@ -2235,21 +2339,32 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
                     continue;
                 }
-            }
-            if !window_verified {
-                match verify_window_empty(
-                    &client,
-                    &config.inner.nodeos_url,
-                    config.inner.height,
-                    pause_height,
-                )
-                .await
+            };
+            // Nothing may have landed from H+1 through the point production
+            // actually stopped: the gate refuses a dirty H+1..P, and blocks
+            // past P (a pause that lands late) carry traffic nothing else
+            // covers. The scan is keyed to the settled id of P, so a reorg
+            // restarts it, and it extends as the head moves.
+            let scan_to = pause_height.max(view.head_num);
+            let scan_from = match &window_verified {
+                Some((id, through)) if *id == settled_id => *through,
+                _ => config.inner.height,
+            };
+            if window_verified
+                .as_ref()
+                .is_none_or(|(id, through)| *id != settled_id || *through < scan_to)
+            {
+                match verify_window_empty(&client, &config.inner.nodeos_url, scan_from, scan_to)
+                    .await
                 {
                     Ok(()) => {
-                        window_verified = true;
-                        log_line!("H+1..P={} verified empty on the local node", pause_height);
+                        window_verified = Some((settled_id.clone(), scan_to));
+                        log_line!(
+                            "H+1..{scan_to} (P={pause_height}) verified empty on the local node"
+                        );
                     }
                     Err(error) => {
+                        window_verified = None;
                         note_throttled(
                             &mut last_note,
                             &mut polls,
@@ -2260,7 +2375,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     }
                 }
             }
-            match submit_confirmation(&client, config).await {
+            match submit_confirmation(&client, config, &settled_id).await {
                 Ok(line) => {
                     log_line!("{line}");
                 }
@@ -2484,6 +2599,104 @@ mod tests {
         bad.source_chain_id = "42".repeat(32);
         let view = view_with(&config, 90, 0, Some(bad), Some(live_member(&config, false)));
         assert!(matches!(decide(&config, &view), Decision::Refuse(_)));
+    }
+
+    // Only the voter's own declaration counts as finalized: a ceremony anyone
+    // stood up (other digest, height or chain) must never arm the pause.
+    #[test]
+    fn only_our_own_finalized_ceremony_arms_anything() {
+        let config = test_loaded_config(100);
+        let finalized = |edit: &dyn Fn(&mut CeremonyRow)| {
+            let mut row = live_singleton(&config);
+            row.finalized = true;
+            edit(&mut row);
+            view_with(&config, 90, 0, Some(row), Some(live_member(&config, false)))
+        };
+        assert!(own_finalized(&config, &finalized(&|_| {})));
+        assert!(!own_finalized(
+            &config,
+            &finalized(&|row| row.digest = "00".repeat(32))
+        ));
+        assert!(!own_finalized(&config, &finalized(&|row| row.h = 101)));
+        assert!(!own_finalized(
+            &config,
+            &finalized(&|row| row.source_chain_id = "42".repeat(32))
+        ));
+        // Not finalized at all.
+        let mut open = live_singleton(&config);
+        open.finalized = false;
+        let view = view_with(
+            &config,
+            90,
+            0,
+            Some(open),
+            Some(live_member(&config, false)),
+        );
+        assert!(!own_finalized(&config, &view));
+        // No singleton.
+        assert!(!own_finalized(
+            &config,
+            &view_with(&config, 90, 0, None, None)
+        ));
+    }
+
+    #[test]
+    fn the_voter_signs_only_a_genesis_it_read_for_its_own_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("voter-genesis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, checkpoint: Option<&str>, schedule: Option<&str>| {
+            let mut genesis: serde_json::Value = serde_json::from_str(
+                r#"{
+                "initial_timestamp": "2023-01-01T00:00:00",
+                "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+                "initial_configuration": {
+                    "max_block_net_usage": 1048576, "target_block_net_usage_pct": 1000,
+                    "max_transaction_net_usage": 524288, "base_per_transaction_net_usage": 12,
+                    "net_usage_leeway": 500, "context_free_discount_net_usage_num": 20,
+                    "context_free_discount_net_usage_den": 100, "max_block_cpu_usage": 3000000000,
+                    "target_block_cpu_usage_pct": 2500, "max_transaction_cpu_usage": 1000000000,
+                    "min_transaction_cpu_usage": 100000, "max_transaction_lifetime": 3600,
+                    "deferred_trx_expiration_window": 600, "max_transaction_delay": 3888000,
+                    "max_inline_action_size": 4096, "max_inline_action_depth": 6,
+                    "max_authority_depth": 6, "max_action_return_value_size": 256
+                }
+            }"#,
+            )
+            .unwrap();
+            if let Some(checkpoint) = checkpoint {
+                genesis["migration_checkpoint_sha256"] = checkpoint.into();
+            }
+            if let Some(schedule) = schedule {
+                genesis["migration_schedule_sha256"] = schedule.into();
+            }
+            let path = dir.join(name);
+            std::fs::write(&path, genesis.to_string()).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let own = "ab".repeat(32);
+        let pin = "cd".repeat(32);
+        let good = write("good.json", Some(&own), Some(&pin));
+        let (chain_id, schedule) = genesis_binding(&good, &own).unwrap();
+        assert_eq!(chain_id.len(), 64);
+        assert_eq!(hex::encode(schedule), pin);
+        // A genesis pinning a checkpoint this voter did not derive.
+        let foreign = write("foreign.json", Some(&"ee".repeat(32)), Some(&pin));
+        let error = genesis_binding(&foreign, &own).unwrap_err();
+        assert!(error.contains("did not derive"), "{error}");
+        // No schedule pin, and no checkpoint pin at all.
+        let unpinned = write("unpinned.json", Some(&own), None);
+        assert!(
+            genesis_binding(&unpinned, &own)
+                .unwrap_err()
+                .contains("migration_schedule_sha256")
+        );
+        let bare = write("bare.json", None, None);
+        assert!(
+            genesis_binding(&bare, &own)
+                .unwrap_err()
+                .contains("no checkpoint binding")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

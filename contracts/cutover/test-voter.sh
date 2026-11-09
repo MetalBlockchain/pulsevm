@@ -180,6 +180,33 @@ printf '%s' "$DEV_WIF" >"$WORK/payer.key"; chmod 600 "$WORK/payer.key"
 table_rows cutover cutover members \
     | python3 -c 'import json,sys; print(json.dumps([{"producer":r["producer"],"key":r["key"],"weight":r["weight"]} for r in json.load(sys.stdin)]))' \
     >"$WORK/roster.json"
+
+# The migration genesis this voter will sign: it pins the checkpoint hash the
+# voter configures as its own and the hash of the one-member source schedule
+# (the published-schedule pin), and its ceremony chain id is what the
+# coordinator must serve. The voter signs only a genesis it has read.
+HALT_BIN="$REPO_ROOT/target/debug/examples/xpr_halt_ceremony"
+GENESIS="$WORK/migration-genesis.json"
+python3 - "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json" "$GENESIS" "$SCHED_VERSION" "$PUB33" <<'PYEOF'
+import hashlib, json, struct, sys
+src, out, version, pub33 = sys.argv[1], sys.argv[2], int(sys.argv[3]), bytes.fromhex(sys.argv[4])
+CHARMAP = ".12345abcdefghijklmnopqrstuvwxyz"
+def name_u64(text):
+    value = 0
+    for i in range(12):
+        c = CHARMAP.index(text[i]) if i < len(text) else 0
+        value |= (c & 0x1f) << (64 - 5 * (i + 1))
+    if len(text) > 12:
+        value |= CHARMAP.index(text[12]) & 0x0f
+    return value
+packed = struct.pack("<I", version) + bytes([1]) + struct.pack("<Q", name_u64("eosio"))
+packed += bytes([0]) + struct.pack("<I", 1) + bytes([1]) + bytes([0]) + pub33 + struct.pack("<H", 1)
+genesis = json.load(open(src))
+genesis["migration_checkpoint_sha256"] = "ab" * 32
+genesis["migration_schedule_sha256"] = hashlib.sha256(packed).hexdigest()
+json.dump(genesis, open(out, "w"))
+PYEOF
+NEW_CHAIN="$("$HALT_BIN" chain-id --genesis "$GENESIS")"
 PLATFORM="$(python3 -c 'print("ee" * 32)')"
 WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
 # Agreed pause head P = H + PAUSE_K, fixed before the freeze like on mainnet.
@@ -202,7 +229,7 @@ mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=s
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
-  "migration_genesis":null,"checkpoint_sha256":"abababababababababababababababababababababababababababababababab","platform_chain_id":$plat},
+  "migration_genesis":"$GENESIS","checkpoint_sha256":"abababababababababababababababababababababababababababababababab","platform_chain_id":$plat},
  $stop}
 EOF
     printf '%s' "$out"
@@ -292,7 +319,7 @@ class H(BaseHTTPRequestHandler):
         h = int(self.path.rsplit("=", 1)[-1]) if "=" in self.path else H_PLACEHOLDER
         blk = rpc("/v1/chain/get_block", {"block_num_or_id": str(h)})
         body = {"halt_height": h, "halt_block_id": blk["id"] if mode in ("good", "bad-platform") else "00" * 32,
-                "checkpoint_sha256": "ab" * 32, "new_chain_id": "cd" * 32,
+                "checkpoint_sha256": "ab" * 32, "new_chain_id": sys.argv[7],
                 "platform_chain_id": plat,
                 "source_chain_id": info["chain_id"]}
         data = json.dumps(body).encode()
@@ -319,7 +346,7 @@ with open(PORT_FILE, "w") as f:
 server.serve_forever()
 PYEOF
 echo "cutover-voter-test: live vote plus coordinator confirmation..."
-python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations.jsonl" "$H" "$WORK/coord.port" "$PLATFORM" >>"$WORK/coordinator.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations.jsonl" "$H" "$WORK/coord.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord.port" ]] && break
@@ -362,7 +389,7 @@ PYEOF
 pass "vote landed and platform-bound confirmation delivered unattended"
 
 echo "cutover-voter-test: lying coordinator is refused..."
-python3 "$WORK/coordinator.py" "$API" bad "$WORK/confirmations-bad.jsonl" "$H" "$WORK/coord-bad.port" "$PLATFORM" >>"$WORK/coordinator-bad.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" bad "$WORK/confirmations-bad.jsonl" "$H" "$WORK/coord-bad.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-bad.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord-bad.port" ]] && break
@@ -388,7 +415,7 @@ grep -q "does not match this node" "$WORK/bad.log" || fail "lying coordinator no
 pass "lying coordinator refused, nothing delivered"
 
 echo "cutover-voter-test: coordinator serving a different platform id is refused..."
-python3 "$WORK/coordinator.py" "$API" bad-platform "$WORK/confirmations-wrongplat.jsonl" "$H" "$WORK/coord-plat.port" "$WRONG_PLATFORM" >>"$WORK/coordinator-plat.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" bad-platform "$WORK/confirmations-wrongplat.jsonl" "$H" "$WORK/coord-plat.port" "$WRONG_PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-plat.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord-plat.port" ]] && break
@@ -459,18 +486,36 @@ start_stub() { # $1=true|false $2=hits-file $3=port-file -> pid in STUB_PID
     done
 }
 
-echo "cutover-voter-test: dry-run rehearses the producer pause..."
+echo "cutover-voter-test: a foreign finalized ceremony never arms the pause..."
+# H=5 names a ceremony this voter did not declare (the on-chain one is for a
+# different height and digest). Even though the singleton is finalized and the
+# head is long past this config's P, nothing may be armed or announced.
 PAST_CFG="$(mk_config 5 true "" "" "http://127.0.0.1:9")"
 "$VOTER_BIN" --config "$PAST_CFG" --dry-run --max-polls 3 >"$WORK/pausedry.log" 2>&1 \
-    || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry.log")"
-grep -q "would pause the local producer at P=25" "$WORK/pausedry.log" \
-    || fail "no dry-run pause line: $(cat "$WORK/pausedry.log")"
+    || fail "dry-run on a foreign ceremony failed: $(cat "$WORK/pausedry.log")"
+! grep -q "would pause" "$WORK/pausedry.log" \
+    || fail "a foreign finalized ceremony armed the pause: $(cat "$WORK/pausedry.log")"
+grep -q "refusing: ceremony height" "$WORK/pausedry.log" \
+    || fail "foreign ceremony was not refused: $(cat "$WORK/pausedry.log")"
+pass "a foreign finalized ceremony never arms the pause"
+
+echo "cutover-voter-test: dry-run rehearses the producer pause for our own ceremony..."
+for _ in $(seq 1 120); do
+    HEAD_NOW="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
+    [[ "$HEAD_NOW" -ge $((H + PAUSE_K)) ]] && break
+    sleep 1
+done
+OWN_CFG="$(mk_config "$H" true "" "" "http://127.0.0.1:9")"
+"$VOTER_BIN" --config "$OWN_CFG" --dry-run --max-polls 3 >"$WORK/pausedry-own.log" 2>&1 \
+    || fail "dry-run pause rehearsal failed: $(cat "$WORK/pausedry-own.log")"
+grep -q "would pause the local producer at P=$((H + PAUSE_K))" "$WORK/pausedry-own.log" \
+    || fail "no dry-run pause line: $(cat "$WORK/pausedry-own.log")"
 pass "dry-run rehearses the producer pause"
 
 echo "cutover-voter-test: live pause after confirmation, enforced continuously..."
 start_stub true "$WORK/pause-hits" "$WORK/stub.port"
 STUB_PORT="$(cat "$WORK/stub.port")"
-python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pause.jsonl" "$H" "$WORK/coord-pause.port" "$PLATFORM" >>"$WORK/coordinator-pause.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pause.jsonl" "$H" "$WORK/coord-pause.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-pause.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord-pause.port" ]] && break
@@ -509,7 +554,7 @@ start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"
 STUB_BAD_PORT="$(cat "$WORK/stub-bad.port")"
 # The pause path sits behind a delivered confirmation, so this run needs a
 # good coordinator too: the point is the pause failing, not the delivery.
-python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pausebad.jsonl" "$H" "$WORK/coord-pausebad.port" "$PLATFORM" >>"$WORK/coordinator-pausebad.log" 2>&1 &
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-pausebad.jsonl" "$H" "$WORK/coord-pausebad.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-pausebad.log" 2>&1 &
 COORD_PID=$!
 for _ in $(seq 1 30); do
     [[ -s "$WORK/coord-pausebad.port" ]] && break

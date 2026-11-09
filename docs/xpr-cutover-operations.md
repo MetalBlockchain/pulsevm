@@ -185,6 +185,25 @@ checkpoint from a peer and may only boot after that peer's hash matches a
 hash it derived itself or that a quorum of independently deriving BPs
 published.
 
+## Ceremony contract authority and the 7-day window
+
+`init` requires the ceremony contract account's own authority
+(`require_auth(get_self())`): nobody else can freeze a schedule or re-freeze a
+voteless one. Without it anyone could stand up a one-member ceremony, vote
+once, and present a finalized singleton; the voter additionally latches
+"finalized" only for a singleton whose digest, H and source chain id equal
+its own expected declaration, so a foreign ceremony can never arm the pause.
+The vote window is 7 days: an `init` after it expires wipes a finalized
+ceremony, and a voter restarted later then never arms. Run the freeze (`init`)
+within 7 days of P and do not re-`init` after the quorum landed.
+
+A voter that learns of the finalization late (read errors, a restart) pauses
+after P. It therefore signs only after scanning H+1 through the head it
+actually stopped at, not just through P, so a late pause cannot carry
+uncovered traffic into a confirmation. `--print-digest` applies the same
+policy as the signing loop (finalized ceremony, pause held, P settled, window
+empty) before it prints a confirmation digest.
+
 ## Coordinator status contract (agent side)
 
 The voter reports its own state via `--status` (one JSON line: head vs H,

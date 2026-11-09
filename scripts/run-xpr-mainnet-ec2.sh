@@ -242,7 +242,8 @@ prepare_canonical_checkpoint() {
       "$ARENA_DIR" \
       "$CANONICAL_CHECKPOINT" \
       "$EXPORT_DIR/deferred-transactions.json" \
-      --leap-snapshot "$snapshot"
+      --leap-snapshot "$snapshot" \
+      --schedule-sha256 "${PULSEVM_SCHEDULE_SHA256:?set PULSEVM_SCHEDULE_SHA256 to the published source schedule hash (xpr_snapshot_schedule prints it)}"
 
   echo "==> Running the Mainnet manifest, 21-table, code-object, and sidecar gates"
   validate_canonical_checkpoint "$snapshot"

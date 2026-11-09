@@ -42,6 +42,14 @@ pub struct GenesisState {
     /// checkpoint committed by a migration manifest. Normal XPR-compatible
     /// genesis files omit it and retain their original packed chain-id layout.
     pub migration_checkpoint_sha256: Option<[u8; 32]>,
+    /// Migration extension: the hash of the source chain's published active
+    /// producer schedule (`pack_schedule_hash` over its version and
+    /// producers). The schedule can be read from any XPR node and published
+    /// weeks ahead, so it is a fact from outside the bundle: the converter,
+    /// the restore gate, the offline verifier and every voter compare the
+    /// committee they hold against it. Only valid together with
+    /// `migration_checkpoint_sha256`.
+    pub migration_schedule_sha256: Option<[u8; 32]>,
     /// Optional operator-pinned chain id (U-1). When present, nodes use it
     /// instead of the computed hash, so wallets and exchanges can ship the
     /// successor id at T-14, before the checkpoint it names exists. The
@@ -79,6 +87,16 @@ impl GenesisState {
             .as_deref()
             .map(|value| decode_hex_32("migration_checkpoint_sha256", value))
             .transpose()?;
+        let migration_schedule_sha256 = raw
+            .migration_schedule_sha256
+            .as_deref()
+            .map(|value| decode_hex_32("migration_schedule_sha256", value))
+            .transpose()?;
+        if migration_schedule_sha256.is_some() && migration_checkpoint_sha256.is_none() {
+            return Err(ChainError::GenesisError(
+                "migration_schedule_sha256 is only valid with migration_checkpoint_sha256".into(),
+            ));
+        }
         let chain_id_override = raw
             .chain_id
             .as_deref()
@@ -92,6 +110,7 @@ impl GenesisState {
             max_action_return_value_size,
             chain_id_includes_max_action_return_value_size,
             migration_checkpoint_sha256,
+            migration_schedule_sha256,
             chain_id_override,
         })
     }
@@ -116,14 +135,16 @@ impl GenesisState {
         self.compute_ceremony_chain_id()
     }
 
-    /// The chain id the cutover ceremony binds: always the hash of the
-    /// genesis fields (initial key, timestamp, configuration and the
-    /// migration checkpoint hash), ignoring any `chain_id` override. With an
-    /// override, `compute_chain_id` is just a pinned number that commits
-    /// nothing about the genesis, so a bundle could keep the pinned id and
-    /// swap the initial key (which seeds the new chain's producer schedule).
-    /// The declaration, confirmation, voter and restore gate all use this
-    /// id, so the quorum signs over the exact genesis it restores under.
+    /// The chain id the cutover ceremony binds: the hash of the genesis fields
+    /// (initial key, timestamp, configuration, the migration checkpoint hash,
+    /// the published schedule hash) and, when present, the `chain_id`
+    /// override. `compute_chain_id` with an override is just a pinned number
+    /// that commits nothing about the genesis, so binding the ceremony to it
+    /// alone would let a bundle keep the pinned id and swap the initial key
+    /// (which seeds the new chain's producer schedule); binding the fields
+    /// without the override would let whoever creates the chain choose the id
+    /// wallets sign for after the quorum signed. This id covers both, and is
+    /// what the declaration, confirmation, voter and restore gate use.
     pub fn compute_ceremony_chain_id(&self) -> [u8; 32] {
         let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
@@ -158,6 +179,19 @@ impl GenesisState {
         if let Some(checkpoint_sha256) = self.migration_checkpoint_sha256 {
             buf.extend_from_slice(&checkpoint_sha256);
         }
+        // Later migration extensions carry a one-byte tag so no combination
+        // of present fields can produce another combination's preimage.
+        if let Some(schedule_sha256) = self.migration_schedule_sha256 {
+            buf.push(0x01);
+            buf.extend_from_slice(&schedule_sha256);
+        }
+        // The override is the id wallets sign for, so it is part of what the
+        // ceremony commits to whenever it is present: whoever creates the
+        // chain cannot choose it after the quorum signed.
+        if let Some(pinned) = self.chain_id_override {
+            buf.push(0x02);
+            buf.extend_from_slice(&pinned);
+        }
 
         pulsevm_crypto::Digest::hash(&buf).0
     }
@@ -170,6 +204,8 @@ struct RawGenesis {
     initial_configuration: RawConfig,
     #[serde(default)]
     migration_checkpoint_sha256: Option<String>,
+    #[serde(default)]
+    migration_schedule_sha256: Option<String>,
     /// U-1 operator-pinned chain id. Independent of the checkpoint: the
     /// pin names the chain early, the checkpoint still binds the state.
     #[serde(default)]
@@ -617,15 +653,23 @@ mod tests {
         let altered = genesis("2023-01-02T00:00:00", Some(&pinned));
         // The override still names the chain at runtime...
         assert_eq!(overridden.compute_chain_id(), altered.compute_chain_id());
-        // ...but the ceremony id is the genesis hash, override or not, so the
-        // quorum cannot sign one genesis and restore under another.
-        assert_eq!(
-            overridden.compute_ceremony_chain_id(),
-            plain.compute_chain_id()
-        );
+        // ...but the ceremony id commits the genesis fields AND the override,
+        // so the quorum cannot sign one genesis and restore under another,
+        // and the override cannot be chosen after the signatures.
         assert_ne!(
             overridden.compute_ceremony_chain_id(),
             altered.compute_ceremony_chain_id()
         );
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            plain.compute_ceremony_chain_id()
+        );
+        let other_override = genesis("2023-01-01T00:00:00", Some(&"cc".repeat(32)));
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            other_override.compute_ceremony_chain_id()
+        );
+        // No override: unchanged from the plain derivation.
+        assert_eq!(plain.compute_ceremony_chain_id(), plain.compute_chain_id());
     }
 }

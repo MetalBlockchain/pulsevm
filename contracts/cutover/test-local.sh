@@ -249,6 +249,12 @@ NOW_US="$(python3 -c 'import time; print(time.time_ns() // 1000)')"
 [[ "$INIT_US" -lt $((NOW_US + 3600 * 1000000)) ]] || fail "init_time is in the future: $INIT_US"
 check "init stamped a sane freeze instant (window anchor present)"
 
+# init is the ceremony contract's own authority only: nobody else may freeze a
+# schedule (or re-freeze a voteless one) and so mint a finalizable ceremony
+# of their own.
+do_init_unauthorized() { mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover init eosio "$(init_hex "$((H1 + 3))")"; }
+expect_fail "init without the contract's authority" "missing authority of cutover" do_init_unauthorized
+
 # Re-init before any vote lands must move the freeze (liveness-only
 # griefing vector); after the first vote the freeze locks. This runs here,
 # on the still-voteless ceremony, so no second chain is needed.

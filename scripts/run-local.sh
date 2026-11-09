@@ -155,6 +155,13 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     echo "error: PULSEVM_LOCAL_CHECKPOINT_SHA256 is required: the checkpoint hash you derived yourself" >&2
     exit 1
   fi
+  # The committee is pinned by the published source schedule hash, a fact from
+  # outside the bundle. The genesis creator supplies it (see
+  # xpr_snapshot_schedule); the node refuses a restore without it.
+  if [[ -z "${PULSEVM_SCHEDULE_SHA256:-}" ]]; then
+    echo "error: PULSEVM_SCHEDULE_SHA256 is required: the published hash of the source chain's active schedule" >&2
+    exit 1
+  fi
   CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256 | select(type == "string" and test("^[[:xdigit:]]{64}$"))' "$MIGRATION_MANIFEST")"
   MIGRATION_GENESIS="$(mktemp "${TMPDIR:-/tmp}/pulsevm-xpr-migration-genesis.XXXXXX")"
   # A migration restore starts a new producer schedule seeded from the
@@ -164,13 +171,15 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   # key no node holds and every build fails closed at the signing gate.
   if [[ -n "${PULSEVM_GENESIS_INITIAL_KEY:-}" ]]; then
     jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
       --arg initial_key "$PULSEVM_GENESIS_INITIAL_KEY" \
-      '. + {migration_checkpoint_sha256: $checkpoint_sha256, initial_key: $initial_key}' \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key}' \
       "$GENESIS_PATH" > "$MIGRATION_GENESIS"
     echo "==> Migration genesis initial key overridden with PULSEVM_GENESIS_INITIAL_KEY"
   else
     jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-      '. + {migration_checkpoint_sha256: $checkpoint_sha256}' \
+      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256}' \
       "$GENESIS_PATH" > "$MIGRATION_GENESIS"
   fi
   # This development key corresponds to genesis.json's initial_key. Override it

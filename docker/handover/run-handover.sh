@@ -1942,11 +1942,20 @@ cmd_checkpoint() {
         --snapshot "$(cat "$WORK_DIR/snapshot")" \
         --work-dir "$export_dir" \
         --source-revision leap-5.0.3) || fail "export failed"
+    # The published source schedule hash. Production reads it from the
+    # published value (anyone can derive it from a current XPR snapshot with
+    # xpr_snapshot_schedule); the rehearsal derives it from the very snapshot
+    # it converts, which exercises every comparison but is self-referential.
+    (cd "$REPO_ROOT" && cargo build --locked -p pulsevm_database --example xpr_snapshot_schedule) \
+        || fail "schedule preflight build failed"
+    SCHEDULE_SHA256="${PULSEVM_SCHEDULE_SHA256:-$("$REPO_ROOT/target/debug/examples/xpr_snapshot_schedule" "$(cat "$WORK_DIR/snapshot")" | sed -n 's/^schedule sha256[^:]*: //p')}"
+    [[ "$SCHEDULE_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "could not derive the published schedule hash"
+    printf '%s\n' "$SCHEDULE_SHA256" >"$WORK_DIR/schedule.sha256"
     (cd "$REPO_ROOT" && cargo run --locked -p pulsevm_database --example xpr_import_check -- \
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --no-deferred-sidecar) || fail "checkpoint import failed"
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar) || fail "checkpoint import failed"
     # Determinism on a REAL export: every BP converts its own export and the
     # fleet has to land on one checkpoint hash. Convert the same export a
     # second time in a separate process with a different working directory,
@@ -1961,7 +1970,7 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$det_dir/arena" \
         "$det_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --no-deferred-sidecar >"$det_dir/convert.log" 2>&1) \
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar >"$det_dir/convert.log" 2>&1) \
         || fail "second conversion failed (see $det_dir/convert.log)"
     first_sum="$(shasum -a 256 "$export_dir/migration.snapshot" | cut -d' ' -f1)"
     second_sum="$(shasum -a 256 "$det_dir/migration.snapshot" | cut -d' ' -f1)"
@@ -2007,9 +2016,11 @@ cmd_checkpoint() {
         GENESIS_BASE="${PULSEVM_GENESIS_PATH:-$REPO_ROOT/genesis.json}"
         GENESIS_KEY="${PULSEVM_GENESIS_INITIAL_KEY:-$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")}"
         CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256' "$manifest")"
+        SCHEDULE_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/schedule.sha256")"
         jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+            --arg schedule_sha256 "$SCHEDULE_SHA256" \
             --arg initial_key "$GENESIS_KEY" \
-            '. + {migration_checkpoint_sha256: $checkpoint_sha256, initial_key: $initial_key}' \
+            '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key}' \
             "$GENESIS_BASE" >"$WORK_DIR/migration.genesis.json" || fail "migration genesis build failed"
         # Platform id the boot will run under: the confirmation binds
         # exactly this id (hex or the base58 log rendering), and the restore
@@ -2146,6 +2157,9 @@ cmd_boot() {
     export PULSEVM_MIGRATION_CHECKPOINT="$checkpoint"
     PULSEVM_LOCAL_CHECKPOINT_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/local-checkpoint.sha256")" \
         || fail "no locally derived checkpoint hash recorded"
+    PULSEVM_SCHEDULE_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/schedule.sha256")" \
+        || fail "no published schedule hash recorded"
+    export PULSEVM_SCHEDULE_SHA256
     export PULSEVM_LOCAL_CHECKPOINT_SHA256
     export PULSEVM_PLUGIN_DIR="$WORK_DIR/plugins"
     export PULSEVM_EC2_RUN_DIR="$WORK_DIR/five-node"

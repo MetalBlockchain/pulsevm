@@ -332,33 +332,45 @@ parent-first. A shuffled export, including permissions listed before their
 parents, converts to the same bytes (`checkpoint_does_not_depend_on_row_order`).
 This removes the assumption that every BP's node emits rows in one order.
 
-**The schedule is anchored in H's own signature.** The id and signature of H
-do not directly commit to the active schedule, which would let an attacker
-holding a real H snapshot keep H's header and producer entry and swap the
-other 20 entries for their own keys. They do commit to something equivalent:
-Leap keeps the hash of the last proposed schedule in
-`pending_schedule.schedule_hash` after it activates, and every block
-signature covers that hash (`sig_digest = sha256(sha256(header_digest ||
-blockroot) || pending_schedule_hash)`). With nothing pending, that hash is
-`sha256(pack(active_schedule))`. Confirmed on a real four-producer snapshot
-(schedule v1): the two hashes are identical. Therefore, for any chain whose
-schedule has ever changed (version > 0, which XPR's has):
+**The committee is authenticated by a published schedule hash, not by H's
+signature.** H's id covers only the unsigned header, so the signature is as
+replaceable as the schedule: a forger can keep H's header and producer order,
+put in 21 keys of their own, set the pending-schedule hash to that schedule's
+hash and re-sign H with the substituted key. Both of the following still pass
+for such a forgery, so they are consistency checks on the snapshot, not
+authentication of the committee:
 
-- the converter refuses a snapshot whose active schedule does not hash to the
-  pending hash, and verifies H's signature over that digest against the
-  producer's scheduled key;
-- the restore gate and `xpr_verify_manifest` require the recorded schedule to
-  hash to the schedule hash in the signature-verified H entry.
+- Leap keeps the hash of the last proposed schedule in
+  `pending_schedule.schedule_hash`, and every block signature covers it
+  (`sig_digest = sha256(sha256(header_digest || blockroot) ||
+  pending_schedule_hash)`); with nothing pending it equals
+  `sha256(pack(active_schedule))` (confirmed on a real 21-producer testnet
+  snapshot, v814). The converter requires this for version > 0 and verifies
+  H's signature against the scheduled producer key; the gate requires the
+  recorded schedule to be consistent with the signed hash in the H entry.
 
-Substituting any schedule entry now requires H's producer key. Version 0 (a
-chain that never changed schedule, i.e. rehearsal fixtures) has only the
-genesis schedule, which no hash covers; the block id binds the schedule
-version, so a real chain with a changed schedule cannot be presented as
-version 0.
+What authenticates the committee is a fact from outside the bundle: the
+**published schedule hash**. The active schedule can be read from any XPR
+node and published weeks ahead (`xpr_snapshot_schedule <snapshot>` prints
+`sha256(pack(version, producers))` from any current snapshot). It is pinned as
+`migration_schedule_sha256` in the migration genesis, which makes it part of
+the ceremony chain id the quorum signs, and every party compares the
+committee it holds against it:
 
-What this does not remove: the id of H itself is still a fact from outside
-the bundle. Anyone can check it on any XPR node, and each BP's voter compares
-it with its own node before signing.
+- the converter refuses a snapshot whose committee hashes to anything else
+  (`--schedule-sha256`, required for any migration checkpoint);
+- the restore gate and `xpr_verify_manifest` refuse a recorded committee that
+  does not hash to the pin, and a genesis without the pin;
+- every voter refuses to sign unless the live active schedule on its own node
+  hashes to the pin, and signs only a genesis it has read, whose checkpoint
+  pin equals the checkpoint hash that voter derived itself.
+
+The trust roots are therefore: the published schedule hash, the id of H (anyone
+can check it on any XPR node, and each voter compares it with its own node),
+and each operator's own derived checkpoint hash. A forged committee fails the
+schedule pin however consistently it was built. Version 0 (a chain that never
+changed schedule, i.e. rehearsal fixtures) has only the genesis schedule; the
+pin still binds whatever the genesis creator publishes.
 
 Two further checks close the rest of the attack that earlier versions
 allowed (a recorded set the attacker controls, one key signing a fabricated

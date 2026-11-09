@@ -50,10 +50,14 @@ fn main() -> ExitCode {
                 );
             } else {
                 println!(
-                    "schedule anchor: ok (active schedule hashes to the pending-schedule hash H's signature covers)"
+                    "schedule consistency: ok (active schedule hashes to the pending-schedule hash in the head's signed digest)"
                 );
             }
             println!("head producer signature: ok");
+            println!(
+                "schedule sha256 (publish this and pin it in the migration genesis): {}",
+                hex::encode(schedule.schedule_sha256())
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
