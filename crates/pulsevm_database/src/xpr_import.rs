@@ -2008,7 +2008,7 @@ pub fn hydrate_full_state_with_deferred_transactions(
             for row in &sidecar.transactions {
                 keyed.push((sidecar_key(row)?, row));
             }
-            keyed.sort_by(|a, b| a.0.trx_id.cmp(&b.0.trx_id));
+            keyed.sort_by_key(|(key, _)| key.trx_id);
             for (key, row) in keyed {
                 db.xpr_import_deferred_transaction(
                     key.sender,
