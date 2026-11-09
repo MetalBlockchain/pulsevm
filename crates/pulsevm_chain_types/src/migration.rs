@@ -571,6 +571,9 @@ pub struct HaltConfirmation {
     pub signatures: Vec<HaltSignature>,
 }
 
+/// Upper bound on a declared committee, checked before any per-member work.
+const MAX_DECLARED_MEMBERS: usize = 1024;
+
 impl HaltDeclaration {
     pub const VERSION: u16 = 1;
 
@@ -790,6 +793,14 @@ impl HaltDeclaration {
             return Err(ChainError::InternalError(format!(
                 "halt declaration height {} does not match cutover height {}",
                 self.last_height, expected_height
+            )));
+        }
+        // Bound the set before any per-member work: a real committee is 21,
+        // and the source schedule rows cap producers at the same figure.
+        if self.validator_set.len() > MAX_DECLARED_MEMBERS {
+            return Err(ChainError::InternalError(format!(
+                "halt declaration names {} members, over the {MAX_DECLARED_MEMBERS} limit",
+                self.validator_set.len()
             )));
         }
         for member in &self.validator_set {

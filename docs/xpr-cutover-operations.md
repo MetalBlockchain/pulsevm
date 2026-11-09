@@ -44,7 +44,12 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
    `stop_producer` armed, each producer pauses at the agreed stop P (not
    after delivering its confirmation), from the head alone, so a slow
    ceremony read cannot delay it. The voter signs only once its pause is
-   confirmed held and the local node shows H+1..P empty (zero transaction
+   confirmed held, the ceremony shows finalized on-chain (the pause is the
+   fleet's pact, which only exists once the declaration has a quorum: a round
+   that never reached 15 of 21 does not halt the chain), block P's id has been
+   identical for several consecutive polls (P is still reversible, and a
+   microfork would split the signers across two ids), and the local node shows
+   H+1..P empty (zero transaction
    root in every block); a dirty window refuses to sign and says so in the
    log, because the restore gate would refuse the round anyway. A voter
    restarted after H keeps enforcing the pause even if the finality window

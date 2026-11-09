@@ -113,6 +113,18 @@ impl GenesisState {
         if let Some(pinned) = self.chain_id_override {
             return pinned;
         }
+        self.compute_ceremony_chain_id()
+    }
+
+    /// The chain id the cutover ceremony binds: always the hash of the
+    /// genesis fields (initial key, timestamp, configuration and the
+    /// migration checkpoint hash), ignoring any `chain_id` override. With an
+    /// override, `compute_chain_id` is just a pinned number that commits
+    /// nothing about the genesis, so a bundle could keep the pinned id and
+    /// swap the initial key (which seeds the new chain's producer schedule).
+    /// The declaration, confirmation, voter and restore gate all use this
+    /// id, so the quorum signs over the exact genesis it restores under.
+    pub fn compute_ceremony_chain_id(&self) -> [u8; 32] {
         let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
 
@@ -570,5 +582,50 @@ mod tests {
         assert_eq!(g.initial_configuration.max_transaction_delay, 0);
         assert_eq!(g.initial_configuration.deferred_trx_expiration_window, 0);
         assert_eq!(g.initial_configuration.max_block_cpu_usage, 3_000_000_000);
+    }
+
+    #[test]
+    fn ceremony_chain_id_commits_the_genesis_even_with_an_override() {
+        let genesis = |timestamp: &str, pinned: Option<&str>| {
+            let mut value: serde_json::Value = serde_json::from_str(
+                r#"{
+                "initial_timestamp": "2023-01-01T00:00:00",
+                "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+                "initial_configuration": {
+                    "max_block_net_usage": 1048576, "target_block_net_usage_pct": 1000,
+                    "max_transaction_net_usage": 524288, "base_per_transaction_net_usage": 12,
+                    "net_usage_leeway": 500, "context_free_discount_net_usage_num": 20,
+                    "context_free_discount_net_usage_den": 100, "max_block_cpu_usage": 3000000000,
+                    "target_block_cpu_usage_pct": 2500, "max_transaction_cpu_usage": 1000000000,
+                    "min_transaction_cpu_usage": 100000, "max_transaction_lifetime": 3600,
+                    "deferred_trx_expiration_window": 600, "max_transaction_delay": 3888000,
+                    "max_inline_action_size": 4096, "max_inline_action_depth": 6,
+                    "max_authority_depth": 6, "max_action_return_value_size": 256
+                }
+            }"#,
+            )
+            .unwrap();
+            value["initial_timestamp"] = timestamp.into();
+            if let Some(pinned) = pinned {
+                value["chain_id"] = pinned.into();
+            }
+            GenesisState::from_json(&value.to_string()).unwrap()
+        };
+        let pinned = "bb".repeat(32);
+        let plain = genesis("2023-01-01T00:00:00", None);
+        let overridden = genesis("2023-01-01T00:00:00", Some(&pinned));
+        let altered = genesis("2023-01-02T00:00:00", Some(&pinned));
+        // The override still names the chain at runtime...
+        assert_eq!(overridden.compute_chain_id(), altered.compute_chain_id());
+        // ...but the ceremony id is the genesis hash, override or not, so the
+        // quorum cannot sign one genesis and restore under another.
+        assert_eq!(
+            overridden.compute_ceremony_chain_id(),
+            plain.compute_chain_id()
+        );
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            altered.compute_ceremony_chain_id()
+        );
     }
 }

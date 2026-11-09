@@ -1946,7 +1946,7 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")") || fail "checkpoint import failed"
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --no-deferred-sidecar) || fail "checkpoint import failed"
     # Determinism on a REAL export: every BP converts its own export and the
     # fleet has to land on one checkpoint hash. Convert the same export a
     # second time in a separate process with a different working directory,
@@ -1961,7 +1961,7 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$det_dir/arena" \
         "$det_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" >"$det_dir/convert.log" 2>&1) \
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --no-deferred-sidecar >"$det_dir/convert.log" 2>&1) \
         || fail "second conversion failed (see $det_dir/convert.log)"
     first_sum="$(shasum -a 256 "$export_dir/migration.snapshot" | cut -d' ' -f1)"
     second_sum="$(shasum -a 256 "$det_dir/migration.snapshot" | cut -d' ' -f1)"

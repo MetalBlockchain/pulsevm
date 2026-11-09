@@ -306,6 +306,23 @@ party deriving it themselves, not from anyone handing it over:
   the manifest hash (see `docs/xpr-cutover-operations.md`, "Self-derived
   checkpoint at boot").
 
+**The successor chain id commits the genesis.** The confirmation's successor
+id is `compute_ceremony_chain_id`: the hash of the genesis fields (initial key,
+timestamp, configuration, and the migration checkpoint hash), whether or not
+the genesis carries an operator-pinned `chain_id` override. The override still
+names the chain at runtime, but it commits nothing, so binding the ceremony to
+it would let a bundle keep the pinned id and swap the initial key that seeds
+the new chain's producer schedule. A coordinator that publishes the override
+as the successor id is refused by the voter.
+
+**The conversion must be complete.** `xpr_import_check` refuses to write a
+migration checkpoint without the v2 deferred-transaction sidecar (with
+`source_chain_id`), because a sidecar-less conversion drops the
+replay-protection set and action sequences and lands on a different hash than
+the rest of the fleet. `--no-deferred-sidecar` waives it for rehearsal
+fixtures only and prints a warning. It also refuses a non-empty arena
+directory.
+
 **The schedule is anchored in H's own signature.** The id and signature of H
 do not directly commit to the active schedule, which would let an attacker
 holding a real H snapshot keep H's header and producer entry and swap the

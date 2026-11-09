@@ -340,7 +340,7 @@ fn successor_chain_id(genesis_path: &str) -> Result<String, String> {
             "migration genesis {genesis_path} carries no migration checkpoint binding"
         ));
     }
-    Ok(hex::encode(genesis.compute_chain_id()))
+    Ok(hex::encode(genesis.compute_ceremony_chain_id()))
 }
 
 fn confirm(request: &ConfirmRequest) -> Result<String, String> {

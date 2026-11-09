@@ -2072,6 +2072,7 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 summary.account_metadata += 1;
             }
         }
+        let code_references = code_reference_counts(&rows);
         for row in &rows {
             if let PortableRow::Code {
                 hash,
@@ -2083,7 +2084,10 @@ pub fn hydrate_full_state_with_deferred_transactions(
                 db.xpr_import_code(
                     *hash,
                     code,
-                    code_reference_count(&rows, *hash, *vm_type, *vm_version),
+                    code_references
+                        .get(&(*hash, *vm_type, *vm_version))
+                        .copied()
+                        .unwrap_or(0),
                     *vm_type,
                     *vm_version,
                 )
@@ -3779,14 +3783,23 @@ fn decode_generated_transaction(bytes: &[u8]) -> Result<PortableRow, XprImportEr
     })
 }
 
-fn code_reference_count(rows: &[PortableRow], hash: [u8; 32], vm_type: u8, vm_version: u8) -> u64 {
-    rows
-        .iter()
-        .filter(|row| {
-            matches!(row, PortableRow::AccountMetadata { code: Some(reference), .. }
-                if reference.hash == hash && reference.vm_type == vm_type && reference.vm_version == vm_version)
-        })
-        .count() as u64
+/// How many accounts reference each (hash, vm type, vm version) code object,
+/// counted in one pass. Looking each code row up with a scan of every row was
+/// quadratic on a mainnet-size export.
+fn code_reference_counts(rows: &[PortableRow]) -> HashMap<([u8; 32], u8, u8), u64> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        if let PortableRow::AccountMetadata {
+            code: Some(reference),
+            ..
+        } = row
+        {
+            *counts
+                .entry((reference.hash, reference.vm_type, reference.vm_version))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -4346,7 +4359,7 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
     }
 
     let payload = &bytes[LOG_HEADER_LEN..LOG_HEADER_LEN + payload_len];
-    let compressed = match payload {
+    let (compressed, claimed) = match payload {
         // Legacy XPR core snapshots: `uint32 compressed_size` plus
         // zlib bytes. Retain this framing for source snapshots from that node.
         payload
@@ -4355,7 +4368,7 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
                     as usize
                     == payload.len() - PAYLOAD_FORMAT_LEN =>
         {
-            &payload[PAYLOAD_FORMAT_LEN..]
+            (&payload[PAYLOAD_FORMAT_LEN..], None)
         }
         // Leap 5: `uint32 format=1`, `uint64 decompressed_size`, then zlib
         // bytes. The source writes the uncompressed length so a SHiP server
@@ -4375,7 +4388,10 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
                     MAX_DECOMPRESSED_DELTA_LEN
                 )));
             }
-            &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..]
+            (
+                &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..],
+                Some(claimed_len),
+            )
         }
         payload if payload.len() < PAYLOAD_FORMAT_LEN => {
             return Err(bad("state-history payload is missing format marker"));
@@ -4399,19 +4415,7 @@ pub fn parse_initial_state_history_log(bytes: &[u8]) -> Result<StateHistoryEntry
         )));
     }
 
-    let mut decoder = ZlibDecoder::new(compressed);
-    let mut raw = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_DECOMPRESSED_DELTA_LEN + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| bad(format!("decompressing state-history delta: {e}")))?;
-    if raw.len() as u64 > MAX_DECOMPRESSED_DELTA_LEN {
-        return Err(bad(format!(
-            "state-history delta exceeds {} byte import limit",
-            MAX_DECOMPRESSED_DELTA_LEN
-        )));
-    }
+    let raw = inflate_bounded(compressed, claimed)?;
 
     Ok(StateHistoryEntry {
         magic,
@@ -4547,14 +4551,14 @@ pub fn inspect_state_history_log(
 }
 
 fn decompress_state_history_payload(payload: &[u8]) -> Result<Vec<u8>, XprImportError> {
-    let compressed = match payload {
+    let (compressed, claimed) = match payload {
         payload
             if payload.len() >= PAYLOAD_FORMAT_LEN
                 && u32::from_le_bytes(payload[0..PAYLOAD_FORMAT_LEN].try_into().unwrap())
                     as usize
                     == payload.len() - PAYLOAD_FORMAT_LEN =>
         {
-            &payload[PAYLOAD_FORMAT_LEN..]
+            (&payload[PAYLOAD_FORMAT_LEN..], None)
         }
         payload
             if payload.len() >= PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN
@@ -4571,7 +4575,10 @@ fn decompress_state_history_payload(payload: &[u8]) -> Result<Vec<u8>, XprImport
                     MAX_DECOMPRESSED_DELTA_LEN
                 )));
             }
-            &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..]
+            (
+                &payload[PAYLOAD_FORMAT_LEN + DECOMPRESSED_SIZE_LEN..],
+                Some(claimed_len),
+            )
         }
         payload if payload.len() < PAYLOAD_FORMAT_LEN => {
             return Err(bad("state-history payload is missing format marker"));
@@ -4583,17 +4590,33 @@ fn decompress_state_history_payload(payload: &[u8]) -> Result<Vec<u8>, XprImport
             )));
         }
     };
-    let mut decoder = ZlibDecoder::new(compressed);
+    inflate_bounded(compressed, claimed)
+}
+
+/// Inflate a state-history delta under a bound taken from the log itself.
+/// When the payload states its decompressed size (Leap 5) that size is both
+/// the ceiling and the exact expectation, so a small bomb is cut off at the
+/// claimed length instead of the 64 GiB global cap, and a stream that
+/// disagrees with its own claim is refused. Payloads without a claim (the
+/// legacy XPR core framing) keep only the global cap.
+fn inflate_bounded(compressed: &[u8], claimed: Option<u64>) -> Result<Vec<u8>, XprImportError> {
+    let limit = claimed.unwrap_or(MAX_DECOMPRESSED_DELTA_LEN);
     let mut raw = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_DECOMPRESSED_DELTA_LEN + 1)
+    ZlibDecoder::new(compressed)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut raw)
         .map_err(|error| bad(format!("decompressing state-history delta: {error}")))?;
-    if raw.len() as u64 > MAX_DECOMPRESSED_DELTA_LEN {
+    let inflated = raw.len() as u64;
+    if inflated > limit {
         return Err(bad(format!(
-            "state-history delta exceeds {} byte import limit",
-            MAX_DECOMPRESSED_DELTA_LEN
+            "state-history delta exceeds its {limit} byte limit"
+        )));
+    }
+    if let Some(claimed) = claimed
+        && inflated != claimed
+    {
+        return Err(bad(format!(
+            "state-history delta inflates to {inflated} bytes but claims {claimed}"
         )));
     }
     Ok(raw)
@@ -8189,5 +8212,30 @@ mod tests {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn inflate_is_bounded_by_the_claimed_length() {
+        let data = vec![7u8; 4096];
+        let packed = zlib(&data);
+        assert_eq!(inflate_bounded(&packed, Some(4096)).unwrap(), data);
+        // No claim (legacy framing): only the global cap applies.
+        assert_eq!(inflate_bounded(&packed, None).unwrap(), data);
+        // A stream longer than it claims is cut off and refused.
+        let error = inflate_bounded(&packed, Some(100)).unwrap_err().to_string();
+        assert!(error.contains("exceeds its 100 byte limit"), "{error}");
+        // A stream shorter than it claims is refused too.
+        let error = inflate_bounded(&packed, Some(5000))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("claims 5000"), "{error}");
     }
 }

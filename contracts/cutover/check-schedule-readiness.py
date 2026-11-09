@@ -188,6 +188,10 @@ def main():
     if not scheduled:
         print("readiness: FAIL: producer schedule carries no active producers")
         return 1
+    # The quorum counts distinct keys, and the restore gate refuses a schedule
+    # in which two producers share one: it would freeze fine and fail only
+    # after the ceremony. Catch it here.
+    seen_keys = {}
     for producer in scheduled:
         name = producer.get("producer_name", "?")
         try:
@@ -195,6 +199,12 @@ def main():
         except ValueError as error:
             failures.append(f"{name}: bad schedule key: {error}")
             continue
+        if scheduled_key in seen_keys:
+            failures.append(
+                f"{name}: shares its signing key with {seen_keys[scheduled_key]}; "
+                "the gate refuses duplicate keys in one schedule"
+            )
+        seen_keys.setdefault(scheduled_key, name)
         if name not in active_names:
             failures.append(f"{name}: scheduled but not active in the producers table")
         elif table_keys.get(name) != scheduled_key:

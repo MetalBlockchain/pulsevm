@@ -1258,7 +1258,7 @@ fn successor_from_genesis(genesis_path: &str) -> Result<String, String> {
     if genesis.migration_checkpoint_sha256.is_none() {
         return Err("migration genesis carries no checkpoint binding".to_string());
     }
-    Ok(hex::encode(genesis.compute_chain_id()))
+    Ok(hex::encode(genesis.compute_ceremony_chain_id()))
 }
 
 /// The unsigned confirmation template plus its signing digest, without
@@ -1561,7 +1561,9 @@ async fn status(config: &LoadedConfig) -> ExitCode {
     };
     let pause_state = if !config.inner.stop_producer.at_pause {
         "off"
-    } else if should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height) {
+    } else if should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
+        && view.singleton.as_ref().is_some_and(|s| s.finalized)
+    {
         "due"
     } else {
         "armed"
@@ -1936,6 +1938,23 @@ fn should_pause_producer(stop: &StopConfig, head_num: u32, pause_height: u32) ->
     stop.at_pause && stop.producer_api_url.is_some() && head_num >= pause_height
 }
 
+/// Consecutive identical reads of P's block id required before signing: the
+/// confirmation commits to P's id, and P is still reversible (LIB sits far
+/// behind it), so a microfork around P would split the signers across two
+/// ids. The id has to hold still for several polls first.
+const SETTLE_POLLS: u32 = 4;
+
+/// Record one read of P's block id and return how many consecutive polls it
+/// has now been the same (1 on any change).
+fn settle_step(state: &mut (Option<String>, u32), id: &str) -> u32 {
+    if state.0.as_deref() == Some(id) {
+        state.1 += 1;
+    } else {
+        *state = (Some(id.to_string()), 1);
+    }
+    state.1
+}
+
 /// Pause the local producer via the Leap producer API, then prove it is
 /// paused instead of trusting the first call. Both endpoints are POSTs.
 async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), String> {
@@ -1989,6 +2008,8 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut pause_holding = false;
     let mut window_checked = false;
     let mut window_verified = false;
+    let mut finalized_seen = false;
+    let mut settle: (Option<String>, u32) = (None, 0);
     let mut pause_note = String::new();
     let mut last_note = String::new();
     let mut polls = 0u64;
@@ -2016,6 +2037,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     && let Ok((head, _, chain_id)) =
                         get_info(&client, &config.inner.nodeos_url).await
                     && chain_id == config.inner.source_chain_id
+                    && finalized_seen
                     && should_pause_producer(&config.inner.stop_producer, head, pause_height)
                 {
                     match pause_producer(&client, &api_url).await {
@@ -2105,7 +2127,16 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // live enforcer re-pauses it. To resume production deliberately,
         // stop this voter first: a manual resume while it runs gets
         // re-paused on the next poll.
+        // The pause is the fleet's pact, and the pact only exists once the
+        // declaration has a quorum. Without one, pausing would halt a live
+        // chain for a round that cannot restore, so it waits for the
+        // contract to show the ceremony finalized (remembered, so a later
+        // read failure does not lose it).
+        if view.singleton.as_ref().is_some_and(|s| s.finalized) {
+            finalized_seen = true;
+        }
         if !dry_run
+            && finalized_seen
             && should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
         {
             if let Some(api_url) = config.inner.stop_producer.producer_api_url.clone() {
@@ -2144,6 +2175,9 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             !should_pause_producer(&config.inner.stop_producer, view.head_num, pause_height)
                 || pause_holding
                 || dry_run;
+        // Signing also needs the ceremony finalized: a voter whose own vote
+        // landed in a round that never reached quorum has nothing to attest.
+        let confirmed_ready = confirmed_ready && (finalized_seen || dry_run);
         if should_sign_confirmation(confirmed_ready, view.head_num, pause_height, pause_ok) {
             if dry_run {
                 log_line!(
@@ -2175,6 +2209,33 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // dirty window would only waste the round. Checked once; a
             // violation refuses to sign and is logged every poll so the
             // operator sees it.
+            // P must hold still before it is signed: see SETTLE_POLLS.
+            match fetch_block_id(&client, &config.inner.nodeos_url, pause_height).await {
+                Ok(id) => {
+                    let steady = settle_step(&mut settle, &id);
+                    if steady < SETTLE_POLLS {
+                        note_throttled(
+                            &mut last_note,
+                            &mut polls,
+                            &format!(
+                                "waiting for block P={pause_height} to settle ({steady}/{SETTLE_POLLS})"
+                            ),
+                        );
+                        tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    settle = (None, 0);
+                    note_throttled(
+                        &mut last_note,
+                        &mut polls,
+                        &format!("cannot read block P to settle it: {error}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+                    continue;
+                }
+            }
             if !window_verified {
                 match verify_window_empty(
                     &client,
@@ -3050,6 +3111,18 @@ mod tests {
         // and waiting for it would deadlock the halt past the agreed stop.
         assert!(should_sign_confirmation(true, 105, 105, true));
         assert!(should_sign_confirmation(true, 150, 105, true));
+    }
+
+    #[test]
+    fn p_must_hold_still_before_it_is_signed() {
+        let mut state = (None, 0);
+        assert_eq!(settle_step(&mut state, "aa"), 1);
+        assert_eq!(settle_step(&mut state, "aa"), 2);
+        // A microfork flips P's id: the count starts over.
+        assert_eq!(settle_step(&mut state, "bb"), 1);
+        assert_eq!(settle_step(&mut state, "bb"), 2);
+        assert_eq!(settle_step(&mut state, "bb"), 3);
+        assert_eq!(settle_step(&mut state, "bb"), SETTLE_POLLS);
     }
 
     #[test]

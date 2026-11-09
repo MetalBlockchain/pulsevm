@@ -1346,10 +1346,9 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
         })?;
         self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
-            ChainError::ParseError(format!(
-                "failed to parse node config JSON: {} - {}",
-                e, config_json
-            ))
+            // The config carries the producer's private key: never echo it.
+            // serde's message already names the line and column.
+            ChainError::ParseError(format!("failed to parse node config JSON: {e}"))
         })?);
 
         Self::ensure_no_incomplete_state_sync(db_path)?;
@@ -1383,6 +1382,20 @@ impl Controller {
         let migration_roster: Option<Vec<pulsevm_database::HaltRosterEntry>>;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
+            // The manifest is untrusted JSON: bound it before reading it.
+            const MAX_MIGRATION_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
+            let manifest_len = fs::metadata(manifest_path)
+                .map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "failed to stat migration manifest {manifest_path}: {e}"
+                    ))
+                })?
+                .len();
+            if manifest_len > MAX_MIGRATION_MANIFEST_BYTES {
+                return Err(ChainError::GenesisError(format!(
+                    "migration manifest {manifest_path} is {manifest_len} bytes, over the {MAX_MIGRATION_MANIFEST_BYTES} byte limit"
+                )));
+            }
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to read migration manifest {manifest_path}: {e}"
@@ -1394,11 +1407,6 @@ impl Controller {
                         "failed to parse migration manifest {manifest_path}: {e}"
                     ))
                 })?;
-            manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
-                ))
-            })?;
             let expected_checkpoint_sha256 =
                 rust_genesis.migration_checkpoint_sha256.ok_or_else(|| {
                     ChainError::GenesisError(
@@ -1410,7 +1418,7 @@ impl Controller {
             // ceremony), not by the platform-assigned chain id, which the
             // launcher may allocate. The two-step confirmation binds this
             // derived id; platform divergence stays on the warning path.
-            let migration_derived_chain_id = Id::new(rust_genesis.compute_chain_id());
+            let migration_derived_chain_id = Id::new(rust_genesis.compute_ceremony_chain_id());
             if manifest.checkpoint_sha256 != hex::encode(expected_checkpoint_sha256) {
                 return Err(ChainError::GenesisError(format!(
                     "migration manifest checkpoint hash {} does not match migration genesis {}",
@@ -1440,6 +1448,13 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
+            // The free comparisons above run first; this hashes the whole
+            // (multi-gigabyte) checkpoint, so it only runs once they pass.
+            manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
+                ))
+            })?;
             migration_source_block = Self::migration_source_block(&manifest)?;
             // The new network only promotes state the old network agreed to
             // freeze: when the manifest carries the producers' signed halt
@@ -1519,9 +1534,23 @@ impl Controller {
                 }
             }
             if self.db.revision() <= 0 {
+                // Hash the bytes while restoring them: the manifest hash was
+                // checked on the path earlier, and a file swapped since would
+                // otherwise be installed on the strength of its own envelope.
+                let manifest_checkpoint_sha256: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        ChainError::GenesisError(
+                            "migration manifest checkpoint hash is not 32 bytes of hex".into(),
+                        )
+                    })?;
                 let header = self
                     .db
-                    .restore_from_path(std::path::Path::new(checkpoint))
+                    .restore_from_path_checked(
+                        std::path::Path::new(checkpoint),
+                        Some(&manifest_checkpoint_sha256),
+                    )
                     .map_err(|e| {
                         ChainError::GenesisError(format!(
                             "failed to restore migration checkpoint {checkpoint}: {e}"

@@ -16,10 +16,13 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin]\n\
+        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin] [--no-deferred-sidecar]\n\
          --leap-snapshot reads H's active producer schedule from the Leap snapshot the state history was exported from and\n\
          writes it into the checkpoint, so the checkpoint hash binds the committee. Required for any checkpoint a cutover\n\
-         restores from."
+         restores from.\n\
+         A checkpoint also needs the complete deferred-transaction sidecar (v2, with source_chain_id): without it the\n\
+         replay-protection set and action sequences are lost and the hash differs from every BP that had it.\n\
+         --no-deferred-sidecar waives that for rehearsal fixtures only."
     );
 }
 
@@ -34,6 +37,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         leap_snapshot_path = Some(raw.remove(position + 1));
+        raw.remove(position);
+    }
+    let mut no_deferred_sidecar = false;
+    if let Some(position) = raw.iter().position(|arg| arg == "--no-deferred-sidecar") {
+        no_deferred_sidecar = true;
         raw.remove(position);
     }
     let mut args = raw.into_iter();
@@ -87,6 +95,41 @@ fn main() -> ExitCode {
         }
         None => None,
     };
+    // A checkpoint a cutover restores from must carry the complete sidecar:
+    // a sidecar-less conversion silently drops the replay-protection set and
+    // action sequences, so that BP lands on a different hash than the rest.
+    if checkpoint_path.is_some() && !no_deferred_sidecar {
+        match &deferred_transactions {
+            None => {
+                eprintln!(
+                    "refusing to write a migration checkpoint without the deferred-transaction sidecar (pass it as the fourth argument, or --no-deferred-sidecar for a rehearsal fixture)"
+                );
+                return ExitCode::from(1);
+            }
+            Some((_, sidecar)) if sidecar.source_chain_id.is_none() => {
+                eprintln!(
+                    "refusing to write a migration checkpoint from a legacy sidecar without source_chain_id: re-export with the v2 sidecar plugin"
+                );
+                return ExitCode::from(1);
+            }
+            Some(_) => {}
+        }
+    } else if checkpoint_path.is_some() {
+        eprintln!(
+            "WARNING: --no-deferred-sidecar: this checkpoint is for rehearsal only and will not match a fleet that converted with the sidecar"
+        );
+    }
+    // A leftover arena would fail with a duplicate-account error or, worse,
+    // hash something other than this export: start from an empty directory.
+    if let Ok(mut existing) = fs::read_dir(&database_path)
+        && existing.next().is_some()
+    {
+        eprintln!(
+            "refusing a non-empty arena directory {}: convert into a fresh one",
+            database_path.to_string_lossy()
+        );
+        return ExitCode::from(1);
+    }
     for delta in &entry.deltas {
         eprintln!(
             "XPR table {:<30} rows={} payload-bytes={}",

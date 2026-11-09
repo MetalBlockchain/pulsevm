@@ -251,7 +251,7 @@ fn run(
                 hex::encode(checkpoint_sha256)
             ));
         }
-        let new_chain_id = genesis.compute_chain_id();
+        let new_chain_id = genesis.compute_ceremony_chain_id();
         let header_schedule_version = match manifest
             .source_block
             .as_deref()
