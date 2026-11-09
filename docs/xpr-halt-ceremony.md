@@ -94,6 +94,12 @@ equal it (forgery dies) → key must be in declared S, exact match
   verified, not assumed).
 - Threshold: `signed x 3 > total x 2`, integer math. Strictly greater —
   exactly-two-thirds fails. That's the +1 in 2/3+1.
+- Only valid signatures count. A signature that is malformed, claims a key
+  outside the declared set, or does not recover to its claimed key is
+  skipped, not fatal: one bad entry (a buggy voter, a voter on another fork,
+  a hostile insider) cannot veto a set that still carries a quorum, and adds
+  nothing to a set that does not. A bundle with more signatures than members
+  is refused before any recovery work is done.
 
 Every member weighs exactly 1: the quorum is a **count quorum** over the
 frozen active schedule (names, schedule keys, version), matching Leap

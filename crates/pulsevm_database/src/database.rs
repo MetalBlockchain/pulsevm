@@ -2729,6 +2729,11 @@ impl Database {
     /// Replace the live arena from a snapshot envelope on disk. The envelope
     /// and sparse payload are streamed into a staged chainbase file, avoiding
     /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    /// Where the durable arena state lives inside a database directory.
+    pub fn arena_state_file(dir: &Path) -> std::path::PathBuf {
+        dir.join(ARENA_STATE_FILE)
+    }
+
     pub fn restore_from_path(
         &self,
         snapshot_path: &Path,

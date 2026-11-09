@@ -1391,12 +1391,14 @@ pub fn verify_migration_post_chain(
     // cross-check: the table carries every active row while the schedule
     // names only the committee, so the table cannot authenticate the set).
     check_declaration_matches_recorded_schedule(declaration, &schedule_keys)?;
-    // No hash pin on the staged pending schedule: with no staged change
-    // Leap serves the EMPTY pending schedule, whose hash cannot equal the
-    // active roster's (proven against live header states). The producer
-    // signature binds the exact (root, hash) pair below — only the true
-    // pair recovers to the roster key — so a forged state fails at
-    // recovery, not at a comparison.
+    // The post-H entries carry whatever pending-schedule hash their producer
+    // signed; it is not compared with the roster here, only bound through
+    // the signature below (only the true (root, hash) pair recovers to the
+    // roster key). The H entry is different: for a chain whose schedule has
+    // changed (version > 0) its signed hash must equal the hash of the
+    // recorded schedule (see `verify_migration_halt_block`). Observed live:
+    // the hash differs from the active roster's only at version 0, the
+    // genesis schedule, which no proposal ever hashed.
     let mut expected_num = height
         .checked_add(1)
         .ok_or_else(|| "migration cutover height overflows u32".to_string())?;
@@ -6334,6 +6336,16 @@ mod tests {
         assert_eq!(
             first, second,
             "independent conversions of one export must be byte-identical"
+        );
+        // Golden value: CI runs this test on amd64 and arm64, so a literal
+        // here is the cross-architecture proof (one fixed export, one hash,
+        // every host). It changes only when the checkpoint format does; update
+        // it deliberately, together with the format change, never to quiet a
+        // failure.
+        assert_eq!(
+            hex::encode(pulsevm_crypto::Digest::hash(&first).0),
+            "b4f029e8e4472e773a6db85a9596da95c4157449dddfa582d160306a05f12761",
+            "checkpoint bytes for the fixed export changed"
         );
     }
 

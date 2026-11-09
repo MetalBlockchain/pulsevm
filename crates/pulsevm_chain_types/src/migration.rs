@@ -1243,39 +1243,44 @@ impl HaltContractCeremony {
     }
 }
 
-/// Recover every signature over `digest`, requiring each claimed key to be
-/// rostered. Returns the rostered keys that signed, each counted once.
-/// `context` names the ceremony step for error messages.
+/// Recover every signature over `digest` and return the rostered keys that
+/// validly signed, each counted once. A signature that is malformed, claims a
+/// key outside the roster, or does not recover to its claimed key is skipped
+/// rather than fatal: it adds nothing to the quorum, and one bad entry (a buggy
+/// voter, a voter on another fork, a hostile insider) must not veto a set that
+/// still carries a valid quorum. An honest bundle carries at most one entry per
+/// roster member, so more entries than that is refused before any recovery
+/// work is spent. `context` names the ceremony step for error messages.
 fn recover_rostered_signatures(
     signatures: &[HaltSignature],
     roster: &[HaltRosterEntry],
     digest: &[u8; 32],
     context: &str,
 ) -> Result<std::collections::HashSet<K1PublicKey>, ChainError> {
+    if signatures.len() > roster.len() {
+        return Err(ChainError::InternalError(format!(
+            "halt {context} carries {} signatures for a {}-member set",
+            signatures.len(),
+            roster.len()
+        )));
+    }
     let mut signed = std::collections::HashSet::new();
     for entry in signatures {
-        let claimed = K1PublicKey::from_string(&entry.key).map_err(|e| {
-            ChainError::InternalError(format!("halt {context} signature key invalid: {e:?}"))
-        })?;
+        let Ok(claimed) = K1PublicKey::from_string(&entry.key) else {
+            continue;
+        };
         if !roster.iter().any(|rostered| rostered.key == claimed) {
-            return Err(ChainError::InternalError(format!(
-                "halt {context} signature from producer {} is not in the declared set",
-                entry.producer
-            )));
+            continue;
         }
-        let signature = K1Signature::from_string(&entry.signature).map_err(|e| {
-            ChainError::InternalError(format!("halt {context} signature malformed: {e:?}"))
-        })?;
-        let recovered = signature.recover(digest).map_err(|e| {
-            ChainError::InternalError(format!("halt {context} signature unrecoverable: {e:?}"))
-        })?;
-        if recovered != claimed {
-            return Err(ChainError::InternalError(format!(
-                "halt {context} signature from producer {} does not verify",
-                entry.producer
-            )));
+        let Ok(signature) = K1Signature::from_string(&entry.signature) else {
+            continue;
+        };
+        match signature.recover(digest) {
+            Ok(recovered) if recovered == claimed => {
+                signed.insert(claimed);
+            }
+            _ => {}
         }
-        signed.insert(claimed);
     }
     Ok(signed)
 }
@@ -2633,5 +2638,103 @@ mod tests {
             .is_err(),
             "votes signed for another contract account must be refused"
         );
+    }
+
+    // 21-member boundary at the gate: 15 distinct valid signatures pass, 14
+    // fail, and one invalid entry neither vetoes a valid quorum nor adds to a
+    // short one.
+    fn twenty_one() -> (Vec<K1PrivateKey>, Vec<HaltRosterEntry>) {
+        let keys: Vec<K1PrivateKey> = (0..21).map(|n| key(&format!("quorum-{n}"))).collect();
+        let roster = keys
+            .iter()
+            .enumerate()
+            .map(|(n, k)| HaltRosterEntry {
+                producer: format!("bp{n}"),
+                key: k.public_key(),
+                weight: HaltWeight::MEMBER,
+            })
+            .collect();
+        (keys, roster)
+    }
+
+    fn quorum_over(
+        signatures: &[HaltSignature],
+        roster: &[HaltRosterEntry],
+        digest: &[u8; 32],
+    ) -> Result<(), ChainError> {
+        let signed = recover_rostered_signatures(signatures, roster, digest, "test")?;
+        check_two_thirds_quorum(roster, &signed, "test")
+    }
+
+    fn sig_by(k: &K1PrivateKey, n: usize, digest: &[u8; 32]) -> HaltSignature {
+        HaltSignature {
+            producer: format!("bp{n}"),
+            key: k.public_key().to_string(),
+            signature: k.sign(digest).to_string(),
+        }
+    }
+
+    #[test]
+    fn twenty_one_member_quorum_boundary_is_fifteen() {
+        let (keys, roster) = twenty_one();
+        let digest = [9u8; 32];
+        let sigs = |count: usize| -> Vec<HaltSignature> {
+            keys.iter()
+                .enumerate()
+                .take(count)
+                .map(|(n, k)| sig_by(k, n, &digest))
+                .collect()
+        };
+        assert!(quorum_over(&sigs(15), &roster, &digest).is_ok());
+        assert!(quorum_over(&sigs(14), &roster, &digest).is_err());
+    }
+
+    #[test]
+    fn one_invalid_signature_cannot_veto_a_valid_quorum() {
+        let (keys, roster) = twenty_one();
+        let digest = [9u8; 32];
+        let mut sigs: Vec<HaltSignature> = keys
+            .iter()
+            .enumerate()
+            .take(15)
+            .map(|(n, k)| sig_by(k, n, &digest))
+            .collect();
+        // A 16th member signs a different digest (a voter on another fork).
+        sigs.push(sig_by(&keys[15], 15, &[1u8; 32]));
+        assert!(quorum_over(&sigs, &roster, &digest).is_ok());
+        // The same garbage entry adds nothing to a short set.
+        let mut short: Vec<HaltSignature> = keys
+            .iter()
+            .enumerate()
+            .take(14)
+            .map(|(n, k)| sig_by(k, n, &digest))
+            .collect();
+        short.push(sig_by(&keys[15], 15, &[1u8; 32]));
+        assert!(quorum_over(&short, &roster, &digest).is_err());
+        // A stranger's key and a non-key string are skipped the same way.
+        let outsider = key("outsider");
+        short.push(sig_by(&outsider, 99, &digest));
+        short.push(HaltSignature {
+            producer: "bp0".into(),
+            key: "not-a-key".into(),
+            signature: "not-a-signature".into(),
+        });
+        assert!(quorum_over(&short, &roster[..21], &digest).is_err());
+    }
+
+    #[test]
+    fn more_signatures_than_members_is_refused() {
+        let (keys, roster) = twenty_one();
+        let digest = [9u8; 32];
+        let mut sigs: Vec<HaltSignature> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, k)| sig_by(k, n, &digest))
+            .collect();
+        sigs.push(sig_by(&keys[0], 0, &digest));
+        let error = quorum_over(&sigs, &roster, &digest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signatures for a 21-member set"), "{error}");
     }
 }

@@ -1289,6 +1289,52 @@ impl Controller {
         upgrade_bytes: &[u8],
         db_path: &str,
     ) -> Result<(), ChainError> {
+        // A migration restore installs the checkpoint on disk before the
+        // checks that follow it (deferred inventory, pause window, schedule
+        // binding) have run. If one of them refuses the boot, the restored
+        // state must not survive: the next start would see a database past
+        // the checkpoint revision, take the "reuse" branch, and skip the
+        // checks that just failed. State this call created is discarded on
+        // error; state that was already there is never touched.
+        let state_file = Database::arena_state_file(std::path::Path::new(db_path));
+        let existed = state_file.exists();
+        let result = self.initialize_with_protocol_upgrades_inner(
+            chain_id,
+            config_bytes,
+            genesis_bytes,
+            upgrade_bytes,
+            db_path,
+        );
+        if result.is_err() && !existed && state_file.exists() && self.restoring_migration() {
+            if let Err(error) = fs::remove_file(&state_file) {
+                warn!(
+                    "migration boot refused and the restored state {} could not be discarded: {error}",
+                    state_file.display()
+                );
+            } else {
+                info!(
+                    "migration boot refused: discarded the restored state {}",
+                    state_file.display()
+                );
+            }
+        }
+        result
+    }
+
+    fn restoring_migration(&self) -> bool {
+        self.node_config
+            .as_ref()
+            .is_some_and(|config| config.migration_checkpoint.is_some())
+    }
+
+    fn initialize_with_protocol_upgrades_inner(
+        &mut self,
+        chain_id: &Id,
+        config_bytes: &[u8],
+        genesis_bytes: &[u8],
+        upgrade_bytes: &[u8],
+        db_path: &str,
+    ) -> Result<(), ChainError> {
         self.subjective_billing.clear();
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
@@ -12204,6 +12250,25 @@ mod tests {
         assert!(
             error.to_string().contains("no source schedule"),
             "expected the missing-schedule refusal, got: {error}"
+        );
+        // The refused boot must not leave the restored state behind, or the
+        // next start would reuse it and skip the checks that just failed.
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "a refused migration boot left restored state on disk"
+        );
+        let mut restarted = Controller::new();
+        let again = restarted
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a restart must be refused the same way");
+        assert!(
+            again.to_string().contains("no source schedule"),
+            "restart took a different path: {again}"
         );
         Ok(())
     }

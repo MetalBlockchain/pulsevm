@@ -1084,6 +1084,50 @@ async fn fetch_block_id(
         .ok_or_else(|| format!("get_block {height} missing id"))
 }
 
+/// One block of the H+1..P window must carry nothing: a zero transaction
+/// merkle root and no transactions. The gate refuses any other window, so a
+/// voter that signed over one would attest a round that cannot restore.
+fn window_block_is_empty(block: &serde_json::Value, number: u32) -> Result<(), String> {
+    let mroot = block
+        .get("transaction_mroot")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("get_block {number} missing transaction_mroot"))?;
+    if mroot.len() != 64 || mroot.bytes().any(|byte| byte != b'0') {
+        return Err(format!(
+            "block {number} in the H..P window carries transactions (transaction_mroot {mroot})"
+        ));
+    }
+    if block
+        .get("transactions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|transactions| !transactions.is_empty())
+    {
+        return Err(format!(
+            "block {number} in the H..P window lists transactions"
+        ));
+    }
+    Ok(())
+}
+
+/// Walk H+1..=P on the local node and require every block to be empty.
+async fn verify_window_empty(
+    client: &reqwest::Client,
+    base: &str,
+    height: u32,
+    pause_height: u32,
+) -> Result<(), String> {
+    for number in height.saturating_add(1)..=pause_height {
+        let block = post_json(
+            client,
+            &format!("{base}/v1/chain/get_block"),
+            &serde_json::json!({ "block_num_or_id": number.to_string() }),
+        )
+        .await?;
+        window_block_is_empty(&block, number)?;
+    }
+    Ok(())
+}
+
 /// Leap block timestamp (`2026-10-23T13:50:31.500`, always UTC) to
 /// microseconds since the Unix epoch. No chrono/time dependency: the
 /// days-from-civil count is exact for the Gregorian calendar, and the
@@ -1944,6 +1988,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut voted = false;
     let mut pause_holding = false;
     let mut window_checked = false;
+    let mut window_verified = false;
     let mut pause_note = String::new();
     let mut last_note = String::new();
     let mut polls = 0u64;
@@ -1961,6 +2006,25 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 if last_note != error {
                     log_line!("node unreachable, retrying: {error}");
                     last_note = error;
+                }
+                // The pause must not queue behind the ceremony reads: one
+                // slow table read or schedule fetch used to skip it for the
+                // whole poll, and the producer kept building past P. Try the
+                // pause from the head alone.
+                if !dry_run
+                    && let Some(api_url) = config.inner.stop_producer.producer_api_url.clone()
+                    && let Ok((head, _, chain_id)) =
+                        get_info(&client, &config.inner.nodeos_url).await
+                    && chain_id == config.inner.source_chain_id
+                    && should_pause_producer(&config.inner.stop_producer, head, pause_height)
+                {
+                    match pause_producer(&client, &api_url).await {
+                        Ok(()) => pause_holding = true,
+                        Err(pause_error) => {
+                            pause_holding = false;
+                            log_line!("producer pause failed, retrying: {pause_error}");
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
                 continue;
@@ -1981,7 +2045,14 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 view.head_num,
                 view.lib_num,
             ) {
-                return Err(error);
+                if view.head_num < config.inner.height {
+                    return Err(error);
+                }
+                // Past H the window is already running and the fleet agreed
+                // P: exiting here would leave this producer unpaused at P.
+                // Keep enforcing the pause; without an irreversible H there
+                // is no snapshot, so no checkpoint hash and no signature.
+                log_line!("WARNING after H: {error}");
             }
         }
         match decide(config, &view) {
@@ -2099,6 +2170,35 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // here on every poll until the coordinator has it — including
             // after the local producer has paused, since the coordinator
             // is off-chain.
+            // Nothing may have landed in H+1..P: the gate refuses any other
+            // window, and by now XPR is already paused, so signing over a
+            // dirty window would only waste the round. Checked once; a
+            // violation refuses to sign and is logged every poll so the
+            // operator sees it.
+            if !window_verified {
+                match verify_window_empty(
+                    &client,
+                    &config.inner.nodeos_url,
+                    config.inner.height,
+                    pause_height,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        window_verified = true;
+                        log_line!("H+1..P={} verified empty on the local node", pause_height);
+                    }
+                    Err(error) => {
+                        note_throttled(
+                            &mut last_note,
+                            &mut polls,
+                            &format!("refusing to sign: {error}"),
+                        );
+                        tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+                        continue;
+                    }
+                }
+            }
             match submit_confirmation(&client, config).await {
                 Ok(line) => {
                     log_line!("{line}");
@@ -2950,6 +3050,29 @@ mod tests {
         // and waiting for it would deadlock the halt past the agreed stop.
         assert!(should_sign_confirmation(true, 105, 105, true));
         assert!(should_sign_confirmation(true, 150, 105, true));
+    }
+
+    #[test]
+    fn window_blocks_must_be_empty() {
+        let empty = serde_json::json!({
+            "transaction_mroot": "0".repeat(64),
+            "transactions": []
+        });
+        assert!(window_block_is_empty(&empty, 101).is_ok());
+        let busy = serde_json::json!({
+            "transaction_mroot": "ab".repeat(32),
+            "transactions": [{"trx": {}}]
+        });
+        let error = window_block_is_empty(&busy, 102).unwrap_err();
+        assert!(error.contains("102"), "{error}");
+        // A zero root with a listed transaction is still refused.
+        let listed = serde_json::json!({
+            "transaction_mroot": "0".repeat(64),
+            "transactions": [{"trx": {}}]
+        });
+        assert!(window_block_is_empty(&listed, 103).is_err());
+        // A node that omits the root cannot be trusted to have checked it.
+        assert!(window_block_is_empty(&serde_json::json!({}), 104).is_err());
     }
 
     #[test]

@@ -41,8 +41,15 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
    should read `on-chain` for every rostered producer. Tally vs 2/3 is
    visible on the contract/ceremony table and the coordinator.
 3. **H.** Nobody acts. The chain produces H; the voter observes it. With
-   `stop_producer` armed, each producer pauses after delivering its
-   confirmation. Post-H stragglers are expected and ignored — the new
+   `stop_producer` armed, each producer pauses at the agreed stop P (not
+   after delivering its confirmation), from the head alone, so a slow
+   ceremony read cannot delay it. The voter signs only once its pause is
+   confirmed held and the local node shows H+1..P empty (zero transaction
+   root in every block); a dirty window refuses to sign and says so in the
+   log, because the restore gate would refuse the round anyway. A voter
+   restarted after H keeps enforcing the pause even if the finality window
+   no longer checks out (it logs a warning instead of exiting). Post-H
+   stragglers are expected and ignored — the new
    chain never honors them — but a producer still building minutes past H
    means its voter is down: page it.
 4. **Confirm (H..H+J deadline).** The voter signs the confirmation over the
