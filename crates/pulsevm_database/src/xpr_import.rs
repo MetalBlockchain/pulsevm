@@ -2002,8 +2002,14 @@ pub fn hydrate_full_state_with_deferred_transactions(
     db.arena_start_undo_session();
     let result = (|| {
         if let Some(sidecar) = deferred_transactions {
+            // Canonical order (by transaction id), not the sidecar's array
+            // order, for the same reason rows are sorted at decode.
+            let mut keyed = Vec::with_capacity(sidecar.transactions.len());
             for row in &sidecar.transactions {
-                let key = sidecar_key(row)?;
+                keyed.push((sidecar_key(row)?, row));
+            }
+            keyed.sort_by(|a, b| a.0.trx_id.cmp(&b.0.trx_id));
+            for (key, row) in keyed {
                 db.xpr_import_deferred_transaction(
                     key.sender,
                     key.sender_id,
@@ -3293,19 +3299,98 @@ struct ImportUsage {
 }
 
 fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, XprImportError> {
-    let mut result = Vec::new();
+    // Canonical order inside a table: by the row's own bytes (which lead with
+    // its key), across every delta of that table. Arena row ids are insertion
+    // order and the checkpoint lists rows by id, so the checkpoint hash would
+    // otherwise depend on the order each BP's state history happened to emit
+    // rows. Tables keep the order they first appear in. Sorting makes the
+    // conversion a function of the set of rows.
+    let mut table_rank: HashMap<&str, usize> = HashMap::new();
+    let mut ordered: Vec<(usize, &str, &TableDeltaRow)> = Vec::new();
     for delta in &entry.deltas {
+        let next = table_rank.len();
+        let rank = *table_rank.entry(delta.name.as_str()).or_insert(next);
         for row in &delta.rows {
-            if !row.present {
-                return Err(bad(format!(
-                    "table {:?} contains a removal; expected a full-state export",
-                    delta.name
-                )));
-            }
-            result.push(decode_portable_row(&delta.name, &row.data)?);
+            ordered.push((rank, delta.name.as_str(), row));
         }
     }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.data.cmp(&b.2.data)));
+    let mut result = Vec::with_capacity(ordered.len());
+    for (_, name, row) in ordered {
+        if !row.present {
+            return Err(bad(format!(
+                "table {name:?} contains a removal; expected a full-state export"
+            )));
+        }
+        result.push(decode_portable_row(name, &row.data)?);
+    }
+    order_permissions_parent_first(&mut result);
     Ok(result)
+}
+
+/// Permissions are inserted with their parent's arena id, so a parent must be
+/// inserted before its children. Reorder the permission rows by depth in the
+/// parent chain, keeping the canonical byte order within one depth. A cycle or
+/// a missing parent keeps its rows last, where hydration reports it.
+fn order_permissions_parent_first(rows: &mut [PortableRow]) {
+    let slots: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row, PortableRow::Permission { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    if slots.len() < 2 {
+        return;
+    }
+    let parents: HashMap<(u64, u64), u64> = slots
+        .iter()
+        .filter_map(|&index| match &rows[index] {
+            PortableRow::Permission {
+                owner,
+                name,
+                parent_name,
+                ..
+            } => Some(((*owner, *name), *parent_name)),
+            _ => None,
+        })
+        .collect();
+    let depth = |owner: u64, name: u64| -> usize {
+        let mut depth = 0;
+        let mut current = name;
+        while let Some(&parent) = parents.get(&(owner, current)) {
+            if parent == 0 {
+                return depth;
+            }
+            depth += 1;
+            current = parent;
+            if depth > parents.len() {
+                break;
+            }
+        }
+        // Missing parent or cycle: after every well-formed chain.
+        usize::MAX
+    };
+    let mut permissions: Vec<(usize, PortableRow)> = slots
+        .iter()
+        .map(|&index| {
+            // Move the row out; the slot is refilled below.
+            let row = std::mem::replace(
+                &mut rows[index],
+                PortableRow::ProtocolState {
+                    features: Vec::new(),
+                },
+            );
+            let key = match &row {
+                PortableRow::Permission { owner, name, .. } => depth(*owner, *name),
+                _ => usize::MAX,
+            };
+            (key, row)
+        })
+        .collect();
+    permissions.sort_by_key(|(key, _)| *key);
+    for (slot, (_, row)) in slots.into_iter().zip(permissions) {
+        rows[slot] = row;
+    }
 }
 
 fn decode_portable_row(name: &str, data: &[u8]) -> Result<PortableRow, XprImportError> {
@@ -8237,5 +8322,94 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("claims 5000"), "{error}");
+    }
+
+    // The checkpoint must be a function of the set of rows, not of the order a
+    // BP's state history emitted them: accounts, permissions (children listed
+    // before their parents) and deferred-style rows in any order give the same
+    // bytes.
+    #[test]
+    fn checkpoint_does_not_depend_on_row_order() {
+        fn convert(entry: &StateHistoryEntry) -> Vec<u8> {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state(&mut db, entry).unwrap();
+            db.set_revision(7).unwrap();
+            db.snapshot_bytes().unwrap()
+        }
+        let account_row = |name: u64| {
+            let mut row = vec![0];
+            row.extend_from_slice(&name.to_le_bytes());
+            row.extend_from_slice(&7u32.to_le_bytes());
+            bytes(&mut row, &[]);
+            row
+        };
+        let permission_row = |owner: u64, name: u64, parent: u64| {
+            let mut row = vec![0];
+            row.extend_from_slice(&owner.to_le_bytes());
+            row.extend_from_slice(&name.to_le_bytes());
+            row.extend_from_slice(&parent.to_le_bytes());
+            row.extend_from_slice(&0i64.to_le_bytes());
+            row.extend_from_slice(&0u32.to_le_bytes());
+            row.extend_from_slice(&[0, 0, 0]);
+            row
+        };
+        let table = |name: &str, rows: Vec<Vec<u8>>| TableDelta {
+            name: name.into(),
+            rows: rows
+                .into_iter()
+                .map(|data| TableDeltaRow {
+                    present: true,
+                    data,
+                })
+                .collect(),
+        };
+        let (a, b) = (1_000u64, 2_000u64);
+        // owner(100) <- active(200) <- custom(300) for each account.
+        let in_order = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                table("account", vec![account_row(a), account_row(b)]),
+                table(
+                    "permission",
+                    vec![
+                        permission_row(a, 100, 0),
+                        permission_row(a, 200, 100),
+                        permission_row(a, 300, 200),
+                        permission_row(b, 100, 0),
+                        permission_row(b, 200, 100),
+                    ],
+                ),
+            ],
+        };
+        // The same rows, accounts swapped and every permission listed child
+        // first, split across two deltas of the same table.
+        let shuffled = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas: vec![
+                table("account", vec![account_row(b), account_row(a)]),
+                table(
+                    "permission",
+                    vec![
+                        permission_row(a, 300, 200),
+                        permission_row(b, 200, 100),
+                        permission_row(a, 200, 100),
+                    ],
+                ),
+                table(
+                    "permission",
+                    vec![permission_row(b, 100, 0), permission_row(a, 100, 0)],
+                ),
+            ],
+        };
+        let first = convert(&in_order);
+        assert!(!first.is_empty());
+        assert_eq!(
+            first,
+            convert(&shuffled),
+            "row order changed the checkpoint bytes"
+        );
     }
 }

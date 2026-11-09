@@ -323,6 +323,15 @@ the rest of the fleet. `--no-deferred-sidecar` waives it for rehearsal
 fixtures only and prints a warning. It also refuses a non-empty arena
 directory.
 
+**The conversion is a function of the set of rows.** Arena row ids are
+insertion order and the checkpoint lists rows by id, so the hash would depend
+on the order each BP's state history emitted rows. The converter therefore
+sorts the rows of each table by their own bytes (and the sidecar's deferred
+transactions by transaction id) before inserting, and orders permissions
+parent-first. A shuffled export, including permissions listed before their
+parents, converts to the same bytes (`checkpoint_does_not_depend_on_row_order`).
+This removes the assumption that every BP's node emits rows in one order.
+
 **The schedule is anchored in H's own signature.** The id and signature of H
 do not directly commit to the active schedule, which would let an attacker
 holding a real H snapshot keep H's header and producer entry and swap the
