@@ -682,6 +682,73 @@ wait "$STUB_PID" 2>/dev/null || true
 [[ -n "$FEDBLOCKED" ]] || fail "operator-fed voter did not report signing blocked: $(tail -5 "$WORK/fed-pause.log")"
 pass "an operator-fed voter pauses at P and reports signing blocked until the inputs land"
 
+echo "cutover-voter-test: the whole operator flow: start fed-empty, pause, feed a bad value, feed the good ones, sign..."
+# The ceremony agent's real order after H. The same chain, one voter config
+# edited between restarts the way the agent edits it.
+feed_config() { # $1=base config $2=checkpoint $3=coordinator url or empty -> new config path
+    local out="$WORK/voter-fed-$RANDOM.json"
+    python3 - "$1" "$out" "$2" "${3:-}" "$GENESIS" "$PLATFORM" <<'PYEOF'
+import json, sys
+src, out, checkpoint, coord, genesis, platform = sys.argv[1:7]
+cfg = json.load(open(src))
+conf = cfg["confirmation"]
+conf["checkpoint_sha256"] = checkpoint
+conf["migration_genesis"] = genesis
+conf["platform_chain_id"] = platform
+if coord:
+    conf["coordinator_url"] = coord
+json.dump(cfg, open(out, "w"))
+PYEOF
+    printf '%s' "$out"
+}
+wait_for_log() { # $1=file $2=pattern $3=pid $4=tries
+    for _ in $(seq 1 "$4"); do
+        grep -q "$2" "$1" 2>/dev/null && return 0
+        kill -0 "$3" 2>/dev/null || return 1
+        sleep 2
+    done
+    return 1
+}
+start_stub true "$WORK/flow-hits" "$WORK/stub-flow.port"
+FLOWSTUB_PORT="$(cat "$WORK/stub-flow.port")"
+FLOW_BASE="$(mk_config "$H" false "" "" "http://127.0.0.1:${FLOWSTUB_PORT}" OPFED)"
+rm -f "$FLOW_BASE.finalized"
+# 1. Nothing fed: pauses, blocks signing.
+"$VOTER_BIN" --config "$FLOW_BASE" >"$WORK/flow-1.log" 2>&1 &
+FLOW_PID=$!
+wait_for_log "$WORK/flow-1.log" "local producer paused at P=" "$FLOW_PID" 60 || fail "flow 1: no pause: $(tail -5 "$WORK/flow-1.log")"
+wait_for_log "$WORK/flow-1.log" "signing blocked" "$FLOW_PID" 15 || fail "flow 1: signing not reported blocked: $(tail -5 "$WORK/flow-1.log")"
+kill "$FLOW_PID" 2>/dev/null || true; wait "$FLOW_PID" 2>/dev/null || true
+[[ -s "$FLOW_BASE.finalized" ]] || fail "flow 1: finalization marker was not written next to the config"
+# 2. A bad checkpoint is fed after H: the voter must keep enforcing the pause
+# and refuse to sign, not exit.
+BAD_FLOW="$(feed_config "$FLOW_BASE" "$(python3 -c 'print("cd" * 32)')" "")"
+cp "$FLOW_BASE.finalized" "$BAD_FLOW.finalized"
+"$VOTER_BIN" --config "$BAD_FLOW" >"$WORK/flow-2.log" 2>&1 &
+FLOW_PID=$!
+wait_for_log "$WORK/flow-2.log" "local producer paused at P=" "$FLOW_PID" 60 || fail "flow 2: a bad fed value ended pause enforcement: $(tail -5 "$WORK/flow-2.log")"
+sleep 6
+kill -0 "$FLOW_PID" 2>/dev/null || fail "flow 2: the voter exited on a bad fed value: $(tail -5 "$WORK/flow-2.log")"
+grep -q "ALARM event=cutover.signing_inputs_invalid" "$WORK/flow-2.log" || fail "flow 2: no alarm for the bad fed value: $(head -5 "$WORK/flow-2.log")"
+grep -q "did not derive" "$WORK/flow-2.log" || fail "flow 2: the bad value was not named: $(head -5 "$WORK/flow-2.log")"
+! grep -q "delivered to coordinator" "$WORK/flow-2.log" || fail "flow 2: the voter signed with a bad fed value"
+kill "$FLOW_PID" 2>/dev/null || true; wait "$FLOW_PID" 2>/dev/null || true
+# 3. The good values land: the restarted voter signs and delivers. The marker
+# from run 1 restores finalization before any chain read.
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-flow.jsonl" "$H" "$WORK/coord-flow.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-flow.log" 2>&1 &
+COORD_PID=$!
+for _ in $(seq 1 30); do [[ -s "$WORK/coord-flow.port" ]] && break; sleep 1; done
+GOOD_FLOW="$(feed_config "$FLOW_BASE" "$(python3 -c 'print("ab" * 32)')" "http://127.0.0.1:$(cat "$WORK/coord-flow.port")")"
+cp "$FLOW_BASE.finalized" "$GOOD_FLOW.finalized"
+"$VOTER_BIN" --config "$GOOD_FLOW" >"$WORK/flow-3.log" 2>&1 &
+FLOW_PID=$!
+wait_for_log "$WORK/flow-3.log" "delivered to coordinator" "$FLOW_PID" 90 || fail "flow 3: no signature after the good values were fed: $(tail -8 "$WORK/flow-3.log")"
+kill "$FLOW_PID" 2>/dev/null || true; wait "$FLOW_PID" 2>/dev/null || true
+kill "$COORD_PID" 2>/dev/null || true; wait "$COORD_PID" 2>/dev/null || true
+kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true
+grep -q "ceremony finalization restored" "$WORK/flow-3.log" || fail "flow 3: the restart did not restore finalization from the marker"
+pass "operator flow: fed-empty pause, bad fed value blocks signing but keeps the pause, good values sign after a restart"
+
 echo "cutover-voter-test: unverified pause never goes quiet..."
 start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"
 STUB_BAD_PORT="$(cat "$WORK/stub-bad.port")"

@@ -549,13 +549,24 @@ fn main() -> ExitCode {
         eprintln!("chainbase sidecar block does not match nodeos full-state record");
         return ExitCode::from(1);
     }
-    let source_rows = match source_tables(&entry) {
+    let mut source_rows = match source_tables(&entry) {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("invalid nodeos table set: {error}");
             return ExitCode::from(1);
         }
     };
+    // The converter moves XPR's microsecond CPU figures to metering points in
+    // global_property and the three resource tables. Apply the same documented
+    // transform to the source side so the comparison is like with like; every
+    // other byte of every table is still compared exactly.
+    if let Err(error) = pulsevm_database::redenominate_source_tables(&mut source_rows) {
+        eprintln!("cannot apply the CPU redenomination to the nodeos tables: {error}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "redenominated CPU figures in nodeos global_property, resource_limits_config, resource_limits_state and resource_usage (the converter's own transform)"
+    );
     let mut database = match Database::new(&arena_path.to_string_lossy(), 64 * 1024 * 1024) {
         Ok(database) => database,
         Err(error) => {

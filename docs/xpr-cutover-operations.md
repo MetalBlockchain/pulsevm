@@ -237,6 +237,22 @@ pauses at P regardless. Signing needs all three and says "signing blocked"
 until they are present. `--preflight` prints WAIT for missing fields before H
 and FAIL at or after H ("pause holds, signing blocked").
 
+A fed value that does not validate (a checkpoint hash that does not match the
+genesis, a malformed platform id) must not end pause enforcement: a voter that
+exits there leaves the producer unpaused, and a nodeos restart would resume
+block production past P. For an `operator_fed` config the voter therefore still
+loads, logs `ALARM event=cutover.signing_inputs_invalid`, keeps enforcing the
+pause, and refuses to sign until the value is fixed and the voter restarted
+(`--preflight` prints FAIL). Without `operator_fed`, a bad value refuses to
+load, as before.
+
+The voter remembers that its own ceremony finalized in `<config>.finalized`
+(bound to the declaration digest). After a restart the fallback pause, which
+runs when chain reads fail, works from that marker instead of waiting for one
+successful read. The tail scan over H+1..P requires each block to name the one
+before it as `previous`, so a reorg between two fetches is caught instead of
+leaving one block uninspected.
+
 ## CPU units after the cut
 
 XPR's `chain_config` carries CPU caps in microseconds; PulseVM bills and limits
@@ -248,14 +264,39 @@ The converter therefore replaces `max_block_cpu_usage`,
 `max_transaction_cpu_usage` and `min_transaction_cpu_usage` with the native
 point values (3,000,000,000 / 1,000,000,000 / 100,000), sized against measured
 intrinsic costs (`docs/intrinsic-cost-model.md`). A fixed x38,000 does not fit
-the `u32` fields. The checkpoint hash covers the result, and
-`global_property` therefore differs from the nodeos snapshot in the table
-compare, as it already did.
+the `u32` fields.
 
-Not covered: the resource-limits config and state rows (virtual CPU limit,
-per-block targets) and account CPU usage accumulators are still microsecond
-values. Accounts with unlimited CPU (`cpu_limit` -1) are unaffected; accounts
-with finite stake need those rows redenominated, which is a separate design.
+The caps alone are not enough, and the first block would also reseed the
+resource-limits config from `chain_config`. An account's CPU allowance is its
+stake share of the virtual CPU limit, and its usage is an accumulator in the
+same unit. So the converter also scales, by one factor, every CPU figure in
+the resource rows: the resource-limits config (CPU target and max), the
+state's virtual CPU limit and block accumulator, and each account's CPU usage
+accumulator (`value_ex` and `consumed`). The factor is
+`3,000,000,000 / the source's own block CPU cap` (15,000 for XPR's 200,000 us),
+read from the source `resource_limits_config` row, so every account's
+used-to-available ratio stays exactly where it was on XPR, and the imported
+config already equals what the first block derives from `chain_config`. Stake
+weights, RAM and NET do not move. The checkpoint hash covers all of it
+(`redenominate_resource_rows`, `crates/pulsevm_database/src/xpr_import.rs`).
+
+The table compare applies the same transform to the nodeos side before it
+compares (`redenominate_source_tables`) for `global_property`,
+`resource_limits_config`, `resource_limits_state` and `resource_usage`, and
+prints a line saying so; every other byte and table is still compared exactly.
+
+The factor is a ratio of block caps, not a measurement of cost per microsecond.
+Whether that makes a typical XPR account's allowance buy the same real work is
+an open calibration question that needs the mainnet replay: measure billed
+points per source microsecond across real traffic and compare it with the
+factor. An account whose whole allowance is below the 100,000-point minimum
+bill cannot transact; that is about 7 us of XPR-equivalent allowance, below
+XPR's own 100 us minimum bill, so nobody who could transact on XPR is locked
+out by the minimum alone.
+
+The state-history window oracle (`xpr_apply_history_window`) replays raw XPR
+deltas onto a hydrated state. After a converted import its CPU figures are in
+different units, so it is only meaningful for tables other than the four above.
 
 ## Coordinator status contract (agent side)
 

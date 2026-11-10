@@ -111,6 +111,7 @@ pub use crate::{
         migration_state_producer_keys,
         packed_source_block_schedule_version,
         parse_initial_state_history_log,
+        redenominate_source_tables,
         verify_memo_names_exist,
         verify_migration_halt_block,
         verify_migration_halt_commitment,

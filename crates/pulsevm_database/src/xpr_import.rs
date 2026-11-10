@@ -1998,7 +1998,8 @@ pub fn hydrate_full_state_with_deferred_transactions(
     entry: &StateHistoryEntry,
     deferred_transactions: Option<&DeferredTransactionSidecar>,
 ) -> Result<ImportSummary, XprImportError> {
-    let rows = decode_portable_rows(entry)?;
+    let mut rows = decode_portable_rows(entry)?;
+    redenominate_resource_rows(&mut rows)?;
     validate_code_links(&rows, entry.block_id, deferred_transactions)?;
     let mut summary = ImportSummary::default();
 
@@ -3967,10 +3968,23 @@ fn decode_global_property(bytes: &[u8]) -> Result<PortableRow, XprImportError> {
 }
 
 fn decode_global_property_layout(
-    mut row: RowCursor<'_>,
+    row: RowCursor<'_>,
     has_producer_schedule: bool,
     legacy_config_fields: bool,
 ) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
+    let (config, source_chain_id, _) =
+        decode_global_property_layout_at(row, has_producer_schedule, legacy_config_fields)?;
+    Ok((config, source_chain_id))
+}
+
+/// As [`decode_global_property_layout`], also returning the byte offset of the
+/// four contiguous CPU fields (`max_block_cpu_usage` .. `min_transaction_cpu_usage`)
+/// so the raw row can be patched without a second parser.
+fn decode_global_property_layout_at(
+    mut row: RowCursor<'_>,
+    has_producer_schedule: bool,
+    legacy_config_fields: bool,
+) -> Result<(ChainConfigV0, [u8; 32], usize), XprImportError> {
     if has_producer_schedule {
         // proposed_schedule_block_num is optional<uint32>.
         if row.bool()? {
@@ -3985,14 +3999,22 @@ fn decode_global_property_layout(
             "unsupported XPR chain_config version {config_version}"
         )));
     }
+    let max_block_net_usage = row.u64()?;
+    let target_block_net_usage_pct = row.u32()?;
+    let max_transaction_net_usage = row.u32()?;
+    let base_per_transaction_net_usage = row.u32()?;
+    let net_usage_leeway = row.u32()?;
+    let context_free_discount_net_usage_num = row.u32()?;
+    let context_free_discount_net_usage_den = row.u32()?;
+    let cpu_offset = row.pos;
     let config = ChainConfigV0 {
-        max_block_net_usage: row.u64()?,
-        target_block_net_usage_pct: row.u32()?,
-        max_transaction_net_usage: row.u32()?,
-        base_per_transaction_net_usage: row.u32()?,
-        net_usage_leeway: row.u32()?,
-        context_free_discount_net_usage_num: row.u32()?,
-        context_free_discount_net_usage_den: row.u32()?,
+        max_block_net_usage,
+        target_block_net_usage_pct,
+        max_transaction_net_usage,
+        base_per_transaction_net_usage,
+        net_usage_leeway,
+        context_free_discount_net_usage_num,
+        context_free_discount_net_usage_den,
         max_block_cpu_usage: row.u32()?,
         target_block_cpu_usage_pct: row.u32()?,
         max_transaction_cpu_usage: row.u32()?,
@@ -4030,7 +4052,7 @@ fn decode_global_property_layout(
         }
     }
     row.finish()?;
-    Ok((redenominate_cpu_caps(config), source_chain_id))
+    Ok((redenominate_cpu_caps(config), source_chain_id, cpu_offset))
 }
 
 /// PulseVM's CPU limits are denominated in metering points (about 1/38000 us
@@ -4052,6 +4074,185 @@ fn redenominate_cpu_caps(mut config: ChainConfigV0) -> ChainConfigV0 {
     config.max_transaction_cpu_usage = POINT_MAX_TRANSACTION_CPU_USAGE;
     config.min_transaction_cpu_usage = POINT_MIN_TRANSACTION_CPU_USAGE;
     config
+}
+
+/// Move every CPU figure in the resource-limits rows from XPR microseconds to
+/// metering points, by one factor: `POINT_MAX_BLOCK_CPU_USAGE` over the source
+/// chain's own block CPU cap (`resource_limits_config`, 200,000 us on XPR).
+///
+/// Capping the chain parameters alone is not enough. Each account's CPU
+/// allowance is its stake share of the virtual CPU limit, and its usage is an
+/// accumulator in the same unit. Left in microseconds, a transaction billed in
+/// points exceeds a finite-stake account's allowance by orders of magnitude,
+/// and the first block would also reseed the config from `chain_config`, so the
+/// chain would change limits under the checkpoint. Scaling the config's
+/// target/max, the state's virtual limit and block accumulator, and every
+/// account accumulator by the same factor keeps each account's used/available
+/// ratio exactly where it was on XPR. Stake weights, RAM and NET are not CPU
+/// figures and do not move. Part of the conversion, so covered by the
+/// checkpoint hash.
+fn redenominate_resource_rows(rows: &mut [PortableRow]) -> Result<(), XprImportError> {
+    let source_cap = rows.iter().find_map(|row| match row {
+        PortableRow::ResourceConfig { cpu, .. } => Some(cpu.max),
+        _ => None,
+    });
+    let has_cpu_rows = rows.iter().any(|row| {
+        matches!(
+            row,
+            PortableRow::ResourceState { .. } | PortableRow::ResourceUsage { .. }
+        )
+    });
+    let Some(source_cap) = source_cap else {
+        if has_cpu_rows {
+            return Err(bad(
+                "cannot redenominate CPU usage: resource_limits_config is missing",
+            ));
+        }
+        return Ok(());
+    };
+    if source_cap == 0 {
+        return Err(bad("XPR resource_limits_config has a zero CPU cap"));
+    }
+    let scale = |value: u64| -> Result<u64, XprImportError> {
+        let scaled =
+            u128::from(value) * u128::from(POINT_MAX_BLOCK_CPU_USAGE) / u128::from(source_cap);
+        u64::try_from(scaled).map_err(|_| {
+            bad(format!(
+                "CPU figure {value} overflows u64 when redenominated"
+            ))
+        })
+    };
+    let scale_usage = |usage: &mut ImportUsage| -> Result<(), XprImportError> {
+        usage.value_ex = scale(usage.value_ex)?;
+        usage.consumed = scale(usage.consumed)?;
+        Ok(())
+    };
+    for row in rows.iter_mut() {
+        match row {
+            PortableRow::ResourceConfig { cpu, .. } => {
+                cpu.max = scale(cpu.max)?;
+                cpu.target = scale(cpu.target)?;
+            }
+            PortableRow::ResourceState {
+                cpu,
+                virtual_cpu_limit,
+                ..
+            } => {
+                scale_usage(cpu)?;
+                *virtual_cpu_limit = scale(*virtual_cpu_limit)?;
+            }
+            PortableRow::ResourceUsage { cpu_usage, .. } => scale_usage(cpu_usage)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Apply the converter's CPU redenomination to the raw SHiP rows of a source
+/// snapshot, so a byte comparison against the converted state compares like
+/// with like. The transform is the importer's own (`redenominate_cpu_caps`,
+/// `redenominate_resource_rows`); this only re-expresses it as in-place byte
+/// patches on the four affected tables: `global_property`,
+/// `resource_limits_config`, `resource_limits_state` and `resource_usage`.
+/// Every other byte of every row, and every other table, is left alone, so
+/// any real divergence still shows up.
+pub fn redenominate_source_tables(
+    tables: &mut std::collections::BTreeMap<String, Vec<(bool, Vec<u8>)>>,
+) -> Result<(), String> {
+    const CONFIG_CPU_TARGET: usize = 2;
+    const CONFIG_CPU_MAX: usize = 10;
+    const STATE_CPU_VALUE_EX: usize = 27;
+    const STATE_CPU_CONSUMED: usize = 35;
+    const STATE_VIRTUAL_CPU: usize = 75;
+    const STATE_LEN: usize = 83;
+    const USAGE_CPU_VALUE_EX: usize = 35;
+    const USAGE_CPU_CONSUMED: usize = 43;
+    const USAGE_LEN: usize = 59;
+
+    fn read(row: &[u8], at: usize) -> Result<u64, String> {
+        let bytes = row
+            .get(at..at + 8)
+            .ok_or("source row is too short to redenominate")?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+    }
+
+    let source_cap = match tables.get("resource_limits_config").map(Vec::as_slice) {
+        Some([(_, row)]) => read(row, CONFIG_CPU_MAX)?,
+        Some(_) => return Err("resource_limits_config must hold exactly one row".into()),
+        None => return Ok(()),
+    };
+    if source_cap == 0 {
+        return Err("source resource_limits_config has a zero CPU cap".into());
+    }
+    let scale = |value: u64| -> Result<u64, String> {
+        u64::try_from(
+            u128::from(value) * u128::from(POINT_MAX_BLOCK_CPU_USAGE) / u128::from(source_cap),
+        )
+        .map_err(|_| format!("CPU figure {value} overflows u64 when redenominated"))
+    };
+    let patch = |row: &mut Vec<u8>, at: usize| -> Result<(), String> {
+        let value = scale(read(row, at)?)?;
+        row[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    };
+    for (table, rows) in tables.iter_mut() {
+        for (_, row) in rows.iter_mut() {
+            match table.as_str() {
+                "resource_limits_config" => {
+                    patch(row, CONFIG_CPU_TARGET)?;
+                    patch(row, CONFIG_CPU_MAX)?;
+                }
+                "resource_limits_state" => {
+                    if row.len() != STATE_LEN {
+                        return Err(format!("resource_limits_state row is {} bytes", row.len()));
+                    }
+                    for at in [STATE_CPU_VALUE_EX, STATE_CPU_CONSUMED, STATE_VIRTUAL_CPU] {
+                        patch(row, at)?;
+                    }
+                }
+                "resource_usage" => {
+                    if row.len() != USAGE_LEN {
+                        return Err(format!("resource_usage row is {} bytes", row.len()));
+                    }
+                    for at in [USAGE_CPU_VALUE_EX, USAGE_CPU_CONSUMED] {
+                        patch(row, at)?;
+                    }
+                }
+                "global_property" => {
+                    let offset = global_property_cpu_offset(row).map_err(|e| e.to_string())?;
+                    let fields = row
+                        .get_mut(offset..offset + 16)
+                        .ok_or("global_property row is too short to redenominate")?;
+                    fields[0..4].copy_from_slice(&POINT_MAX_BLOCK_CPU_USAGE.to_le_bytes());
+                    fields[8..12].copy_from_slice(&POINT_MAX_TRANSACTION_CPU_USAGE.to_le_bytes());
+                    fields[12..16].copy_from_slice(&POINT_MIN_TRANSACTION_CPU_USAGE.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn global_property_cpu_offset(bytes: &[u8]) -> Result<usize, XprImportError> {
+    // The same three layouts, in the same order, as `decode_global_property`.
+    let mut first_error = None;
+    for (has_schedule, legacy_fields) in [(true, false), (true, true), (false, true)] {
+        let mut row = RowCursor::new(bytes);
+        let version = row.varuint()?;
+        if version != 1 {
+            return Err(bad(format!(
+                "unsupported XPR global_property version {version}"
+            )));
+        }
+        match decode_global_property_layout_at(row, has_schedule, legacy_fields) {
+            Ok((_, _, offset)) => return Ok(offset),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.expect("three layouts were attempted"))
 }
 
 fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
@@ -5020,6 +5221,408 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn xpr_cpu_params(max: u64, target: u64) -> crate::backend::ElasticParams {
+        crate::backend::ElasticParams {
+            target,
+            max,
+            periods: 120,
+            max_multiplier: 1000,
+            contract: (99, 100),
+            expand: (1000, 999),
+        }
+    }
+
+    fn usage(value_ex: u64, consumed: u64) -> ImportUsage {
+        ImportUsage {
+            value_ex,
+            consumed,
+            last_ordinal: 7,
+        }
+    }
+
+    fn xpr_resource_rows() -> Vec<PortableRow> {
+        vec![
+            PortableRow::ResourceConfig {
+                cpu: xpr_cpu_params(200_000, 50_000),
+                net: xpr_cpu_params(1_048_576, 104_857),
+                cpu_window: 172_800,
+                net_window: 172_800,
+            },
+            PortableRow::ResourceState {
+                net: usage(11, 12),
+                cpu: usage(2_000_000, 300),
+                total_net_weight: 5,
+                total_cpu_weight: 6,
+                total_ram_bytes: 7,
+                virtual_net_limit: 1_048_576,
+                virtual_cpu_limit: 400_000,
+            },
+            PortableRow::ResourceUsage {
+                owner: 9,
+                ram_usage: 4,
+                net_usage: usage(21, 22),
+                cpu_usage: usage(1_000, 3),
+            },
+            PortableRow::ResourceLimits {
+                owner: 9,
+                net_weight: 1,
+                cpu_weight: 2,
+                ram_bytes: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn resource_rows_scale_by_the_block_cap_ratio_and_keep_every_account_ratio() {
+        let mut rows = xpr_resource_rows();
+        redenominate_resource_rows(&mut rows).unwrap();
+        // 3e9 points / 200,000 us.
+        let factor = 15_000u64;
+        let PortableRow::ResourceConfig { cpu, net, .. } = &rows[0] else {
+            panic!()
+        };
+        assert_eq!(cpu.max, 3_000_000_000);
+        assert_eq!(cpu.target, 50_000 * factor);
+        assert_eq!((cpu.periods, cpu.max_multiplier), (120, 1000));
+        assert_eq!((cpu.contract, cpu.expand), ((99, 100), (1000, 999)));
+        assert_eq!(
+            (net.max, net.target),
+            (1_048_576, 104_857),
+            "net is untouched"
+        );
+        let PortableRow::ResourceState {
+            net,
+            cpu,
+            virtual_cpu_limit,
+            virtual_net_limit,
+            total_cpu_weight,
+            ..
+        } = &rows[1]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (cpu.value_ex, cpu.consumed),
+            (2_000_000 * factor, 300 * factor)
+        );
+        assert_eq!(cpu.last_ordinal, 7);
+        assert_eq!((net.value_ex, net.consumed), (11, 12));
+        assert_eq!(*virtual_cpu_limit, 400_000 * factor);
+        assert_eq!(*virtual_net_limit, 1_048_576);
+        assert_eq!(
+            *total_cpu_weight, 6,
+            "stake weights are not CPU-denominated"
+        );
+        let PortableRow::ResourceUsage {
+            cpu_usage,
+            net_usage,
+            ram_usage,
+            ..
+        } = &rows[2]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (cpu_usage.value_ex, cpu_usage.consumed),
+            (1_000 * factor, 3 * factor)
+        );
+        assert_eq!(
+            (net_usage.value_ex, net_usage.consumed, *ram_usage),
+            (21, 22, 4)
+        );
+        let PortableRow::ResourceLimits { cpu_weight, .. } = &rows[3] else {
+            panic!()
+        };
+        assert_eq!(*cpu_weight, 2);
+    }
+
+    #[test]
+    fn the_scaled_config_already_matches_what_the_first_block_would_derive() {
+        // finalize_block_resources rebuilds the config from chain_config each
+        // block. If the imported row differed, the first block would silently
+        // change the limits and the checkpoint would not describe the chain.
+        let mut rows = xpr_resource_rows();
+        redenominate_resource_rows(&mut rows).unwrap();
+        let PortableRow::ResourceConfig { cpu, .. } = &rows[0] else {
+            panic!()
+        };
+        assert_eq!(cpu.max, u64::from(POINT_MAX_BLOCK_CPU_USAGE));
+        // 25% target (2500 basis points), as eos_percent does it.
+        assert_eq!(
+            cpu.target,
+            u64::from(POINT_MAX_BLOCK_CPU_USAGE) * 2500 / 10_000
+        );
+    }
+
+    #[test]
+    fn resource_rows_without_a_source_cpu_cap_are_refused() {
+        let mut rows = xpr_resource_rows();
+        rows.remove(0);
+        let error = redenominate_resource_rows(&mut rows)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resource_limits_config"), "{error}");
+
+        let mut rows = xpr_resource_rows();
+        let PortableRow::ResourceConfig { cpu, .. } = &mut rows[0] else {
+            panic!()
+        };
+        cpu.max = 0;
+        assert!(redenominate_resource_rows(&mut rows).is_err());
+    }
+
+    #[test]
+    fn a_cpu_accumulator_that_overflows_u64_is_refused_not_wrapped() {
+        let mut rows = xpr_resource_rows();
+        let PortableRow::ResourceUsage { cpu_usage, .. } = &mut rows[2] else {
+            panic!()
+        };
+        cpu_usage.value_ex = u64::MAX / 2;
+        let error = redenominate_resource_rows(&mut rows)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overflow"), "{error}");
+    }
+
+    #[test]
+    fn a_non_microsecond_source_cap_scales_by_its_own_ratio() {
+        let mut rows = xpr_resource_rows();
+        let PortableRow::ResourceConfig { cpu, .. } = &mut rows[0] else {
+            panic!()
+        };
+        cpu.max = 150_000;
+        redenominate_resource_rows(&mut rows).unwrap();
+        let PortableRow::ResourceState {
+            virtual_cpu_limit, ..
+        } = &rows[1]
+        else {
+            panic!()
+        };
+        assert_eq!(*virtual_cpu_limit, 400_000 * 20_000);
+    }
+
+    fn put_u64(row: &mut [u8], at: usize, value: u64) {
+        row[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn raw_config_row(cpu_max: u64, cpu_target: u64) -> Vec<u8> {
+        let mut row = vec![0];
+        for (target, max) in [(cpu_target, cpu_max), (104_857, 1_048_576)] {
+            row.push(0);
+            row.extend_from_slice(&target.to_le_bytes());
+            row.extend_from_slice(&max.to_le_bytes());
+            row.extend_from_slice(&120u32.to_le_bytes());
+            row.extend_from_slice(&1000u32.to_le_bytes());
+            for (num, den) in [(99u64, 100u64), (1000, 999)] {
+                row.push(0);
+                row.extend_from_slice(&num.to_le_bytes());
+                row.extend_from_slice(&den.to_le_bytes());
+            }
+        }
+        row.extend_from_slice(&172_800u32.to_le_bytes());
+        row.extend_from_slice(&172_800u32.to_le_bytes());
+        row
+    }
+
+    fn raw_state_row() -> Vec<u8> {
+        let mut row = vec![0];
+        for (ordinal, value_ex, consumed) in [(7u32, 11u64, 12u64), (7, 2_000_000, 300)] {
+            row.push(0);
+            row.extend_from_slice(&ordinal.to_le_bytes());
+            row.extend_from_slice(&value_ex.to_le_bytes());
+            row.extend_from_slice(&consumed.to_le_bytes());
+        }
+        for value in [5u64, 6, 7, 1_048_576, 400_000] {
+            row.extend_from_slice(&value.to_le_bytes());
+        }
+        row
+    }
+
+    fn raw_usage_row() -> Vec<u8> {
+        let mut row = vec![0];
+        row.extend_from_slice(&9u64.to_le_bytes());
+        for (ordinal, value_ex, consumed) in [(7u32, 21u64, 22u64), (7, 1_000, 3)] {
+            row.push(0);
+            row.extend_from_slice(&ordinal.to_le_bytes());
+            row.extend_from_slice(&value_ex.to_le_bytes());
+            row.extend_from_slice(&consumed.to_le_bytes());
+        }
+        row.extend_from_slice(&4u64.to_le_bytes());
+        row
+    }
+
+    #[test]
+    fn the_raw_byte_patch_agrees_with_the_decoded_row_transform() {
+        // The compare tool patches source bytes; the importer transforms
+        // decoded rows. They must give the same state or the compare would
+        // hide (or invent) a divergence.
+        let config = raw_config_row(200_000, 50_000);
+        let state = raw_state_row();
+        let usage = raw_usage_row();
+        let mut decoded = vec![
+            decode_resource_config(&config).unwrap(),
+            decode_resource_state(&state).unwrap(),
+            decode_resource_usage(&usage).unwrap(),
+        ];
+        redenominate_resource_rows(&mut decoded).unwrap();
+
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("resource_limits_config".to_owned(), vec![(true, config)]);
+        tables.insert("resource_limits_state".to_owned(), vec![(true, state)]);
+        tables.insert("resource_usage".to_owned(), vec![(true, usage)]);
+        redenominate_source_tables(&mut tables).unwrap();
+
+        let PortableRow::ResourceConfig { cpu, .. } = &decoded[0] else {
+            panic!()
+        };
+        let patched = decode_resource_config(&tables["resource_limits_config"][0].1).unwrap();
+        let PortableRow::ResourceConfig {
+            cpu: patched_cpu, ..
+        } = patched
+        else {
+            panic!()
+        };
+        assert_eq!((patched_cpu.max, patched_cpu.target), (cpu.max, cpu.target));
+
+        let PortableRow::ResourceState {
+            cpu,
+            virtual_cpu_limit,
+            net,
+            ..
+        } = &decoded[1]
+        else {
+            panic!()
+        };
+        let PortableRow::ResourceState {
+            cpu: p_cpu,
+            virtual_cpu_limit: p_virtual,
+            net: p_net,
+            ..
+        } = decode_resource_state(&tables["resource_limits_state"][0].1).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (p_cpu.value_ex, p_cpu.consumed),
+            (cpu.value_ex, cpu.consumed)
+        );
+        assert_eq!(p_virtual, *virtual_cpu_limit);
+        assert_eq!(
+            (p_net.value_ex, p_net.consumed),
+            (net.value_ex, net.consumed)
+        );
+
+        let PortableRow::ResourceUsage {
+            cpu_usage,
+            net_usage,
+            ..
+        } = &decoded[2]
+        else {
+            panic!()
+        };
+        let PortableRow::ResourceUsage {
+            cpu_usage: p_cpu,
+            net_usage: p_net,
+            ..
+        } = decode_resource_usage(&tables["resource_usage"][0].1).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (p_cpu.value_ex, p_cpu.consumed),
+            (cpu_usage.value_ex, cpu_usage.consumed)
+        );
+        assert_eq!(
+            (p_net.value_ex, p_net.consumed),
+            (net_usage.value_ex, net_usage.consumed)
+        );
+    }
+
+    #[test]
+    fn the_raw_byte_patch_touches_only_the_cpu_bytes() {
+        let original = raw_usage_row();
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            "resource_limits_config".to_owned(),
+            vec![(true, raw_config_row(200_000, 50_000))],
+        );
+        tables.insert("resource_usage".to_owned(), vec![(true, original.clone())]);
+        redenominate_source_tables(&mut tables).unwrap();
+        let patched = &tables["resource_usage"][0].1;
+        let changed: Vec<usize> = (0..original.len())
+            .filter(|&i| original[i] != patched[i])
+            .collect();
+        // value_ex 1000 -> 15,000,000 and consumed 3 -> 45,000 only.
+        assert!(changed.iter().all(|i| (35..51).contains(i)), "{changed:?}");
+        assert_eq!(patched[..35], original[..35]);
+        assert_eq!(patched[51..], original[51..]);
+    }
+
+    #[test]
+    fn the_raw_global_property_patch_matches_the_decoded_caps() {
+        let current = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
+        let legacy = hex::decode("01010000100000000000e8030000000008000c000000f40100001400000064000000005ed0b2c409000000ca9a3ba0860100100e000000100000060006000001000098f998d9010e744bddcef4a12ac306b93919537caa232ca19de2ed50322bb6fa0000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
+        for mut row in [current, legacy] {
+            let offset = global_property_cpu_offset(&row).unwrap();
+            // Put XPR's microsecond caps in the row, as a real source has them.
+            row[offset..offset + 4].copy_from_slice(&200_000u32.to_le_bytes());
+            row[offset + 8..offset + 12].copy_from_slice(&150_000u32.to_le_bytes());
+            row[offset + 12..offset + 16].copy_from_slice(&100u32.to_le_bytes());
+            let mut tables = std::collections::BTreeMap::new();
+            tables.insert(
+                "resource_limits_config".to_owned(),
+                vec![(true, raw_config_row(200_000, 50_000))],
+            );
+            tables.insert("global_property".to_owned(), vec![(true, row.clone())]);
+            redenominate_source_tables(&mut tables).unwrap();
+            let patched = &tables["global_property"][0].1;
+            assert_eq!(patched.len(), row.len());
+            let changed: Vec<usize> = (0..row.len()).filter(|&i| row[i] != patched[i]).collect();
+            assert!(!changed.is_empty());
+            assert!(
+                changed.iter().all(|i| (offset..offset + 16).contains(i)),
+                "{changed:?}"
+            );
+            // Decoding the patched row reaches the same config as the original
+            // (both redenominate), and the raw bytes now hold the point values.
+            let PortableRow::GlobalProperty { config: a, .. } =
+                decode_global_property(&row).unwrap()
+            else {
+                panic!()
+            };
+            let PortableRow::GlobalProperty { config: b, .. } =
+                decode_global_property(patched).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(a, b);
+            assert_eq!(
+                &patched[offset..offset + 4],
+                &POINT_MAX_BLOCK_CPU_USAGE.to_le_bytes()
+            );
+            assert_eq!(
+                &patched[offset + 8..offset + 12],
+                &POINT_MAX_TRANSACTION_CPU_USAGE.to_le_bytes()
+            );
+            assert_eq!(
+                &patched[offset + 12..offset + 16],
+                &POINT_MIN_TRANSACTION_CPU_USAGE.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_patch_refuses_a_malformed_resource_row_instead_of_guessing() {
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            "resource_limits_config".to_owned(),
+            vec![(true, raw_config_row(200_000, 50_000))],
+        );
+        tables.insert("resource_usage".to_owned(), vec![(true, vec![0; 10])]);
+        assert!(redenominate_source_tables(&mut tables).is_err());
+        let _ = put_u64;
+    }
 
     #[test]
     fn imported_cpu_caps_are_point_denominated_not_xpr_microseconds() {
@@ -6624,6 +7227,26 @@ mod tests {
         }
         usage_row.extend_from_slice(&4u64.to_le_bytes());
         deltas.push(delta("resource_usage", usage_row));
+        // The CPU redenomination needs the source's block CPU cap, which only
+        // `resource_limits_config` carries, so a full state must include it.
+        let mut config_row = vec![0];
+        for (target, max) in [(50_000u64, 200_000u64), (104_857, 1_048_576)] {
+            config_row.push(0);
+            config_row.extend_from_slice(&target.to_le_bytes());
+            config_row.extend_from_slice(&max.to_le_bytes());
+            config_row.extend_from_slice(&120u32.to_le_bytes());
+            config_row.extend_from_slice(&1000u32.to_le_bytes());
+            for (num, den) in [(99u64, 100u64), (1000, 999)] {
+                config_row.push(0);
+                config_row.extend_from_slice(&num.to_le_bytes());
+                config_row.extend_from_slice(&den.to_le_bytes());
+            }
+        }
+        for window in [172_800u32, 172_800] {
+            config_row.extend_from_slice(&window.to_le_bytes());
+        }
+        deltas.push(delta("resource_limits_config", config_row));
+        deltas.push(delta("resource_limits_state", raw_state_row()));
         // One account with metadata, code, and an owner permission, exactly
         // the rows the sidecar must cover one-for-one.
         let code_hash = [0xC0u8; 32];
@@ -6706,6 +7329,17 @@ mod tests {
                 packed_trx: hex::encode(&packed_trx),
             }],
         };
+        // Before any block, the chain must already report the point-denominated
+        // limits. A restored chain only refreshes them in finalize_block_resources,
+        // so a block-sized transaction would otherwise be dropped until a
+        // smaller one landed and built the first block.
+        {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+            assert_eq!(db.get_block_cpu_limit().unwrap(), 3_000_000_000);
+            assert_eq!(db.get_virtual_block_cpu_limit().unwrap(), 400_000 * 15_000);
+        }
         let first = convert(&entry, &sidecar);
         let second = convert(&entry, &sidecar);
         assert!(!first.is_empty());

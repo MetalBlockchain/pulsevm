@@ -186,6 +186,35 @@ struct LoadedConfig {
     /// The published source schedule hash pinned in the migration genesis
     /// this voter will sign. The live active schedule must hash to it.
     schedule_pin: [u8; 32],
+    /// Why signing is blocked although the config loaded: an operator-fed
+    /// value (checkpoint hash, genesis, platform id) was supplied after H and
+    /// does not validate. The voter must keep running, because exiting here
+    /// would end pause enforcement and a nodeos restart would resume
+    /// production past P. Signing refuses until the operator fixes the value.
+    fed_inputs_error: Option<String>,
+    /// Remembers that this voter's own ceremony finalized, so the fallback
+    /// pause still works after a restart while the chain reads fail.
+    finalized_marker: std::path::PathBuf,
+}
+
+/// The marker sits next to the config and is bound to the declaration digest:
+/// a different ceremony never inherits it.
+fn finalized_marker_path(config_path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{config_path}.finalized"))
+}
+
+fn read_finalized_marker(path: &std::path::Path, digest: &[u8; 32]) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text.trim() == hex::encode(digest))
+        .unwrap_or(false)
+}
+
+fn write_finalized_marker(path: &std::path::Path, digest: &[u8; 32]) -> Result<(), String> {
+    let tmp = path.with_extension("finalized.tmp");
+    std::fs::write(&tmp, format!("{}\n", hex::encode(digest)))
+        .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|error| format!("rename {} to {}: {error}", tmp.display(), path.display()))
 }
 
 fn load_config(path: &str) -> Result<Config, String> {
@@ -366,17 +395,28 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
     let schedule_pin = parse_hash32(schedule_hex)
         .map_err(|error| format!("confirmation.schedule_sha256: {error}"))?;
     let checkpoint = inner.confirmation.checkpoint_sha256.as_deref();
-    if let Some(checkpoint) = checkpoint {
-        parse_hash32(checkpoint)
-            .map_err(|error| format!("confirmation.checkpoint_sha256: {error}"))?;
-    }
-    if let Some(platform) = inner.confirmation.platform_chain_id.as_deref() {
-        pulsevm_crypto::parse_chain_id(platform)
-            .map_err(|error| format!("confirmation.platform_chain_id: {error}"))?;
-    }
-    if let Some(genesis_path) = inner.confirmation.migration_genesis.as_deref() {
-        genesis_binding(genesis_path, checkpoint, &schedule_pin)?;
-    }
+    let validate_present_inputs = || -> Result<(), String> {
+        if let Some(checkpoint) = checkpoint {
+            parse_hash32(checkpoint)
+                .map_err(|error| format!("confirmation.checkpoint_sha256: {error}"))?;
+        }
+        if let Some(platform) = inner.confirmation.platform_chain_id.as_deref() {
+            pulsevm_crypto::parse_chain_id(platform)
+                .map_err(|error| format!("confirmation.platform_chain_id: {error}"))?;
+        }
+        if let Some(genesis_path) = inner.confirmation.migration_genesis.as_deref() {
+            genesis_binding(genesis_path, checkpoint, &schedule_pin)?;
+        }
+        Ok(())
+    };
+    // An operator-fed value arrives after H, when the voter is already
+    // enforcing the pause: a bad one must block signing, not stop the voter.
+    // A config that is not operator-fed has nothing to protect and refuses.
+    let fed_inputs_error = match validate_present_inputs() {
+        Ok(()) => None,
+        Err(error) if inner.confirmation.operator_fed => Some(error),
+        Err(error) => return Err(error),
+    };
     let missing = missing_confirmation_inputs(&inner.confirmation);
     if !missing.is_empty() && !inner.confirmation.operator_fed {
         return Err(format!(
@@ -391,6 +431,8 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
         payer_account,
         expected_digest,
         schedule_pin,
+        fed_inputs_error,
+        finalized_marker: finalized_marker_path(path),
     })
 }
 
@@ -1183,8 +1225,28 @@ fn window_block_is_empty(block: &serde_json::Value, number: u32) -> Result<(), S
     Ok(())
 }
 
+/// Each block must name the previous one as its parent. The scan fetches by
+/// number, so without this a reorg between two fetches could leave one block
+/// uninspected while the final id still matched.
+fn window_block_links(
+    block: &serde_json::Value,
+    number: u32,
+    expected_previous: &str,
+) -> Result<(), String> {
+    let previous = block
+        .get("previous")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("get_block {number} missing previous"))?;
+    if !previous.eq_ignore_ascii_case(expected_previous) {
+        return Err(format!(
+            "block {number} does not link to the block scanned before it (previous {previous}, expected {expected_previous}): the chain reorganized during the scan"
+        ));
+    }
+    Ok(())
+}
+
 /// Walk the blocks after `after` through `through` on the local node and
-/// require every one to be empty.
+/// require every one to be empty and to link to the one before it.
 async fn verify_window_empty(
     client: &reqwest::Client,
     base: &str,
@@ -1192,6 +1254,11 @@ async fn verify_window_empty(
     through: u32,
 ) -> Result<String, String> {
     let mut last_id = None;
+    let mut expected_previous = if through > after {
+        Some(fetch_block_id(client, base, after).await?)
+    } else {
+        None
+    };
     for number in after.saturating_add(1)..=through {
         let block = post_json(
             client,
@@ -1200,10 +1267,16 @@ async fn verify_window_empty(
         )
         .await?;
         window_block_is_empty(&block, number)?;
-        last_id = block
+        if let Some(previous) = &expected_previous {
+            window_block_links(&block, number, previous)?;
+        }
+        let id = block
             .get("id")
             .and_then(|value| value.as_str())
-            .map(str::to_owned);
+            .ok_or_else(|| format!("get_block {number} missing id"))?
+            .to_owned();
+        expected_previous = Some(id.clone());
+        last_id = Some(id);
     }
     // The id of the block coverage ends at: a fork that replaces blocks above
     // P changes it, so cached coverage keyed to it cannot go stale.
@@ -1467,6 +1540,11 @@ async fn unsigned_confirmation(
     let checkpoint = config.inner.confirmation.checkpoint_sha256.clone();
     // The voter signs only a genesis it has read: the successor id is
     // derived from the configured genesis, never adopted from a coordinator.
+    if let Some(error) = &config.fed_inputs_error {
+        return Err(format!(
+            "signing blocked (the pause is unaffected): a fed input is invalid: {error}"
+        ));
+    }
     let missing = missing_confirmation_inputs(&config.inner.confirmation);
     if !missing.is_empty() {
         return Err(format!(
@@ -1871,7 +1949,12 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
                 );
             }
             let missing = missing_confirmation_inputs(&config.inner.confirmation);
-            if missing.is_empty() {
+            if let Some(error) = &config.fed_inputs_error {
+                failures += 1;
+                println!(
+                    "PREFLIGHT FAIL: confirmation inputs: a fed value is invalid ({error}): the pause holds but signing is blocked until it is fixed"
+                );
+            } else if missing.is_empty() {
                 println!(
                     "PREFLIGHT ok: confirmation inputs: checkpoint hash, migration genesis and platform id are set and bound to the pinned schedule"
                 );
@@ -2279,7 +2362,22 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut pause_holding = false;
     let mut window_checked = false;
     let mut window_verified: Option<(String, u32, String)> = None;
-    let mut finalized_seen = false;
+    // Restored from the marker so a restart does not drop the fallback pause
+    // until one chain read succeeds.
+    let mut finalized_seen =
+        read_finalized_marker(&config.finalized_marker, &config.expected_digest);
+    if finalized_seen {
+        log_line!(
+            "ceremony finalization restored from {}",
+            config.finalized_marker.display()
+        );
+    }
+    if let Some(error) = &config.fed_inputs_error {
+        log_line!(
+            "ALARM event=cutover.signing_inputs_invalid producer={} outcome=failure: {error}; the pause stays enforced and signing is blocked until the value is fixed and the voter restarted",
+            config.inner.producer
+        );
+    }
     let mut settle: (Option<String>, u32) = (None, 0);
     let mut pause_note = String::new();
     let mut last_note = String::new();
@@ -2425,6 +2523,12 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // contract to show the ceremony finalized (remembered, so a later
         // read failure does not lose it).
         if own_finalized(config, &view) {
+            if !finalized_seen
+                && let Err(error) =
+                    write_finalized_marker(&config.finalized_marker, &config.expected_digest)
+            {
+                log_line!("could not persist the finalization marker: {error}");
+            }
             finalized_seen = true;
         }
         if !dry_run
@@ -2762,6 +2866,8 @@ mod tests {
             payer_account: "prod.a".to_string(),
             expected_digest: digest,
             schedule_pin: [0x5C; 32],
+            fed_inputs_error: None,
+            finalized_marker: std::path::PathBuf::from("/nonexistent/voter.finalized"),
         }
     }
 
@@ -3644,11 +3750,57 @@ mod tests {
             ),
         ];
         for (confirmation, expected) in refusals {
-            let error = load_loaded_config(&with(confirmation))
+            // Not operator-fed: nothing is running yet, so a bad value refuses.
+            let strict = confirmation.replace(r#""operator_fed":true,"#, "");
+            let error = load_loaded_config(&with(strict))
                 .err()
                 .expect("a bad confirmation input must refuse to load");
             assert!(error.contains(expected), "{error} (wanted {expected})");
+            // Operator-fed: the value arrives after H, with the pause already
+            // enforced. Refusing to start would end that enforcement, so the
+            // voter loads, remembers why, and refuses only to sign.
+            let loaded = load_loaded_config(&with(confirmation))
+                .expect("an operator-fed bad value must not stop the voter");
+            let reason = loaded.fed_inputs_error.expect("the reason is recorded");
+            assert!(reason.contains(expected), "{reason} (wanted {expected})");
         }
+        assert!(good.fed_inputs_error.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_window_block_must_link_to_the_one_scanned_before_it() {
+        let block = serde_json::json!({ "previous": "AB12" });
+        assert!(window_block_links(&block, 5, "ab12").is_ok());
+        let error = window_block_links(&block, 5, "cd34").unwrap_err();
+        assert!(error.contains("reorganized"), "{error}");
+        let error = window_block_links(&serde_json::json!({}), 5, "ab12").unwrap_err();
+        assert!(error.contains("missing previous"), "{error}");
+    }
+
+    #[test]
+    fn the_finalized_marker_survives_a_restart_and_is_bound_to_its_digest() {
+        let dir = std::env::temp_dir().join(format!("voter-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voter.json.finalized");
+        let digest = [7u8; 32];
+        assert!(
+            !read_finalized_marker(&path, &digest),
+            "absent means not finalized"
+        );
+        write_finalized_marker(&path, &digest).unwrap();
+        assert!(read_finalized_marker(&path, &digest));
+        assert!(
+            !read_finalized_marker(&path, &[8u8; 32]),
+            "another ceremony must not inherit it"
+        );
+        std::fs::write(&path, "not a digest").unwrap();
+        assert!(!read_finalized_marker(&path, &digest));
+        assert!(write_finalized_marker(&dir.join("missing/dir/m"), &digest).is_err());
+        assert_eq!(
+            finalized_marker_path("/etc/voter.json"),
+            std::path::PathBuf::from("/etc/voter.json.finalized")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
