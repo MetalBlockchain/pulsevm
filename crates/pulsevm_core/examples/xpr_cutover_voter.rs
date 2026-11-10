@@ -1757,7 +1757,8 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
             .await
             .map(|state| format!(
                 "paused={}",
-                state.get("paused").unwrap_or(&serde_json::Value::Null)
+                paused_flag(&state)
+                    .map_or_else(|| "unknown".to_string(), |paused| paused.to_string())
             )),
         ];
     }
@@ -1901,7 +1902,7 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
             &serde_json::json!({}),
         )
         .await?;
-        if state.get("paused").and_then(|v| v.as_bool()) != Some(true) {
+        if paused_flag(&state) != Some(true) {
             return Err("nothing to sign: the local producer is not paused".to_string());
         }
     }
@@ -2056,6 +2057,16 @@ fn settle_step(state: &mut (Option<String>, u32), id: &str) -> u32 {
     state.1
 }
 
+/// Read the producer API's paused state. Leap 5.0.3 answers
+/// `/v1/producer/paused` with a bare JSON boolean (HTTP 201); some builds and
+/// wrappers answer `{"paused": bool}`. Accept both, and treat anything else
+/// as unknown, which never counts as paused.
+fn paused_flag(state: &serde_json::Value) -> Option<bool> {
+    state
+        .as_bool()
+        .or_else(|| state.get("paused").and_then(|value| value.as_bool()))
+}
+
 /// Pause the local producer via the Leap producer API, then prove it is
 /// paused instead of trusting the first call. Both endpoints are POSTs.
 async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), String> {
@@ -2071,7 +2082,7 @@ async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), S
         &serde_json::json!({}),
     )
     .await?;
-    if state.get("paused").and_then(|v| v.as_bool()) == Some(true) {
+    if paused_flag(&state) == Some(true) {
         Ok(())
     } else {
         Err(format!("producer pause unverified: {state}"))
@@ -3415,6 +3426,12 @@ mod tests {
     /// bodies over sequential connections. std-only; the test drives the
     /// real `pause_producer` HTTP path against it.
     fn stub_producer_api(paused_reports: bool) -> String {
+        stub_producer_api_shaped(paused_reports, false)
+    }
+
+    /// `bare` answers like Leap 5.0.3 (`true`/`false`), otherwise the object
+    /// form `{"paused": ...}`.
+    fn stub_producer_api_shaped(paused_reports: bool, bare: bool) -> String {
         use std::io::{
             Read,
             Write,
@@ -3452,7 +3469,11 @@ mod tests {
                 let mut body = vec![0u8; content_len];
                 stream.read_exact(&mut body).ok();
                 let response_body = if path.ends_with("/v1/producer/paused") {
-                    format!("{{\"paused\":{paused_reports}}}")
+                    if bare {
+                        paused_reports.to_string()
+                    } else {
+                        format!("{{\"paused\":{paused_reports}}}")
+                    }
                 } else {
                     "{}".to_string()
                 };
@@ -3472,6 +3493,40 @@ mod tests {
         let client = reqwest::Client::builder().build().unwrap();
         let api = stub_producer_api(true);
         assert!(pause_producer(&client, &api).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_producer_accepts_leaps_bare_boolean_paused_reply() {
+        // Real nodeos 5.0.3 answers /v1/producer/paused with a bare boolean.
+        let client = reqwest::Client::builder().build().unwrap();
+        assert!(
+            pause_producer(&client, &stub_producer_api_shaped(true, true))
+                .await
+                .is_ok()
+        );
+        // A bare `false` is an unverified pause, never a verified one.
+        assert!(
+            pause_producer(&client, &stub_producer_api_shaped(false, true))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn paused_flag_reads_both_shapes_and_nothing_else() {
+        assert_eq!(paused_flag(&serde_json::json!(true)), Some(true));
+        assert_eq!(paused_flag(&serde_json::json!(false)), Some(false));
+        assert_eq!(
+            paused_flag(&serde_json::json!({"paused": true})),
+            Some(true)
+        );
+        assert_eq!(
+            paused_flag(&serde_json::json!({"paused": false})),
+            Some(false)
+        );
+        assert_eq!(paused_flag(&serde_json::json!({})), None);
+        assert_eq!(paused_flag(&serde_json::json!("true")), None);
+        assert_eq!(paused_flag(&serde_json::json!(null)), None);
     }
 
     #[tokio::test]

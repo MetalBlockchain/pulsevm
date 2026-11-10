@@ -508,7 +508,8 @@ class H(BaseHTTPRequestHandler):
             open(hits_path, "a").write("pause\n")
             data = b"{}"
         elif self.path.endswith("/v1/producer/paused"):
-            data = ('{"paused":' + paused_value + "}").encode()
+            # Leap 5.0.3 answers with a bare boolean, not an object.
+            data = paused_value.encode()
         else:
             self.send_response(404)
             self.end_headers()

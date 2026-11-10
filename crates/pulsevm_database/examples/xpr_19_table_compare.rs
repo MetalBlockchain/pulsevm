@@ -63,6 +63,37 @@ struct Report {
 
 type TableRows = BTreeMap<String, Vec<(bool, Vec<u8>)>>;
 
+/// The converter writes the source chain's producer schedule into every
+/// migration checkpoint as ordinary contract rows under code `eosio`, scope
+/// `eosio`, table `migsrcsched` (`pulsevm_database::source_schedule`). They
+/// are not part of the source chain's state, so the comparison against the
+/// nodeos snapshot excludes exactly those rows (one `contract_table` row and
+/// the `contract_row` rows) and nothing else.
+fn exclude_migration_schedule_rows(tables: &mut TableRows) {
+    use std::str::FromStr;
+    let value = |text: &str| pulsevm_name::Name::from_str(text).map(|name| name.as_u64());
+    let (Ok(code), Ok(scope), Ok(table)) = (value("eosio"), value("eosio"), value("migsrcsched"))
+    else {
+        return;
+    };
+    let word = |bytes: &[u8], index: usize| -> Option<u64> {
+        bytes
+            .get(1 + index * 8..9 + index * 8)
+            .and_then(|slice| slice.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    for name in ["contract_table", "contract_row"] {
+        if let Some(rows) = tables.get_mut(name) {
+            rows.retain(|(_, data)| {
+                !(data.first() == Some(&0)
+                    && word(data, 0) == Some(code)
+                    && word(data, 1) == Some(scope)
+                    && word(data, 2) == Some(table))
+            });
+        }
+    }
+}
+
 fn usage() {
     eprintln!(
         "Usage: xpr_19_table_compare <nodeos-log> <checkpoint> <arena-dir> <source-chain-id-hex> <chainbase-sidecar.json> [report.json]"
@@ -296,6 +327,10 @@ fn diagnose_rows(table: &str, nodeos: &[(bool, Vec<u8>)], arena: &[(bool, Vec<u8
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        TableRows,
+        exclude_migration_schedule_rows,
+    };
     use pulsevm_database::{
         Database,
         DeferredTransactionSidecar,
@@ -321,6 +356,45 @@ mod tests {
         let row = vec![(true, vec![1, 2])];
         assert_ne!(hash_rows(&row), hash_rows(&[(false, vec![1, 2])]));
         assert_ne!(hash_rows(&row), hash_rows(&[(true, vec![1, 3])]));
+    }
+
+    #[test]
+    fn migration_schedule_rows_are_excluded_and_nothing_else() {
+        use std::str::FromStr;
+        let name = |text: &str| pulsevm_name::Name::from_str(text).unwrap().as_u64();
+        let row = |code: &str, scope: &str, table: &str, extra: u64| {
+            let mut data = vec![0u8];
+            for value in [name(code), name(scope), name(table), extra] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            (true, data)
+        };
+        let mut tables = TableRows::new();
+        tables.insert(
+            "contract_table".to_owned(),
+            vec![
+                row("eosio", "eosio", "migsrcsched", 1),
+                row("eosio", "eosio", "producers", 2),
+                row("token", "eosio", "migsrcsched", 3),
+            ],
+        );
+        tables.insert(
+            "contract_row".to_owned(),
+            vec![
+                row("eosio", "eosio", "migsrcsched", 4),
+                row("eosio", "eosio", "migsrcsched", 5),
+                row("eosio", "user", "migsrcsched", 6),
+            ],
+        );
+        tables.insert(
+            "account".to_owned(),
+            vec![row("eosio", "eosio", "migsrcsched", 7)],
+        );
+        exclude_migration_schedule_rows(&mut tables);
+        assert_eq!(tables["contract_table"].len(), 2);
+        assert_eq!(tables["contract_row"].len(), 1);
+        // Other tables are never touched, whatever their bytes look like.
+        assert_eq!(tables["account"].len(), 1);
     }
 
     #[test]
@@ -450,7 +524,10 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let arena_rows = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
-        Ok(tables) => tables,
+        Ok(mut tables) => {
+            exclude_migration_schedule_rows(&mut tables);
+            tables
+        }
         Err(error) => {
             eprintln!("cannot parse Arena SHiP snapshot: {error}");
             return ExitCode::from(1);
