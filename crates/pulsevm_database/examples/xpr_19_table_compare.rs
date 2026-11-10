@@ -69,12 +69,16 @@ type TableRows = BTreeMap<String, Vec<(bool, Vec<u8>)>>;
 /// are not part of the source chain's state, so the comparison against the
 /// nodeos snapshot excludes exactly those rows (one `contract_table` row and
 /// the `contract_row` rows) and nothing else.
-fn exclude_migration_schedule_rows(tables: &mut TableRows) {
+///
+/// Returns how many `contract_table` and `contract_row` rows it removed, so the
+/// caller can check the count against the schedule the checkpoint carries: a
+/// silent, unbounded exclusion could hide real divergence.
+fn exclude_migration_schedule_rows(tables: &mut TableRows) -> (usize, usize) {
     use std::str::FromStr;
     let value = |text: &str| pulsevm_name::Name::from_str(text).map(|name| name.as_u64());
     let (Ok(code), Ok(scope), Ok(table)) = (value("eosio"), value("eosio"), value("migsrcsched"))
     else {
-        return;
+        return (0, 0);
     };
     let word = |bytes: &[u8], index: usize| -> Option<u64> {
         bytes
@@ -82,15 +86,44 @@ fn exclude_migration_schedule_rows(tables: &mut TableRows) {
             .and_then(|slice| slice.try_into().ok())
             .map(u64::from_le_bytes)
     };
-    for name in ["contract_table", "contract_row"] {
+    let mut removed = [0usize; 2];
+    for (slot, name) in ["contract_table", "contract_row"].into_iter().enumerate() {
         if let Some(rows) = tables.get_mut(name) {
+            let before = rows.len();
             rows.retain(|(_, data)| {
                 !(data.first() == Some(&0)
                     && word(data, 0) == Some(code)
                     && word(data, 1) == Some(scope)
                     && word(data, 2) == Some(table))
             });
+            removed[slot] = before - rows.len();
         }
+    }
+    (removed[0], removed[1])
+}
+
+/// The exclusion must remove exactly what the converter wrote: one
+/// `contract_table` row, plus the header row and one row per producer. Any
+/// other count means rows were dropped (or left behind) that the comparison
+/// should have seen.
+fn check_excluded_counts(
+    removed: (usize, usize),
+    schedule_producers: Option<usize>,
+) -> Result<String, String> {
+    let expected = match schedule_producers {
+        Some(producers) => (1, producers + 1),
+        None => (0, 0),
+    };
+    if removed == expected {
+        Ok(format!(
+            "excluded {} contract_table and {} contract_row migration schedule rows (expected {} and {})",
+            removed.0, removed.1, expected.0, expected.1
+        ))
+    } else {
+        Err(format!(
+            "excluded {} contract_table and {} contract_row rows but the checkpoint's schedule accounts for {} and {}: refusing to compare",
+            removed.0, removed.1, expected.0, expected.1
+        ))
     }
 }
 
@@ -329,6 +362,7 @@ fn diagnose_rows(table: &str, nodeos: &[(bool, Vec<u8>)], arena: &[(bool, Vec<u8
 mod tests {
     use super::{
         TableRows,
+        check_excluded_counts,
         exclude_migration_schedule_rows,
     };
     use pulsevm_database::{
@@ -390,11 +424,25 @@ mod tests {
             "account".to_owned(),
             vec![row("eosio", "eosio", "migsrcsched", 7)],
         );
-        exclude_migration_schedule_rows(&mut tables);
+        let removed = exclude_migration_schedule_rows(&mut tables);
+        assert_eq!(removed, (1, 2));
         assert_eq!(tables["contract_table"].len(), 2);
         assert_eq!(tables["contract_row"].len(), 1);
         // Other tables are never touched, whatever their bytes look like.
         assert_eq!(tables["account"].len(), 1);
+    }
+
+    #[test]
+    fn the_excluded_count_must_match_the_checkpoint_schedule() {
+        // One table row, plus the header and one row per producer.
+        assert!(check_excluded_counts((1, 22), Some(21)).is_ok());
+        // Too many rows removed, too few, no table row, or any exclusion at
+        // all for a checkpoint that carries no schedule: all refuse.
+        assert!(check_excluded_counts((1, 23), Some(21)).is_err());
+        assert!(check_excluded_counts((1, 21), Some(21)).is_err());
+        assert!(check_excluded_counts((0, 22), Some(21)).is_err());
+        assert!(check_excluded_counts((1, 1), None).is_err());
+        assert!(check_excluded_counts((0, 0), None).is_ok());
     }
 
     #[test]
@@ -523,9 +571,23 @@ fn main() -> ExitCode {
         eprintln!("cannot restore Arena checkpoint: {error}");
         return ExitCode::from(1);
     }
+    let schedule_producers = match pulsevm_database::read_source_schedule(&database) {
+        Ok(schedule) => schedule.map(|schedule| schedule.producers.len()),
+        Err(error) => {
+            eprintln!("cannot read the checkpoint's migration schedule: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let arena_rows = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
         Ok(mut tables) => {
-            exclude_migration_schedule_rows(&mut tables);
+            let removed = exclude_migration_schedule_rows(&mut tables);
+            match check_excluded_counts(removed, schedule_producers) {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            }
             tables
         }
         Err(error) => {

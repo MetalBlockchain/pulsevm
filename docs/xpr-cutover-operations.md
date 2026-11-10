@@ -206,10 +206,16 @@ empty) before it prints a confirmation digest.
 
 ## A stale schedule pin: abort before H
 
-The published schedule hash pinned in the genesis includes the schedule
+The published schedule hash (`confirmation.schedule_sha256`, also pinned in the
+genesis) includes the schedule
 version, and XPR's version moves. The voter checks the live active schedule
 against the pin at start and on every poll before H, and in `--preflight`, and
 exits with an explicit error if they differ (nothing has been paused before H).
+The exit code is 3 and the log carries an `ALARM event=cutover.schedule_pin_abort`
+line: page on either. There is no on-chain abort, so a bump between
+finalization and H splits the fleet (voters that polled in the gap exit; the
+rest pause at P and then cannot sign): tell the coordinator out of band the
+moment it fires, before P.
 Recovery for a stale pin, all before H: read the new hash from any node
 (`xpr_snapshot_schedule <current snapshot>` prints it), rebuild the migration
 genesis with the new `migration_schedule_sha256` (the ceremony chain id changes
@@ -217,11 +223,39 @@ with it), republish the genesis and chain id, and re-run the declaration on a
 fresh contract account. After H the schedule is frozen by the window; a pin
 mismatch there refuses to sign instead.
 
-The voter's config is checked when it starts: `confirmation.checkpoint_sha256`
-(the operator's own derived hash), `confirmation.migration_genesis` (which must
-pin that checkpoint and carry the schedule pin) and
-`confirmation.platform_chain_id` are all required, so a coordinator-only config
-refuses to load rather than vote, pause at P and then refuse to sign.
+The voter's config is checked when it starts. `confirmation.schedule_sha256`
+(the published schedule hash) is always required: it is the one pin known
+before H. The checkpoint hash, the migration genesis and the platform id only
+exist after H (conversion of the H snapshot, then chain creation), so the
+ceremony agent starts the voter with `confirmation.operator_fed: true` and no
+post-H fields, then restarts it as each one is written. Whatever is present is
+validated at load (the genesis must pin the operator's own checkpoint and the
+same schedule hash). Without `operator_fed`, a config missing any of the three
+refuses to load, so a coordinator-only config still cannot start. The pause
+never waits on these fields: once this voter's own declaration is finalized it
+pauses at P regardless. Signing needs all three and says "signing blocked"
+until they are present. `--preflight` prints WAIT for missing fields before H
+and FAIL at or after H ("pause holds, signing blocked").
+
+## CPU units after the cut
+
+XPR's `chain_config` carries CPU caps in microseconds; PulseVM bills and limits
+CPU in metering points (`POINTS_PER_US` = 38,000 per microsecond of reference
+compute). Imported as-is, XPR's 150,000 us transaction cap would be read as
+150,000 points, about 4 us of reference CPU, and ordinary contract actions
+(a few index lookups) would be dropped at block build after being admitted.
+The converter therefore replaces `max_block_cpu_usage`,
+`max_transaction_cpu_usage` and `min_transaction_cpu_usage` with the native
+point values (3,000,000,000 / 1,000,000,000 / 100,000), sized against measured
+intrinsic costs (`docs/intrinsic-cost-model.md`). A fixed x38,000 does not fit
+the `u32` fields. The checkpoint hash covers the result, and
+`global_property` therefore differs from the nodeos snapshot in the table
+compare, as it already did.
+
+Not covered: the resource-limits config and state rows (virtual CPU limit,
+per-block targets) and account CPU usage accumulators are still microsecond
+values. Accounts with unlimited CPU (`cpu_limit` -1) are unaffected; accounts
+with finite stake need those rows redenominated, which is a separate design.
 
 ## Coordinator status contract (agent side)
 

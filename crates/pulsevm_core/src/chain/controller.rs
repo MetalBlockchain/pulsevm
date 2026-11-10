@@ -620,6 +620,10 @@ pub struct Controller {
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
+    // Set when a refused migration boot discarded the arena it was about to
+    // run on. `shutdown` must then not close (and so re-persist) the database,
+    // or the discarded state would be written straight back to disk.
+    state_discarded: bool,
 
     // Consensus-critical upgrade schedule supplied in `upgrade_bytes` at VM
     // initialization. MetalGo sources it from each node's chain configuration,
@@ -1126,6 +1130,7 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            state_discarded: false,
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
             db_path: None,
             snapshot_cache: None,
@@ -1297,6 +1302,7 @@ impl Controller {
         // error; state that was already there is never touched.
         let state_file = Database::arena_state_file(std::path::Path::new(db_path));
         let existed = state_file.exists();
+        self.state_discarded = false;
         let result = self.initialize_with_protocol_upgrades_inner(
             chain_id,
             config_bytes,
@@ -1305,19 +1311,28 @@ impl Controller {
             db_path,
         );
         if result.is_err() && !existed && state_file.exists() && self.restoring_migration() {
-            if let Err(error) = fs::remove_file(&state_file) {
-                warn!(
-                    "migration boot refused and the restored state {} could not be discarded: {error}",
-                    state_file.display()
-                );
-            } else {
-                info!(
-                    "migration boot refused: discarded the restored state {}",
-                    state_file.display()
-                );
-            }
+            self.discard_restored_state(&state_file);
         }
         result
+    }
+
+    /// Remove an arena a refused migration boot must not leave behind, and keep
+    /// `shutdown` from writing it back. A failed removal is logged at error
+    /// level: the next start would see that state, and the marker check (not
+    /// this call) is what still refuses to reuse it unverified.
+    fn discard_restored_state(&mut self, state_file: &std::path::Path) {
+        self.state_discarded = true;
+        match fs::remove_file(state_file) {
+            Ok(()) => info!(
+                "migration boot refused: discarded the restored state {}",
+                state_file.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => error!(
+                "migration boot refused and the restored state {} could not be discarded: {error}",
+                state_file.display()
+            ),
+        }
     }
 
     fn restoring_migration(&self) -> bool {
@@ -1568,6 +1583,20 @@ impl Controller {
                             "migration manifest checkpoint hash is not 32 bytes of hex".into(),
                         )
                     })?;
+                // A marker left by an earlier restore describes state that is
+                // about to be replaced: clear it before the new restore starts,
+                // so a crash part-way cannot pair an old marker with new state.
+                let stale_marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                match fs::remove_file(&stale_marker) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ChainError::GenesisError(format!(
+                            "cannot clear the previous restore marker {}: {error}",
+                            stale_marker.display()
+                        )));
+                    }
+                }
                 let header = self
                     .db
                     .restore_from_path_checked(
@@ -1693,7 +1722,7 @@ impl Controller {
                         .unwrap_or(false);
                     if !verified {
                         let arena = Database::arena_state_file(std::path::Path::new(db_path));
-                        let _ = fs::remove_file(&arena);
+                        self.discard_restored_state(&arena);
                         return Err(ChainError::GenesisError(
                             "the existing arena is at the checkpoint revision but no completed restore verified it (a previous boot did not finish): it was discarded, restart to restore the checkpoint again"
                                 .into(),
@@ -2226,6 +2255,12 @@ impl Controller {
         // database so shutdown leaves no speculative state behind.
         self.clear_pending()?;
 
+        // A refused migration boot discarded its arena: closing would
+        // checkpoint the in-memory copy straight back to disk.
+        if self.state_discarded {
+            info!("shutting down controller without persisting the discarded migration state");
+            return Ok(());
+        }
         // Explicitly close the database
         info!("shutting down controller and closing database");
         self.db.close()?;
@@ -12424,6 +12459,13 @@ mod tests {
         assert!(
             !Database::arena_state_file(&target_path).exists(),
             "the unverified arena was not discarded"
+        );
+        // MetalGo may call Shutdown after a failed Initialize: closing the
+        // database must not write the discarded arena back to disk.
+        second.shutdown().expect("shutdown after a refused boot");
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "shutdown re-persisted the arena a refused boot had discarded"
         );
         // The next start restores from the checkpoint and verifies it fully.
         let mut third = Controller::new();

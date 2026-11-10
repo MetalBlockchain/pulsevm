@@ -208,11 +208,15 @@ genesis["migration_schedule_sha256"] = hashlib.sha256(packed).hexdigest()
 json.dump(genesis, open(out, "w"))
 PYEOF
 NEW_CHAIN="$("$HALT_BIN" chain-id --genesis "$GENESIS")"
+# The published schedule hash is a pre-H config field, known before the genesis.
+SCHEDULE_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["migration_schedule_sha256"])' "$GENESIS")"
 PLATFORM="$(python3 -c 'print("ee" * 32)')"
 WRONG_PLATFORM="$(python3 -c 'print("ef" * 32)')"
 # Agreed pause head P = H + PAUSE_K, fixed before the freeze like on mainnet.
 PAUSE_K=20
-mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty -> path
+# $6=OPFED starts the voter as the ceremony agent does before H: no checkpoint
+# hash, genesis or platform id yet. CFG_SCHEDULE overrides the published pin.
+mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=stop-url-or-HALF-or-empty $6=OPFED-or-empty -> path
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
     [[ -n "${3:-}" ]] && coord="\"$3\""
@@ -224,13 +228,17 @@ mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=s
     elif [[ -n "${5:-}" ]]; then
         stop="\"stop_producer\":{\"at_pause\":true,\"producer_api_url\":\"$5\"}"
     fi
+    local confirmation_inputs="\"migration_genesis\":\"$GENESIS\",\"checkpoint_sha256\":\"abababababababababababababababababababababababababababababababab\",\"platform_chain_id\":$plat"
+    if [[ "${6:-}" == "OPFED" ]]; then
+        confirmation_inputs="\"operator_fed\":true"
+    fi
     cat >"$out" <<EOF
 {"nodeos_url":"http://127.0.0.1:${PORT}","contract":"cutover","producer":"eosio",
  "source_chain_id":"$CHAIN_ID","height":$1,"pause_height":$(($1 + PAUSE_K)),"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
  "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
  "poll_secs":1,"dry_run":$2,"enabled":true,
  "confirmation":{"coordinator_url":$coord,"out_file":"$WORK/confirmation.json",
-  "migration_genesis":"$GENESIS","checkpoint_sha256":"abababababababababababababababababababababababababababababababab","platform_chain_id":$plat},
+  "schedule_sha256":"${CFG_SCHEDULE:-$SCHEDULE_SHA256}",$confirmation_inputs},
  $stop}
 EOF
     printf '%s' "$out"
@@ -270,6 +278,22 @@ grep -q "PREFLIGHT: GO" "$WORK/preflight.log" || fail "no preflight GO: $(cat "$
 grep -q "freeze on-chain" "$WORK/preflight.log" || fail "preflight skipped the freeze check"
 pass "preflight GO before the window"
 
+echo "cutover-voter-test: an operator-fed voter starts before H and preflight says WAIT..."
+FED_CFG="$(mk_config "$H" true "" "" "" OPFED)"
+"$VOTER_BIN" --config "$FED_CFG" --preflight >"$WORK/preflight-fed.log" 2>&1 \
+    || fail "preflight refused an operator-fed config before H: $(cat "$WORK/preflight-fed.log")"
+grep -q "PREFLIGHT WAIT: confirmation inputs" "$WORK/preflight-fed.log" \
+    || fail "preflight did not WAIT on the post-H inputs: $(cat "$WORK/preflight-fed.log")"
+grep -q "PREFLIGHT: GO" "$WORK/preflight-fed.log" \
+    || fail "operator-fed preflight is not GO before H: $(cat "$WORK/preflight-fed.log")"
+# Without the opt-in the same config can never sign and refuses to load.
+sed 's/"operator_fed":true/"operator_fed":false/' "$FED_CFG" >"$WORK/not-fed.json"
+if "$VOTER_BIN" --config "$WORK/not-fed.json" --preflight >"$WORK/not-fed.log" 2>&1; then
+    fail "a config without the post-H inputs loaded without operator_fed: $(cat "$WORK/not-fed.log")"
+fi
+grep -q "operator_fed" "$WORK/not-fed.log" || fail "refusal does not name operator_fed: $(cat "$WORK/not-fed.log")"
+pass "operator-fed voter loads and preflights before H; a config that can never sign still refuses"
+
 echo "cutover-voter-test: preflight refuses a stop window inside the finality lag..."
 SHORT_CFG="$WORK/voter-short-window.json"
 python3 -I - "$PREFLIGHT_CFG" "$SHORT_CFG" "$H" <<'PYEOF'
@@ -301,21 +325,21 @@ pass "preflight parses the real producer API's paused reply"
 
 # A stale schedule pin must abort before H, while nothing has been paused.
 echo "cutover-voter-test: a stale schedule pin aborts the voter before H..."
-python3 - "$GENESIS" "$WORK/genesis-stale-pin.json" <<'PYEOF'
-import json, sys
-genesis = json.load(open(sys.argv[1]))
-genesis["migration_schedule_sha256"] = "22" * 32
-json.dump(genesis, open(sys.argv[2], "w"))
-PYEOF
-GOOD_GENESIS_EARLY="$GENESIS"
-GENESIS="$WORK/genesis-stale-pin.json"
-STALE_CFG="$(mk_config "$H" true "")"
-GENESIS="$GOOD_GENESIS_EARLY"
+CFG_SCHEDULE="$(python3 -c 'print("22" * 32)')"
+STALE_CFG="$(mk_config "$H" true "" "" "" OPFED)"
+unset CFG_SCHEDULE
 if "$VOTER_BIN" --config "$STALE_CFG" --dry-run --max-polls 3 >"$WORK/stale-pin.log" 2>&1; then
     fail "the voter ran on a stale schedule pin: $(cat "$WORK/stale-pin.log")"
 fi
-grep -q "no longer hashes to the genesis's migration_schedule_sha256" "$WORK/stale-pin.log" \
+grep -q "no longer hashes to confirmation.schedule_sha256" "$WORK/stale-pin.log" \
     || fail "stale pin not reported: $(cat "$WORK/stale-pin.log")"
+grep -q "ALARM event=cutover.schedule_pin_abort" "$WORK/stale-pin.log" \
+    || fail "stale pin raised no alarm line: $(cat "$WORK/stale-pin.log")"
+set +e
+"$VOTER_BIN" --config "$STALE_CFG" --dry-run --max-polls 3 >/dev/null 2>&1
+STALE_EXIT=$?
+set -e
+[[ "$STALE_EXIT" == 3 ]] || fail "stale pin exit code is $STALE_EXIT, not the distinct abort code 3"
 # The same stale pin fails the operator's preflight too.
 if "$VOTER_BIN" --config "$STALE_CFG" --preflight >"$WORK/stale-pin-preflight.log" 2>&1; then
     fail "preflight accepted a stale schedule pin: $(cat "$WORK/stale-pin-preflight.log")"
@@ -518,7 +542,7 @@ run_refused_genesis() { # $1=genesis file $2=log name $3=expected substring $4=c
 }
 run_refused_genesis "$WORK/genesis-foreign-checkpoint.json" foreigncp "did not derive" "$NEW_CHAIN"
 WRONG_SCHEDULE_CHAIN="$("$HALT_BIN" chain-id --genesis "$WORK/genesis-wrong-schedule.json")"
-run_refused_genesis "$WORK/genesis-wrong-schedule.json" wrongsched "does not hash to the migration genesis" "$WRONG_SCHEDULE_CHAIN"
+run_refused_genesis "$WORK/genesis-wrong-schedule.json" wrongsched "not told to expect" "$WRONG_SCHEDULE_CHAIN"
 pass "foreign checkpoint pin and wrong schedule pin refused, nothing delivered"
 
 echo "cutover-voter-test: half-configured stop fails fast..."
@@ -632,6 +656,31 @@ kill "$COORD_PID" 2>/dev/null || true
 wait "$COORD_PID" 2>/dev/null || true
 [[ -n "$REENFORCED" ]] || fail "pause asserted only once, not enforced: $(cat "$WORK/pause-hits" 2>/dev/null)"
 pass "producer paused after confirmation and re-asserted"
+
+echo "cutover-voter-test: the pause never waits on the post-H inputs..."
+start_stub true "$WORK/fed-hits" "$WORK/stub-fed.port"
+FEDSTUB_PORT="$(cat "$WORK/stub-fed.port")"
+FEDPAUSE_CFG="$(mk_config "$H" false "" "" "http://127.0.0.1:${FEDSTUB_PORT}" OPFED)"
+"$VOTER_BIN" --config "$FEDPAUSE_CFG" >"$WORK/fed-pause.log" 2>&1 &
+FEDPAUSE_PID=$!
+FEDPAUSED=""
+for _ in $(seq 1 60); do
+    grep -q "local producer paused at P=" "$WORK/fed-pause.log" 2>/dev/null && { FEDPAUSED=1; break; }
+    kill -0 "$FEDPAUSE_PID" 2>/dev/null || break
+    sleep 2
+done
+FEDBLOCKED=""
+for _ in $(seq 1 15); do
+    grep -q "signing blocked" "$WORK/fed-pause.log" 2>/dev/null && { FEDBLOCKED=1; break; }
+    sleep 2
+done
+kill "$FEDPAUSE_PID" 2>/dev/null || true
+wait "$FEDPAUSE_PID" 2>/dev/null || true
+kill "$STUB_PID" 2>/dev/null || true
+wait "$STUB_PID" 2>/dev/null || true
+[[ -n "$FEDPAUSED" ]] || fail "operator-fed voter never paused: $(tail -5 "$WORK/fed-pause.log")"
+[[ -n "$FEDBLOCKED" ]] || fail "operator-fed voter did not report signing blocked: $(tail -5 "$WORK/fed-pause.log")"
+pass "an operator-fed voter pauses at P and reports signing blocked until the inputs land"
 
 echo "cutover-voter-test: unverified pause never goes quiet..."
 start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"

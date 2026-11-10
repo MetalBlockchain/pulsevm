@@ -4030,7 +4030,28 @@ fn decode_global_property_layout(
         }
     }
     row.finish()?;
-    Ok((config, source_chain_id))
+    Ok((redenominate_cpu_caps(config), source_chain_id))
+}
+
+/// PulseVM's CPU limits are denominated in metering points (about 1/38000 us
+/// of reference compute, `POINTS_PER_US`), while XPR's chain_config carries
+/// microseconds. Imported unchanged, XPR's 150,000 us transaction cap would
+/// be read as 150,000 points, about 4 us of reference CPU, and ordinary
+/// contract actions would be dropped at block build. A fixed x38000 does not
+/// fit the u32 fields (200,000 us would become 7.6e9), so the three caps take
+/// the point values the native genesis uses, sized against measured
+/// intrinsic costs (docs/intrinsic-cost-model.md, docs/resource-model.md).
+/// This is part of the conversion, so it is covered by the checkpoint hash
+/// every operator derives for itself.
+pub(crate) const POINT_MAX_BLOCK_CPU_USAGE: u32 = 3_000_000_000;
+pub(crate) const POINT_MAX_TRANSACTION_CPU_USAGE: u32 = 1_000_000_000;
+pub(crate) const POINT_MIN_TRANSACTION_CPU_USAGE: u32 = 100_000;
+
+fn redenominate_cpu_caps(mut config: ChainConfigV0) -> ChainConfigV0 {
+    config.max_block_cpu_usage = POINT_MAX_BLOCK_CPU_USAGE;
+    config.max_transaction_cpu_usage = POINT_MAX_TRANSACTION_CPU_USAGE;
+    config.min_transaction_cpu_usage = POINT_MIN_TRANSACTION_CPU_USAGE;
+    config
 }
 
 fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
@@ -4999,6 +5020,44 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn imported_cpu_caps_are_point_denominated_not_xpr_microseconds() {
+        let mut xpr = ChainConfigV0 {
+            max_block_net_usage: 1_048_576,
+            target_block_net_usage_pct: 1000,
+            max_transaction_net_usage: 524_288,
+            base_per_transaction_net_usage: 12,
+            net_usage_leeway: 500,
+            context_free_discount_net_usage_num: 20,
+            context_free_discount_net_usage_den: 100,
+            max_block_cpu_usage: 200_000,
+            target_block_cpu_usage_pct: 2500,
+            max_transaction_cpu_usage: 150_000,
+            min_transaction_cpu_usage: 100,
+            max_transaction_lifetime: 3600,
+            deferred_trx_expiration_window: 600,
+            max_transaction_delay: 3_888_000,
+            max_inline_action_size: 4096,
+            max_inline_action_depth: 4,
+            max_authority_depth: 6,
+        };
+        let converted = redenominate_cpu_caps(xpr);
+        assert_eq!(converted.max_block_cpu_usage, 3_000_000_000);
+        assert_eq!(converted.max_transaction_cpu_usage, 1_000_000_000);
+        assert_eq!(converted.min_transaction_cpu_usage, 100_000);
+        // 150,000 us read as points would be about 4 us of reference CPU: the
+        // converted cap must buy at least the 26 ms the native genesis does.
+        assert!(
+            // 38,000 is `pulsevm_core::config::POINTS_PER_US`.
+            u64::from(converted.max_transaction_cpu_usage) / 38_000 >= 26_000
+        );
+        // Nothing else moves.
+        xpr.max_block_cpu_usage = converted.max_block_cpu_usage;
+        xpr.max_transaction_cpu_usage = converted.max_transaction_cpu_usage;
+        xpr.min_transaction_cpu_usage = converted.min_transaction_cpu_usage;
+        assert_eq!(xpr, converted);
+    }
 
     #[test]
     fn accepts_current_and_legacy_global_property_rows() {

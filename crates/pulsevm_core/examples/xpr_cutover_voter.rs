@@ -144,6 +144,20 @@ struct ConfirmationConfig {
     /// rehearsal-only mode.
     #[serde(default)]
     platform_chain_id: Option<String>,
+    /// The published sha256 of the source producer schedule
+    /// (`xpr_snapshot_schedule` prints it). It is known before H, so it is
+    /// required at load: the live schedule is checked against it on every
+    /// poll before H, and at signing the migration genesis must pin the same
+    /// value. Never taken from the genesis, which does not exist yet.
+    schedule_sha256: Option<String>,
+    /// The checkpoint hash, the genesis and the platform id all come into
+    /// being after the voter has started (conversion of the H snapshot, then
+    /// chain creation), so a ceremony agent starts the voter without them and
+    /// restarts it as each lands. That is allowed only when this is set: a
+    /// config that omits them without it can never sign and refuses to load.
+    /// The pause is never gated on these fields; signing requires all three.
+    #[serde(default)]
+    operator_fed: bool,
 }
 
 fn default_poll_secs() -> u64 {
@@ -264,6 +278,27 @@ fn expected_declaration_digest(
         .map_err(|error| format!("declaration digest: {error}"))
 }
 
+fn parse_hash32(text: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(text).map_err(|_| "is not hex".to_string())?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "must be 32 bytes of hex".to_string())
+}
+
+/// The confirmation inputs that only exist after H. Signing needs all of
+/// them; the pause and the declaration vote need none.
+fn missing_confirmation_inputs(confirmation: &ConfirmationConfig) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if confirmation.checkpoint_sha256.is_none() {
+        missing.push("confirmation.checkpoint_sha256");
+    }
+    if confirmation.migration_genesis.is_none() {
+        missing.push("confirmation.migration_genesis");
+    }
+    if confirmation.platform_chain_id.is_none() {
+        missing.push("confirmation.platform_chain_id");
+    }
+    missing
+}
+
 fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
     let inner = load_config(path)?;
     if !inner.enabled {
@@ -318,24 +353,37 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
         &members,
         &inner.contract,
     )?;
-    // Everything the confirmation needs from outside the chain is checked at
-    // load, not at signing time: a config that can never sign must refuse to
-    // start rather than vote, pause the producer at P and then refuse forever.
-    let checkpoint = inner.confirmation.checkpoint_sha256.as_deref().ok_or_else(|| {
-        "confirmation.checkpoint_sha256 is required: the hash of the checkpoint this operator derived from its own snapshot"
+    // The published schedule hash is the one pin known before H, so it is
+    // always required. The checkpoint hash, the genesis and the platform id
+    // exist only after H (conversion, then chain creation): each is validated
+    // when present, and all three may be absent only for an operator-fed
+    // config, which refuses to sign until they have landed. The pause never
+    // depends on them.
+    let schedule_hex = inner.confirmation.schedule_sha256.as_deref().ok_or_else(|| {
+        "confirmation.schedule_sha256 is required: the published hash of the source producer schedule (xpr_snapshot_schedule prints it)"
             .to_string()
     })?;
-    let genesis_path = inner.confirmation.migration_genesis.as_deref().ok_or_else(|| {
-        "confirmation.migration_genesis is required: the voter signs only a genesis it has read (a coordinator-only config can never sign)"
-            .to_string()
-    })?;
-    let (_, schedule_pin) = genesis_binding(genesis_path, checkpoint)?;
-    let platform = inner.confirmation.platform_chain_id.as_deref().ok_or_else(|| {
-        "confirmation.platform_chain_id is required: the id transactions on the new chain are signed under is never adopted from a coordinator"
-            .to_string()
-    })?;
-    pulsevm_crypto::parse_chain_id(platform)
-        .map_err(|error| format!("confirmation.platform_chain_id: {error}"))?;
+    let schedule_pin = parse_hash32(schedule_hex)
+        .map_err(|error| format!("confirmation.schedule_sha256: {error}"))?;
+    let checkpoint = inner.confirmation.checkpoint_sha256.as_deref();
+    if let Some(checkpoint) = checkpoint {
+        parse_hash32(checkpoint)
+            .map_err(|error| format!("confirmation.checkpoint_sha256: {error}"))?;
+    }
+    if let Some(platform) = inner.confirmation.platform_chain_id.as_deref() {
+        pulsevm_crypto::parse_chain_id(platform)
+            .map_err(|error| format!("confirmation.platform_chain_id: {error}"))?;
+    }
+    if let Some(genesis_path) = inner.confirmation.migration_genesis.as_deref() {
+        genesis_binding(genesis_path, checkpoint, &schedule_pin)?;
+    }
+    let missing = missing_confirmation_inputs(&inner.confirmation);
+    if !missing.is_empty() && !inner.confirmation.operator_fed {
+        return Err(format!(
+            "{} not set: a config without them can never sign. A ceremony agent that supplies them after H must set confirmation.operator_fed = true; the voter then pauses on schedule and refuses to sign until all three are present",
+            missing.join(", ")
+        ));
+    }
     Ok(LoadedConfig {
         inner,
         vote_key,
@@ -1292,7 +1340,11 @@ async fn fetch_coordinator_params(
 /// hash it pins. The voter signs only a genesis it has read itself: the
 /// checkpoint pin must equal the voter's own checkpoint hash (from its own
 /// conversion) and the schedule pin must be present.
-fn genesis_binding(genesis_path: &str, own_checkpoint: &str) -> Result<(String, [u8; 32]), String> {
+fn genesis_binding(
+    genesis_path: &str,
+    own_checkpoint: Option<&str>,
+    expected_schedule_pin: &[u8; 32],
+) -> Result<(String, [u8; 32]), String> {
     let bytes = std::fs::read(genesis_path)
         .map_err(|error| format!("read migration genesis {genesis_path}: {error}"))?;
     let genesis = pulsevm_database::GenesisState::from_bytes(&bytes)
@@ -1300,7 +1352,9 @@ fn genesis_binding(genesis_path: &str, own_checkpoint: &str) -> Result<(String, 
     let pinned_checkpoint = genesis
         .migration_checkpoint_sha256
         .ok_or_else(|| "migration genesis carries no checkpoint binding".to_string())?;
-    if !hex::encode(pinned_checkpoint).eq_ignore_ascii_case(own_checkpoint) {
+    if let Some(own_checkpoint) = own_checkpoint
+        && !hex::encode(pinned_checkpoint).eq_ignore_ascii_case(own_checkpoint)
+    {
         return Err(format!(
             "migration genesis pins checkpoint {} but this voter derived {own_checkpoint}: refusing to sign a genesis for a checkpoint it did not derive",
             hex::encode(pinned_checkpoint)
@@ -1310,6 +1364,13 @@ fn genesis_binding(genesis_path: &str, own_checkpoint: &str) -> Result<(String, 
         "migration genesis carries no migration_schedule_sha256: the published source schedule hash must be pinned"
             .to_string()
     })?;
+    if &schedule_pin != expected_schedule_pin {
+        return Err(format!(
+            "migration genesis pins schedule {} but confirmation.schedule_sha256 is {}: refusing a genesis for a schedule this voter was not told to expect",
+            hex::encode(schedule_pin),
+            hex::encode(expected_schedule_pin)
+        ));
+    }
     Ok((
         hex::encode(genesis.compute_ceremony_chain_id()),
         schedule_pin,
@@ -1336,7 +1397,7 @@ fn live_schedule_hash(live: &LiveSchedule) -> Result<[u8; 32], String> {
 async fn unsigned_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
-    expected: Option<(&str, u32)>,
+    expected: Option<(&str, u32, &str)>,
 ) -> Result<(HaltConfirmation, [u8; 32]), String> {
     let height = config.inner.height;
     // The agreed pause head P: the ceremony fixes P (a strict H+k) before
@@ -1376,7 +1437,7 @@ async fn unsigned_confirmation(
     // The id that was settled and scanned is the id that gets signed: a
     // reorg of P since then refuses instead of signing a branch nobody
     // verified.
-    if let Some((expected_id, covered_through)) = expected {
+    if let Some((expected_id, covered_through, covered_tip)) = expected {
         if expected_id != local_pause_block_id {
             return Err(format!(
                 "block P={pause_height} changed from {expected_id} to {local_pause_block_id} since it was verified: refusing to sign"
@@ -1391,6 +1452,14 @@ async fn unsigned_confirmation(
                 "head {head_now} is past the scanned coverage {covered_through}: rescanning before signing"
             ));
         }
+        // Coverage is by block id, not height: a same-height fork above P
+        // between the scan and now would otherwise pass unseen.
+        let tip_now = fetch_block_id(client, &config.inner.nodeos_url, covered_through).await?;
+        if tip_now != covered_tip {
+            return Err(format!(
+                "block {covered_through} changed from {covered_tip} to {tip_now} since the scan: rescanning before signing"
+            ));
+        }
     }
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
@@ -1398,6 +1467,13 @@ async fn unsigned_confirmation(
     let checkpoint = config.inner.confirmation.checkpoint_sha256.clone();
     // The voter signs only a genesis it has read: the successor id is
     // derived from the configured genesis, never adopted from a coordinator.
+    let missing = missing_confirmation_inputs(&config.inner.confirmation);
+    if !missing.is_empty() {
+        return Err(format!(
+            "signing blocked (the pause is unaffected): {} not set yet; the voter signs only a checkpoint it derived, a genesis it read and a platform id it was configured with",
+            missing.join(", ")
+        ));
+    }
     let own_checkpoint = checkpoint.as_deref().ok_or_else(|| {
         "no checkpoint: set confirmation.checkpoint_sha256 from your own conversion".to_string()
     })?;
@@ -1405,7 +1481,8 @@ async fn unsigned_confirmation(
         "confirmation.migration_genesis is required: the voter signs only a genesis it has read, not a successor id a coordinator supplies"
             .to_string()
     })?;
-    let (new_chain, schedule_pin) = genesis_binding(genesis_path, own_checkpoint)?;
+    let (new_chain, schedule_pin) =
+        genesis_binding(genesis_path, Some(own_checkpoint), &config.schedule_pin)?;
     let mut platform = config.inner.confirmation.platform_chain_id.clone();
     if let Some(url) = config.inner.confirmation.coordinator_url.as_deref() {
         let params = fetch_coordinator_params(client, url).await?;
@@ -1534,10 +1611,15 @@ async fn submit_confirmation(
     config: &LoadedConfig,
     expected_pause_id: &str,
     covered_through: u32,
+    covered_tip: &str,
 ) -> Result<String, String> {
     let height = config.inner.height;
-    let (template, digest) =
-        unsigned_confirmation(client, config, Some((expected_pause_id, covered_through))).await?;
+    let (template, digest) = unsigned_confirmation(
+        client,
+        config,
+        Some((expected_pause_id, covered_through, covered_tip)),
+    )
+    .await?;
     let local_block_id = template.halt_block_id.clone();
     let pause_block_id = template.pause_block_id.clone();
     let checkpoint = template.checkpoint_sha256.clone();
@@ -1780,12 +1862,29 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
             }
             if view.live_schedule_hash == config.schedule_pin {
                 println!(
-                    "PREFLIGHT ok: schedule pin: the live active schedule hashes to the genesis's migration_schedule_sha256"
+                    "PREFLIGHT ok: schedule pin: the live active schedule hashes to confirmation.schedule_sha256"
                 );
             } else {
                 failures += 1;
                 println!(
-                    "PREFLIGHT FAIL: schedule pin: the live active schedule does not hash to the genesis's migration_schedule_sha256 (version bump?): publish the new hash and rebuild the genesis and ceremony id"
+                    "PREFLIGHT FAIL: schedule pin: the live active schedule does not hash to confirmation.schedule_sha256 (version bump?): publish the new hash and rebuild the genesis and ceremony id"
+                );
+            }
+            let missing = missing_confirmation_inputs(&config.inner.confirmation);
+            if missing.is_empty() {
+                println!(
+                    "PREFLIGHT ok: confirmation inputs: checkpoint hash, migration genesis and platform id are set and bound to the pinned schedule"
+                );
+            } else if view.head_num < config.inner.height {
+                println!(
+                    "PREFLIGHT WAIT: confirmation inputs: {} not set yet; they exist only after H, the agent supplies them and restarts the voter (the pause does not need them)",
+                    missing.join(", ")
+                );
+            } else {
+                failures += 1;
+                println!(
+                    "PREFLIGHT FAIL: confirmation inputs: {} not set after H: the pause holds but signing is blocked until they are supplied",
+                    missing.join(", ")
                 );
             }
             println!(
@@ -1969,7 +2068,7 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
     };
     let (head_now, _, _) = get_info(&client, &config.inner.nodeos_url).await?;
     let covered = pause_height.max(head_now);
-    verify_window_empty(
+    let covered_tip = verify_window_empty(
         &client,
         &config.inner.nodeos_url,
         config.inner.height,
@@ -1978,7 +2077,7 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
     .await
     .map_err(|error| format!("nothing to sign: {error}"))?;
     let (template, digest) =
-        unsigned_confirmation(&client, config, Some((&settled_id, covered))).await?;
+        unsigned_confirmation(&client, config, Some((&settled_id, covered, &covered_tip))).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&confirmation_digest_json(
@@ -2094,6 +2193,11 @@ fn own_finalized(config: &LoadedConfig, view: &CeremonyView) -> bool {
             && singleton.source_chain_id == config.inner.source_chain_id
     })
 }
+
+/// Marks an exit made because the published schedule pin went stale before
+/// H; `main` turns it into a distinct exit code so supervisors can alarm.
+const PIN_ABORT_PREFIX: &str = "schedule pin abort: ";
+const EXIT_PIN_ABORT: u8 = 3;
 
 /// Consecutive identical reads of P's block id required before signing: the
 /// confirmation commits to P's id, and P is still reversible (LIB sits far
@@ -2250,10 +2354,20 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // at signing, with the chain already paused. Before H this fails
         // loudly and nothing has been paused.
         if view.head_num < config.inner.height && view.live_schedule_hash != config.schedule_pin {
-            return Err(
-                "the live active schedule no longer hashes to the genesis's migration_schedule_sha256 (a schedule version bump?): abort this round before H, publish the new hash, rebuild the genesis and ceremony id, and re-run the declaration"
-                    .to_string(),
+            // A schedule bump between finalization and H makes the voters that
+            // polled in that gap exit here while the rest pause at P and then
+            // cannot sign. There is no on-chain abort, so the alarm line and
+            // the distinct exit code are the signal: page on either and tell
+            // the coordinator out of band before P.
+            log_line!(
+                "ALARM event=cutover.schedule_pin_abort producer={} height={} head={} outcome=failure: the live schedule no longer hashes to the published pin; other voters may still pause at P, tell the coordinator now",
+                config.inner.producer,
+                config.inner.height,
+                view.head_num
             );
+            return Err(format!(
+                "{PIN_ABORT_PREFIX}the live active schedule no longer hashes to confirmation.schedule_sha256 (a schedule version bump?): abort this round before H, publish the new hash, rebuild the genesis and ceremony id, and re-run the declaration"
+            ));
         }
         match decide(config, &view) {
             Decision::Vote => {
@@ -2446,19 +2560,26 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 }
                 _ => None,
             };
-            let covered_through = match cached {
-                Some(through) if through >= scan_to => through,
+            let (covered_through, covered_tip) = match cached {
+                Some(through) if through >= scan_to => {
+                    // `cached` already matched the stored tip id.
+                    let tip = window_verified
+                        .as_ref()
+                        .map(|(_, _, tip)| tip.clone())
+                        .unwrap_or_default();
+                    (through, tip)
+                }
                 _ => {
                     let scan_from = cached.unwrap_or(config.inner.height);
                     match verify_window_empty(&client, &config.inner.nodeos_url, scan_from, scan_to)
                         .await
                     {
                         Ok(tip) => {
-                            window_verified = Some((settled_id.clone(), scan_to, tip));
+                            window_verified = Some((settled_id.clone(), scan_to, tip.clone()));
                             log_line!(
                                 "H+1..{scan_to} (P={pause_height}) verified empty on the local node"
                             );
-                            scan_to
+                            (scan_to, tip)
                         }
                         Err(error) => {
                             window_verified = None;
@@ -2473,7 +2594,9 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     }
                 }
             };
-            match submit_confirmation(&client, config, &settled_id, covered_through).await {
+            match submit_confirmation(&client, config, &settled_id, covered_through, &covered_tip)
+                .await
+            {
                 Ok(line) => {
                     log_line!("{line}");
                 }
@@ -2560,7 +2683,11 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("xpr_cutover_voter: {error}");
-            ExitCode::from(1)
+            if error.starts_with(PIN_ABORT_PREFIX) {
+                ExitCode::from(EXIT_PIN_ABORT)
+            } else {
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -2622,6 +2749,8 @@ mod tests {
                     migration_genesis: None,
                     checkpoint_sha256: None,
                     platform_chain_id: None,
+                    schedule_sha256: None,
+                    operator_fed: true,
                 },
                 stop_producer: StopConfig::default(),
             },
@@ -2776,26 +2905,39 @@ mod tests {
         let own = "ab".repeat(32);
         let pin = "cd".repeat(32);
         let good = write("good.json", Some(&own), Some(&pin));
-        let (chain_id, schedule) = genesis_binding(&good, &own).unwrap();
+        let pin_bytes = [0xcd; 32];
+        let (chain_id, schedule) = genesis_binding(&good, Some(&own), &pin_bytes).unwrap();
         assert_eq!(chain_id.len(), 64);
         assert_eq!(hex::encode(schedule), pin);
         // A genesis pinning a checkpoint this voter did not derive.
         let foreign = write("foreign.json", Some(&"ee".repeat(32)), Some(&pin));
-        let error = genesis_binding(&foreign, &own).unwrap_err();
+        let error = genesis_binding(&foreign, Some(&own), &pin_bytes).unwrap_err();
         assert!(error.contains("did not derive"), "{error}");
         // No schedule pin, and no checkpoint pin at all.
         let unpinned = write("unpinned.json", Some(&own), None);
         assert!(
-            genesis_binding(&unpinned, &own)
+            genesis_binding(&unpinned, Some(&own), &pin_bytes)
                 .unwrap_err()
                 .contains("migration_schedule_sha256")
         );
         let bare = write("bare.json", None, None);
         assert!(
-            genesis_binding(&bare, &own)
+            genesis_binding(&bare, Some(&own), &pin_bytes)
                 .unwrap_err()
                 .contains("no checkpoint binding")
         );
+        // A genesis pinning a different schedule than the one this voter was
+        // configured to expect is refused, whatever its checkpoint says.
+        let other_pin = write("other-pin.json", Some(&own), Some(&"ee".repeat(32)));
+        assert!(
+            genesis_binding(&other_pin, Some(&own), &pin_bytes)
+                .unwrap_err()
+                .contains("not told to expect")
+        );
+        // Without an own checkpoint yet (operator-fed, pre-conversion) the
+        // genesis is still read and its schedule pin still checked.
+        assert!(genesis_binding(&good, None, &pin_bytes).is_ok());
+        assert!(genesis_binding(&other_pin, None, &pin_bytes).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3430,38 +3572,81 @@ mod tests {
                 ),
             )
         };
+        let pin = "cd".repeat(32);
         let complete = format!(
-            r#""migration_genesis":"{genesis}","checkpoint_sha256":"{own}","platform_chain_id":"{platform}""#
+            r#""schedule_sha256":"{pin}","migration_genesis":"{genesis}","checkpoint_sha256":"{own}","platform_chain_id":"{platform}""#
         );
         let good = load_loaded_config(&with(complete.clone())).expect("a complete config loads");
-        assert_eq!(hex::encode(good.schedule_pin), "cd".repeat(32));
-        // Coordinator-only (no genesis), no own checkpoint, no platform id, a
-        // genesis pinning a foreign checkpoint: each refuses to load.
+        assert_eq!(hex::encode(good.schedule_pin), pin);
+        // The published schedule hash is the one pin known before H: it is
+        // required, and it is what the pre-H check compares against.
+        let error = load_loaded_config(&with(String::new()))
+            .err()
+            .expect("no schedule pin refuses");
+        assert!(error.contains("schedule_sha256 is required"), "{error}");
+        let error = load_loaded_config(&with(r#""schedule_sha256":"zz""#.to_string()))
+            .err()
+            .expect("a malformed pin refuses");
+        assert!(error.contains("schedule_sha256"), "{error}");
+        // An operator-fed config starts before H with none of the post-H
+        // inputs: this is how the ceremony agent actually runs the voter.
+        let fed = load_loaded_config(&with(format!(
+            r#""schedule_sha256":"{pin}","operator_fed":true"#
+        )))
+        .expect(
+            "an operator-fed config loads before the checkpoint, genesis and platform id exist",
+        );
+        assert_eq!(hex::encode(fed.schedule_pin), pin);
+        assert_eq!(
+            missing_confirmation_inputs(&fed.inner.confirmation).len(),
+            3
+        );
+        // Without the opt-in the same config is a config that can never sign.
+        let error = load_loaded_config(&with(format!(r#""schedule_sha256":"{pin}""#)))
+            .err()
+            .expect("an unsignable config must refuse to load");
+        assert!(
+            error.contains("checkpoint_sha256")
+                && error.contains("migration_genesis")
+                && error.contains("platform_chain_id")
+                && error.contains("operator_fed"),
+            "{error}"
+        );
+        // Whatever is present is validated, even when operator-fed: a
+        // genesis for a checkpoint this operator did not derive, one pinning
+        // another schedule, and malformed values all refuse.
         let refusals = [
             (
-                format!(r#""checkpoint_sha256":"{own}","platform_chain_id":"{platform}""#),
-                "migration_genesis is required",
-            ),
-            (
-                format!(r#""migration_genesis":"{genesis}","platform_chain_id":"{platform}""#),
-                "checkpoint_sha256 is required",
-            ),
-            (
-                format!(r#""migration_genesis":"{genesis}","checkpoint_sha256":"{own}""#),
-                "platform_chain_id is required",
-            ),
-            (
                 format!(
-                    r#""migration_genesis":"{genesis}","checkpoint_sha256":"{}","platform_chain_id":"{platform}""#,
+                    r#""schedule_sha256":"{pin}","operator_fed":true,"migration_genesis":"{genesis}","checkpoint_sha256":"{}","platform_chain_id":"{platform}""#,
                     "ee".repeat(32)
                 ),
                 "did not derive",
+            ),
+            (
+                format!(
+                    r#""schedule_sha256":"{}","operator_fed":true,"migration_genesis":"{genesis}","checkpoint_sha256":"{own}""#,
+                    "ee".repeat(32)
+                ),
+                "not told to expect",
+            ),
+            (
+                format!(
+                    r#""schedule_sha256":"{pin}","operator_fed":true,"checkpoint_sha256":"12""#
+                ),
+                "checkpoint_sha256",
+            ),
+            (
+                format!(
+                    r#""schedule_sha256":"{pin}","operator_fed":true,"platform_chain_id":"nope""#
+                ),
+                "platform_chain_id",
             ),
         ];
         for (confirmation, expected) in refusals {
             let error = load_loaded_config(&with(confirmation))
                 .err()
-                .expect("an unsignable config must refuse to load");
+                .expect("a bad confirmation input must refuse to load");
             assert!(error.contains(expected), "{error} (wanted {expected})");
         }
         std::fs::remove_dir_all(&dir).unwrap();
