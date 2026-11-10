@@ -3306,8 +3306,9 @@ fn decode_portable_rows(entry: &StateHistoryEntry) -> Result<Vec<PortableRow>, X
     // its key), across every delta of that table. Arena row ids are insertion
     // order and the checkpoint lists rows by id, so the checkpoint hash would
     // otherwise depend on the order each BP's state history happened to emit
-    // rows. Tables keep the order they first appear in. Sorting makes the
-    // conversion a function of the set of rows.
+    // rows. Tables go in a fixed canonical order (`canonical_table_rank`), not
+    // the order they appear in the stream. Sorting makes the conversion a
+    // function of the set of rows.
     let mut ordered: Vec<(usize, &str, &TableDeltaRow)> = Vec::new();
     for delta in &entry.deltas {
         let rank = canonical_table_rank(&delta.name);

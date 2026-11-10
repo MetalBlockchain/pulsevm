@@ -216,7 +216,7 @@ mk_config() { # $1=height $2=dry $3=coord-url-or-empty $4=platform-or-empty $5=s
     local out="$WORK/voter-$RANDOM.json"
     local coord="null"
     [[ -n "${3:-}" ]] && coord="\"$3\""
-    local plat="null"
+    local plat="\"$PLATFORM\""   # the platform id is mandatory config: never adopted
     [[ -n "${4:-}" ]] && plat="\"$4\""
     local stop='"stop_producer":{"at_pause":false}'
     if [[ "${5:-}" == "HALF" ]]; then
@@ -286,6 +286,43 @@ grep -q "PREFLIGHT FAIL: stop window past finality" "$WORK/preflight-short.log" 
 grep -q "PREFLIGHT: NO-GO" "$WORK/preflight-short.log" || fail "short stop window did not produce NO-GO"
 grep -q "stop window past finality" "$WORK/preflight.log" || fail "GO preflight skipped the stop-window check"
 pass "preflight refuses a stop window shorter than the finality lag"
+
+# The producer API check runs against the REAL nodeos producer API of the
+# throwaway node (read-only: it only asks paused, it never pauses the chain).
+# Leap 5.0.3 answers with a bare boolean; the stubs elsewhere in this script
+# also answer that way.
+echo "cutover-voter-test: preflight reads the real producer API's paused reply..."
+REAL_API_CFG="$(mk_config "$H" true "" "$PLATFORM" "$API")"
+"$VOTER_BIN" --config "$REAL_API_CFG" --preflight >"$WORK/preflight-real-api.log" 2>&1 \
+    || fail "preflight against the real producer API failed: $(cat "$WORK/preflight-real-api.log")"
+grep -q "producer api reachable: paused=false" "$WORK/preflight-real-api.log" \
+    || fail "the real producer API's paused reply was not read: $(cat "$WORK/preflight-real-api.log")"
+pass "preflight parses the real producer API's paused reply"
+
+# A stale schedule pin must abort before H, while nothing has been paused.
+echo "cutover-voter-test: a stale schedule pin aborts the voter before H..."
+python3 - "$GENESIS" "$WORK/genesis-stale-pin.json" <<'PYEOF'
+import json, sys
+genesis = json.load(open(sys.argv[1]))
+genesis["migration_schedule_sha256"] = "22" * 32
+json.dump(genesis, open(sys.argv[2], "w"))
+PYEOF
+GOOD_GENESIS_EARLY="$GENESIS"
+GENESIS="$WORK/genesis-stale-pin.json"
+STALE_CFG="$(mk_config "$H" true "")"
+GENESIS="$GOOD_GENESIS_EARLY"
+if "$VOTER_BIN" --config "$STALE_CFG" --dry-run --max-polls 3 >"$WORK/stale-pin.log" 2>&1; then
+    fail "the voter ran on a stale schedule pin: $(cat "$WORK/stale-pin.log")"
+fi
+grep -q "no longer hashes to the genesis's migration_schedule_sha256" "$WORK/stale-pin.log" \
+    || fail "stale pin not reported: $(cat "$WORK/stale-pin.log")"
+# The same stale pin fails the operator's preflight too.
+if "$VOTER_BIN" --config "$STALE_CFG" --preflight >"$WORK/stale-pin-preflight.log" 2>&1; then
+    fail "preflight accepted a stale schedule pin: $(cat "$WORK/stale-pin-preflight.log")"
+fi
+grep -q "PREFLIGHT FAIL: schedule pin" "$WORK/stale-pin-preflight.log" \
+    || fail "preflight did not flag the stale pin: $(cat "$WORK/stale-pin-preflight.log")"
+pass "a stale schedule pin aborts before H and fails preflight"
 
 echo "cutover-voter-test: status reports the loop state as JSON..."
 "$VOTER_BIN" --config "$PREFLIGHT_CFG" --status >"$WORK/status.json" 2>"$WORK/status.err" \

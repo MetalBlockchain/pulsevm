@@ -431,7 +431,11 @@ impl SourceSchedule {
             head_block_id: *state.id.as_bytes(),
             head_block_num: state.block_num,
             schedule_version: state.active_schedule.version,
-            pending_schedule_staged: !state.pending_schedule.schedule.producers.is_empty(),
+            // A staged change is refused above, so a converted checkpoint
+            // never carries one; the flag stays in the row layout (and the
+            // gate refuses a checkpoint that sets it) so a hand-built
+            // checkpoint cannot claim an unstaged schedule it does not have.
+            pending_schedule_staged: false,
             producers,
         })
     }

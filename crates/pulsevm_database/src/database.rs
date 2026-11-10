@@ -2635,6 +2635,72 @@ impl Database {
         snapshot
     }
 
+    /// The sha256 of the checkpoint file `snapshot_bytes` would produce,
+    /// computed as a stream: the arena is read twice in fixed chunks (once for
+    /// the payload hash the envelope header carries, once to hash header and
+    /// payload together) and the sparse payload is never held in memory. On
+    /// mainnet-size state the in-memory snapshot is many gigabytes, which a
+    /// restart check should not need.
+    pub fn snapshot_sha256(&self) -> Result<[u8; 32], ChainError> {
+        let revision = self.backend.revision();
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
+        self.backend
+            .checkpoint(&file)
+            .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
+        let result = Self::stream_snapshot_sha256(&file, revision);
+        let _ = fs::remove_file(&file);
+        result
+    }
+
+    fn stream_snapshot_sha256(file: &Path, revision: i64) -> Result<[u8; 32], ChainError> {
+        // Feed the sparse payload of `file` to `sink`, chunk by chunk. Runs do
+        // not merge across chunks, so a fresh scratch buffer per chunk yields
+        // exactly the bytes `read_sparse_snapshot` would append.
+        fn stream_payload(file: &Path, mut sink: impl FnMut(&[u8])) -> Result<u64, ChainError> {
+            let mut f = fs::File::open(file).map_err(|e| {
+                ChainError::InternalError(format!("snapshot: open {}: {e}", file.display()))
+            })?;
+            let len = f
+                .metadata()
+                .map_err(|e| ChainError::InternalError(format!("snapshot: stat: {e}")))?
+                .len();
+            let begin = crate::snapshot::sparse_begin(len);
+            sink(&begin);
+            let mut total = begin.len() as u64;
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut scratch = Vec::new();
+            let mut offset = 0u64;
+            loop {
+                let n = fill(&mut f, &mut buf)
+                    .map_err(|e| ChainError::InternalError(format!("snapshot: read: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                scratch.clear();
+                crate::snapshot::sparse_append(&mut scratch, offset, &buf[..n]);
+                sink(&scratch);
+                total += scratch.len() as u64;
+                offset += n as u64;
+            }
+            Ok(total)
+        }
+        let mut payload_hasher = Sha256::new();
+        let payload_len = stream_payload(file, |bytes| payload_hasher.update(bytes))?;
+        let payload_sha: [u8; 32] = payload_hasher.finalize().into();
+        let mut whole = Sha256::new();
+        whole.update(crate::snapshot::encode_header(
+            revision,
+            payload_len,
+            &payload_sha,
+        ));
+        stream_payload(file, |bytes| whole.update(bytes))?;
+        Ok(whole.finalize().into())
+    }
+
     /// Read `shared_memory.bin` into a sparse, envelope-wrapped snapshot without
     /// ever holding the whole (mostly-zero) file in memory. Fixed-size,
     /// block-aligned chunks keep the run boundaries deterministic, so re-reading
@@ -7297,6 +7363,22 @@ mod tests {
         assert_eq!(header.revision, 4);
         assert_eq!(target.revision(), 4);
         assert!(target.arena_account_exists(alice));
+    }
+
+    #[test]
+    fn streamed_snapshot_hash_equals_the_hash_of_the_snapshot_bytes() {
+        let dir = TempDir::new().unwrap();
+        let mut database = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        database.add_indices().unwrap();
+        database.set_revision(11).unwrap();
+        for name in ["alice", "bob", "carol", "dave"] {
+            database.create_account(name_u64(name), 1).unwrap();
+        }
+        let bytes = database.snapshot_bytes().unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
+        // Stable across repeated calls on unchanged state.
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
     }
 
     #[test]

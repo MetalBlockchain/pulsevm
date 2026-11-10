@@ -112,6 +112,10 @@ use pulsevm_constants::{
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
 
+/// Written into the database directory once a migration restore has passed
+/// every restore-only check; names the checkpoint hash it covers.
+const RESTORE_VERIFIED_MARKER: &str = "migration-restore-verified";
+
 const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
     0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67, 0xb8,
     0x43, 0xa7, 0x26, 0x2a, 0x84, 0x8a, 0xf0, 0xa4, 0x9a, 0x6e, 0x2f, 0xa9, 0xf6, 0x58, 0x4e, 0xb4,
@@ -1644,6 +1648,17 @@ impl Controller {
                         );
                     }
                 }
+                // Every restore-only check above has passed: record that, so a
+                // crash or restart before the node builds its first block cannot
+                // fall into the "reuse" branch below and skip them. The marker
+                // names the checkpoint it covers.
+                let marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                fs::write(&marker, hex::encode(expected_checkpoint_sha256)).map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "cannot record the verified restore at {}: {error}",
+                        marker.display()
+                    ))
+                })?;
                 info!(
                     "restored migration Arena checkpoint {} at revision {} from manifest {}",
                     checkpoint, header.revision, manifest_path
@@ -1662,11 +1677,31 @@ impl Controller {
                 // this boot. Past that revision the chain has advanced and the
                 // local state is the node's own.
                 if self.db.revision() == manifest.checkpoint_revision {
-                    let existing = self.db.snapshot_bytes()?;
-                    let existing_sha256: [u8; 32] = {
-                        use sha2::Digest as _;
-                        sha2::Sha256::digest(&existing).into()
-                    };
+                    // The restore-only checks (deferred ids, the pause-window
+                    // inventory, stage-2 retirement) run only on a fresh
+                    // restore. An arena at the checkpoint revision without the
+                    // marker that a completed restore writes came from a boot
+                    // that did not finish them: discard it so the next start
+                    // restores and verifies from the checkpoint again.
+                    let marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                    let verified = fs::read_to_string(&marker)
+                        .map(|recorded| {
+                            recorded
+                                .trim()
+                                .eq_ignore_ascii_case(&hex::encode(expected_checkpoint_sha256))
+                        })
+                        .unwrap_or(false);
+                    if !verified {
+                        let arena = Database::arena_state_file(std::path::Path::new(db_path));
+                        let _ = fs::remove_file(&arena);
+                        return Err(ChainError::GenesisError(
+                            "the existing arena is at the checkpoint revision but no completed restore verified it (a previous boot did not finish): it was discarded, restart to restore the checkpoint again"
+                                .into(),
+                        ));
+                    }
+                    // Hashed as a stream: the in-memory snapshot is many
+                    // gigabytes on mainnet-size state.
+                    let existing_sha256 = self.db.snapshot_sha256()?;
                     if existing_sha256 != expected_checkpoint_sha256 {
                         return Err(ChainError::GenesisError(format!(
                             "the existing arena at revision {} hashes to {} but the migration genesis pins {}: refusing to reuse a database that is not the checkpoint",
@@ -12309,6 +12344,92 @@ mod tests {
             )
             .expect("a restart at the checkpoint revision reuses the verified arena");
         assert_eq!(again.database().revision(), source_revision);
+    }
+
+    // A boot that restored the checkpoint but never finished verifying it (a
+    // crash) must not leave a database the next start reuses: with no
+    // verified-restore marker the arena is discarded and the next start
+    // restores and verifies from the checkpoint again.
+    #[tokio::test]
+    async fn migration_crash_before_the_restore_is_verified_forces_a_fresh_restore() {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pulse_k1, keys[0].clone(), keys[1].clone()],
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("crash-target");
+        let boot = |controller: &mut Controller| {
+            controller.initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+        };
+        let mut first = Controller::new();
+        boot(&mut first).expect("first boot restores and verifies");
+        drop(first);
+        let marker = target_path.join(RESTORE_VERIFIED_MARKER);
+        assert!(marker.exists(), "a verified restore leaves its marker");
+        // Simulate the crash: the arena is on disk, the marker never landed.
+        std::fs::remove_file(&marker).unwrap();
+        let mut second = Controller::new();
+        let error = boot(&mut second).expect_err("an unverified arena must not be reused");
+        assert!(
+            error.to_string().contains("did not finish"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "the unverified arena was not discarded"
+        );
+        // The next start restores from the checkpoint and verifies it fully.
+        let mut third = Controller::new();
+        boot(&mut third).expect("the restart restores the checkpoint again");
+        assert_eq!(third.database().revision(), source_revision);
+        assert!(marker.exists());
     }
 
     // Self-derivation: a delivered checkpoint is only restored when this

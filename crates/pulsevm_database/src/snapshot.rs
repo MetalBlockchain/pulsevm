@@ -36,15 +36,31 @@ pub struct SnapshotHeader {
     pub payload_sha256: [u8; 32],
 }
 
+/// The envelope header for a payload of `payload_len` bytes whose sha256 is
+/// `payload_sha256`.
+pub fn encode_header(
+    revision: i64,
+    payload_len: u64,
+    payload_sha256: &[u8; 32],
+) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[0..4].copy_from_slice(&MAGIC);
+    out[4..6].copy_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    // bytes 6..8: reserved, zero
+    out[8..16].copy_from_slice(&revision.to_le_bytes());
+    out[16..24].copy_from_slice(&payload_len.to_le_bytes());
+    out[24..56].copy_from_slice(payload_sha256);
+    out
+}
+
 /// Wrap raw arena checkpoint bytes in the transport envelope.
 pub fn encode(revision: i64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    out.extend_from_slice(&revision.to_le_bytes());
-    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(Digest::hash(payload).as_bytes());
+    out.extend_from_slice(&encode_header(
+        revision,
+        payload.len() as u64,
+        Digest::hash(payload).as_bytes(),
+    ));
     out.extend_from_slice(payload);
     out
 }

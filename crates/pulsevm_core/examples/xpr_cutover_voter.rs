@@ -169,6 +169,9 @@ struct LoadedConfig {
     payer_key: PrivateKey,
     payer_account: String,
     expected_digest: [u8; 32],
+    /// The published source schedule hash pinned in the migration genesis
+    /// this voter will sign. The live active schedule must hash to it.
+    schedule_pin: [u8; 32],
 }
 
 fn load_config(path: &str) -> Result<Config, String> {
@@ -315,12 +318,31 @@ fn load_loaded_config(path: &str) -> Result<LoadedConfig, String> {
         &members,
         &inner.contract,
     )?;
+    // Everything the confirmation needs from outside the chain is checked at
+    // load, not at signing time: a config that can never sign must refuse to
+    // start rather than vote, pause the producer at P and then refuse forever.
+    let checkpoint = inner.confirmation.checkpoint_sha256.as_deref().ok_or_else(|| {
+        "confirmation.checkpoint_sha256 is required: the hash of the checkpoint this operator derived from its own snapshot"
+            .to_string()
+    })?;
+    let genesis_path = inner.confirmation.migration_genesis.as_deref().ok_or_else(|| {
+        "confirmation.migration_genesis is required: the voter signs only a genesis it has read (a coordinator-only config can never sign)"
+            .to_string()
+    })?;
+    let (_, schedule_pin) = genesis_binding(genesis_path, checkpoint)?;
+    let platform = inner.confirmation.platform_chain_id.as_deref().ok_or_else(|| {
+        "confirmation.platform_chain_id is required: the id transactions on the new chain are signed under is never adopted from a coordinator"
+            .to_string()
+    })?;
+    pulsevm_crypto::parse_chain_id(platform)
+        .map_err(|error| format!("confirmation.platform_chain_id: {error}"))?;
     Ok(LoadedConfig {
         inner,
         vote_key,
         payer_key,
         payer_account,
         expected_digest,
+        schedule_pin,
     })
 }
 
@@ -351,6 +373,9 @@ struct CeremonyView {
     /// (member or schedule-key drift since the freeze): the freeze is stale
     /// and the vote refuses until it is re-taken.
     schedule_mismatch: bool,
+    /// Hash of the live active schedule in the form the genesis pins
+    /// (`pack_schedule_hash`). A schedule version bump changes it.
+    live_schedule_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -917,6 +942,7 @@ async fn read_view(
         member,
         schedule_blocked: live.blocked,
         schedule_mismatch,
+        live_schedule_hash: live_schedule_hash(&live)?,
     })
 }
 
@@ -1116,7 +1142,8 @@ async fn verify_window_empty(
     base: &str,
     after: u32,
     through: u32,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    let mut last_id = None;
     for number in after.saturating_add(1)..=through {
         let block = post_json(
             client,
@@ -1125,8 +1152,17 @@ async fn verify_window_empty(
         )
         .await?;
         window_block_is_empty(&block, number)?;
+        last_id = block
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
     }
-    Ok(())
+    // The id of the block coverage ends at: a fork that replaces blocks above
+    // P changes it, so cached coverage keyed to it cannot go stale.
+    match last_id {
+        Some(id) => Ok(id),
+        None => fetch_block_id(client, base, through).await,
+    }
 }
 
 /// Leap block timestamp (`2026-10-23T13:50:31.500`, always UTC) to
@@ -1300,7 +1336,7 @@ fn live_schedule_hash(live: &LiveSchedule) -> Result<[u8; 32], String> {
 async fn unsigned_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
-    expected_pause_id: Option<&str>,
+    expected: Option<(&str, u32)>,
 ) -> Result<(HaltConfirmation, [u8; 32]), String> {
     let height = config.inner.height;
     // The agreed pause head P: the ceremony fixes P (a strict H+k) before
@@ -1340,12 +1376,21 @@ async fn unsigned_confirmation(
     // The id that was settled and scanned is the id that gets signed: a
     // reorg of P since then refuses instead of signing a branch nobody
     // verified.
-    if let Some(expected) = expected_pause_id
-        && expected != local_pause_block_id
-    {
-        return Err(format!(
-            "block P={pause_height} changed from {expected} to {local_pause_block_id} since it was verified: refusing to sign"
-        ));
+    if let Some((expected_id, covered_through)) = expected {
+        if expected_id != local_pause_block_id {
+            return Err(format!(
+                "block P={pause_height} changed from {expected_id} to {local_pause_block_id} since it was verified: refusing to sign"
+            ));
+        }
+        // The emptiness scan must reach the head the node has now: a block
+        // that arrived after the scan could carry a transaction nothing else
+        // covers (the proof and the gate stop at P).
+        let (head_now, _, _) = get_info(client, &config.inner.nodeos_url).await?;
+        if head_now > covered_through {
+            return Err(format!(
+                "head {head_now} is past the scanned coverage {covered_through}: rescanning before signing"
+            ));
+        }
     }
     // Checkpoint and successor id: explicit config wins; the coordinator may
     // supply them, but anything it says must match what is configured and
@@ -1418,28 +1463,23 @@ async fn unsigned_confirmation(
         }
         // The platform id is the one value that must agree three ways
         // (config, coordinator, boot): wallets sign under it while the
-        // ceremony commits to it, so any mismatch refuses loudly. Either
-        // side may use hex or the base58 log rendering; bytes are compared.
-        match (platform.as_deref(), params.platform_chain_id.as_deref()) {
-            (Some(configured), Some(coordinated)) => {
-                let configured_id = pulsevm_crypto::parse_chain_id(configured)
-                    .map_err(|error| format!("configured platform chain id: {error}"))?;
-                let coordinated_id = pulsevm_crypto::parse_chain_id(coordinated)
-                    .map_err(|error| format!("coordinator platform chain id: {error}"))?;
-                if configured_id != coordinated_id {
-                    return Err(
-                        "coordinator platform chain id does not match configured platform chain id"
-                            .to_string(),
-                    );
-                }
-                platform = Some(pulsevm_crypto::chain_id_hex(&configured_id));
+        // ceremony commits to it, so any mismatch refuses loudly. It is
+        // configured, never adopted from the coordinator. Either side may
+        // use hex or the base58 log rendering; bytes are compared.
+        if let (Some(configured), Some(coordinated)) =
+            (platform.as_deref(), params.platform_chain_id.as_deref())
+        {
+            let configured_id = pulsevm_crypto::parse_chain_id(configured)
+                .map_err(|error| format!("configured platform chain id: {error}"))?;
+            let coordinated_id = pulsevm_crypto::parse_chain_id(coordinated)
+                .map_err(|error| format!("coordinator platform chain id: {error}"))?;
+            if configured_id != coordinated_id {
+                return Err(
+                    "coordinator platform chain id does not match configured platform chain id"
+                        .to_string(),
+                );
             }
-            (None, Some(coordinated)) => {
-                let coordinated_id = pulsevm_crypto::parse_chain_id(coordinated)
-                    .map_err(|error| format!("coordinator platform chain id: {error}"))?;
-                platform = Some(pulsevm_crypto::chain_id_hex(&coordinated_id));
-            }
-            _ => {}
+            platform = Some(pulsevm_crypto::chain_id_hex(&configured_id));
         }
     }
     let checkpoint = checkpoint.ok_or_else(|| {
@@ -1450,7 +1490,7 @@ async fn unsigned_confirmation(
     // is never useful. Fail here, loudly, instead of signing evidence the
     // gate must reject.
     let platform = platform.ok_or_else(|| {
-        "no platform chain id configured: set confirmation.platform_chain_id or coordinator_url"
+        "no platform chain id configured: set confirmation.platform_chain_id (it is never adopted from a coordinator)"
             .to_string()
     })?;
     let parsed = pulsevm_crypto::parse_chain_id(&platform)
@@ -1493,9 +1533,11 @@ async fn submit_confirmation(
     client: &reqwest::Client,
     config: &LoadedConfig,
     expected_pause_id: &str,
+    covered_through: u32,
 ) -> Result<String, String> {
     let height = config.inner.height;
-    let (template, digest) = unsigned_confirmation(client, config, Some(expected_pause_id)).await?;
+    let (template, digest) =
+        unsigned_confirmation(client, config, Some((expected_pause_id, covered_through))).await?;
     let local_block_id = template.halt_block_id.clone();
     let pause_block_id = template.pause_block_id.clone();
     let checkpoint = template.checkpoint_sha256.clone();
@@ -1736,6 +1778,16 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
             } else {
                 println!("PREFLIGHT ok: schedule: frozen set matches the live active schedule");
             }
+            if view.live_schedule_hash == config.schedule_pin {
+                println!(
+                    "PREFLIGHT ok: schedule pin: the live active schedule hashes to the genesis's migration_schedule_sha256"
+                );
+            } else {
+                failures += 1;
+                println!(
+                    "PREFLIGHT FAIL: schedule pin: the live active schedule does not hash to the genesis's migration_schedule_sha256 (version bump?): publish the new hash and rebuild the genesis and ceremony id"
+                );
+            }
             println!(
                 "PREFLIGHT ok: head vs H: head {} vs H {}",
                 view.head_num, config.inner.height
@@ -1755,11 +1807,12 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
                 &serde_json::json!({})
             )
             .await
-            .map(|state| format!(
-                "paused={}",
-                paused_flag(&state)
-                    .map_or_else(|| "unknown".to_string(), |paused| paused.to_string())
-            )),
+            .and_then(|state| match paused_flag(&state) {
+                Some(paused) => Ok(format!("paused={paused}")),
+                None => Err(format!(
+                    "the producer API's paused reply is neither a boolean nor {{\"paused\": bool}}: {state}"
+                )),
+            }),
         ];
     }
     if failures == 0 {
@@ -1915,15 +1968,17 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
         tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
     };
     let (head_now, _, _) = get_info(&client, &config.inner.nodeos_url).await?;
+    let covered = pause_height.max(head_now);
     verify_window_empty(
         &client,
         &config.inner.nodeos_url,
         config.inner.height,
-        pause_height.max(head_now),
+        covered,
     )
     .await
     .map_err(|error| format!("nothing to sign: {error}"))?;
-    let (template, digest) = unsigned_confirmation(&client, config, Some(&settled_id)).await?;
+    let (template, digest) =
+        unsigned_confirmation(&client, config, Some((&settled_id, covered))).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&confirmation_digest_json(
@@ -2119,7 +2174,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut voted = false;
     let mut pause_holding = false;
     let mut window_checked = false;
-    let mut window_verified: Option<(String, u32)> = None;
+    let mut window_verified: Option<(String, u32, String)> = None;
     let mut finalized_seen = false;
     let mut settle: (Option<String>, u32) = (None, 0);
     let mut pause_note = String::new();
@@ -2188,6 +2243,17 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 // is no snapshot, so no checkpoint hash and no signature.
                 log_line!("WARNING after H: {error}");
             }
+        }
+        // The published schedule pin must still describe the live committee
+        // while there is time to abort. XPR's schedule version moves, the pin
+        // includes the version, and a stale pin would otherwise only show up
+        // at signing, with the chain already paused. Before H this fails
+        // loudly and nothing has been paused.
+        if view.head_num < config.inner.height && view.live_schedule_hash != config.schedule_pin {
+            return Err(
+                "the live active schedule no longer hashes to the genesis's migration_schedule_sha256 (a schedule version bump?): abort this round before H, publish the new hash, rebuild the genesis and ceremony id, and re-run the declaration"
+                    .to_string(),
+            );
         }
         match decide(config, &view) {
             Decision::Vote => {
@@ -2354,39 +2420,60 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // Nothing may have landed from H+1 through the point production
             // actually stopped: the gate refuses a dirty H+1..P, and blocks
             // past P (a pause that lands late) carry traffic nothing else
-            // covers. The scan is keyed to the settled id of P, so a reorg
-            // restarts it, and it extends as the head moves.
-            let scan_to = pause_height.max(view.head_num);
-            let scan_from = match &window_verified {
-                Some((id, through)) if *id == settled_id => *through,
-                _ => config.inner.height,
+            // covers. The head is read now, after the pause is confirmed
+            // held, not taken from the start of the poll. Coverage is cached
+            // against the id of the last block scanned (not just P's), so a
+            // fork that replaces blocks above P restarts the scan.
+            let (head_after_pause, _, _) = match get_info(&client, &config.inner.nodeos_url).await {
+                Ok(info) => info,
+                Err(error) => {
+                    note_throttled(
+                        &mut last_note,
+                        &mut polls,
+                        &format!("cannot read the head after the pause: {error}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+                    continue;
+                }
             };
-            if window_verified
-                .as_ref()
-                .is_none_or(|(id, through)| *id != settled_id || *through < scan_to)
-            {
-                match verify_window_empty(&client, &config.inner.nodeos_url, scan_from, scan_to)
-                    .await
-                {
-                    Ok(()) => {
-                        window_verified = Some((settled_id.clone(), scan_to));
-                        log_line!(
-                            "H+1..{scan_to} (P={pause_height}) verified empty on the local node"
-                        );
-                    }
-                    Err(error) => {
-                        window_verified = None;
-                        note_throttled(
-                            &mut last_note,
-                            &mut polls,
-                            &format!("refusing to sign: {error}"),
-                        );
-                        tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
-                        continue;
+            let scan_to = pause_height.max(head_after_pause);
+            let cached = match &window_verified {
+                Some((id, through, tip)) if *id == settled_id => {
+                    match fetch_block_id(&client, &config.inner.nodeos_url, *through).await {
+                        Ok(current) if current == *tip => Some(*through),
+                        _ => None,
                     }
                 }
-            }
-            match submit_confirmation(&client, config, &settled_id).await {
+                _ => None,
+            };
+            let covered_through = match cached {
+                Some(through) if through >= scan_to => through,
+                _ => {
+                    let scan_from = cached.unwrap_or(config.inner.height);
+                    match verify_window_empty(&client, &config.inner.nodeos_url, scan_from, scan_to)
+                        .await
+                    {
+                        Ok(tip) => {
+                            window_verified = Some((settled_id.clone(), scan_to, tip));
+                            log_line!(
+                                "H+1..{scan_to} (P={pause_height}) verified empty on the local node"
+                            );
+                            scan_to
+                        }
+                        Err(error) => {
+                            window_verified = None;
+                            note_throttled(
+                                &mut last_note,
+                                &mut polls,
+                                &format!("refusing to sign: {error}"),
+                            );
+                            tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
+                            continue;
+                        }
+                    }
+                }
+            };
+            match submit_confirmation(&client, config, &settled_id, covered_through).await {
                 Ok(line) => {
                     log_line!("{line}");
                 }
@@ -2545,6 +2632,7 @@ mod tests {
             .unwrap(),
             payer_account: "prod.a".to_string(),
             expected_digest: digest,
+            schedule_pin: [0x5C; 32],
         }
     }
 
@@ -2564,6 +2652,7 @@ mod tests {
             member,
             schedule_blocked: false,
             schedule_mismatch: false,
+            live_schedule_hash: config.schedule_pin,
         }
     }
 
@@ -3310,6 +3399,70 @@ mod tests {
                 ),
             );
             assert!(load_loaded_config(&bad_p).is_err());
+        }
+        // A config that can never sign must not start: the confirmation's
+        // outside facts are checked at load, not at signing time.
+        let own = "ab".repeat(32);
+        let genesis = write(
+            "genesis.json",
+            &format!(
+                r#"{{"initial_timestamp":"2023-01-01T00:00:00","initial_key":"PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX","initial_configuration":{{"max_block_net_usage":1048576,"target_block_net_usage_pct":1000,"max_transaction_net_usage":524288,"base_per_transaction_net_usage":12,"net_usage_leeway":500,"context_free_discount_net_usage_num":20,"context_free_discount_net_usage_den":100,"max_block_cpu_usage":3000000000,"target_block_cpu_usage_pct":2500,"max_transaction_cpu_usage":1000000000,"min_transaction_cpu_usage":100000,"max_transaction_lifetime":3600,"deferred_trx_expiration_window":600,"max_transaction_delay":3888000,"max_inline_action_size":4096,"max_inline_action_depth":6,"max_authority_depth":6,"max_action_return_value_size":256}},"migration_checkpoint_sha256":"{own}","migration_schedule_sha256":"{}"}}"#,
+                "cd".repeat(32)
+            ),
+        );
+        let platform = "51".repeat(32);
+        // A roster whose key is real (the earlier cases never got that far).
+        let real_key =
+            K1PrivateKey::from_string("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap()
+                .public_key()
+                .to_string();
+        let roster = write(
+            "roster-real.json",
+            &format!(r#"[{{"producer":"prod.a","key":"{real_key}","weight":"1"}}]"#),
+        );
+        let with = |confirmation: String| {
+            write(
+                "full.json",
+                &format!(
+                    r#"{{"nodeos_url":"http://x","contract":"cutover","producer":"prod.a","source_chain_id":"{}","height":100,"pause_height":120,"schedule_version":7,"roster_file":"{roster}","vote_key_file":"{key}","payer_account":"prod.a","payer_key_file":"{key}","confirmation":{{{confirmation}}}}}"#,
+                    "41".repeat(32),
+                ),
+            )
+        };
+        let complete = format!(
+            r#""migration_genesis":"{genesis}","checkpoint_sha256":"{own}","platform_chain_id":"{platform}""#
+        );
+        let good = load_loaded_config(&with(complete.clone())).expect("a complete config loads");
+        assert_eq!(hex::encode(good.schedule_pin), "cd".repeat(32));
+        // Coordinator-only (no genesis), no own checkpoint, no platform id, a
+        // genesis pinning a foreign checkpoint: each refuses to load.
+        let refusals = [
+            (
+                format!(r#""checkpoint_sha256":"{own}","platform_chain_id":"{platform}""#),
+                "migration_genesis is required",
+            ),
+            (
+                format!(r#""migration_genesis":"{genesis}","platform_chain_id":"{platform}""#),
+                "checkpoint_sha256 is required",
+            ),
+            (
+                format!(r#""migration_genesis":"{genesis}","checkpoint_sha256":"{own}""#),
+                "platform_chain_id is required",
+            ),
+            (
+                format!(
+                    r#""migration_genesis":"{genesis}","checkpoint_sha256":"{}","platform_chain_id":"{platform}""#,
+                    "ee".repeat(32)
+                ),
+                "did not derive",
+            ),
+        ];
+        for (confirmation, expected) in refusals {
+            let error = load_loaded_config(&with(confirmation))
+                .err()
+                .expect("an unsignable config must refuse to load");
+            assert!(error.contains(expected), "{error} (wanted {expected})");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

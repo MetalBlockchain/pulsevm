@@ -204,6 +204,25 @@ uncovered traffic into a confirmation. `--print-digest` applies the same
 policy as the signing loop (finalized ceremony, pause held, P settled, window
 empty) before it prints a confirmation digest.
 
+## A stale schedule pin: abort before H
+
+The published schedule hash pinned in the genesis includes the schedule
+version, and XPR's version moves. The voter checks the live active schedule
+against the pin at start and on every poll before H, and in `--preflight`, and
+exits with an explicit error if they differ (nothing has been paused before H).
+Recovery for a stale pin, all before H: read the new hash from any node
+(`xpr_snapshot_schedule <current snapshot>` prints it), rebuild the migration
+genesis with the new `migration_schedule_sha256` (the ceremony chain id changes
+with it), republish the genesis and chain id, and re-run the declaration on a
+fresh contract account. After H the schedule is frozen by the window; a pin
+mismatch there refuses to sign instead.
+
+The voter's config is checked when it starts: `confirmation.checkpoint_sha256`
+(the operator's own derived hash), `confirmation.migration_genesis` (which must
+pin that checkpoint and carry the schedule pin) and
+`confirmation.platform_chain_id` are all required, so a coordinator-only config
+refuses to load rather than vote, pause at P and then refuse to sign.
+
 ## Coordinator status contract (agent side)
 
 The voter reports its own state via `--status` (one JSON line: head vs H,

@@ -17,15 +17,15 @@
   "dry_run": false,
   "enabled": true,
   "confirmation": {
-    "_comment": "Either point at the coordinator (recommended: params are cross-checked against the local node) or fill in checkpoint/genesis explicitly. platform_chain_id is the MetalGo blockchain id wallets sign under, from the ceremony config; it is mandatory because version-2 confirmations always bind it.",
+    "_comment": "Everything here is required and checked when the voter starts, so a config that can never sign refuses to run. checkpoint_sha256 is the hash of the checkpoint THIS operator derived from its own Leap snapshot at H (never taken from the coordinator). migration_genesis is the genesis the voter will sign: it must pin that same checkpoint hash and carry migration_schedule_sha256 (the published source schedule hash; xpr_snapshot_schedule prints it), and the successor chain id is derived from it, never adopted from a coordinator. platform_chain_id is the MetalGo blockchain id wallets sign under; it is configured, never adopted. coordinator_url is optional: when set, its params are cross-checked against all of the above and the local node.",
     "coordinator_url": "https://cutover-coordinator.example.com",
     "out_file": "/var/lib/cutover/confirmation.json",
     "migration_genesis": "/etc/cutover/migration.genesis.json",
-    "checkpoint_sha256": null,
+    "checkpoint_sha256": "<64 hex chars: the checkpoint hash this operator derived itself>",
     "platform_chain_id": "<64 hex chars of the MetalGo blockchain id, published with the ceremony>"
   },
   "stop_producer": {
-    "_comment": "Opt-in local halt. When at_pause is true, the voter pauses its own producer (Leap producer/pause) once its confirmation for the agreed pause_height is delivered and the local head has reached P, then proves it is paused. A contract cannot stop block production, only the producer can. Omit or set at_pause false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint. at_h was removed: configs still carrying it are refused.",
+    "_comment": "Opt-in local halt. When at_pause is true, the voter pauses its own producer (Leap producer/pause) once the ceremony is finalized on-chain (this voter's own declaration, not any ceremony) and the local head has reached P, then proves it is paused (Leap answers /v1/producer/paused with a bare boolean). A contract cannot stop block production, only the producer can. Omit or set at_pause false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint. at_h was removed: configs still carrying it are refused.",
     "at_pause": false,
     "producer_api_url": "http://127.0.0.1:8888"
   }
