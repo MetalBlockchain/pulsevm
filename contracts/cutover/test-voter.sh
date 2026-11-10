@@ -37,10 +37,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "cutover-voter-test: building tools..."
-(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example xpr_cutover_voter --example make_probe_tx) \
+(cd "$REPO_ROOT" && cargo build --locked -p pulsevm_core --example xpr_cutover_voter --example make_probe_tx --example xpr_halt_ceremony) \
     || fail "tool build failed"
 [[ -x "$VOTER_BIN" ]] || fail "voter binary missing"
 [[ -x "$PROBE_BIN" ]] || fail "probe binary missing"
+[[ -x "$REPO_ROOT/target/debug/examples/xpr_halt_ceremony" ]] || fail "ceremony tool binary missing"
 
 DEV_WIF="$(grep -o 'KEY:[A-Za-z0-9]*' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/producer-config.ini" | head -1 | cut -d: -f2)"
 [[ -n "$DEV_WIF" ]] || fail "fixture dev key not found"
@@ -400,7 +401,7 @@ COORD_BAD_PORT="$(cat "$WORK/coord-bad.port")"
 BAD_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_BAD_PORT}")"
 # The vote is already on-chain, so the voter heads straight for the
 # confirmation, which must fail closed on the mismatched block id.
-"$VOTER_BIN" --config "$BAD_CFG" --max-polls 4 >"$WORK/bad.log" 2>&1 &
+"$VOTER_BIN" --config "$BAD_CFG" --max-polls 16 >"$WORK/bad.log" 2>&1 &
 BAD_PID=$!
 for _ in $(seq 1 15); do
     kill -0 "$BAD_PID" 2>/dev/null || break
@@ -424,7 +425,7 @@ for _ in $(seq 1 30); do
 done
 COORD_PLAT_PORT="$(cat "$WORK/coord-plat.port")"
 PLAT_CFG="$(mk_config "$H" false "http://127.0.0.1:${COORD_PLAT_PORT}" "$PLATFORM")"
-"$VOTER_BIN" --config "$PLAT_CFG" --max-polls 4 >"$WORK/plat.log" 2>&1 &
+"$VOTER_BIN" --config "$PLAT_CFG" --max-polls 16 >"$WORK/plat.log" 2>&1 &
 PLAT_PID=$!
 for _ in $(seq 1 15); do
     kill -0 "$PLAT_PID" 2>/dev/null || break
@@ -437,6 +438,51 @@ wait "$COORD_PID" 2>/dev/null || true
 grep -q "platform chain id does not match" "$WORK/plat.log" || fail "wrong platform not refused: $(tail -5 "$WORK/plat.log")"
 [[ -s "$WORK/confirmations-wrongplat.jsonl" ]] && fail "confirmation delivered to wrong-platform coordinator"
 pass "wrong platform refused, nothing delivered"
+
+# The voter signs only a genesis it has read: one that pins a checkpoint it did
+# not derive, or a schedule hash the live committee does not match, is refused
+# and nothing is delivered.
+echo "cutover-voter-test: a genesis pinning a foreign checkpoint or a wrong schedule is refused..."
+python3 - "$GENESIS" "$WORK/genesis-foreign-checkpoint.json" "$WORK/genesis-wrong-schedule.json" <<'PYEOF'
+import json, sys
+src = json.load(open(sys.argv[1]))
+foreign = dict(src); foreign["migration_checkpoint_sha256"] = "cc" * 32
+wrong = dict(src); wrong["migration_schedule_sha256"] = "11" * 32
+json.dump(foreign, open(sys.argv[2], "w"))
+json.dump(wrong, open(sys.argv[3], "w"))
+PYEOF
+GOOD_GENESIS="$GENESIS"
+run_refused_genesis() { # $1=genesis file $2=log name $3=expected substring $4=coordinator chain id
+    local cfg coord_pid port_file="$WORK/coord-$2.port"
+    rm -f "$port_file" "$WORK/confirmations-$2.jsonl"
+    python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-$2.jsonl" "$H" "$port_file" "$PLATFORM" "$4" >>"$WORK/coordinator-$2.log" 2>&1 &
+    coord_pid=$!
+    for _ in $(seq 1 30); do
+        [[ -s "$port_file" ]] && break
+        kill -0 "$coord_pid" 2>/dev/null || fail "coordinator ($2) died on startup: $(cat "$WORK/coordinator-$2.log")"
+        sleep 1
+    done
+    GENESIS="$1"
+    cfg="$(mk_config "$H" false "http://127.0.0.1:$(cat "$port_file")" "$PLATFORM")"
+    GENESIS="$GOOD_GENESIS"
+    "$VOTER_BIN" --config "$cfg" --max-polls 16 >"$WORK/$2.log" 2>&1 &
+    local vpid=$!
+    for _ in $(seq 1 30); do
+        kill -0 "$vpid" 2>/dev/null || break
+        sleep 2
+    done
+    kill "$vpid" 2>/dev/null || true
+    wait "$vpid" 2>/dev/null || true
+    kill "$coord_pid" 2>/dev/null || true
+    wait "$coord_pid" 2>/dev/null || true
+    grep -q "$3" "$WORK/$2.log" || fail "$2 not refused ($3): $(tail -5 "$WORK/$2.log")"
+    [[ -s "$WORK/confirmations-$2.jsonl" ]] && fail "confirmation delivered despite $2"
+    return 0
+}
+run_refused_genesis "$WORK/genesis-foreign-checkpoint.json" foreigncp "did not derive" "$NEW_CHAIN"
+WRONG_SCHEDULE_CHAIN="$("$HALT_BIN" chain-id --genesis "$WORK/genesis-wrong-schedule.json")"
+run_refused_genesis "$WORK/genesis-wrong-schedule.json" wrongsched "does not hash to the migration genesis" "$WRONG_SCHEDULE_CHAIN"
+pass "foreign checkpoint pin and wrong schedule pin refused, nothing delivered"
 
 echo "cutover-voter-test: half-configured stop fails fast..."
 HALF_CFG="$(mk_config "$H" true "" "" HALF)"

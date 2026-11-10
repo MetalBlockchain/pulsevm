@@ -15,6 +15,9 @@ on:
       - 'crates/pulsevm_core/examples/xpr_cutover_voter.rs'
       - 'crates/pulsevm_core/examples/xpr_scan_contract_votes.rs'
       - 'crates/pulsevm_core/examples/make_probe_tx.rs'
+      - 'crates/pulsevm_core/examples/xpr_halt_ceremony.rs'
+      - 'crates/pulsevm_chain_types/src/genesis.rs'
+      - 'crates/pulsevm_database/src/source_schedule.rs'
       - 'tools/xpr-chainbase-export/localnet/**'
       - '.github/workflows/cutover-fixtures.yml'
   workflow_dispatch:
