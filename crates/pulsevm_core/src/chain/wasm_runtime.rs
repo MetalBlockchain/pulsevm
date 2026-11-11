@@ -1190,7 +1190,82 @@ const MAX_CACHED_MODULES: usize = 1024;
 /// Serialized modules contain native code plus the output of PulseVM's WASM
 /// transforms and metering middleware. Bump this namespace whenever any of
 /// those inputs change so an old artifact is never reused under new rules.
-const WASM_ARTIFACT_CACHE_NAMESPACE: &str = "wasmer-7.2.0-llvm-pulsevm-v1";
+const WASM_ARTIFACT_CACHE_NAMESPACE: &str = "wasmer-7.4.0-llvm-pulsevm-v1";
+
+/// Create the cache directory (and parents) readable only by this user. An
+/// existing directory is left as it is and judged by
+/// `verify_artifact_dir_private`.
+fn create_private_dir_all(directory: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)
+}
+
+/// A cached artifact is deserialized as native code, so whoever can write the
+/// cache directory can run code in the node. Trust it only when it is a real
+/// directory (not a symlink) that nobody but the node's own user can write.
+/// Ownership is checked without libc: a file this process just created is
+/// owned by its effective user, so the directory must have the same owner.
+#[cfg(unix)]
+fn verify_artifact_dir_private(directory: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a plain directory (symlinks are refused)",
+            directory.display()
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} is group- or world-writable (mode {:o}); cached artifacts are native code",
+            directory.display(),
+            metadata.mode() & 0o7777
+        ));
+    }
+    let probe = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|error| format!("cannot write to {}: {error}", directory.display()))?;
+    let own_uid = probe
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("cannot inspect probe file: {error}"))?
+        .uid();
+    if metadata.uid() != own_uid {
+        return Err(format!(
+            "{} is owned by uid {}, not by the node's user ({own_uid})",
+            directory.display(),
+            metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_artifact_dir_private(_directory: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// One artifact file: a regular file (not a symlink) that only its owner can
+/// write. The directory check covers the usual case; this stops a planted
+/// file or link inside an otherwise private directory.
+#[cfg(unix)]
+fn artifact_file_is_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && metadata.mode() & 0o022 == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn artifact_file_is_trusted(path: &Path) -> bool {
+    path.is_file()
+}
 
 // A warm store owns raw VM pointers and so is neither `Send` nor `Sync`; it
 // cannot live in the shared runtime state. Keep the pool thread-local instead —
@@ -1288,10 +1363,18 @@ impl WasmRuntime {
                 ))
             });
         if let Some(directory) = &artifact_cache_dir {
-            fs::create_dir_all(directory).map_err(|error| {
+            create_private_dir_all(directory).map_err(|error| {
                 ChainError::WasmRuntimeError(format!(
                     "cannot create WASM artifact cache {}: {error}",
                     directory.display()
+                ))
+            })?;
+            // Fail closed: the operator opted in to a cache that would load
+            // native code from a directory someone else can write. Refuse to
+            // start instead of quietly running with it.
+            verify_artifact_dir_private(directory).map_err(|error| {
+                ChainError::WasmRuntimeError(format!(
+                    "refusing to use the WASM artifact cache: {error}"
                 ))
             })?;
         }
@@ -1420,9 +1503,12 @@ impl WasmRuntime {
             .map(|directory| directory.join(format!("{}.artifact", hex::encode(id.as_bytes()))));
         if let Some(path) = &artifact_path
             && path.is_file()
+            && artifact_file_is_trusted(path)
         {
-            // SAFETY: this opt-in directory contains only artifacts emitted by
-            // this runtime below. The versioned namespace separates changes to
+            // SAFETY: this opt-in directory was verified private to this user at
+            // startup (`verify_artifact_dir_private`) and the file is a plain,
+            // owner-writable file, so it holds only artifacts emitted by this
+            // runtime below. The versioned namespace separates changes to
             // Wasmer, the compiler, transforms, and metering configuration.
             if let Ok(module) = unsafe { Module::deserialize_from_file(&store, path) } {
                 let resettable = instance_reuse_enabled() && module_is_resettable(&module);
@@ -2038,11 +2124,16 @@ mod tests {
 
     use crate::chain::webassembly::cost;
 
+    use std::fs;
+
     use super::{
         ModuleCacheStatus,
         ResettableInstance,
+        WASM_ARTIFACT_CACHE_NAMESPACE,
         WasmRuntime,
+        artifact_file_is_trusted,
         charge_metering_points,
+        create_private_dir_all,
         defer_start_function,
         execution_meter_budget,
         exported_memory,
@@ -2050,7 +2141,88 @@ mod tests {
         expose_reset_state,
         metered_cpu_to_bill,
         module_is_resettable,
+        verify_artifact_dir_private,
     };
+
+    #[test]
+    fn the_artifact_namespace_names_the_locked_wasmer_version() {
+        // The namespace separates artifacts across Wasmer upgrades. It went
+        // stale once (7.2.0 while 7.4.0 was locked); pin it to Cargo.lock.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("read Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|block| block.contains("name = \"wasmer\"\n"))
+            .and_then(|block| {
+                block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+            })
+            .map(|line| line.trim_end_matches('"').to_owned())
+            .expect("wasmer is locked");
+        assert!(
+            WASM_ARTIFACT_CACHE_NAMESPACE.contains(&format!("wasmer-{version}-")),
+            "namespace {WASM_ARTIFACT_CACHE_NAMESPACE} does not name locked wasmer {version}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_cache_directory_must_be_private_to_the_node_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+
+        let private = root.path().join("private");
+        create_private_dir_all(&private).unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        verify_artifact_dir_private(&private).expect("a private directory is trusted");
+
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = verify_artifact_dir_private(&shared).unwrap_err();
+        assert!(error.contains("writable"), "{error}");
+
+        let group = root.path().join("group");
+        fs::create_dir(&group).unwrap();
+        fs::set_permissions(&group, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(verify_artifact_dir_private(&group).is_err());
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let error = verify_artifact_dir_private(&link).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+
+        assert!(verify_artifact_dir_private(&root.path().join("missing")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_or_writable_artifact_file_is_not_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real.artifact");
+        fs::write(&real, b"x").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(artifact_file_is_trusted(&real));
+
+        let writable = root.path().join("writable.artifact");
+        fs::write(&writable, b"x").unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!artifact_file_is_trusted(&writable));
+
+        let link = root.path().join("link.artifact");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            !artifact_file_is_trusted(&link),
+            "a symlink is never trusted"
+        );
+        assert!(!artifact_file_is_trusted(&root.path().join("missing")));
+    }
 
     #[test]
     fn serialized_module_artifact_survives_memory_cache_eviction() {
