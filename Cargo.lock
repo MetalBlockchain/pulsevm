@@ -4110,6 +4110,7 @@ dependencies = [
 name = "pulsevm_wasm_validation"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "thiserror 2.0.20",
  "wasmparser 0.258.0",
  "wat",

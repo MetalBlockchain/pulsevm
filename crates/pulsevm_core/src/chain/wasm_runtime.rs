@@ -2144,6 +2144,79 @@ mod tests {
         verify_artifact_dir_private,
     };
 
+    mod hostile_bytecode {
+        use proptest::{
+            collection::vec,
+            prelude::*,
+        };
+
+        use super::{
+            defer_start_function,
+            expose_internal_memory,
+            expose_reset_state,
+        };
+
+        fn seed() -> Vec<u8> {
+            wat::parse_str(
+                r#"(module
+                    (memory (export "memory") 1 4)
+                    (table 4 funcref)
+                    (global $g (mut i32) (i32.const 7))
+                    (data (i32.const 0) "hello")
+                    (func $start (global.set $g (i32.const 9)))
+                    (start $start)
+                    (func (export "apply") (param i64 i64 i64)
+                      (global.set $g (i32.add (global.get $g) (i32.const 1)))))"#,
+            )
+            .expect("seed assembles")
+        }
+
+        fn transforms_return(bytes: &[u8]) {
+            // These run on contract code after validation, and on code already
+            // in state, which is never validated again. They must refuse bad
+            // input with an error, never panic.
+            let _ = expose_internal_memory(bytes);
+            let _ = expose_reset_state(bytes);
+            let _ = defer_start_function(bytes);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1500))]
+
+            #[test]
+            fn arbitrary_bytes_behind_a_header(body in vec(any::<u8>(), 0..2048)) {
+                let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+                bytes.extend(body);
+                transforms_return(&bytes);
+            }
+
+            #[test]
+            fn mutated_valid_modules(
+                at in 0usize..400,
+                value in any::<u8>(),
+                op in 0usize..4,
+                extra in vec(any::<u8>(), 0..32),
+            ) {
+                let mut bytes = seed();
+                match op {
+                    0 => { if let Some(b) = bytes.get_mut(at) { *b = value; } }
+                    1 => bytes.truncate(at),
+                    2 => bytes.extend_from_slice(&extra),
+                    _ => { if at < bytes.len() { bytes.remove(at); } }
+                }
+                transforms_return(&bytes);
+            }
+        }
+
+        #[test]
+        fn the_seed_is_accepted_by_every_transform() {
+            let seed = seed();
+            assert!(expose_internal_memory(&seed).is_ok());
+            assert!(expose_reset_state(&seed).is_ok());
+            assert!(defer_start_function(&seed).is_ok());
+        }
+    }
+
     #[test]
     fn the_artifact_namespace_names_the_locked_wasmer_version() {
         // The namespace separates artifacts across Wasmer upgrades. It went
