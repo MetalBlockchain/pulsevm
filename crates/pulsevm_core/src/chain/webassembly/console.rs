@@ -7,8 +7,9 @@ use wasmer::{
 use super::cost;
 use crate::wasm_runtime::WasmContext;
 
-// TODO: Implement console functions to log output from WASM modules. For now, these functions are
-// no-ops to avoid unnecessary overhead in the current implementation.
+// Console output is not consensus-visible and is never stored, so these host
+// functions only charge CPU and discard the text. That is deliberate: logging
+// guest output would add I/O to the execution path for no consensus benefit.
 
 pub fn prints(
     mut env: FunctionEnvMut<WasmContext>,
