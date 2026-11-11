@@ -3725,6 +3725,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "pulsevm_abi",
+ "pulsevm_constants",
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_grpc",
