@@ -48,8 +48,11 @@ use tokio::{
     },
     task::JoinHandle,
 };
-use tokio_tungstenite::accept_async;
-use tungstenite::Message;
+use tokio_tungstenite::accept_async_with_config;
+use tungstenite::{
+    Message,
+    protocol::WebSocketConfig,
+};
 
 use super::{
     request::RequestType,
@@ -62,6 +65,14 @@ use super::{
         TransactionTraceV0,
     },
 };
+
+/// Largest request a client may send. Requests are block-id lists and
+/// acknowledgements; nothing legitimate approaches this.
+const MAX_REQUEST_BYTES: usize = 1 << 20;
+
+/// Time allowed for the WebSocket upgrade. A session slot is held from accept,
+/// so an idle half-open connection must not keep one.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Session {
     peer: SocketAddr,
@@ -94,7 +105,19 @@ impl Session {
     }
 
     pub async fn start(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
-        let ws = accept_async(stream).await?;
+        // A peer that connects and never completes the upgrade would hold a
+        // session slot forever, and the slots are bounded. Requests are small
+        // (block-id lists), so cap the message size well below the 64 MiB
+        // default as well.
+        let mut config = WebSocketConfig::default();
+        config.max_message_size = Some(MAX_REQUEST_BYTES);
+        config.max_frame_size = Some(MAX_REQUEST_BYTES);
+        let ws = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            accept_async_with_config(stream, Some(config)),
+        )
+        .await
+        .map_err(|_| anyhow!("websocket handshake from {} timed out", self.peer))??;
 
         // Split socket once; dedicate a writer task fed by mpsc
         let (mut sink, mut reader) = ws.split();
