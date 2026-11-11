@@ -325,7 +325,7 @@ pub fn assert_recover_key(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let sig_slice = sig_ptr.slice(&view, sig_len)?;
     let mut sig_bytes = vec![0u8; sig_len as usize];
@@ -375,7 +375,7 @@ pub fn recover_key(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let sig_slice = sig_ptr.slice(&view, sig_len)?;
     let mut sig_bytes = vec![0u8; sig_len as usize];
@@ -414,7 +414,7 @@ pub fn sha1(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -438,7 +438,7 @@ pub fn sha224(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -462,7 +462,7 @@ pub fn sha256(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -486,7 +486,7 @@ pub fn sha512(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];
@@ -510,7 +510,7 @@ pub fn ripemd160(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = msg_ptr.slice(&view, msg_size)?;
     let mut src_bytes = vec![0u8; msg_size as usize];

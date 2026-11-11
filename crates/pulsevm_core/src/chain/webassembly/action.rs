@@ -45,7 +45,7 @@ pub fn read_action_data(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = buffer_ptr.slice(&view, copy_size)?;
     slice.write_slice(&action_data[..copy_size as usize])?;
@@ -94,7 +94,7 @@ pub fn set_action_return_value(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = buffer_ptr.slice(&view, buffer_len)?;
     let mut return_value = vec![0u8; buffer_len as usize];
