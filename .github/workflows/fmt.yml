@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   rustfmt:
     name: cargo fmt --check
@@ -13,13 +16,13 @@ jobs:
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # rustfmt.toml relies on unstable options that only apply on nightly, so
       # pin the nightly here: formatting is then identical for everyone and a
       # rustfmt behaviour change can only land as a deliberate bump of this line.
       - name: Install pinned nightly rustfmt
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly-2026-07-27
           components: rustfmt
