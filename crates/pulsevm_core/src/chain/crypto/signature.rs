@@ -137,7 +137,8 @@ impl Signature {
         }
     }
 
-    fn to_string(&self) -> String {
+    /// The `SIG_*` text form. Named so it does not shadow `Display::to_string`.
+    fn encode(&self) -> String {
         match &self.inner {
             SignatureInner::K1(signature) => signature.to_string(),
             SignatureInner::R1(signature) => signature.to_string(),
@@ -148,13 +149,13 @@ impl Signature {
 
 impl Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_string())
+        f.write_str(&self.encode())
     }
 }
 
 impl Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_string())
+        f.write_str(&self.encode())
     }
 }
 
@@ -189,7 +190,7 @@ impl Serialize for Signature {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(&self.encode())
     }
 }
 
