@@ -1237,10 +1237,11 @@ fn verify_artifact_dir_private(directory: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot inspect probe file: {error}"))?
         .uid();
     if metadata.uid() != own_uid {
+        // No numeric ids in the message: it ends up in logs, and the operator
+        // only needs to know the owner is not the node's user.
         return Err(format!(
-            "{} is owned by uid {}, not by the node's user ({own_uid})",
-            directory.display(),
-            metadata.uid()
+            "{} is owned by a different user than the node",
+            directory.display()
         ));
     }
     Ok(())
