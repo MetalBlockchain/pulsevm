@@ -228,6 +228,16 @@ impl ArenaObject for ResourceLimitsRow {
     }
 }
 
+/// Which slice of an ordered table or index a page read returns: keys in
+/// `[lower, upper]`, ascending or (if `reverse`) descending, at most `take`.
+#[derive(Clone, Copy, Debug)]
+pub struct RowPage {
+    pub lower: u64,
+    pub upper: u64,
+    pub reverse: bool,
+    pub take: usize,
+}
+
 /// Chainbase `elastic_limit_parameters` for one resource, as plain values pulled
 /// from config so the database can run `update_elastic_limit` itself.
 #[derive(Clone, Copy)]
@@ -4879,6 +4889,55 @@ impl ChainDatabase {
             .collect()
     }
 
+    /// A bounded page of a contract table: rows with primary key in
+    /// `[lower, upper]`, ascending or (if `reverse`) descending, at most `take`.
+    /// Walks the `(t_id, primary_key)` index from the right end and stops after
+    /// `take` rows, so a request costs the page, not the table. `lower > upper`
+    /// is an empty page.
+    pub fn table_page_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        page: RowPage,
+    ) -> Vec<(u64, u64, Vec<u8>)> {
+        use std::ops::Bound;
+        let RowPage {
+            lower,
+            upper,
+            reverse,
+            take,
+        } = page;
+        if lower > upper || take == 0 {
+            return Vec::new();
+        }
+        let db = self.read();
+        let Some(t_id) = db
+            .find_by::<ContractTableRow, ContractTableByCodeScopeTable>(&(code, scope, table))
+            .ok()
+            .flatten()
+            .map(|t| t.id().raw())
+        else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractKeyValueRow>() else {
+            return Vec::new();
+        };
+        let index = tbl.get_index::<ContractKvByScopePrimary>();
+        let range = index.range((
+            Bound::Included((t_id, lower)),
+            Bound::Included((t_id, upper)),
+        ));
+        let row = |(&(_, primary), row): (&(i64, u64), &ContractKeyValueRow)| {
+            (primary, row.payer, tbl.blob(row.value).to_vec())
+        };
+        if reverse {
+            range.rev().take(take).map(row).collect()
+        } else {
+            range.take(take).map(row).collect()
+        }
+    }
+
     /// Iterator positioning from the arena — the primary key a contract's cursor
     /// lands on. `kv_lower_bound` = smallest primary >= key (db_lowerbound_i64);
     /// `kv_upper_bound` = smallest primary > key (db_upperbound_i64, and the
@@ -5134,6 +5193,48 @@ impl ChainDatabase {
             ))
             .map(|(&(_, secondary, primary), row)| (secondary, primary, row.payer))
             .collect()
+    }
+
+    /// A bounded page of an idx64 table: rows whose secondary key lies in
+    /// `[lower, upper]`, in `(secondary, primary)` order or its reverse, at most
+    /// `take`, as `(secondary, primary, payer)`. See [`Self::table_page_with_payer`].
+    pub fn idx64_page_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        page: RowPage,
+    ) -> Vec<(u64, u64, u64)> {
+        use std::ops::Bound;
+        let RowPage {
+            lower,
+            upper,
+            reverse,
+            take,
+        } = page;
+        if lower > upper || take == 0 {
+            return Vec::new();
+        }
+        let db = self.read();
+        let Some(t_id) = self.resolve_t_id(&db, code, scope, table) else {
+            return Vec::new();
+        };
+        let Ok(tbl) = db.table::<ContractIndex64Row>() else {
+            return Vec::new();
+        };
+        let index = tbl.get_index::<ContractIdx64BySecondary>();
+        let range = index.range((
+            Bound::Included((t_id, lower, u64::MIN)),
+            Bound::Included((t_id, upper, u64::MAX)),
+        ));
+        let row = |(&(_, secondary, primary), row): (&(i64, u64, u64), &ContractIndex64Row)| {
+            (secondary, primary, row.payer)
+        };
+        if reverse {
+            range.rev().take(take).map(row).collect()
+        } else {
+            range.take(take).map(row).collect()
+        }
     }
 
     /// idx128 secondary-index positioning, same semantics as the idx64 family but
@@ -6492,6 +6593,124 @@ mod tests {
                 (300, 7, payer)
             ]
         );
+    }
+
+    /// A page read must return exactly what scanning the whole table and then
+    /// slicing would, for every range, direction and size, without visiting
+    /// rows outside the page. RPC `get_table_rows` is served from this; the old
+    /// path collected the entire table per request.
+    #[test]
+    fn table_pages_match_slicing_a_full_scan() {
+        let s = ChainDatabase::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        for &pk in &[50u64, 10, 30, 20, 40, 60, 5] {
+            s.create_key_value_object(code, scope, table, payer, pk, &[pk as u8])
+                .unwrap();
+        }
+        // A neighbouring table must never leak into a page.
+        s.create_key_value_object(code, scope, table + 1, payer, 25, &[25])
+            .unwrap();
+
+        let full = s.table_range_with_payer(code, scope, table);
+        for (lower, upper) in [
+            (0, u64::MAX),
+            (10, 40),
+            (11, 39),
+            (30, 30),
+            (61, 99),
+            (40, 10),
+        ] {
+            for reverse in [false, true] {
+                for take in [0usize, 1, 2, 3, 100] {
+                    let mut expected: Vec<_> = full
+                        .iter()
+                        .filter(|(k, _, _)| *k >= lower && *k <= upper)
+                        .cloned()
+                        .collect();
+                    if reverse {
+                        expected.reverse();
+                    }
+                    expected.truncate(take);
+                    assert_eq!(
+                        s.table_page_with_payer(
+                            code,
+                            scope,
+                            table,
+                            RowPage {
+                                lower,
+                                upper,
+                                reverse,
+                                take
+                            }
+                        ),
+                        expected,
+                        "range {lower}..={upper} reverse={reverse} take={take}"
+                    );
+                }
+            }
+        }
+        // A missing table is an empty page, not an error.
+        assert!(
+            s.table_page_with_payer(
+                code,
+                scope,
+                999,
+                RowPage {
+                    lower: 0,
+                    upper: u64::MAX,
+                    reverse: false,
+                    take: 10
+                }
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn idx64_pages_match_slicing_a_full_scan() {
+        let s = ChainDatabase::new().unwrap();
+        let (code, scope, table, payer) = (1u64, 2u64, 3u64, 9u64);
+        for &(primary, secondary) in &[(7u64, 300u64), (5, 200), (2, 200), (9, 100), (11, 400)] {
+            s.create_index64_object(code, scope, table, payer, primary, secondary)
+                .unwrap();
+        }
+        let full = s.idx64_range_with_payer(code, scope, table);
+        for (lower, upper) in [
+            (0, u64::MAX),
+            (100, 200),
+            (150, 350),
+            (200, 200),
+            (401, 999),
+        ] {
+            for reverse in [false, true] {
+                for take in [0usize, 1, 2, 4, 100] {
+                    let mut expected: Vec<_> = full
+                        .iter()
+                        .filter(|(sec, _, _)| *sec >= lower && *sec <= upper)
+                        .cloned()
+                        .collect();
+                    if reverse {
+                        expected.reverse();
+                    }
+                    expected.truncate(take);
+                    assert_eq!(
+                        s.idx64_page_with_payer(
+                            code,
+                            scope,
+                            table,
+                            RowPage {
+                                lower,
+                                upper,
+                                reverse,
+                                take
+                            }
+                        ),
+                        expected,
+                        "range {lower}..={upper} reverse={reverse} take={take}"
+                    );
+                }
+            }
+        }
     }
 
     /// idx128 reads follow the same (secondary, primary) order over a u128 key,
