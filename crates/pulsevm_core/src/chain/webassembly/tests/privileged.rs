@@ -286,3 +286,94 @@ fn privileged_calls_reject_unprivileged_and_context_free_callers() {
         );
     }
 }
+
+/// XPR states CPU parameters in microseconds (a minimum bill of 100).
+fn xpr_microsecond_parameters(db: &pulsevm_database::Database) -> pulsevm_database::ChainConfigV0 {
+    let mut cfg = db.chain_config().unwrap();
+    cfg.max_block_cpu_usage = 200_000;
+    cfg.max_transaction_cpu_usage = 150_000;
+    cfg.min_transaction_cpu_usage = 100;
+    cfg
+}
+
+#[test]
+fn before_protocol_v2_microsecond_parameters_are_still_accepted() {
+    // The legacy rule: only the relations between fields are checked. This is
+    // exactly the hazard the v2 guard closes, and what blocks before the
+    // activation height already ran under.
+    let mut h = Host::new(false);
+    let cfg = xpr_microsecond_parameters(&h.db);
+    let packed = cfg.pack().unwrap();
+    h.write(OUT, &packed);
+    set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32).unwrap();
+    assert_eq!(h.db.chain_config().unwrap().min_transaction_cpu_usage, 100);
+}
+
+#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+mod protocol_v2 {
+    use super::*;
+    use crate::chain::protocol_features::ProtocolUpgradeSchedule;
+
+    fn v2_host() -> Host {
+        let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )
+        .unwrap();
+        Host::with_protocol(false, schedule.execution_context(2).unwrap())
+    }
+
+    #[test]
+    fn microsecond_parameters_are_refused_and_leave_the_caps_alone() {
+        let mut h = v2_host();
+        let before = h.db.chain_config().unwrap();
+        let packed = xpr_microsecond_parameters(&h.db).pack().unwrap();
+        h.write(OUT, &packed);
+        let error = set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32)
+            .expect_err("XPR's microsecond values must not be applied under v2");
+        assert!(
+            error.to_string().contains("metering points"),
+            "the refusal says why: {error}"
+        );
+        assert_eq!(
+            h.db.chain_config().unwrap().pack().unwrap(),
+            before.pack().unwrap(),
+            "a refused call changes nothing"
+        );
+    }
+
+    #[test]
+    fn point_denominated_parameters_are_applied() {
+        let mut h = v2_host();
+        let mut cfg = h.db.chain_config().unwrap();
+        cfg.min_transaction_cpu_usage = 100_000;
+        cfg.max_transaction_cpu_usage = 1_000_000_000;
+        cfg.max_block_cpu_usage = 3_000_000_000;
+        let packed = cfg.pack().unwrap();
+        h.write(OUT, &packed);
+        set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32).unwrap();
+        assert_eq!(
+            h.db.chain_config().unwrap().min_transaction_cpu_usage,
+            100_000
+        );
+    }
+
+    #[test]
+    fn the_floor_is_exactly_one_microsecond_of_metering() {
+        let floor = crate::config::POINTS_PER_US as u32;
+        for (min, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
+            let mut h = v2_host();
+            let mut cfg = h.db.chain_config().unwrap();
+            cfg.min_transaction_cpu_usage = min;
+            cfg.max_transaction_cpu_usage = 1_000_000_000;
+            cfg.max_block_cpu_usage = 3_000_000_000;
+            let packed = cfg.pack().unwrap();
+            h.write(OUT, &packed);
+            let result = set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "min_transaction_cpu_usage = {min}"
+            );
+        }
+    }
+}

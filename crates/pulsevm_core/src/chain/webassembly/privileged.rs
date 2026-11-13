@@ -23,6 +23,7 @@ use crate::chain::{
         ProducerKey,
         ProducerSchedule,
     },
+    protocol_features::ProtocolFeature,
     resource_limits::ResourceLimitsManager,
     utils::pulse_assert,
     wasm_runtime::WasmContext,
@@ -247,6 +248,30 @@ pub fn get_blockchain_parameters_packed(
     Ok(size)
 }
 
+/// Under [`ProtocolFeature::CpuUnitsInPoints`], refuse CPU parameters that are
+/// plainly microseconds.
+///
+/// XPR states its CPU parameters in microseconds (a minimum transaction usage of
+/// 100); this chain bills and limits in metering points, where one microsecond of
+/// reference compute is `POINTS_PER_US` points. A governance call that carries
+/// the XPR numbers over would pass `ChainConfigV0::validate` (that only checks
+/// relations between fields) and silently reset every cap to a few microseconds
+/// of reference compute, dropping most transactions at block build. The one
+/// field that cannot be mistaken for anything else is the minimum bill, so it is
+/// the guard: a minimum under one microsecond of metering is a microsecond
+/// value, not a point value.
+#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+fn validate_cpu_parameters_in_points(cfg: &ChainConfigV0) -> Result<(), ChainError> {
+    let floor = crate::config::POINTS_PER_US;
+    if u64::from(cfg.min_transaction_cpu_usage) < floor {
+        return Err(ChainError::ActionValidationError(format!(
+            "min_transaction_cpu_usage {} is under one microsecond of metering ({floor} points): CPU parameters are metering points, not microseconds, so values carried over from XPR cannot be applied as they stand",
+            cfg.min_transaction_cpu_usage
+        )));
+    }
+    Ok(())
+}
+
 pub fn set_blockchain_parameters_packed(
     mut env: FunctionEnvMut<WasmContext>,
     data_ptr: WasmPtr<u8>,
@@ -275,6 +300,14 @@ pub fn set_blockchain_parameters_packed(
         .map_err(|e| RuntimeError::new(format!("failed to read blockchain parameters: {}", e)))?;
     cfg.validate()?;
     let context = env_data.apply_context_mut();
+    if context.protocol_feature_enabled(ProtocolFeature::CpuUnitsInPoints) {
+        #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+        validate_cpu_parameters_in_points(&cfg)?;
+        #[cfg(not(feature = "protocol_feature_cpu_units_in_points"))]
+        return Err(RuntimeError::new(
+            "CPU units in points was not compiled into this binary",
+        ));
+    }
     context.set_global_properties(&cfg)?;
     Ok(())
 }

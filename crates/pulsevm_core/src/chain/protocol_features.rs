@@ -42,7 +42,7 @@ const STABLE_PROTOCOL_VERSION: ProtocolVersion = GENESIS_PROTOCOL_VERSION;
 /// Advance this only after every unfinished implementation assigned to the new
 /// version is present and its `protocol_feature_*` Cargo flag is included by
 /// `nightly`. It may equal the stable version when no future feature exists.
-const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = STABLE_PROTOCOL_VERSION;
+const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = 2;
 
 /// Newest protocol version this particular binary can execute.
 ///
@@ -70,6 +70,20 @@ pub enum ProtocolFeature {
     /// The protocol rules present at chain launch. This anchor keeps the first
     /// real breaking change on the same code path as every later feature.
     Baseline,
+    /// CPU figures that a transaction or a governance call states are metering
+    /// points, the unit the chain bills and limits in, not microseconds.
+    ///
+    /// Two rules change together, because they are the same unit mistake:
+    ///
+    /// - A transaction header's `max_cpu_usage_ms` asks for that many milliseconds of reference
+    ///   compute (`ms * 1000 * POINTS_PER_US` points). Before, the byte was used as a point count,
+    ///   so a transaction that set it got at most 255 points and could never pay the minimum bill.
+    ///   Leap multiplies by 1000; this is the equivalent here.
+    /// - `set_blockchain_parameters_packed` refuses a configuration whose
+    ///   `min_transaction_cpu_usage` is under one microsecond of metering (`POINTS_PER_US`). A
+    ///   configuration copied from XPR carries microsecond values (a minimum of 100), and applying
+    ///   it would silently put every cap back to a few microseconds of reference compute.
+    CpuUnitsInPoints,
 }
 
 /// A block height and protocol version that this binary has proved it can run.
@@ -109,6 +123,7 @@ impl ProtocolFeature {
     const fn protocol_version(self) -> ProtocolVersion {
         match self {
             Self::Baseline => GENESIS_PROTOCOL_VERSION,
+            Self::CpuUnitsInPoints => 2,
         }
     }
 
@@ -348,13 +363,17 @@ mod tests {
         // the condition under test. Change them only with the corresponding
         // stable/nightly implementation and boundary-test updates.
         assert_eq!(STABLE_PROTOCOL_VERSION, 1);
-        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 1);
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 2);
+        assert_eq!(
+            PROTOCOL_VERSION,
+            if cfg!(feature = "nightly") { 2 } else { 1 }
+        );
     }
 
     #[test]
     fn permanent_feature_version_mappings_are_stable() {
         assert_eq!(ProtocolFeature::Baseline.protocol_version(), 1);
+        assert_eq!(ProtocolFeature::CpuUnitsInPoints.protocol_version(), 2);
     }
 
     #[test]

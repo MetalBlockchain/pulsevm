@@ -55,7 +55,10 @@ default = []
 # Aggregate every unfinished `protocol_feature_*` flag here. This controls
 # which implementations are compiled; the chain schedule still controls when
 # compiled behavior activates.
-nightly = []
+nightly = ["protocol_feature_cpu_units_in_points"]
+# Protocol version 2: CPU figures a transaction header or a governance call
+# states are metering points, not microseconds. See docs/protocol-features.md.
+protocol_feature_cpu_units_in_points = []
 arena-shadow = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
