@@ -6069,6 +6069,90 @@ mod tests {
         Ok(())
     }
 
+    // The start function writes a byte; apply asserts it is there, so the
+    // transaction only succeeds if the deferred start function really ran.
+    const START_SECTION_WAT: &str = r#"(module
+        (import "env" "pulse_assert" (func $assert (param i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 8) "start did not run\00")
+        (func $init (i32.store8 (i32.const 100) (i32.const 1)))
+        (start $init)
+        (func (export "apply") (param i64 i64 i64)
+            (call $assert (i32.load8_u (i32.const 100)) (i32.const 8) (i32.const 17))))"#;
+
+    #[cfg(feature = "protocol_feature_wasm_start_sections")]
+    fn init_controller_with_upgrades(
+        upgrades: &[u8],
+    ) -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            upgrades,
+            temp_path.path().to_str().unwrap(),
+        )?;
+        Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    #[tokio::test]
+    async fn setcode_with_a_start_section_is_refused_before_protocol_v2() -> Result<(), ChainError>
+    {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let wasm = wat::parse_str(START_SECTION_WAT).expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let result = controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        );
+        assert!(
+            result.is_err(),
+            "a start section must not deploy under protocol version 1"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "protocol_feature_wasm_start_sections")]
+    #[tokio::test]
+    async fn setcode_with_a_start_section_deploys_and_runs_under_protocol_v2()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_controller_with_upgrades(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )?;
+        let wasm = wat::parse_str(START_SECTION_WAT).expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        let transaction = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("anything")?,
+            &7u8,
+            chain_id,
+        )?;
+        let result =
+            controller.execute_transaction(&transaction, &timestamp, &BlockStatus::Building)?;
+        assert_eq!(result.trace.action_traces.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn forward_setcode_executes_the_newly_installed_code() -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;

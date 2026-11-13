@@ -744,6 +744,9 @@ behavior.
 
 ## 13. `CpuUnitsInPoints` (version 2)
 
+Version 2 carries two changes. This section covers the CPU units; the start
+section rule is at the end of the section.
+
 Two CPU figures that a transaction or a governance call states are in the
 unit the chain bills and limits in, metering points (`POINTS_PER_US` = 38,000
 per microsecond of reference compute), not microseconds. Both rules were wrong
@@ -784,3 +787,29 @@ Tests: `header_cpu_limit_tests` (`transaction_context.rs`) covers the unit
 conversion on both sides of the activation height;
 `webassembly/tests/privileged.rs` covers the floor, including exactly at
 `POINTS_PER_US`, and that a refused call changes nothing.
+
+### `WasmStartSections` (also version 2)
+
+Before version 2 `setcode` rejects a module that declares a WASM start section.
+XPR accepts them, so contracts compiled for XPR that use one (some toolchains
+emit it for global constructors) could not be redeployed here. From the
+activation height a new `setcode` may declare a start section.
+
+This is safe to allow because the runtime already handled the case: the start
+function is deferred until the module is instantiated for an action and runs
+under the same instruction metering as `apply`, so a start function cannot run
+for free or unbounded. Code installed before activation is unchanged, and
+blocks before the activation height keep refusing start sections, so replay
+agrees on both sides of the boundary.
+
+Code is behind the Cargo flag `protocol_feature_wasm_start_sections`, collected
+by `nightly`. A stable binary that reaches the activation height refuses the
+block ("WASM start sections were not compiled into this binary") rather than
+guessing, so version 2 must only be scheduled on chains whose validators all run
+a nightly build, exactly as for the CPU units.
+
+Tests: `pulsevm_wasm_validation` covers the validator entry point;
+`webassembly/tests/privileged.rs` covers the gate on both sides of the activation
+height; `setcode_with_a_start_section_*` in `controller.rs` deploys and executes
+a start-section contract on a real version 2 chain (nightly) and shows the
+refusal under version 1.

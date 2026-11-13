@@ -377,3 +377,45 @@ mod protocol_v2 {
         }
     }
 }
+
+#[test]
+fn before_protocol_v2_setcode_still_refuses_start_sections() {
+    // The legacy rule, which every block before an activation already ran under.
+    let mut h = Host::new(false);
+    let env = h.env();
+    assert!(
+        !crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context()).unwrap()
+    );
+}
+
+#[cfg(feature = "protocol_feature_wasm_start_sections")]
+mod start_sections_v2 {
+    use super::*;
+    use crate::chain::protocol_features::ProtocolUpgradeSchedule;
+
+    fn host_at(height: u32) -> Host {
+        let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )
+        .unwrap();
+        Host::with_protocol(false, schedule.execution_context(height).unwrap())
+    }
+
+    #[test]
+    fn start_sections_are_allowed_from_the_activation_height_and_not_before() {
+        let mut before = host_at(1);
+        let env = before.env();
+        assert!(
+            !crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context())
+                .unwrap(),
+            "the last block under version 1 still refuses them"
+        );
+        let mut after = host_at(2);
+        let env = after.env();
+        assert!(
+            crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context())
+                .unwrap(),
+            "the first block under version 2 allows them"
+        );
+    }
+}

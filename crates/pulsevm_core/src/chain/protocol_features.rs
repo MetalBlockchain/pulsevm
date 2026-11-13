@@ -84,6 +84,17 @@ pub enum ProtocolFeature {
     ///   configuration copied from XPR carries microsecond values (a minimum of 100), and applying
     ///   it would silently put every cap back to a few microseconds of reference compute.
     CpuUnitsInPoints,
+    /// New contract code may declare a WASM start section, as XPR allows.
+    ///
+    /// Before this version `setcode` refused any module with one. The reason was
+    /// that a start function runs during instantiation, before the CPU budget
+    /// existed, so it could do work nobody paid for. The runtime now defers the
+    /// start function (`defer_start_function`) and calls it after the budget is
+    /// set and the billing timer is running, inside the same metered call as
+    /// `apply`, so its work is billed and a trap fails the action like any
+    /// other. Contracts that were already deployed with one (migrated from XPR)
+    /// have always run that way.
+    WasmStartSections,
 }
 
 /// A block height and protocol version that this binary has proved it can run.
@@ -124,6 +135,7 @@ impl ProtocolFeature {
         match self {
             Self::Baseline => GENESIS_PROTOCOL_VERSION,
             Self::CpuUnitsInPoints => 2,
+            Self::WasmStartSections => 2,
         }
     }
 
@@ -374,6 +386,7 @@ mod tests {
     fn permanent_feature_version_mappings_are_stable() {
         assert_eq!(ProtocolFeature::Baseline.protocol_version(), 1);
         assert_eq!(ProtocolFeature::CpuUnitsInPoints.protocol_version(), 2);
+        assert_eq!(ProtocolFeature::WasmStartSections.protocol_version(), 2);
     }
 
     #[test]
