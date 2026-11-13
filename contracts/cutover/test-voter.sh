@@ -749,6 +749,60 @@ kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true
 grep -q "ceremony finalization restored" "$WORK/flow-3.log" || fail "flow 3: the restart did not restore finalization from the marker"
 pass "operator flow: fed-empty pause, bad fed value blocks signing but keeps the pause, good values sign after a restart"
 
+echo "cutover-voter-test: a config that stops loading keeps the pause; enabled=false still stops it..."
+# After P the pause is the whole point: a voter that exits because its config
+# became unreadable lets the next nodeos restart resume block production. With
+# a recorded round it must keep pausing from the record and sign nothing.
+start_stub true "$WORK/deg-hits" "$WORK/stub-deg.port"
+DEG_PORT="$(cat "$WORK/stub-deg.port")"
+DEG_CFG="$WORK/voter-degraded.json"
+cp "$FLOW_BASE" "$DEG_CFG"
+python3 - "$FLOW_BASE.finalized" "$DEG_CFG.finalized" "$DEG_PORT" <<'PYEOF'
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state["format"] == 1 and state["pause_height"] > state["height"], state
+state["producer_api_url"] = f"http://127.0.0.1:{sys.argv[3]}"
+json.dump(state, open(sys.argv[2], "w"))
+PYEOF
+: > "$DEG_CFG"   # truncated: not parseable
+"$VOTER_BIN" --config "$DEG_CFG" >"$WORK/deg.log" 2>&1 &
+DEG_PID=$!
+wait_for_log "$WORK/deg.log" "from the recorded state" "$DEG_PID" 40 || fail "degraded voter did not pause from the record: $(tail -5 "$WORK/deg.log")"
+kill -0 "$DEG_PID" 2>/dev/null || fail "degraded voter exited instead of holding the pause: $(tail -5 "$WORK/deg.log")"
+grep -q "ALARM event=cutover.voter_degraded" "$WORK/deg.log" || fail "no degraded alarm: $(head -5 "$WORK/deg.log")"
+! grep -qE "vote submitted|delivered to coordinator" "$WORK/deg.log" || fail "the degraded voter signed or voted"
+[[ "$(wc -l <"$WORK/deg-hits" 2>/dev/null || echo 0)" -ge 1 ]] || fail "the stub never saw a pause call"
+kill "$DEG_PID" 2>/dev/null || true; wait "$DEG_PID" 2>/dev/null || true
+# An unreadable key file is the other way a config stops loading.
+KEYFAIL_CFG="$WORK/voter-keyfail.json"
+python3 - "$FLOW_BASE" "$KEYFAIL_CFG" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["vote_key_file"] = "/nonexistent/vote.key"
+json.dump(cfg, open(sys.argv[2], "w"))
+PYEOF
+cp "$DEG_CFG.finalized" "$KEYFAIL_CFG.finalized"
+"$VOTER_BIN" --config "$KEYFAIL_CFG" >"$WORK/keyfail.log" 2>&1 &
+KEYFAIL_PID=$!
+wait_for_log "$WORK/keyfail.log" "from the recorded state" "$KEYFAIL_PID" 40 || fail "an unreadable key file ended pause enforcement: $(tail -5 "$WORK/keyfail.log")"
+kill "$KEYFAIL_PID" 2>/dev/null || true; wait "$KEYFAIL_PID" 2>/dev/null || true
+# The operator saying stop is honoured even with a record.
+DISABLED_CFG="$WORK/voter-disabled.json"
+python3 - "$FLOW_BASE" "$DISABLED_CFG" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["enabled"] = False
+json.dump(cfg, open(sys.argv[2], "w"))
+PYEOF
+cp "$DEG_CFG.finalized" "$DISABLED_CFG.finalized"
+# The voter is expected to exit non-zero here; capture it without tripping errexit.
+DISABLED_STATUS=0
+"$VOTER_BIN" --config "$DISABLED_CFG" >"$WORK/disabled.log" 2>&1 || DISABLED_STATUS=$?
+[[ "$DISABLED_STATUS" == 1 ]] || fail "enabled=false should stop the voter (exit 1), got $DISABLED_STATUS: $(tail -3 "$WORK/disabled.log")"
+! grep -q "from the recorded state" "$WORK/disabled.log" || fail "a disabled voter still enforced the pause"
+kill "$STUB_PID" 2>/dev/null || true; wait "$STUB_PID" 2>/dev/null || true
+pass "a voter whose config stops loading keeps the pause and signs nothing; enabled=false still stops it"
+
 echo "cutover-voter-test: unverified pause never goes quiet..."
 start_stub false "$WORK/pause-bad-hits" "$WORK/stub-bad.port"
 STUB_BAD_PORT="$(cat "$WORK/stub-bad.port")"

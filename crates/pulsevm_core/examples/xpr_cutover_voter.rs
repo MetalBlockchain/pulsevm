@@ -53,7 +53,10 @@ use pulsevm_database::{
     HaltDeclarationMember,
     HaltSignature,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 macro_rules! log_line {
     ($($arg:tt)*) => {{
@@ -197,22 +200,83 @@ struct LoadedConfig {
     finalized_marker: std::path::PathBuf,
 }
 
-/// The marker sits next to the config and is bound to the declaration digest:
-/// a different ceremony never inherits it.
+/// The state file sits next to the config. It records that this voter's own
+/// ceremony finalized and everything needed to keep enforcing the pause if the
+/// config stops loading.
 fn finalized_marker_path(config_path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{config_path}.finalized"))
 }
 
-fn read_finalized_marker(path: &std::path::Path, digest: &[u8; 32]) -> bool {
-    std::fs::read_to_string(path)
-        .map(|text| text.trim() == hex::encode(digest))
-        .unwrap_or(false)
+const PAUSE_STATE_FORMAT: u32 = 1;
+
+/// What the voter keeps on disk once its ceremony is finalized.
+///
+/// It is bound to every input that defines the round: the declaration digest
+/// (which covers H, the member set and the contract), but also P and the
+/// schedule version, which the digest does not cover. A re-init that reuses the
+/// same declaration fields but agrees a different P or schedule must not start
+/// out "finalized" from an earlier round's state: it has no new quorum.
+///
+/// It also carries the pause essentials (node, host header, producer API), so a
+/// voter whose config later fails to load (malformed JSON, an unreadable key
+/// file) can still hold the producer paused instead of exiting, which would
+/// let a restart of nodeos resume block production past P.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PauseState {
+    format: u32,
+    digest: String,
+    source_chain_id: String,
+    producer: String,
+    height: u32,
+    pause_height: u32,
+    schedule_version: u32,
+    nodeos_url: String,
+    host_header: String,
+    producer_api_url: String,
 }
 
-fn write_finalized_marker(path: &std::path::Path, digest: &[u8; 32]) -> Result<(), String> {
+impl PauseState {
+    /// The state this config would record, or `None` when it has no producer
+    /// API to pause (there is then nothing to enforce or to restore).
+    fn from_config(config: &LoadedConfig) -> Option<Self> {
+        let stop = &config.inner.stop_producer;
+        if !stop.at_pause {
+            return None;
+        }
+        Some(Self {
+            format: PAUSE_STATE_FORMAT,
+            digest: hex::encode(config.expected_digest),
+            source_chain_id: config.inner.source_chain_id.clone(),
+            producer: config.inner.producer.clone(),
+            height: config.inner.height,
+            pause_height: config.inner.pause_height?,
+            schedule_version: config.inner.schedule_version,
+            nodeos_url: config.inner.nodeos_url.clone(),
+            host_header: config.inner.host_header.clone(),
+            producer_api_url: stop.producer_api_url.clone()?,
+        })
+    }
+
+    /// Whether this recorded state belongs to the round `config` describes.
+    fn describes(&self, config: &LoadedConfig) -> bool {
+        Self::from_config(config).is_some_and(|expected| *self == expected)
+    }
+}
+
+/// The recorded state, or `None` if the file is absent, unreadable, not this
+/// format (an older bare-digest marker included) or not valid JSON.
+fn read_pause_state(path: &std::path::Path) -> Option<PauseState> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let state: PauseState = serde_json::from_str(&text).ok()?;
+    (state.format == PAUSE_STATE_FORMAT).then_some(state)
+}
+
+fn write_pause_state(path: &std::path::Path, state: &PauseState) -> Result<(), String> {
     let tmp = path.with_extension("finalized.tmp");
-    std::fs::write(&tmp, format!("{}\n", hex::encode(digest)))
-        .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    let mut bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("serialize pause state: {error}"))?;
+    bytes.push(b'\n');
+    std::fs::write(&tmp, bytes).map_err(|error| format!("write {}: {error}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .map_err(|error| format!("rename {} to {}: {error}", tmp.display(), path.display()))
 }
@@ -1247,17 +1311,24 @@ fn window_block_links(
 
 /// Walk the blocks after `after` through `through` on the local node and
 /// require every one to be empty and to link to the one before it.
+///
+/// `anchor` is the id block `after` is already known to have. A caller that
+/// extends earlier coverage passes the tip id it cached, so the first block
+/// scanned must link to *that* block. Fetching the anchor here instead would
+/// let a fork switch between the caller's cache check and this call leave
+/// the earlier coverage unverified while the extension still looks linked.
 async fn verify_window_empty(
     client: &reqwest::Client,
     base: &str,
     after: u32,
     through: u32,
+    anchor: Option<&str>,
 ) -> Result<String, String> {
     let mut last_id = None;
-    let mut expected_previous = if through > after {
-        Some(fetch_block_id(client, base, after).await?)
-    } else {
-        None
+    let mut expected_previous = match anchor {
+        Some(id) => Some(id.to_owned()),
+        None if through > after => Some(fetch_block_id(client, base, after).await?),
+        None => None,
     };
     for number in after.saturating_add(1)..=through {
         let block = post_json(
@@ -2156,6 +2227,7 @@ async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
         &config.inner.nodeos_url,
         config.inner.height,
         covered,
+        None,
     )
     .await
     .map_err(|error| format!("nothing to sign: {error}"))?;
@@ -2362,10 +2434,13 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     let mut pause_holding = false;
     let mut window_checked = false;
     let mut window_verified: Option<(String, u32, String)> = None;
-    // Restored from the marker so a restart does not drop the fallback pause
-    // until one chain read succeeds.
+    // Restored from the state file, but only if it describes exactly this round,
+    // so a restart does not drop the fallback pause until one chain read
+    // succeeds and a different round never inherits it.
     let mut finalized_seen =
-        read_finalized_marker(&config.finalized_marker, &config.expected_digest);
+        read_pause_state(&config.finalized_marker).is_some_and(|state| state.describes(config));
+    let mut state_persisted = finalized_seen;
+    let mut state_note = String::new();
     if finalized_seen {
         log_line!(
             "ceremony finalization restored from {}",
@@ -2523,13 +2598,25 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // contract to show the ceremony finalized (remembered, so a later
         // read failure does not lose it).
         if own_finalized(config, &view) {
-            if !finalized_seen
-                && let Err(error) =
-                    write_finalized_marker(&config.finalized_marker, &config.expected_digest)
-            {
-                log_line!("could not persist the finalization marker: {error}");
-            }
             finalized_seen = true;
+            // Keep trying until the write lands: a read-only config directory
+            // is fixed by an operator some time after the first failure.
+            if !state_persisted {
+                match PauseState::from_config(config) {
+                    Some(state) => match write_pause_state(&config.finalized_marker, &state) {
+                        Ok(()) => {
+                            state_persisted = true;
+                            log_line!("pause state saved to {}", config.finalized_marker.display());
+                        }
+                        Err(error) => note_throttled(
+                            &mut state_note,
+                            &mut polls,
+                            &format!("could not save the pause state, will retry: {error}"),
+                        ),
+                    },
+                    None => state_persisted = true,
+                }
+            }
         }
         if !dry_run
             && finalized_seen
@@ -2655,28 +2742,33 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 }
             };
             let scan_to = pause_height.max(head_after_pause);
-            let cached = match &window_verified {
+            let cached: Option<(u32, String)> = match &window_verified {
                 Some((id, through, tip)) if *id == settled_id => {
                     match fetch_block_id(&client, &config.inner.nodeos_url, *through).await {
-                        Ok(current) if current == *tip => Some(*through),
+                        Ok(current) if current == *tip => Some((*through, tip.clone())),
                         _ => None,
                     }
                 }
                 _ => None,
             };
-            let (covered_through, covered_tip) = match cached {
-                Some(through) if through >= scan_to => {
+            let (covered_through, covered_tip) = match &cached {
+                Some((through, tip)) if *through >= scan_to => {
                     // `cached` already matched the stored tip id.
-                    let tip = window_verified
-                        .as_ref()
-                        .map(|(_, _, tip)| tip.clone())
-                        .unwrap_or_default();
-                    (through, tip)
+                    (*through, tip.clone())
                 }
                 _ => {
-                    let scan_from = cached.unwrap_or(config.inner.height);
-                    match verify_window_empty(&client, &config.inner.nodeos_url, scan_from, scan_to)
-                        .await
+                    let (scan_from, anchor) = match &cached {
+                        Some((through, tip)) => (*through, Some(tip.as_str())),
+                        None => (config.inner.height, None),
+                    };
+                    match verify_window_empty(
+                        &client,
+                        &config.inner.nodeos_url,
+                        scan_from,
+                        scan_to,
+                        anchor,
+                    )
+                    .await
                     {
                         Ok(tip) => {
                             window_verified = Some((settled_id.clone(), scan_to, tip.clone()));
@@ -2720,6 +2812,99 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
 }
 
 /// Log state changes immediately, repeats at most every dozen polls.
+/// What `main` does when the config does not load.
+#[derive(Debug, PartialEq, Eq)]
+enum DegradedPlan {
+    /// Nothing safe to do: exit with the load error.
+    Refuse(String),
+    /// Keep the producer paused from the recorded state; sign nothing.
+    PauseOnly(PauseState),
+}
+
+/// Decide what to do after a failed config load.
+///
+/// Exiting is the wrong answer once the pause is armed: it ends enforcement,
+/// and the next nodeos restart resumes block production past P. So if this
+/// voter recorded a finalized round next to the config, keep enforcing it from
+/// that record and sign nothing. Two cases still stop the voter: the operator
+/// said so (`enabled = false` in a config that does parse), and there is no
+/// record, because then the pause was never armed.
+fn degraded_plan(config_path: &str, load_error: &str) -> DegradedPlan {
+    if let Ok(raw) = load_config(config_path)
+        && !raw.enabled
+    {
+        return DegradedPlan::Refuse(load_error.to_owned());
+    }
+    match read_pause_state(&finalized_marker_path(config_path)) {
+        Some(state) => DegradedPlan::PauseOnly(state),
+        None => DegradedPlan::Refuse(load_error.to_owned()),
+    }
+}
+
+/// Hold the producer paused using only the recorded state: no keys, no
+/// roster, no ceremony reads. Runs until killed (or `max_polls`, for tests).
+async fn run_pause_only(state: &PauseState, max_polls: u64) -> Result<(), String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HOST,
+        reqwest::header::HeaderValue::from_str(&state.host_header)
+            .map_err(|error| format!("bad host_header in the pause state: {error}"))?,
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .default_headers(headers)
+        .build()
+        .map_err(|error| format!("http client: {error}"))?;
+    let mut holding = false;
+    let mut last_note = String::new();
+    let mut polls = 0u64;
+    loop {
+        polls += 1;
+        if max_polls > 0 && polls > max_polls {
+            log_line!("poll limit reached ({max_polls}), exiting");
+            return Ok(());
+        }
+        match get_info(&client, &state.nodeos_url).await {
+            Ok((head, _, chain_id)) if chain_id == state.source_chain_id => {
+                if head >= state.pause_height {
+                    match pause_producer(&client, &state.producer_api_url).await {
+                        Ok(()) => {
+                            if !holding {
+                                log_line!(
+                                    "local producer paused at P={} (head {head}) from the recorded state",
+                                    state.pause_height
+                                );
+                            }
+                            holding = true;
+                        }
+                        Err(error) => {
+                            holding = false;
+                            note_throttled(
+                                &mut last_note,
+                                &mut polls,
+                                &format!("producer pause failed, retrying: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok((_, _, chain_id)) => note_throttled(
+                &mut last_note,
+                &mut polls,
+                &format!(
+                    "node reports chain {chain_id}, not the recorded source chain: not pausing"
+                ),
+            ),
+            Err(error) => note_throttled(
+                &mut last_note,
+                &mut polls,
+                &format!("node unreachable, retrying: {error}"),
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn note_throttled(last_note: &mut String, polls: &mut u64, note: &str) {
     if *last_note != note || *polls % 12 == 0 {
         log_line!("{note}");
@@ -2762,7 +2947,28 @@ async fn main() -> ExitCode {
         Ok(config) => config,
         Err(error) => {
             eprintln!("xpr_cutover_voter: {error}");
-            return ExitCode::from(1);
+            // The one-shot operator commands report the error and stop. The
+            // long-running voter must not: see `degraded_plan`.
+            if print_digest_only || preflight_only || status_only {
+                return ExitCode::from(1);
+            }
+            return match degraded_plan(&config_path, &error) {
+                DegradedPlan::Refuse(_) => ExitCode::from(1),
+                DegradedPlan::PauseOnly(state) => {
+                    log_line!(
+                        "ALARM event=cutover.voter_degraded producer={} outcome=failure: the config did not load ({error}); enforcing the pause from {} and signing nothing until the config loads and the voter is restarted",
+                        state.producer,
+                        finalized_marker_path(&config_path).display()
+                    );
+                    match run_pause_only(&state, max_polls).await {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("xpr_cutover_voter: {error}");
+                            ExitCode::from(1)
+                        }
+                    }
+                }
+            };
         }
     };
     if print_digest_only {
@@ -3778,30 +3984,339 @@ mod tests {
         assert!(error.contains("missing previous"), "{error}");
     }
 
+    fn armed_config() -> LoadedConfig {
+        let mut config = test_loaded_config(100);
+        config.inner.stop_producer = armed_stop();
+        config
+    }
+
     #[test]
-    fn the_finalized_marker_survives_a_restart_and_is_bound_to_its_digest() {
-        let dir = std::env::temp_dir().join(format!("voter-marker-{}", std::process::id()));
+    fn the_pause_state_describes_only_the_round_it_was_written_for() {
+        let config = armed_config();
+        let state = PauseState::from_config(&config).expect("an armed config has a state");
+        assert!(state.describes(&config));
+
+        // Everything that defines the round must bind it. The declaration
+        // digest covers H, the member set and the contract, but not P or the
+        // schedule version: a re-init that agrees a different P, or the next
+        // schedule, has no quorum yet and must not start out finalized.
+        let mut other = armed_config();
+        other.inner.pause_height = Some(other.inner.pause_height.unwrap() + 1);
+        assert!(
+            !state.describes(&other),
+            "a different P is a different round"
+        );
+
+        let mut other = armed_config();
+        other.inner.schedule_version += 1;
+        assert!(!state.describes(&other), "a different schedule version");
+
+        let mut other = armed_config();
+        other.expected_digest[0] ^= 1;
+        assert!(!state.describes(&other), "a different declaration digest");
+
+        let mut other = armed_config();
+        other.inner.height += 1;
+        assert!(!state.describes(&other), "a different H");
+
+        let mut other = armed_config();
+        other.inner.source_chain_id = "42".repeat(32);
+        assert!(!state.describes(&other), "a different source chain");
+
+        let mut other = armed_config();
+        other.inner.producer = "prod.b".to_string();
+        assert!(!state.describes(&other), "a different producer");
+
+        let mut other = armed_config();
+        other.inner.stop_producer.producer_api_url = Some("http://127.0.0.1:9999".to_string());
+        assert!(!state.describes(&other), "a different producer API");
+
+        // No producer API to pause means nothing to record.
+        let mut unarmed = armed_config();
+        unarmed.inner.stop_producer.at_pause = false;
+        assert!(PauseState::from_config(&unarmed).is_none());
+        let mut no_url = armed_config();
+        no_url.inner.stop_producer.producer_api_url = None;
+        assert!(PauseState::from_config(&no_url).is_none());
+    }
+
+    #[test]
+    fn the_pause_state_survives_a_restart_and_foreign_files_are_ignored() {
+        let dir = std::env::temp_dir().join(format!("voter-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("voter.json.finalized");
-        let digest = [7u8; 32];
+        let state = PauseState::from_config(&armed_config()).unwrap();
+
         assert!(
-            !read_finalized_marker(&path, &digest),
+            read_pause_state(&path).is_none(),
             "absent means not finalized"
         );
-        write_finalized_marker(&path, &digest).unwrap();
-        assert!(read_finalized_marker(&path, &digest));
-        assert!(
-            !read_finalized_marker(&path, &[8u8; 32]),
-            "another ceremony must not inherit it"
-        );
-        std::fs::write(&path, "not a digest").unwrap();
-        assert!(!read_finalized_marker(&path, &digest));
-        assert!(write_finalized_marker(&dir.join("missing/dir/m"), &digest).is_err());
+        write_pause_state(&path, &state).unwrap();
+        assert_eq!(read_pause_state(&path), Some(state.clone()));
+
+        // The old bare-digest marker, noise and another format all read as
+        // "no state": never as finalized.
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
+        assert!(read_pause_state(&path).is_none());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_pause_state(&path).is_none());
+        let mut future = state.clone();
+        future.format = PAUSE_STATE_FORMAT + 1;
+        std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(read_pause_state(&path).is_none());
+
+        assert!(write_pause_state(&dir.join("missing/dir/state"), &state).is_err());
         assert_eq!(
             finalized_marker_path("/etc/voter.json"),
             std::path::PathBuf::from("/etc/voter.json.finalized")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_write_that_failed_succeeds_once_the_directory_is_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("voter-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voter.json.finalized");
+        let state = PauseState::from_config(&armed_config()).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Running as root ignores directory modes; only assert the failure
+        // where the mode is honoured.
+        let blocked = write_pause_state(&path, &state);
+        if std::fs::write(dir.join("probe"), b"x").is_err() {
+            assert!(
+                blocked.is_err(),
+                "a read-only directory cannot take the state"
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_pause_state(&path, &state).expect("the retry lands once the directory is writable");
+        assert_eq!(read_pause_state(&path), Some(state));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn write_config_file(dir: &std::path::Path, extra: &str) -> String {
+        let path = dir.join("voter.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"nodeos_url":"http://x","contract":"cutover","producer":"prod.a","source_chain_id":"{}","height":100,"pause_height":120,"schedule_version":7,"roster_file":"/nonexistent/roster.json","vote_key_file":"/nonexistent/vote.key","payer_account":"prod.a","payer_key_file":"/nonexistent/payer.key"{extra}}}"#,
+                "41".repeat(32)
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_config_that_stops_loading_keeps_the_pause_if_a_round_was_recorded() {
+        let dir = std::env::temp_dir().join(format!("voter-degraded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = PauseState::from_config(&armed_config()).unwrap();
+
+        // No record: the pause was never armed, so there is nothing to keep.
+        let config = write_config_file(&dir, "");
+        assert!(matches!(
+            degraded_plan(&config, "key file unreadable"),
+            DegradedPlan::Refuse(_)
+        ));
+
+        // A record plus a config that parses but fails validation (here the key
+        // files are missing): keep enforcing from the record.
+        write_pause_state(&finalized_marker_path(&config), &state).unwrap();
+        assert_eq!(
+            degraded_plan(&config, "key file unreadable"),
+            DegradedPlan::PauseOnly(state.clone())
+        );
+
+        // Malformed JSON cannot say whether the operator disabled the voter;
+        // with a record, fail safe toward holding the pause.
+        std::fs::write(&config, "{ this is not json").unwrap();
+        assert_eq!(
+            degraded_plan(&config, "parse error"),
+            DegradedPlan::PauseOnly(state.clone())
+        );
+
+        // An explicit `enabled = false` in a config that does parse is the
+        // operator stopping the voter. Honour it even with a record.
+        let disabled = write_config_file(&dir, r#","enabled":false"#);
+        assert!(matches!(
+            degraded_plan(&disabled, "voter is disabled"),
+            DegradedPlan::Refuse(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tiny HTTP server for the voter's JSON-over-HTTP calls. `handler` maps
+    /// (path, request body) to the JSON reply; every path is recorded.
+    fn spawn_http_server(
+        handler: impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{
+            Read,
+            Write,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(at + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + length {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&buf[header_end..]).unwrap_or(serde_json::Value::Null);
+                log.lock().unwrap().push(path.clone());
+                let reply = handler(&path, &body).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn empty_block(number: u32, previous: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("id{number}"),
+            "previous": previous,
+            "block_num": number,
+            "transaction_mroot": "0".repeat(64),
+            "transactions": [],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_scan_extension_links_to_the_cached_tip_without_refetching_the_anchor() {
+        let blocks = |_: &str, body: &serde_json::Value| {
+            let number: u32 = body["block_num_or_id"].as_str().unwrap().parse().unwrap();
+            empty_block(number, &format!("id{}", number - 1))
+        };
+        let client = reqwest::Client::new();
+
+        // With the cached tip as the anchor, only the three new blocks are
+        // fetched. Re-fetching block 10 here is the race: a fork switch between
+        // the cache check and that fetch would leave blocks <= 10 unverified.
+        let (url, seen) = spawn_http_server(blocks);
+        let tip = verify_window_empty(&client, &url, 10, 13, Some("id10"))
+            .await
+            .expect("blocks 11..13 link to the cached tip");
+        assert_eq!(tip, "id13");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "no extra fetch for the anchor"
+        );
+
+        // A fork above the cached tip: block 11 names a different parent.
+        let (url, _) = spawn_http_server(blocks);
+        let error = verify_window_empty(&client, &url, 10, 13, Some("forked-id10"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("does not link"), "{error}");
+
+        // Without a cached anchor the scan still fetches and checks one.
+        let (url, seen) = spawn_http_server(blocks);
+        verify_window_empty(&client, &url, 10, 13, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            4,
+            "the anchor plus three blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_degraded_voter_pauses_from_the_record_and_only_when_it_should() {
+        let state = PauseState::from_config(&armed_config()).unwrap();
+        let reply_for = |head: u32, chain: String| {
+            move |path: &str, _: &serde_json::Value| match path {
+                "/v1/chain/get_info" => serde_json::json!({
+                    "head_block_num": head,
+                    "last_irreversible_block_num": head.saturating_sub(5),
+                    "chain_id": chain,
+                }),
+                "/v1/producer/paused" => serde_json::json!(true),
+                _ => serde_json::json!({}),
+            }
+        };
+        let pause_calls = |seen: &std::sync::Mutex<Vec<String>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/v1/producer/pause")
+                .count()
+        };
+
+        // Head at or past P on the recorded chain: it pauses, and keeps asserting.
+        let (url, seen) =
+            spawn_http_server(reply_for(state.pause_height, state.source_chain_id.clone()));
+        let mut live = state.clone();
+        live.nodeos_url = url.clone();
+        live.producer_api_url = url;
+        run_pause_only(&live, 2).await.unwrap();
+        assert_eq!(pause_calls(&seen), 2, "the pause is re-asserted every poll");
+
+        // Head before P: nothing to pause yet.
+        let (url, seen) = spawn_http_server(reply_for(
+            state.pause_height - 1,
+            state.source_chain_id.clone(),
+        ));
+        let mut early = state.clone();
+        early.nodeos_url = url.clone();
+        early.producer_api_url = url;
+        run_pause_only(&early, 2).await.unwrap();
+        assert_eq!(pause_calls(&seen), 0, "never pauses before P");
+
+        // A node on another chain is not paused on the record's say-so.
+        let (url, seen) = spawn_http_server(reply_for(state.pause_height + 5, "99".repeat(32)));
+        let mut foreign = state.clone();
+        foreign.nodeos_url = url.clone();
+        foreign.producer_api_url = url;
+        run_pause_only(&foreign, 2).await.unwrap();
+        assert_eq!(pause_calls(&seen), 0, "never pauses a different chain");
     }
 
     fn armed_stop() -> StopConfig {
