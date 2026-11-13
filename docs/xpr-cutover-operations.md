@@ -281,18 +281,87 @@ weights, RAM and NET do not move. The checkpoint hash covers all of it
 (`redenominate_resource_rows`, `crates/pulsevm_database/src/xpr_import.rs`).
 
 The table compare applies the same transform to the nodeos side before it
-compares (`redenominate_source_tables`) for `global_property`,
-`resource_limits_config`, `resource_limits_state` and `resource_usage`, and
-prints a line saying so; every other byte and table is still compared exactly.
+compares (`redenominate_source_tables`) for the three resource tables and prints
+a line saying so; every other byte and table is still compared exactly.
+`global_property` is the exception to a byte compare. PulseVM's row is 143 bytes
+and Leap's is 157: Leap prefixes the config with an optional proposed-schedule
+block number and a proposed producer schedule (6 bytes when empty) and carries
+two deferred-transaction fields, `deferred_trx_expiration_window` and
+`max_transaction_delay` (8 bytes), which PulseVM does not have. A byte compare
+can never match, so it used to end in FAILED and operators learned to accept
+it. The compare now decodes both rows with the importer's decoder and requires
+the chain id and every other field to be equal (the CPU caps are read from the
+target as stored, so a wrong cap fails), then prints the two ignored values. A
+run that previously needed `global_property` and `contract_index_double`
+accepted as known differences should now exit 0 with nothing waved through.
+
+`contract_index_double` and `contract_index_long_double` used to be missing from
+the exported state for a different reason: the state-history exporter built the
+tables but left them out of its table list, so a restored checkpoint exported
+with no double-keyed secondary index rows although the state held them (a
+snapshot, restore and export round trip is now a test). Indexers reading the
+state-history stream see them too.
+
+### Calibration of the factor
 
 The factor is a ratio of block caps, not a measurement of cost per microsecond.
-Whether that makes a typical XPR account's allowance buy the same real work is
-an open calibration question that needs the mainnet replay: measure billed
-points per source microsecond across real traffic and compare it with the
-factor. An account whose whole allowance is below the 100,000-point minimum
-bill cannot transact; that is about 7 us of XPR-equivalent allowance, below
-XPR's own 100 us minimum bill, so nobody who could transact on XPR is locked
-out by the minimum alone.
+Paul Grey's replay of 100,000 XPR mainnet blocks (413,240,694 to 413,340,693,
+2.83M transactions, 13.9 hours) on `359d0582` measured it:
+
+- PulseVM charged about 6,950 points per Leap-billed microsecond (sum over sum);
+  per-transaction median 5,547, p5 710, p95 13,088. 28.8% of transactions sit at
+  Leap's 100 us floor.
+- At 15,000 an account gets about 2.2x the transactions per day it had on Leap
+  for the same stake (3.7x for the median account), and one account in the
+  window comes out below 1x. At 10,000, 1.4% of accounts are worse off; at
+  7,000, 14% (21% of the traffic, mostly arbitrage and liquidation bots).
+- No transaction exceeded the 1e9 cap (largest 2.5e8); 6.8% fall under the
+  100,000 minimum bill; one block metered 3.14e9 points, 105% of the block cap.
+- One machine (EPYC-Milan, dedicated vCPU) ran about 10,000 points per
+  microsecond against the 38,000 `POINTS_PER_US` assumes: a full 3e9 block took
+  300 to 350 ms of the 500 ms slot.
+
+That supports 15,000 and says not to go below 10,000. The number to watch is the
+block cap on slower validators, not the per-account factor. Caveats from the
+same report: one 14-hour window, bot-heavy traffic (one account sends 19%), and
+Leap's microseconds are noisy and include signature checks.
+
+An account whose whole allowance is below the 100,000-point minimum bill cannot
+transact; that is about 7 us of XPR-equivalent allowance, below XPR's own 100 us
+minimum bill, so nobody who could transact on XPR is locked out by the minimum
+alone. Two accounts with 3 us and 13 us allowances were refused on Leap and on
+the target alike.
+
+### Two more places microseconds leak in
+
+- **A transaction header's `max_cpu_usage_ms`** was used as a point count, so a
+  transaction that set it (imported multisig proposals, deferred transactions)
+  got at most 255 points and could never pay the minimum bill. Leap multiplies
+  by 1000. Fixed by protocol version 2 (`CpuUnitsInPoints`,
+  `docs/protocol-features.md` section 13); it is not active on a chain until its
+  upgrade schedule says so, and it needs a `nightly` build today.
+- **A later `setparams`** applies whatever it is given. The chain only checks
+  relations between fields, so XPR's microsecond values (a minimum bill of 100)
+  would be accepted and put every cap back to a few microseconds. Version 2
+  refuses a minimum under `POINTS_PER_US`. Until it is active, any `setparams`
+  after the cut must carry point values, and `getInfo` (`block_cpu_limit`,
+  `virtual_block_cpu_limit`) should be checked after it. The system contract's
+  own global row still holds microsecond values; nothing re-applies it by
+  itself, but a governance call that copies it will.
+
+### A payer refused for a bill it cannot see
+
+A transaction that fails at block build leaves a node-local ("subjective") CPU
+bill on its payer, which decays over the usage window. Execution subtracts it
+from the payer's available CPU, so a payer whose bill exceeds its allowance runs
+with a limit of 0 ("CPU limit of 0 exhausted during apply") and everything it
+sends is dropped. Admission used to ignore the bill, so the transaction was
+accepted every time and dropped every time, and `getAccount` showed no bill.
+Admission now subtracts the same bill and says so in the refusal ("available CPU
+N (after a node-local bill of M from earlier failed transactions) is below the
+100000 minimum"), and `getAccount` reports it in `subjective_cpu_bill_limit`
+(`used` and `current_used`). The bill never reaches consensus state and is
+per node.
 
 The state-history window oracle (`xpr_apply_history_window`) replays raw XPR
 deltas onto a hydrated state. After a converted import its CPU figures are in
@@ -344,3 +413,28 @@ equivalents.
 5. **Confirmation set published.** The full confirmation set (one per
    rostered signer) is archived with the manifest so any node can
    re-verify the gate decision offline later.
+
+## The voter after a failure: restart, degraded mode, state file
+
+- **A config fix needs a restart.** The voter reads its config at start. Fixing
+  a bad fed value (a mistyped checkpoint hash, for example) in the file does not
+  change a running voter: it keeps logging
+  `ALARM event=cutover.signing_inputs_invalid`, keeps the producer paused and
+  refuses to sign until it is restarted with the corrected file.
+- **State file.** Once the voter sees its own ceremony finalized it writes
+  `<config>.finalized` (JSON). It is bound to the declaration digest, H, P, the
+  schedule version, the source chain id, the producer and the node and producer
+  API addresses, so a re-init that agrees a different P or schedule does not
+  start out "finalized": it needs its own quorum. The config directory must be
+  writable; a failed write is logged and retried every poll until it lands. A
+  file in the old format (a bare digest) is ignored and rewritten.
+- **A config that stops loading keeps the pause.** If the config cannot be
+  loaded after the voter recorded a finalized round (malformed JSON, an
+  unreadable key file, a failed validation), the voter does not exit: exiting
+  would end pause enforcement and the next nodeos restart would resume block
+  production past P. It logs `ALARM event=cutover.voter_degraded`, keeps the
+  producer paused from the recorded state, and signs nothing. Restart it with a
+  working config to sign. Two things still stop it: `enabled = false` in a config
+  that parses (an explicit stop), and the absence of a recorded round (the pause
+  was never armed). `--preflight`, `--status` and `--print-digest` still exit 1
+  on a bad config.
