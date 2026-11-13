@@ -38,15 +38,17 @@ pub const MAX_SUBMIT_BODY_BYTES: usize =
 /// short fields, so a body past this is not a query; refuse it before parsing.
 pub const MAX_QUERY_BODY_BYTES: usize = 64 * 1024;
 
-/// The body-size ceiling for a request to `url`. Transaction submission (both
-/// the nodeos-style push routes and the `pulsevm.*` JSON-RPC route, whose
-/// method is only known after parsing) may be large; every other nodeos route
-/// is a small query.
+/// The body-size ceiling for a request to `url`. Routes whose body is a
+/// transaction (the nodeos-style push routes, `get_required_keys`, and the
+/// `pulsevm.*` JSON-RPC route, whose method is only known after parsing) may be
+/// large; every other nodeos route is a small query.
 pub fn max_body_bytes(url: &str) -> usize {
     match extract_method(url).as_deref() {
-        Some("push_transaction") | Some("send_transaction") | Some("send_transaction2") => {
-            MAX_SUBMIT_BODY_BYTES
-        }
+        // get_required_keys is read-only but its body is a whole transaction.
+        Some("push_transaction")
+        | Some("send_transaction")
+        | Some("send_transaction2")
+        | Some("get_required_keys") => MAX_SUBMIT_BODY_BYTES,
         Some(_) => MAX_QUERY_BODY_BYTES,
         None => MAX_SUBMIT_BODY_BYTES,
     }
@@ -607,7 +609,15 @@ mod tests {
                 "{method}"
             );
         }
-        for method in ["push_transaction", "send_transaction", "send_transaction2"] {
+        // get_required_keys carries the whole transaction (cleos calls it with
+        // the full setcode payload before every deploy), so it is a submit-sized
+        // route even though it only reads.
+        for method in [
+            "push_transaction",
+            "send_transaction",
+            "send_transaction2",
+            "get_required_keys",
+        ] {
             assert_eq!(
                 max_body_bytes(&format!("/v1/chain/{method}")),
                 MAX_SUBMIT_BODY_BYTES,
