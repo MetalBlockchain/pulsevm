@@ -14278,7 +14278,7 @@ mod tests {
         let shown = controller.subjective_cpu_bill(&alice)?;
         assert!(
             (4_900_000..=5_000_100).contains(&shown),
-            "the bill is shown, give or take decay and the ledger's round-up: {shown}"
+            "the bill is shown, give or take decay and the ledger's round-up"
         );
         assert_eq!(
             controller.subjective_cpu_bill(&Name::from_str("bob")?)?,
