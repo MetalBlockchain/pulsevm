@@ -165,6 +165,21 @@ pub trait Rpc {
     ) -> Result<Value, ErrorObjectOwned>;
 }
 
+/// Show the node-local CPU bill in `getAccount`'s `subjective_cpu_bill_limit`.
+/// The database layer builds that field without the controller's ledger, so it
+/// is always zero there; without this overlay a payer refused for a bill it
+/// cannot see has no way to find out why.
+fn overlay_subjective_cpu_bill(account_info: &mut Value, bill: u64) {
+    let bill = i64::try_from(bill).unwrap_or(i64::MAX);
+    if let Some(limit) = account_info
+        .get_mut("subjective_cpu_bill_limit")
+        .and_then(Value::as_object_mut)
+    {
+        limit.insert("used".to_owned(), Value::from(bill));
+        limit.insert("current_used".to_owned(), Value::from(bill));
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
@@ -436,6 +451,7 @@ impl RpcServer for RpcService {
         let db = controller.database();
         let head_block_time = controller.last_accepted_block().timestamp().to_time_point();
         let head_block_num = controller.last_accepted_block().block_num();
+        let subjective_cpu_bill = controller.subjective_cpu_bill(&name)?;
 
         match expected_core_symbol {
             Some(symbol) => {
@@ -445,10 +461,11 @@ impl RpcServer for RpcService {
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value =
+                let mut account_info: Value =
                     serde_json::from_str(&account_info_json).map_err(|e| {
                         ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
                     })?;
+                overlay_subjective_cpu_bill(&mut account_info, subjective_cpu_bill);
                 Ok(account_info)
             }
             None => {
@@ -457,10 +474,11 @@ impl RpcServer for RpcService {
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value =
+                let mut account_info: Value =
                     serde_json::from_str(&account_info_json).map_err(|e| {
                         ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
                     })?;
+                overlay_subjective_cpu_bill(&mut account_info, subjective_cpu_bill);
                 Ok(account_info)
             }
         }

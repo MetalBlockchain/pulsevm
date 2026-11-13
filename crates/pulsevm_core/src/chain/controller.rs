@@ -80,8 +80,8 @@ use crate::{
         },
         state_sync,
         subjective_billing::{
+            SharedSubjectiveBilling,
             SubjectiveBill,
-            SubjectiveBilling,
         },
         transaction::{
             ACTION_RETURN_VALUE_FEATURE_DIGEST,
@@ -680,7 +680,7 @@ pub struct Controller {
 
     // Local-only CPU/NET retained for transactions whose consensus state was
     // rolled back after an execution failure.
-    subjective_billing: SubjectiveBilling,
+    subjective_billing: SharedSubjectiveBilling,
 }
 
 /// Read-only state required for mempool admission. See
@@ -696,6 +696,9 @@ pub struct MempoolAdmissionState {
     db: Database,
     chain_id: Id,
     protocol_upgrade_schedule: ProtocolUpgradeSchedule,
+    /// The controller's own ledger, so admission applies the same node-local
+    /// bill execution subtracts from the payer.
+    subjective_billing: SharedSubjectiveBilling,
 }
 
 impl MempoolAdmissionState {
@@ -784,7 +787,13 @@ impl MempoolAdmissionState {
         // cannot afford the transaction is refused here instead of occupying a
         // mempool slot and a block builder's time before failing the same
         // objective checks at execution.
-        Self::check_payer_resource_window(&self.db, packed_transaction, transaction)?;
+        Self::check_payer_resource_window(
+            &self.db,
+            &self.subjective_billing,
+            pending_block_timestamp,
+            packed_transaction,
+            transaction,
+        )?;
 
         if self
             .db
@@ -815,6 +824,8 @@ impl MempoolAdmissionState {
     /// (limit `-1`) and greylisting are handled as at execution.
     fn check_payer_resource_window(
         db: &Database,
+        subjective_billing: &SharedSubjectiveBilling,
+        pending_block_timestamp: &BlockTimestamp,
         packed_transaction: &PackedTransaction,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
@@ -824,16 +835,38 @@ impl MempoolAdmissionState {
         let payer = Name::new(payer);
         let chain_config = db.chain_config()?;
 
+        // Execution subtracts the node-local bill that this payer's earlier
+        // failed transactions left behind (`TransactionContext::
+        // set_subjective_bill`), so the budget it enforces is the available CPU
+        // minus that bill. Check the same figure here.
+        let bill = subjective_billing.get_bill(
+            payer.as_u64(),
+            pending_block_timestamp.slot(),
+            db.get_account_cpu_usage_average_window()?,
+            db.get_account_net_usage_average_window()?,
+        );
+        let billed_note = |bill: u64| {
+            if bill > 0 {
+                format!(" (after a node-local bill of {bill} from earlier failed transactions)")
+            } else {
+                String::new()
+            }
+        };
+
         let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
             db,
             &payer,
             Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
         )?;
         let min_cpu = chain_config.min_transaction_cpu_usage as u64;
-        if cpu_limit >= 0 && (cpu_limit as u64) < min_cpu {
+        let cpu_available = (cpu_limit as u64).saturating_sub(bill.cpu);
+        if cpu_limit >= 0 && cpu_available < min_cpu {
             return Err(ChainError::TransactionError(format!(
-                "payer {} cannot afford the transaction: available CPU {} is below the {} minimum",
-                payer, cpu_limit, min_cpu
+                "payer {} cannot afford the transaction: available CPU {}{} is below the {} minimum",
+                payer,
+                cpu_available,
+                billed_note(bill.cpu),
+                min_cpu
             )));
         }
 
@@ -855,10 +888,14 @@ impl MempoolAdmissionState {
             &payer,
             Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
         )?;
-        if net_limit >= 0 && (net_limit as u64) < net_usage {
+        let net_available = (net_limit as u64).saturating_sub(bill.net);
+        if net_limit >= 0 && net_available < net_usage {
             return Err(ChainError::TransactionError(format!(
-                "payer {} cannot afford the transaction: available NET {} is below its {} bytes",
-                payer, net_limit, net_usage
+                "payer {} cannot afford the transaction: available NET {}{} is below its {} bytes",
+                payer,
+                net_available,
+                billed_note(bill.net),
+                net_usage
             )));
         }
         Ok(())
@@ -1142,7 +1179,7 @@ impl Controller {
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
-            subjective_billing: SubjectiveBilling::default(),
+            subjective_billing: SharedSubjectiveBilling::default(),
         }
     }
 
@@ -4118,6 +4155,7 @@ impl Controller {
             db: self.db.clone(),
             chain_id: self.chain_id.clone(),
             protocol_upgrade_schedule: self.protocol_upgrade_schedule.clone(),
+            subjective_billing: self.subjective_billing.clone(),
         }
     }
 
@@ -5269,6 +5307,23 @@ impl Controller {
 
     pub fn database(&self) -> Database {
         self.db.clone()
+    }
+
+    /// The node-local CPU bill, in points, that `account` carries from earlier
+    /// failed input transactions right now. It never reaches consensus state;
+    /// RPC reports it so a payer can see why a transaction it can otherwise
+    /// afford is being refused.
+    pub fn subjective_cpu_bill(&self, account: &Name) -> Result<u64, ChainError> {
+        let now: BlockTimestamp = TimePoint::now().into();
+        Ok(self
+            .subjective_billing
+            .get_bill(
+                account.as_u64(),
+                now.slot(),
+                self.db.get_account_cpu_usage_average_window()?,
+                self.db.get_account_net_usage_average_window()?,
+            )
+            .cpu)
     }
 
     /// Best-effort migration replay look-ahead for direct WASM receivers.
@@ -14195,6 +14250,161 @@ mod tests {
                 .database()
                 .is_known_unexpired_transaction(&packed.id().0.0)?
         );
+        Ok(())
+    }
+
+    /// `getAccount` shows the bill through `Controller::subjective_cpu_bill`,
+    /// which reads at the current time like any later transaction would.
+    #[tokio::test]
+    async fn the_rpc_accessor_reports_the_live_subjective_cpu_bill() -> Result<(), ChainError> {
+        let (controller, _private_key, _chain_id, _temp) = init_test_controller()?;
+        let alice = Name::from_str("alice")?;
+        assert_eq!(
+            controller.subjective_cpu_bill(&alice)?,
+            0,
+            "no failures, no bill"
+        );
+
+        let db = controller.database();
+        let now: BlockTimestamp = TimePoint::now().into();
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            5_000_000,
+            0,
+            now.slot(),
+            db.get_account_cpu_usage_average_window()?,
+            db.get_account_net_usage_average_window()?,
+        );
+        let shown = controller.subjective_cpu_bill(&alice)?;
+        assert!(
+            (4_900_000..=5_000_100).contains(&shown),
+            "the bill is shown, give or take decay and the ledger's round-up: {shown}"
+        );
+        assert_eq!(
+            controller.subjective_cpu_bill(&Name::from_str("bob")?)?,
+            0,
+            "another account carries nothing"
+        );
+        Ok(())
+    }
+
+    /// Execution subtracts a node-local bill (left by the payer's earlier failed
+    /// transactions) from the payer's available CPU, so a payer whose bill
+    /// exceeds its allowance runs with a limit of 0 and everything it sends is
+    /// dropped at block build. Admission has to apply the same bill, or it
+    /// admits the transaction every time and the payer is never told why.
+    #[tokio::test]
+    async fn mempool_admission_applies_the_payers_subjective_bill() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+
+        let alice = Name::from_str("alice")?;
+        let bob = Name::from_str("bob")?;
+        for name in [alice, bob] {
+            controller.execute_transaction(
+                &create_account(&private_key, name, chain_id)?,
+                &ts,
+                &BlockStatus::Building,
+            )?;
+        }
+        // Finite stakes for both, so alice's allowance is a real number.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(bob.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            alice,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("a payer that can afford the transaction is admitted");
+
+        let db = controller.database();
+        let (available, _) = ResourceLimitsManager::get_account_cpu_limit(
+            &db,
+            &alice,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        let available = available as u64;
+        let min_cpu = db.chain_config()?.min_transaction_cpu_usage as u64;
+        assert!(
+            available > min_cpu,
+            "the fixture must start with room to spare"
+        );
+        let cpu_window = db.get_account_cpu_usage_average_window()?;
+        let net_window = db.get_account_net_usage_average_window()?;
+        let slot = ts.slot();
+
+        // A bill that leaves a little more than the minimum: still affordable.
+        // (The ledger rounds up, so test with a margin rather than the exact edge.)
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            available - min_cpu - 10,
+            0,
+            slot,
+            cpu_window,
+            net_window,
+        );
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("available CPU just above the minimum is still admitted");
+
+        // A little more and execution would run with less than the minimum.
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            20,
+            0,
+            slot,
+            cpu_window,
+            net_window,
+        );
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer whose bill leaves under the minimum must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("payer alice cannot afford") && message.contains("node-local bill"),
+            "the refusal must say the bill is the reason: {message}"
+        );
+        // Read at the slot the bill was written (the ledger decays and prunes
+        // by the ordinal it is read at, so a wall-clock read years after this
+        // test chain's genesis would find it fully decayed).
+        let carried = controller
+            .subjective_billing
+            .get_bill(alice.as_u64(), slot, cpu_window, net_window)
+            .cpu;
+        assert!(
+            carried > available - min_cpu,
+            "the ledger carries the bill that explains the refusal"
+        );
+
+        // The bill is per payer: bob is unaffected.
+        let bob_trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            bob,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&bob_trx, &ts)
+            .expect("another payer is not charged for alice's failures");
+
+        // Clearing the ledger (as a restart or reset does) lifts the refusal.
+        controller.subjective_billing.clear();
+        assert_eq!(controller.subjective_cpu_bill(&alice)?, 0);
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("admitted again once the bill is gone");
         Ok(())
     }
 
