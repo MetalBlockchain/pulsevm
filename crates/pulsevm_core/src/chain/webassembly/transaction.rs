@@ -43,7 +43,7 @@ pub fn send_inline(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = ptr.slice(&view, length)?;
     let mut src_bytes = vec![0u8; length as usize];
@@ -81,7 +81,7 @@ pub fn send_context_free_inline(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = ptr.slice(&view, length)?;
     let mut src_bytes = vec![0u8; length as usize];
@@ -190,7 +190,7 @@ pub fn read_transaction(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
 
     let copy_size = (trx_length as usize).min(packed.len());

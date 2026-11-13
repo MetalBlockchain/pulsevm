@@ -67,6 +67,46 @@ mod auth_tests {
         Ok(())
     }
 
+    /// A contract with no linear memory has nothing to pass pointers in, but it
+    /// can still call an intrinsic that takes one (here with a null pointer and
+    /// zero length). That must fail the transaction cleanly, never panic inside
+    /// the host function, which would take the executing thread with it.
+    #[tokio::test]
+    async fn a_contract_without_memory_calling_an_intrinsic_fails_cleanly() -> Result<()> {
+        const NO_MEMORY_WAST: &str = r#"(module
+            (import "env" "db_store_i64"
+              (func $store (param i64 i64 i64 i64 i32 i32) (result i32)))
+            (func (export "apply") (param i64 i64 i64)
+              (drop (call $store
+                (local.get 0) (i64.const 1) (local.get 0) (i64.const 1)
+                (i32.const 0) (i32.const 0)))))"#;
+
+        let mut chain = Testing::new().await;
+        chain.create_accounts(vec![name!("nomem").into()], false, true)?;
+        chain.set_code(name!("nomem").into(), wat2wasm(NO_MEMORY_WAST)?.into())?;
+        let mut trx = Transaction::default();
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
+        trx.actions.push(Action {
+            account: name!("nomem").into(),
+            name: name!("go").into(),
+            authorization: vec![PermissionLevel {
+                actor: name!("nomem").into(),
+                permission: name!("active").into(),
+            }],
+            data: Arc::from(vec![]),
+        });
+        let trx = trx.sign(
+            &get_private_key(name!("nomem").into(), "active"),
+            chain.controller.chain_id(),
+        )?;
+        let result = chain.push_transaction(trx);
+        assert!(
+            result.is_err(),
+            "a memory-less contract cannot store a row; the action must fail, not succeed"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_entry_behavior() -> Result<()> {
         // A start section runs during instantiation, before apply is called and

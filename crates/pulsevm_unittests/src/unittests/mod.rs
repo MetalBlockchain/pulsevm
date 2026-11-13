@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod auth_tests;
 mod contracts;
+mod hostile_intrinsics;
 mod net_tests;
 mod private_key_tests;
 mod public_key_tests;

@@ -3725,6 +3725,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "pulsevm_abi",
+ "pulsevm_constants",
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_grpc",
@@ -4103,6 +4104,7 @@ dependencies = [
  "pulsevm_crypto",
  "pulsevm_name_macro",
  "pulsevm_serialization",
+ "regex",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4112,6 +4114,7 @@ dependencies = [
 name = "pulsevm_wasm_validation"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "thiserror 2.0.20",
  "wasmparser 0.258.0",
  "wat",

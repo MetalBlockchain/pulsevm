@@ -5601,10 +5601,6 @@ impl Controller {
         Ok(())
     }
 
-    pub fn get_greylist_limit() -> Result<u32, ChainError> {
-        Ok(1000) // TODO: Implement greylist limit
-    }
-
     fn update_producers_authority(&mut self, producers: &[ProducerKey]) -> Result<(), ChainError> {
         let num_producers = producers.len() as u32;
 

@@ -58,7 +58,7 @@ pub fn preactivate_feature(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = feature_ptr.slice(&view, 32)?;
     let mut digest = [0u8; 32];
@@ -123,7 +123,7 @@ fn read_producer_schedule_bytes(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = data_ptr.slice(&view, data_len)?;
     let mut src_bytes = vec![0u8; data_len as usize];
@@ -241,7 +241,7 @@ pub fn get_blockchain_parameters_packed(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = data_ptr.slice(&view, size)?;
     slice.write_slice(&packed)?;
@@ -291,7 +291,7 @@ pub fn set_blockchain_parameters_packed(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let slice = data_ptr.slice(&view, data_len)?;
     let mut src_bytes = vec![0u8; data_len as usize];
@@ -410,7 +410,7 @@ pub fn get_resource_limits(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let ram_bytes_slice = ram_bytes_ptr.slice(&view, 8)?;
     let net_weight_slice = net_weight_ptr.slice(&view, 8)?;

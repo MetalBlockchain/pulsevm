@@ -1371,6 +1371,11 @@ impl Http for VirtualMachine {
                 body: Vec::new(),
             }));
         }
+        // Bound the body before parsing anything: the route decides the ceiling.
+        let limit = api::nodeos_compat::max_body_bytes(url);
+        if http_req.body.len() > limit {
+            return Ok(api::nodeos_compat::body_too_large(limit));
+        }
         let body = std::str::from_utf8(http_req.body.as_slice())
             .map_err(|_| Status::invalid_argument("invalid utf-8"))?;
 
@@ -1492,6 +1497,57 @@ mod ram_usage_metric_tests {
                 .iter()
                 .all(|handler| handler.server_addr == "127.0.0.1:1234")
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_body_is_refused_before_it_is_parsed() {
+        let vm = VirtualMachine::new("127.0.0.1:1234".parse().unwrap()).unwrap();
+        let request = |url: &str, body: Vec<u8>| {
+            Request::new(http::HandleSimpleHttpRequest {
+                method: "POST".to_string(),
+                url: url.to_string(),
+                request_headers: vec![],
+                body,
+                response_headers: vec![],
+            })
+        };
+
+        // A query route takes at most a small body. This one is not valid
+        // UTF-8, so reaching the parser would have failed differently: the
+        // 413 proves the size check ran first.
+        let query_limit = api::nodeos_compat::MAX_QUERY_BODY_BYTES;
+        let refused = vm
+            .handle_simple(request(
+                "/v1/chain/get_account",
+                vec![0xff; query_limit + 1],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(refused.code, 413);
+        assert!(
+            String::from_utf8(refused.body)
+                .unwrap()
+                .contains("payload_too_large")
+        );
+
+        // A body at the limit is still handed to the route (and rejected as
+        // bad JSON, not as too large).
+        let at_limit = vm
+            .handle_simple(request("/v1/chain/get_account", vec![b' '; query_limit]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(at_limit.code, 400);
+
+        // The JSON-RPC and submit routes keep the large ceiling.
+        let submit_limit = api::nodeos_compat::MAX_SUBMIT_BODY_BYTES;
+        let refused = vm
+            .handle_simple(request("/rpc", vec![b' '; submit_limit + 1]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(refused.code, 413);
     }
 
     #[tokio::test]

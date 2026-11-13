@@ -1,58 +1,73 @@
 # Security scan exceptions and open exposures
 
-What the secret, dependency and SAST gates report on this repository, what is
+What the secret, dependency and SBOM gates report on this repository, what is
 allowlisted and why, and what is genuinely open. The gates are in
 `.github/workflows/security.yml`; the secret allowlist is `.gitleaks.toml`.
-Last full local run: 2026-11-02 (gitleaks 8.30.1, trivy 0.76.1, syft 1.55.0,
-semgrep 1.183.0).
+SAST is GitHub's CodeQL default setup (the `Analyze (...)` checks); it is not a
+workflow file in this repository.
 
-## Open: historical credential in git history (needs the key owner)
+Last local run: 2026-11-11 on the tree of this document (gitleaks 8.30.1,
+trivy 0.76.1). Re-run after any dependency change; dependency pins are
+reviewed at least monthly.
 
-Commit `8983f0df` added a `.env` file containing a `WEBAUTH_PKEY` value.
-The file is no longer tracked and `.env` is in `.gitignore`, but the value is
-still in history, which is how `gitleaks detect` finds it: one finding, the
-only one that survives `.gitleaks.toml`. It is deliberately **not**
-allowlisted.
+## Secrets
 
-Required, in order, by the owner of that credential (this cannot be done from
-the repository):
+`gitleaks detect` over the full history of `main` (828 commits) reports no
+findings with `.gitleaks.toml`.
 
-1. Treat it as exposed: rotate the key, revoke anything it authorizes, and
-   check what it was used for since that commit (incident process).
-2. Only then decide whether to rewrite history. A rewrite does not undo the
-   exposure, only stops re-distributing it.
-3. Once rotated, record the commit in a gitleaks baseline so the full-history
-   scan returns to green without hiding new findings.
-
-Until then the pull-request job scans only its own commits and the weekly job
-is allowed to report this single known finding.
+Open item (owner action, not a repository change): commit `8983f0df` adds a
+`.env` containing a `WEBAUTH_PKEY` test value. That commit exists only on a
+local branch of one developer clone (`feat/webauthn-wallet-compat`). It is on
+no remote branch and not in `main`. `main` only references the variable
+(`.env.localnet.example` carries it empty; the E2E scripts read it from the
+environment). The owner should confirm the key was never shared or used beyond
+local testing, rotate it if it was, and delete or rewrite that local branch.
+Nothing in the repository can do this.
 
 ## Allowlisted (documented in `.gitleaks.toml`)
 
-- Vendored third-party crypto test vectors under `crates/pulsevm_ffi/pulsevm/`
-  (BoringSSL CAVP and Wycheproof known-answer data): tens of thousands of
-  matches, none are credentials.
-- Public keys (`PUB_K1_`, `EOS...`, `SIG_K1_`) and 64-hex ids: public by
+- The removed vendored crypto library under `crates/pulsevm_ffi/pulsevm/`
+  (BoringSSL CAVP and Wycheproof known-answer data): present only in history,
+  tens of thousands of matches, none are credentials.
+- Public keys and signatures (`PUB_K1_`, `EOS...`, `SIG_K1_`): public by
   construction.
+- 64-hex ids and digests, limited to the `generic-api-key` rule and to test,
+  fixture, documentation, example, contract and genesis paths
+  (`condition = "AND"`, so the path must match as well). A raw hex key in
+  source code is still reported. Real keys on this chain are WIF
+  (`PVT_K1_` / `5K...`), which are scanned everywhere.
+- One compressed public key in a test vector in a historical copy of
+  `public_key.rs` (commit `5410042f`).
 - Disposable local-network fixture private keys, prefix-matched (the genesis
   dev key, the `chain_config.json` dev key, the rehearsal WIF). They must
   never be used on a real network. Owner: chain ops. Review by 2027-02-01.
 
 ## Dependency CVEs
 
-`trivy fs` (HIGH/CRITICAL): no findings in `Cargo.lock`. The Go e2e module
-(`tests/e2e/go.mod`) had 30, all fixed by upgrading to patched versions
-(grpc 1.83.2, x/crypto 0.57.0, x/net 0.60.0, x/text 0.42.0, x/mod 0.41.0,
-otel sdk 1.44.0, gnark-crypto 0.18.1, klauspost/compress 1.18.7, spdystream
-0.5.1, plus go-kzg-4844 1.1.0 which the patched gnark-crypto requires);
-`go vet` is clean and the e2e suite passes 5/5 against a freshly built plugin and MetalGo v1.14.2-tahoe (the module now requires Go 1.26, so the e2e workflow uses it). Re-run after any
-dependency change; pins are reviewed at least monthly.
+`trivy fs . --scanners vuln --severity HIGH,CRITICAL`: no findings in
+`Cargo.lock` or `tests/e2e/go.mod`. Before this change `main` had 31
+findings (one CRITICAL, grpc) in `tests/e2e/go.mod`, a test-only module that
+is not shipped. They were cleared by upgrading to patched versions (grpc
+1.83.2, x/crypto 0.57.0, x/net 0.60.0, x/text 0.42.0, x/mod 0.41.0, otel sdk
+1.44.0, gnark-crypto 0.18.1, klauspost/compress 1.18.7, spdystream 0.5.1, plus
+go-kzg-4844 1.1.0 which the patched gnark-crypto requires) and `rustls`
+0.23.44 to 0.23.46. The module now requires Go 1.26, so the e2e workflow uses
+it. `go vet ./...` is clean.
 
-## SAST
+## Supply chain
 
-Semgrep (rust, github-actions, secrets, dockerfile rulesets) on the
-cutover code, harness and workflows: two `run-shell-injection` errors fixed
-(workflow inputs now pass through `env`), 38 mutable-action-tag warnings
-fixed (every action pinned to a commit SHA). Remaining INFO notes are
-`std::env::args` in developer CLI examples and one temp dir in a unit test:
-not security findings, accepted. CodeQL runs through the repository's default setup (the `Analyze (...)` checks, which cover actions, c-cpp, go, javascript-typescript, python and rust); an extra advanced CodeQL workflow is rejected by GitHub while the default setup is on.
+Every GitHub Action is pinned to a commit SHA (a mutable tag such as `@v4`
+can be repointed), and every workflow declares read-only `permissions`; the
+release job keeps its own wider block. Security tool versions are pinned in
+`security.yml`. The tool downloads there are not yet verified against a
+published checksum, which is an open improvement.
+
+## Known gap: consensus replay gate
+
+The consensus replay workflow downloaded its frozen corpus from a release
+asset on a personal fork that no longer exists (HTTP 404). The archive is
+pinned by SHA-256, so it cannot be regenerated. The workflow was removed; see
+`ARENA_CUTOVER.md`. Until the archive is re-hosted somewhere the organization
+owns, `scripts/run-replay-regression.sh` must be run locally before any
+consensus change, and the replay evidence in that document cannot be
+re-verified in CI.

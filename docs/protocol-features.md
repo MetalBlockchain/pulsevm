@@ -711,9 +711,9 @@ rollback.
   [`test.yml`](../.github/workflows/test.yml)
 - Initialization, build/verify gates, state-sync gate, and boundary test:
   [`controller.rs`](../crates/pulsevm_core/src/chain/controller.rs)
-- Transactional activation ledger in chainbase:
-  [`database.rs`](../crates/pulsevm_ffi/src/database.rs) and
-  [`database.cpp`](../crates/pulsevm_ffi/database.cpp)
+- Transactional activation ledger in the arena database:
+  [`database.rs`](../crates/pulsevm_database/src/database.rs) and
+  [`lib.rs`](../crates/pulsevm_chaindb/src/lib.rs)
 - State-summary protocol commitment and legacy/versioned wire barrier:
   [`state_sync.rs`](../crates/pulsevm_core/src/chain/state_sync.rs)
 - State-sync staged validation, publication marker, re-based logs, and

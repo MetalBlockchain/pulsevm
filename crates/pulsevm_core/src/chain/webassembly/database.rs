@@ -92,7 +92,7 @@ pub fn db_store_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
     let view = memory.view(&store);
     let source = checked_range("db_store_i64", "source", buffer_ptr, buffer_len, &view)?;
@@ -122,7 +122,7 @@ pub fn db_get_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
     let view = memory.view(&store);
     let destination = checked_range("db_get_i64", "destination", buffer_ptr, buffer_len, &view)?;
@@ -150,7 +150,7 @@ pub fn db_update_i64(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
     let view = memory.view(&store);
     let source = checked_range("db_update_i64", "source", buffer_ptr, buffer_len, &view)?;
@@ -189,7 +189,7 @@ pub fn db_next_i64(
         let memory = env_data
             .memory()
             .as_ref()
-            .expect("Wasm memory not initialized");
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
         let view = memory.view(&store);
         let slice = primary_ptr.slice(&view, 8)?;
         let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
@@ -216,7 +216,7 @@ pub fn db_previous_i64(
         let memory = env_data
             .memory()
             .as_ref()
-            .expect("Wasm memory not initialized");
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
         let view = memory.view(&store);
         let slice = primary_ptr.slice(&view, 8)?;
         let dest_bytes = next_primary.to_le_bytes(); // Convert to little-endian bytes, which is standard for WASM
@@ -283,7 +283,7 @@ pub fn db_idx64_store(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -303,7 +303,7 @@ pub fn db_idx64_update(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
 
@@ -337,7 +337,7 @@ pub fn db_idx64_find_secondary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -377,7 +377,7 @@ pub fn db_idx64_find_primary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Now safe to borrow env_data mutably
@@ -414,7 +414,7 @@ pub fn db_idx64_lowerbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -455,7 +455,7 @@ pub fn db_idx64_upperbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -504,7 +504,7 @@ pub fn db_idx64_next(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -525,7 +525,7 @@ pub fn db_idx64_previous(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -549,7 +549,7 @@ pub fn db_idx128_store(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u128 = read_u128(&view, secondary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -569,7 +569,7 @@ pub fn db_idx128_update(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u128 = read_u128(&view, secondary_ptr)?;
 
@@ -606,7 +606,7 @@ pub fn db_idx128_find_secondary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -646,7 +646,7 @@ pub fn db_idx128_find_primary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Now safe to borrow env_data mutably
@@ -683,7 +683,7 @@ pub fn db_idx128_lowerbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -724,7 +724,7 @@ pub fn db_idx128_upperbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -773,7 +773,7 @@ pub fn db_idx128_next(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -794,7 +794,7 @@ pub fn db_idx128_previous(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -819,7 +819,7 @@ pub fn db_idx256_store(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: U256 = read_u256(&view, secondary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -840,7 +840,7 @@ pub fn db_idx256_update(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: U256 = read_u256(&view, secondary_ptr)?;
 
@@ -878,7 +878,7 @@ pub fn db_idx256_find_secondary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -919,7 +919,7 @@ pub fn db_idx256_find_primary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Now safe to borrow env_data mutably
@@ -957,7 +957,7 @@ pub fn db_idx256_lowerbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -999,7 +999,7 @@ pub fn db_idx256_upperbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1048,7 +1048,7 @@ pub fn db_idx256_next(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -1069,7 +1069,7 @@ pub fn db_idx256_previous(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -1093,7 +1093,7 @@ pub fn db_idx_double_store(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
     reject_nan_f64(secondary)?;
@@ -1114,7 +1114,7 @@ pub fn db_idx_double_update(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: u64 = read_u64(&view, secondary_ptr)?;
     reject_nan_f64(secondary)?;
@@ -1152,7 +1152,7 @@ pub fn db_idx_double_find_secondary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1193,7 +1193,7 @@ pub fn db_idx_double_find_primary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Now safe to borrow env_data mutably
@@ -1230,7 +1230,7 @@ pub fn db_idx_double_lowerbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1272,7 +1272,7 @@ pub fn db_idx_double_upperbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1322,7 +1322,7 @@ pub fn db_idx_double_next(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -1343,7 +1343,7 @@ pub fn db_idx_double_previous(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -1367,7 +1367,7 @@ pub fn db_idx_long_double_store(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: Float128 = read_float128(&view, secondary_ptr)?;
     reject_nan_f128(&secondary)?;
@@ -1388,7 +1388,7 @@ pub fn db_idx_long_double_update(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let secondary: Float128 = read_float128(&view, secondary_ptr)?;
     reject_nan_f128(&secondary)?;
@@ -1426,7 +1426,7 @@ pub fn db_idx_long_double_find_secondary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1467,7 +1467,7 @@ pub fn db_idx_long_double_find_primary(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Now safe to borrow env_data mutably
@@ -1504,7 +1504,7 @@ pub fn db_idx_long_double_lowerbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1546,7 +1546,7 @@ pub fn db_idx_long_double_upperbound(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized")
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?
         .clone();
 
     // Read input from Wasm memory
@@ -1596,7 +1596,7 @@ pub fn db_idx_long_double_next(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();
@@ -1617,7 +1617,7 @@ pub fn db_idx_long_double_previous(
     let memory = env_data
         .memory()
         .as_ref()
-        .expect("Wasm memory not initialized");
+        .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
     let view = memory.view(&store);
     let mut next_primary = read_u64(&view, primary_ptr)?;
     let context = env_data.apply_context_mut();

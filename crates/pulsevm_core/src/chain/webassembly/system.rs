@@ -41,7 +41,7 @@ pub fn eosio_assert(
         let memory = env_data
             .memory()
             .as_ref()
-            .expect("Wasm memory not initialized");
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
         let view = memory.view(&store);
 
         // Clamp the read window to what memory can actually provide, so a short
@@ -84,7 +84,7 @@ pub fn pulse_assert(
         let memory = env_data
             .memory()
             .as_ref()
-            .expect("Wasm memory not initialized");
+            .ok_or_else(|| RuntimeError::new("Wasm memory not initialized"))?;
         let view = memory.view(&store);
         let slice = msg_ptr.slice(&view, msg_len)?;
         let mut src_bytes = vec![0u8; msg_len as usize];
