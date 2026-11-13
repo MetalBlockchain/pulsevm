@@ -3182,7 +3182,9 @@ impl ArenaIteratorCache {
         if handle >= -1 {
             return None;
         }
-        let idx = (-handle - 2) as usize;
+        // `handle` is contract-controlled. `-i32::MIN` does not fit, so negate
+        // with a check: the answer must not depend on the build's overflow mode.
+        let idx = usize::try_from(handle.checked_neg()?.checked_sub(2)?).ok()?;
         self.end_to_table.get(idx).copied()
     }
 

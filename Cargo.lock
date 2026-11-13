@@ -3725,6 +3725,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "pulsevm_abi",
+ "pulsevm_constants",
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_grpc",
@@ -4101,6 +4102,7 @@ dependencies = [
  "pulsevm_crypto",
  "pulsevm_name_macro",
  "pulsevm_serialization",
+ "regex",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4110,6 +4112,7 @@ dependencies = [
 name = "pulsevm_wasm_validation"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "thiserror 2.0.20",
  "wasmparser 0.258.0",
  "wat",
@@ -4600,9 +4603,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.44"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -5400,7 +5403,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -9,3 +9,4 @@ wasmparser = "0.258"
 
 [dev-dependencies]
 wat = "1"
+proptest = "1"

@@ -671,6 +671,9 @@ type RpcPositionedRow = (u64, u64, Vec<u8>);
 
 /// Apply the common inclusive-bound, direction, and pagination rules after a
 /// primary or secondary index has produced rows in ascending key order.
+/// Most rows one `get_table_rows` call returns, whatever `limit` asks for.
+const RPC_TABLE_ROWS_MAX: u32 = 1000;
+
 fn rpc_table_page(
     rows: impl IntoIterator<Item = RpcPositionedRow>,
     lower: u64,
@@ -685,7 +688,7 @@ fn rpc_table_page(
     if reverse {
         rows.reverse();
     }
-    let limit = limit.min(1000) as usize;
+    let limit = limit.min(RPC_TABLE_ROWS_MAX) as usize;
     let more = rows.len() > limit;
     let next_key = rows
         .get(limit)
@@ -1515,6 +1518,30 @@ impl Database {
                 .map(|s| s.table_range_with_payer(code, scope, table))
                 .unwrap_or_default()
         }
+    }
+
+    /// A bounded page of a contract table (see
+    /// `ChainDatabase::table_page_with_payer`): primary key in `[lower, upper]`,
+    /// at most `take` rows, optionally descending. Cost is the page, not the table.
+    pub fn arena_table_page_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        page: pulsevm_chaindb::RowPage,
+    ) -> Vec<(u64, u64, Vec<u8>)> {
+        self.backend.table_page_with_payer(code, scope, table, page)
+    }
+
+    /// A bounded page of an idx64 table, `(secondary, primary, payer)`.
+    pub fn arena_idx64_page_with_payer(
+        &self,
+        code: u64,
+        scope: u64,
+        table: u64,
+        page: pulsevm_chaindb::RowPage,
+    ) -> Vec<(u64, u64, u64)> {
+        self.backend.idx64_page_with_payer(code, scope, table, page)
     }
 
     /// An idx64 table's rows as `(secondary_key, primary_key, payer)`, ordered
@@ -6296,20 +6323,43 @@ impl Database {
             return Ok(serde_json::to_string(&value).unwrap());
         }
 
+        // Read only the page (plus one row to learn `more` and the next key)
+        // from the storage index. This used to collect the whole table per
+        // request and filter afterwards, so a request cost the table's size.
+        let take = (limit.min(RPC_TABLE_ROWS_MAX) as usize).saturating_add(1);
         let positioned: Vec<RpcPositionedRow> = if primary {
-            self.arena_table_range_with_payer(code, scope, table)
-                .into_iter()
-                .collect()
+            self.arena_table_page_with_payer(
+                code,
+                scope,
+                table,
+                pulsevm_chaindb::RowPage {
+                    lower,
+                    upper,
+                    reverse,
+                    take,
+                },
+            )
         } else {
-            self.arena_idx64_range_with_payer(code, scope, index_table)
-                .into_iter()
-                .filter_map(|(secondary, primary, payer)| {
-                    self.arena_kv_get(code, scope, table, primary)
-                        .map(|data| (secondary, payer, data))
-                })
-                .collect()
+            self.arena_idx64_page_with_payer(
+                code,
+                scope,
+                index_table,
+                pulsevm_chaindb::RowPage {
+                    lower,
+                    upper,
+                    reverse,
+                    take,
+                },
+            )
+            .into_iter()
+            .filter_map(|(secondary, primary, payer)| {
+                self.arena_kv_get(code, scope, table, primary)
+                    .map(|data| (secondary, payer, data))
+            })
+            .collect()
         };
-        let (positioned, more, next_key) = rpc_table_page(positioned, lower, upper, reverse, limit);
+        // Already filtered and in the requested direction, so no re-reverse.
+        let (positioned, more, next_key) = rpc_table_page(positioned, lower, upper, false, limit);
         let rows: Vec<pulsevm_rpc::TableRow> = positioned
             .into_iter()
             .map(|(_, payer, data)| pulsevm_rpc::TableRow { payer, data })

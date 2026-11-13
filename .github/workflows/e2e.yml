@@ -17,6 +17,9 @@ env:
   # zero-padded to 32 bytes; see scripts/install.sh.
   VM_ID: rXcAFxZvio99epp6TzEwYfexCfPAbJuBTMsjUUoiT7PkVykNs
 
+permissions:
+  contents: read
+
 jobs:
   e2e:
     name: e2e-linux-amd64
@@ -30,10 +33,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
 
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: Install Protobuf (protoc)
         uses: ./.github/actions/setup-protoc
@@ -41,7 +46,7 @@ jobs:
           version: '27.1'
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -61,12 +66,18 @@ jobs:
           chmod +x "build/${VM_ID}"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.25'
+          # Pinned to a patch release on purpose. Go 1.26.11 refuses to build
+          # MetalGo v1.14.2-tahoe: its firewood-go-ethhash/ffi static library
+          # carries LLVM bitcode and the toolchain now rejects the ".llvmbc"
+          # section in #cgo LDFLAGS ("disallowed LTO section"). 1.26.10 built it.
+          # A floating '1.26' picked up 1.26.11 and broke every e2e run before
+          # our tests started. Unpin once the MetalGo pin or the library moves on.
+          go-version: '1.26.10'
 
       - name: Check out metalgo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: MetalBlockchain/metalgo
           ref: ${{ env.METALGO_VERSION }}
@@ -87,7 +98,7 @@ jobs:
       # node or the plugin rather than in the test.
       - name: Collect network artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tmpnet-networks
           path: ~/.tmpnet/networks

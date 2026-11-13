@@ -6,19 +6,42 @@ use std::{
     io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use crate::controller::Controller;
 use tokio::{
     net::TcpListener as TokioTcpListener,
     sync::{
+        OwnedSemaphorePermit,
         RwLock,
         Semaphore,
+        TryAcquireError,
     },
 };
 use tokio_util::sync::CancellationToken;
 
 use self::session::Session;
+
+/// Most simultaneous state-history sessions. A new connection past this is
+/// closed immediately rather than queued: the peers are indexers, a handful
+/// per node, and each session holds a writer task and a block stream.
+pub(crate) const MAX_CONNECTIONS: usize = 1024;
+
+/// Pause after a failed `accept`. File-descriptor exhaustion is the usual
+/// cause; retrying at once would spin, and returning would end the server.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Take a session slot, or `None` when the server is at its limit. The permit
+/// is held by the session task and released when the session ends.
+fn try_admit(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    match permits.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(TryAcquireError::NoPermits) => None,
+        // The semaphore is never closed; treat it like exhaustion if it were.
+        Err(TryAcquireError::Closed) => None,
+    }
+}
 
 /// Rewrites a bind address to request an ephemeral port, preserving the host.
 /// Falls back to all interfaces if the host cannot be determined.
@@ -71,8 +94,7 @@ impl StateHistoryServer {
         // whenever a port of 0 or a fallback is in play.
         spdlog::info!("WebSocket listening on {}", listener.local_addr()?);
 
-        // TODO: Limit concurrent connections
-        let _permits = Arc::new(Semaphore::new(1024));
+        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
         loop {
             tokio::select! {
@@ -81,12 +103,31 @@ impl StateHistoryServer {
                     break;
                 }
                 accept_res = listener.accept() => {
+                    let (stream, peer): (tokio::net::TcpStream, SocketAddr) = match accept_res {
+                        Ok(accepted) => accepted,
+                        Err(e) => {
+                            // A transient accept failure must not take the
+                            // whole state-history service down.
+                            spdlog::warn!("state history server: accept failed: {e}");
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    let Some(permit) = try_admit(&permits) else {
+                        spdlog::warn!(
+                            "state history server: connection from {peer} refused, \
+                             {MAX_CONNECTIONS} sessions already open"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     spdlog::info!("state history server: new connection accepted");
-                    let (stream, peer): (tokio::net::TcpStream, SocketAddr) = accept_res?;
                     stream.set_nodelay(true).ok();
                     let controller = self.controller.clone();
 
                     tokio::spawn(async move {
+                        // Held for the life of the session.
+                        let _permit = permit;
                         let mut session = Session::new(peer, controller);
                         if let Err(e) = session.start(stream).await {
                             eprintln!("{} conn error: {e:?}", peer);
@@ -107,7 +148,30 @@ mod tests {
 
     use crate::controller::Controller;
 
-    use super::StateHistoryServer;
+    use super::{
+        StateHistoryServer,
+        try_admit,
+    };
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn connections_past_the_limit_are_refused_and_slots_are_reused() {
+        let permits = StdArc::new(Semaphore::new(2));
+        let first = try_admit(&permits).expect("first slot");
+        let _second = try_admit(&permits).expect("second slot");
+        assert!(try_admit(&permits).is_none(), "the third must be refused");
+        drop(first);
+        assert!(
+            try_admit(&permits).is_some(),
+            "a finished session frees its slot"
+        );
+    }
+
+    #[test]
+    fn the_server_limit_is_the_documented_constant() {
+        assert_eq!(super::MAX_CONNECTIONS, 1024);
+    }
 
     #[test]
     fn server_retains_the_supplied_controller() {

@@ -28,6 +28,53 @@ use tonic::{
 
 use crate::chain::RpcService;
 
+/// Largest request body any route accepts: a pushed transaction, which is hex
+/// of up to `MAX_UNCOMPRESSED_PACKED_TRX_SIZE` bytes (two characters per byte)
+/// plus signatures and JSON framing. Everything else is a small query.
+pub const MAX_SUBMIT_BODY_BYTES: usize =
+    2 * pulsevm_constants::MAX_UNCOMPRESSED_PACKED_TRX_SIZE + 1024 * 1024;
+
+/// Largest body for the read-only query routes. Their requests are a handful of
+/// short fields, so a body past this is not a query; refuse it before parsing.
+pub const MAX_QUERY_BODY_BYTES: usize = 64 * 1024;
+
+/// The body-size ceiling for a request to `url`. Routes whose body is a
+/// transaction (the nodeos-style push routes, `get_required_keys`, and the
+/// `pulsevm.*` JSON-RPC route, whose method is only known after parsing) may be
+/// large; every other nodeos route is a small query.
+pub fn max_body_bytes(url: &str) -> usize {
+    match extract_method(url).as_deref() {
+        // get_required_keys is read-only but its body is a whole transaction.
+        Some("push_transaction")
+        | Some("send_transaction")
+        | Some("send_transaction2")
+        | Some("get_required_keys") => MAX_SUBMIT_BODY_BYTES,
+        Some(_) => MAX_QUERY_BODY_BYTES,
+        None => MAX_SUBMIT_BODY_BYTES,
+    }
+}
+
+/// HTTP 413 in nodeos' error shape, for a body over [`max_body_bytes`].
+pub fn body_too_large(limit: usize) -> Response<http::HandleSimpleHttpResponse> {
+    let message = format!("request body exceeds the {limit} byte limit");
+    let mut body = json!({
+        "code": 413,
+        "message": message,
+        "error": {"code": 0, "name": "payload_too_large", "what": message, "details": []}
+    })
+    .to_string()
+    .into_bytes();
+    body.shrink_to_fit();
+    Response::new(http::HandleSimpleHttpResponse {
+        code: 413,
+        headers: vec![Element {
+            key: "Content-Type".to_string(),
+            values: vec!["application/json".to_string()],
+        }],
+        body,
+    })
+}
+
 /// MetalGo's HTTP router requires exact paths for VM handlers. Register every
 /// supported Antelope chain endpoint so standard clients can call
 /// `/v1/chain/{method}` directly.
@@ -542,6 +589,62 @@ fn opt_bool_flex<'de, D: Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Er
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_routes_get_a_small_body_limit_and_submission_a_large_one() {
+        use super::{
+            MAX_QUERY_BODY_BYTES,
+            MAX_SUBMIT_BODY_BYTES,
+            max_body_bytes,
+        };
+        for method in [
+            "get_info",
+            "get_account",
+            "get_table_rows",
+            "get_block",
+            "get_abi",
+        ] {
+            assert_eq!(
+                max_body_bytes(&format!("/ext/bc/x/v1/chain/{method}")),
+                MAX_QUERY_BODY_BYTES,
+                "{method}"
+            );
+        }
+        // get_required_keys carries the whole transaction (cleos calls it with
+        // the full setcode payload before every deploy), so it is a submit-sized
+        // route even though it only reads.
+        for method in [
+            "push_transaction",
+            "send_transaction",
+            "send_transaction2",
+            "get_required_keys",
+        ] {
+            assert_eq!(
+                max_body_bytes(&format!("/v1/chain/{method}")),
+                MAX_SUBMIT_BODY_BYTES,
+                "{method}"
+            );
+        }
+        // A query string does not change the route, and the JSON-RPC route
+        // (method known only after parsing) keeps the submission ceiling.
+        assert_eq!(
+            max_body_bytes("/v1/chain/get_info?x=1"),
+            MAX_QUERY_BODY_BYTES
+        );
+        assert_eq!(max_body_bytes("/rpc"), MAX_SUBMIT_BODY_BYTES);
+        // A maximal legitimate transaction must fit under the submission limit.
+        assert!(MAX_SUBMIT_BODY_BYTES > 2 * pulsevm_constants::MAX_UNCOMPRESSED_PACKED_TRX_SIZE);
+        assert!(MAX_QUERY_BODY_BYTES < MAX_SUBMIT_BODY_BYTES);
+    }
+
+    #[test]
+    fn an_oversized_body_is_answered_with_413_in_the_nodeos_error_shape() {
+        let response = super::body_too_large(65_536).into_inner();
+        assert_eq!(response.code, 413);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], 413);
+        assert_eq!(body["error"]["name"], "payload_too_large");
+    }
+
     use super::*;
 
     fn parse<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, serde_json::Error> {

@@ -1,0 +1,62 @@
+title = "pulsevm gitleaks"
+
+[extend]
+useDefault = true
+
+# Documented exceptions only. Anything not listed here is a finding. Review
+# this file whenever the vendored libraries or the fixture keys change.
+
+# The vendored C++ tree was deleted from the working tree but remains in
+# history, where its published known-answer (CAVP, Wycheproof) vectors look like
+# secrets. The path no longer exists in any checkout.
+[[allowlists]]
+description = "Removed vendored crypto library: published test vectors in history, not credentials"
+paths = [
+  '''crates/pulsevm_ffi/pulsevm/''',
+]
+
+# A compressed public key (66 hex) in a unit-test vector, committed 2025-09-01
+# (5410042f). The variable is called hex_key, which trips generic-api-key.
+[[allowlists]]
+description = "Public-key test vector in a historical copy of public_key.rs"
+targetRules = ["generic-api-key"]
+paths = [
+  '''^crates/pulsevm/src/chain/secp256k1/public_key\.rs$''',
+]
+
+[[allowlists]]
+description = "Public keys and signatures (PUB_K1_/EOS... keys, SIG_K1_) are public by construction and trip the generic-api-key rule"
+regexes = [
+  '''PUB_K1_[1-9A-HJ-NP-Za-km-z]{40,60}''',
+  '''EOS[1-9A-HJ-NP-Za-km-z]{48,52}''',
+  '''SIG_K1_[1-9A-HJ-NP-Za-km-z]{40,120}''',
+]
+
+# 64-hex strings are block ids, transaction ids, digests and chain ids, and they
+# are everywhere in this repository's tests and docs. A raw 32-byte private key
+# has the same shape, so this exception is limited to the one rule that flags
+# them (generic-api-key) and to test, fixture and documentation paths. Real
+# keys on this chain are WIF (PVT_K1_ / 5K...), which are still scanned
+# everywhere.
+[[allowlists]]
+description = "64-hex ids and digests in tests, fixtures and docs"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''(^|/)tests?/''',
+  '''(^|/)fixtures?/''',
+  '''^docs/''',
+  '''\.md$''',
+  '''(^|/)examples/''',
+  '''^genesis\.json$''',
+  '''^contracts/''',
+]
+regexes = ['''[0-9a-f]{64}''']
+
+[[allowlists]]
+description = "Disposable local-network fixture keys (committed dev genesis/producer keys, never used on a real network); owner: chain ops, review by 2027-02-01. Prefix-only so the full keys are not repeated here"
+regexes = [
+  '''PVT_K1_5G7JEG7C''',
+  '''PVT_K1_2pjSqJxT''',
+  '''5KQwrPbwdL6P''',
+]

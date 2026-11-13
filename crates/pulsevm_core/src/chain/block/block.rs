@@ -277,7 +277,10 @@ pub struct SignedBlockHeader {
 impl SignedBlockHeader {
     pub fn validate(&self, db: &Database) -> Result<(), ChainError> {
         self.header.validate(db)?;
-        // TODO: validate signature if we have the producer's public key available
+        // The producer signature is authenticated by the controller
+        // (`verify_block_signature`), which holds the producer schedule active
+        // at this block's parent. A header alone cannot be checked against a
+        // key, so this only checks the header's own fields.
         Ok(())
     }
 }
