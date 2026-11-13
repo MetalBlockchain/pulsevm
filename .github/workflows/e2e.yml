@@ -68,7 +68,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.26'
+          # Pinned to a patch release on purpose. Go 1.26.11 refuses to build
+          # MetalGo v1.14.2-tahoe: its firewood-go-ethhash/ffi static library
+          # carries LLVM bitcode and the toolchain now rejects the ".llvmbc"
+          # section in #cgo LDFLAGS ("disallowed LTO section"). 1.26.10 built it.
+          # A floating '1.26' picked up 1.26.11 and broke every e2e run before
+          # our tests started. Unpin once the MetalGo pin or the library moves on.
+          go-version: '1.26.10'
 
       - name: Check out metalgo
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
