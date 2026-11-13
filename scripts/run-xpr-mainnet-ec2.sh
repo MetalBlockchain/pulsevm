@@ -241,7 +241,9 @@ prepare_canonical_checkpoint() {
       "$EXPORT_DIR/state-history/chain_state_history.log" \
       "$ARENA_DIR" \
       "$CANONICAL_CHECKPOINT" \
-      "$EXPORT_DIR/deferred-transactions.json"
+      "$EXPORT_DIR/deferred-transactions.json" \
+      --leap-snapshot "$snapshot" \
+      --schedule-sha256 "${PULSEVM_SCHEDULE_SHA256:?set PULSEVM_SCHEDULE_SHA256 to the published source schedule hash (xpr_snapshot_schedule prints it)}"
 
   echo "==> Running the Mainnet manifest, 21-table, code-object, and sidecar gates"
   validate_canonical_checkpoint "$snapshot"
@@ -382,6 +384,7 @@ start_cluster() {
     METAL_NETWORK_RUNNER_ROOT_DATA_DIR="$session/nodes" \
     PULSEVM_MIGRATION_CHECKPOINT="$BOOT_CHECKPOINT" \
     PULSEVM_MIGRATION_MANIFEST="$BOOT_MANIFEST" \
+    PULSEVM_LOCAL_CHECKPOINT_SHA256="${PULSEVM_LOCAL_CHECKPOINT_SHA256:-$(sha256_file "$BOOT_CHECKPOINT")}" \
     PULSEVM_PRODUCER_NAME="${PULSEVM_PRODUCER_NAME:-pulse}" \
     PULSEVM_PRODUCER_KEY="$BOOT_PRODUCER_KEY" \
     PULSEVM_FIVE_NODE_REPORT="$report" \

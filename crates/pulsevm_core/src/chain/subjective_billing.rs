@@ -1,4 +1,11 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        Mutex,
+        MutexGuard,
+    },
+};
 
 use pulsevm_constants::RATE_LIMITING_PRECISION;
 
@@ -11,6 +18,53 @@ use pulsevm_constants::RATE_LIMITING_PRECISION;
 #[derive(Default)]
 pub(super) struct SubjectiveBilling {
     accounts: HashMap<u64, AccountBill>,
+}
+
+/// The ledger behind a lock, shared by the controller (which records failures
+/// and applies the bill while executing) and mempool admission (which must apply
+/// the same bill). If admission ignored it, a payer whose failed transactions
+/// left a bill larger than its available CPU would have every later transaction
+/// admitted and then dropped at block build with "CPU limit of 0 exhausted".
+#[derive(Clone, Default)]
+pub(super) struct SharedSubjectiveBilling(Arc<Mutex<SubjectiveBilling>>);
+
+impl SharedSubjectiveBilling {
+    /// The ledger holds only decaying counters, so a panic elsewhere cannot
+    /// leave it in a state worth refusing to read; recover it.
+    fn lock(&self) -> MutexGuard<'_, SubjectiveBilling> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn get_bill(
+        &self,
+        account: u64,
+        ordinal: u32,
+        cpu_window: u32,
+        net_window: u32,
+    ) -> SubjectiveBill {
+        self.lock()
+            .get_bill(account, ordinal, cpu_window, net_window)
+    }
+
+    pub fn bill_failure(
+        &self,
+        account: u64,
+        cpu_usage: u64,
+        net_usage: u64,
+        ordinal: u32,
+        cpu_window: u32,
+        net_window: u32,
+    ) {
+        self.lock().bill_failure(
+            account, cpu_usage, net_usage, ordinal, cpu_window, net_window,
+        );
+    }
+
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -515,6 +515,33 @@ pub(crate) struct TransactionFailureBill {
     pub(crate) net_usage: u64,
 }
 
+/// The CPU budget, in metering points, that a transaction header's
+/// `max_cpu_usage_ms` byte asks for.
+///
+/// Under [`ProtocolFeature::CpuUnitsInPoints`] the byte is milliseconds of
+/// reference compute, `ms * 1000 * POINTS_PER_US` points, as it is milliseconds
+/// (times 1000 for microseconds) on Leap. Before that version it was used as a
+/// raw point count, which caps such a transaction at 255 points and makes it
+/// impossible to pay the minimum bill; that behaviour is kept for blocks before
+/// the activation height because they already ran under it.
+///
+/// A larger request than the chain's own limit is ignored by the caller, as on
+/// Leap: the header can only lower the limit, never raise it.
+fn header_cpu_limit_points(
+    protocol: ProtocolExecutionContext,
+    max_cpu_usage_ms: u8,
+) -> Result<i64, ChainError> {
+    if protocol.feature_enabled(ProtocolFeature::CpuUnitsInPoints) {
+        #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+        return Ok(i64::from(max_cpu_usage_ms) * 1_000 * crate::config::POINTS_PER_US as i64);
+        #[cfg(not(feature = "protocol_feature_cpu_units_in_points"))]
+        return Err(ChainError::BlockError(
+            "CPU units in points was not compiled into this binary".into(),
+        ));
+    }
+    Ok(i64::from(max_cpu_usage_ms))
+}
+
 struct TransactionContextInner {
     initialized: bool,
     trace: TransactionTrace,
@@ -727,9 +754,13 @@ impl TransactionContext {
         }
 
         // Possibly lower cpu_limit to optional limit set in the transaction header
-        if trx.header.max_cpu_usage() > 0 && trx.header.max_cpu_usage() as i64 <= inner.cpu_limit {
-            inner.cpu_limit = trx.header.max_cpu_usage() as i64;
-            inner.cpu_limit_due_to_block = false;
+        if trx.header.max_cpu_usage() > 0 {
+            let requested =
+                header_cpu_limit_points(self.protocol_context, trx.header.max_cpu_usage())?;
+            if requested <= inner.cpu_limit {
+                inner.cpu_limit = requested;
+                inner.cpu_limit_due_to_block = false;
+            }
         }
 
         // Record accounts to be billed for network and CPU usage
@@ -2124,5 +2155,55 @@ mod xpr_mechanics_tests {
         let mut stateful_payload = transaction;
         stateful_payload.actions[0].data = vec![1].into();
         assert!(!is_xpr_mechanics_benchmark_transaction(&stateful_payload));
+    }
+}
+
+#[cfg(test)]
+mod header_cpu_limit_tests {
+    use super::*;
+    use crate::chain::protocol_features::ProtocolUpgradeSchedule;
+
+    fn context_at(height: u32, schedule: &[u8]) -> ProtocolExecutionContext {
+        ProtocolUpgradeSchedule::from_upgrade_bytes(schedule)
+            .unwrap()
+            .execution_context(height)
+            .unwrap()
+    }
+
+    #[test]
+    fn before_the_activation_the_header_byte_is_still_a_raw_point_count() {
+        // Genesis rules: what every block before an activation already ran.
+        let genesis = context_at(1, b"");
+        assert_eq!(header_cpu_limit_points(genesis, 5).unwrap(), 5);
+        assert_eq!(header_cpu_limit_points(genesis, 255).unwrap(), 255);
+    }
+
+    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+    #[test]
+    fn from_the_activation_the_header_byte_is_milliseconds_of_reference_compute() {
+        let schedule = br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":100}]}"#;
+        let per_ms = 1_000 * crate::config::POINTS_PER_US as i64;
+
+        // The last block under the old rule and the first under the new one.
+        assert_eq!(
+            header_cpu_limit_points(context_at(99, schedule), 5).unwrap(),
+            5
+        );
+        assert_eq!(
+            header_cpu_limit_points(context_at(100, schedule), 5).unwrap(),
+            5 * per_ms
+        );
+
+        // The smallest request buys far more than the minimum bill, which is
+        // the point: the old rule could never pay it.
+        let one_ms = header_cpu_limit_points(context_at(100, schedule), 1).unwrap();
+        assert!(
+            one_ms >= 100_000,
+            "1 ms of reference compute is {one_ms} points"
+        );
+        // The largest byte still fits an i64 with room to spare.
+        let max = header_cpu_limit_points(context_at(100, schedule), 255).unwrap();
+        assert_eq!(max, 255 * per_ms);
+        assert!(max > 0);
     }
 }

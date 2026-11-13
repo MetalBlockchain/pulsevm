@@ -2662,6 +2662,72 @@ impl Database {
         snapshot
     }
 
+    /// The sha256 of the checkpoint file `snapshot_bytes` would produce,
+    /// computed as a stream: the arena is read twice in fixed chunks (once for
+    /// the payload hash the envelope header carries, once to hash header and
+    /// payload together) and the sparse payload is never held in memory. On
+    /// mainnet-size state the in-memory snapshot is many gigabytes, which a
+    /// restart check should not need.
+    pub fn snapshot_sha256(&self) -> Result<[u8; 32], ChainError> {
+        let revision = self.backend.revision();
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
+        self.backend
+            .checkpoint(&file)
+            .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
+        let result = Self::stream_snapshot_sha256(&file, revision);
+        let _ = fs::remove_file(&file);
+        result
+    }
+
+    fn stream_snapshot_sha256(file: &Path, revision: i64) -> Result<[u8; 32], ChainError> {
+        // Feed the sparse payload of `file` to `sink`, chunk by chunk. Runs do
+        // not merge across chunks, so a fresh scratch buffer per chunk yields
+        // exactly the bytes `read_sparse_snapshot` would append.
+        fn stream_payload(file: &Path, mut sink: impl FnMut(&[u8])) -> Result<u64, ChainError> {
+            let mut f = fs::File::open(file).map_err(|e| {
+                ChainError::InternalError(format!("snapshot: open {}: {e}", file.display()))
+            })?;
+            let len = f
+                .metadata()
+                .map_err(|e| ChainError::InternalError(format!("snapshot: stat: {e}")))?
+                .len();
+            let begin = crate::snapshot::sparse_begin(len);
+            sink(&begin);
+            let mut total = begin.len() as u64;
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut scratch = Vec::new();
+            let mut offset = 0u64;
+            loop {
+                let n = fill(&mut f, &mut buf)
+                    .map_err(|e| ChainError::InternalError(format!("snapshot: read: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                scratch.clear();
+                crate::snapshot::sparse_append(&mut scratch, offset, &buf[..n]);
+                sink(&scratch);
+                total += scratch.len() as u64;
+                offset += n as u64;
+            }
+            Ok(total)
+        }
+        let mut payload_hasher = Sha256::new();
+        let payload_len = stream_payload(file, |bytes| payload_hasher.update(bytes))?;
+        let payload_sha: [u8; 32] = payload_hasher.finalize().into();
+        let mut whole = Sha256::new();
+        whole.update(crate::snapshot::encode_header(
+            revision,
+            payload_len,
+            &payload_sha,
+        ));
+        stream_payload(file, |bytes| whole.update(bytes))?;
+        Ok(whole.finalize().into())
+    }
+
     /// Read `shared_memory.bin` into a sparse, envelope-wrapped snapshot without
     /// ever holding the whole (mostly-zero) file in memory. Fixed-size,
     /// block-aligned chunks keep the run boundaries deterministic, so re-reading
@@ -2756,9 +2822,26 @@ impl Database {
     /// Replace the live arena from a snapshot envelope on disk. The envelope
     /// and sparse payload are streamed into a staged chainbase file, avoiding
     /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    /// Where the durable arena state lives inside a database directory.
+    pub fn arena_state_file(dir: &Path) -> std::path::PathBuf {
+        dir.join(ARENA_STATE_FILE)
+    }
+
     pub fn restore_from_path(
         &self,
         snapshot_path: &Path,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        self.restore_from_path_checked(snapshot_path, None)
+    }
+
+    /// Restore a checkpoint and, when `expected_file_sha256` is given, require
+    /// the sha256 of the whole file to equal it. The hash is taken over the
+    /// very bytes this call reads and stages, so a file swapped between an
+    /// earlier hash of the path and this restore cannot be installed.
+    pub fn restore_from_path_checked(
+        &self,
+        snapshot_path: &Path,
+        expected_file_sha256: Option<&[u8; 32]>,
     ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
         let dir = Path::new(&self.path);
         fs::create_dir_all(dir).map_err(|e| {
@@ -2795,7 +2878,13 @@ impl Database {
             )));
         }
 
-        let staged = Self::stage_snapshot_stream(&mut input, header, dir)?;
+        let staged = Self::stage_snapshot_stream(
+            &mut input,
+            header,
+            &header_bytes,
+            expected_file_sha256,
+            dir,
+        )?;
         let candidate = crate::backend::ChainDatabase::new()
             .map_err(|e| ChainError::InternalError(format!("restore: arena init: {e:?}")))?;
         candidate
@@ -2859,18 +2948,24 @@ impl Database {
     fn stage_snapshot_stream(
         input: &mut fs::File,
         header: crate::snapshot::SnapshotHeader,
+        header_bytes: &[u8],
+        expected_file_sha256: Option<&[u8; 32]>,
         dir: &Path,
     ) -> Result<tempfile::NamedTempFile, ChainError> {
         let staged = tempfile::NamedTempFile::new_in(dir)
             .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
         let mut output = staged.as_file();
         let mut hasher = Sha256::new();
+        // Whole-file hash: the envelope header followed by every payload byte.
+        let mut file_hasher = Sha256::new();
+        file_hasher.update(header_bytes);
         let mut payload_read = 0u64;
         let mut read_payload = |buf: &mut [u8], payload_read: &mut u64| -> Result<(), ChainError> {
             input.read_exact(buf).map_err(|e| {
                 ChainError::InternalError(format!("restore: read sparse payload: {e}"))
             })?;
             hasher.update(&*buf);
+            file_hasher.update(&*buf);
             *payload_read = (*payload_read)
                 .checked_add(buf.len() as u64)
                 .ok_or_else(|| {
@@ -2935,6 +3030,14 @@ impl Database {
         if hasher.finalize().as_slice() != header.payload_sha256 {
             return Err(ChainError::InternalError(
                 "restore: snapshot payload checksum mismatch".into(),
+            ));
+        }
+        if let Some(expected) = expected_file_sha256
+            && file_hasher.finalize().as_slice() != expected
+        {
+            return Err(ChainError::InternalError(
+                "restore: checkpoint file changed after it was verified (whole-file hash mismatch)"
+                    .into(),
             ));
         }
         output
@@ -7310,6 +7413,59 @@ mod tests {
         assert_eq!(header.revision, 4);
         assert_eq!(target.revision(), 4);
         assert!(target.arena_account_exists(alice));
+    }
+
+    #[test]
+    fn streamed_snapshot_hash_equals_the_hash_of_the_snapshot_bytes() {
+        let dir = TempDir::new().unwrap();
+        let mut database = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        database.add_indices().unwrap();
+        database.set_revision(11).unwrap();
+        for name in ["alice", "bob", "carol", "dave"] {
+            database.create_account(name_u64(name), 1).unwrap();
+        }
+        let bytes = database.snapshot_bytes().unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
+        // Stable across repeated calls on unchanged state.
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
+    }
+
+    #[test]
+    fn restore_checks_the_whole_file_hash_of_the_bytes_it_installs() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(4).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let checkpoint = src.path().join("migration.snapshot");
+        fs::write(&checkpoint, &snapshot).unwrap();
+        let file_sha: [u8; 32] = Sha256::digest(&snapshot).into();
+
+        // The right hash installs.
+        let ok_dir = TempDir::new().unwrap();
+        let mut ok = Database::new(ok_dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        ok.add_indices().unwrap();
+        ok.restore_from_path_checked(&checkpoint, Some(&file_sha))
+            .unwrap();
+        assert!(ok.arena_account_exists(alice));
+
+        // A different expected hash (the file was swapped after it was hashed
+        // on its path) installs nothing, and the live state is untouched.
+        let bad_dir = TempDir::new().unwrap();
+        let mut bad = Database::new(bad_dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        bad.add_indices().unwrap();
+        bad.set_revision(9).unwrap();
+        let wrong = [0xAB; 32];
+        let error = bad
+            .restore_from_path_checked(&checkpoint, Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("whole-file hash mismatch"), "{error}");
+        assert_eq!(bad.revision(), 9);
+        assert!(!bad.arena_account_exists(alice));
     }
 
     #[test]

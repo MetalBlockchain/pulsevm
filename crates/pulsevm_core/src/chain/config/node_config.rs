@@ -51,6 +51,14 @@ pub struct NodeConfig {
     /// bytes and revision to the source state-history export.
     #[serde(default)]
     pub migration_manifest: Option<String>,
+    /// Checkpoint hash this operator derived itself, by converting its own
+    /// Leap snapshot at H (`xpr_import_check --leap-snapshot`). A migration
+    /// restore refuses to start unless it equals the genesis pin and the
+    /// manifest hash, so a checkpoint delivered by anyone else is only
+    /// trusted once it matches what this operator derived independently.
+    /// Required for a migration restore.
+    #[serde(default)]
+    pub migration_local_checkpoint_sha256: Option<String>,
     // Wall-clock ceiling on how long a single transaction may spend executing
     // before it is abandoned, in milliseconds. This is a SUBJECTIVE, node-local
     // guard (it depends on this machine's speed, not the transaction's result), so

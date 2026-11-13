@@ -63,6 +63,70 @@ struct Report {
 
 type TableRows = BTreeMap<String, Vec<(bool, Vec<u8>)>>;
 
+/// The converter writes the source chain's producer schedule into every
+/// migration checkpoint as ordinary contract rows under code `eosio`, scope
+/// `eosio`, table `migsrcsched` (`pulsevm_database::source_schedule`). They
+/// are not part of the source chain's state, so the comparison against the
+/// nodeos snapshot excludes exactly those rows (one `contract_table` row and
+/// the `contract_row` rows) and nothing else.
+///
+/// Returns how many `contract_table` and `contract_row` rows it removed, so the
+/// caller can check the count against the schedule the checkpoint carries: a
+/// silent, unbounded exclusion could hide real divergence.
+fn exclude_migration_schedule_rows(tables: &mut TableRows) -> (usize, usize) {
+    use std::str::FromStr;
+    let value = |text: &str| pulsevm_name::Name::from_str(text).map(|name| name.as_u64());
+    let (Ok(code), Ok(scope), Ok(table)) = (value("eosio"), value("eosio"), value("migsrcsched"))
+    else {
+        return (0, 0);
+    };
+    let word = |bytes: &[u8], index: usize| -> Option<u64> {
+        bytes
+            .get(1 + index * 8..9 + index * 8)
+            .and_then(|slice| slice.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let mut removed = [0usize; 2];
+    for (slot, name) in ["contract_table", "contract_row"].into_iter().enumerate() {
+        if let Some(rows) = tables.get_mut(name) {
+            let before = rows.len();
+            rows.retain(|(_, data)| {
+                !(data.first() == Some(&0)
+                    && word(data, 0) == Some(code)
+                    && word(data, 1) == Some(scope)
+                    && word(data, 2) == Some(table))
+            });
+            removed[slot] = before - rows.len();
+        }
+    }
+    (removed[0], removed[1])
+}
+
+/// The exclusion must remove exactly what the converter wrote: one
+/// `contract_table` row, plus the header row and one row per producer. Any
+/// other count means rows were dropped (or left behind) that the comparison
+/// should have seen.
+fn check_excluded_counts(
+    removed: (usize, usize),
+    schedule_producers: Option<usize>,
+) -> Result<String, String> {
+    let expected = match schedule_producers {
+        Some(producers) => (1, producers + 1),
+        None => (0, 0),
+    };
+    if removed == expected {
+        Ok(format!(
+            "excluded {} contract_table and {} contract_row migration schedule rows (expected {} and {})",
+            removed.0, removed.1, expected.0, expected.1
+        ))
+    } else {
+        Err(format!(
+            "excluded {} contract_table and {} contract_row rows but the checkpoint's schedule accounts for {} and {}: refusing to compare",
+            removed.0, removed.1, expected.0, expected.1
+        ))
+    }
+}
+
 fn usage() {
     eprintln!(
         "Usage: xpr_19_table_compare <nodeos-log> <checkpoint> <arena-dir> <source-chain-id-hex> <chainbase-sidecar.json> [report.json]"
@@ -296,6 +360,11 @@ fn diagnose_rows(table: &str, nodeos: &[(bool, Vec<u8>)], arena: &[(bool, Vec<u8
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        TableRows,
+        check_excluded_counts,
+        exclude_migration_schedule_rows,
+    };
     use pulsevm_database::{
         Database,
         DeferredTransactionSidecar,
@@ -321,6 +390,59 @@ mod tests {
         let row = vec![(true, vec![1, 2])];
         assert_ne!(hash_rows(&row), hash_rows(&[(false, vec![1, 2])]));
         assert_ne!(hash_rows(&row), hash_rows(&[(true, vec![1, 3])]));
+    }
+
+    #[test]
+    fn migration_schedule_rows_are_excluded_and_nothing_else() {
+        use std::str::FromStr;
+        let name = |text: &str| pulsevm_name::Name::from_str(text).unwrap().as_u64();
+        let row = |code: &str, scope: &str, table: &str, extra: u64| {
+            let mut data = vec![0u8];
+            for value in [name(code), name(scope), name(table), extra] {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            (true, data)
+        };
+        let mut tables = TableRows::new();
+        tables.insert(
+            "contract_table".to_owned(),
+            vec![
+                row("eosio", "eosio", "migsrcsched", 1),
+                row("eosio", "eosio", "producers", 2),
+                row("token", "eosio", "migsrcsched", 3),
+            ],
+        );
+        tables.insert(
+            "contract_row".to_owned(),
+            vec![
+                row("eosio", "eosio", "migsrcsched", 4),
+                row("eosio", "eosio", "migsrcsched", 5),
+                row("eosio", "user", "migsrcsched", 6),
+            ],
+        );
+        tables.insert(
+            "account".to_owned(),
+            vec![row("eosio", "eosio", "migsrcsched", 7)],
+        );
+        let removed = exclude_migration_schedule_rows(&mut tables);
+        assert_eq!(removed, (1, 2));
+        assert_eq!(tables["contract_table"].len(), 2);
+        assert_eq!(tables["contract_row"].len(), 1);
+        // Other tables are never touched, whatever their bytes look like.
+        assert_eq!(tables["account"].len(), 1);
+    }
+
+    #[test]
+    fn the_excluded_count_must_match_the_checkpoint_schedule() {
+        // One table row, plus the header and one row per producer.
+        assert!(check_excluded_counts((1, 22), Some(21)).is_ok());
+        // Too many rows removed, too few, no table row, or any exclusion at
+        // all for a checkpoint that carries no schedule: all refuse.
+        assert!(check_excluded_counts((1, 23), Some(21)).is_err());
+        assert!(check_excluded_counts((1, 21), Some(21)).is_err());
+        assert!(check_excluded_counts((0, 22), Some(21)).is_err());
+        assert!(check_excluded_counts((1, 1), None).is_err());
+        assert!(check_excluded_counts((0, 0), None).is_ok());
     }
 
     #[test]
@@ -427,13 +549,24 @@ fn main() -> ExitCode {
         eprintln!("chainbase sidecar block does not match nodeos full-state record");
         return ExitCode::from(1);
     }
-    let source_rows = match source_tables(&entry) {
+    let mut source_rows = match source_tables(&entry) {
         Ok(tables) => tables,
         Err(error) => {
             eprintln!("invalid nodeos table set: {error}");
             return ExitCode::from(1);
         }
     };
+    // The converter moves XPR's microsecond CPU figures to metering points in
+    // global_property and the three resource tables. Apply the same documented
+    // transform to the source side so the comparison is like with like; every
+    // other byte of every table is still compared exactly.
+    if let Err(error) = pulsevm_database::redenominate_source_tables(&mut source_rows) {
+        eprintln!("cannot apply the CPU redenomination to the nodeos tables: {error}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "redenominated CPU figures in nodeos global_property, resource_limits_config, resource_limits_state and resource_usage (the converter's own transform)"
+    );
     let mut database = match Database::new(&arena_path.to_string_lossy(), 64 * 1024 * 1024) {
         Ok(database) => database,
         Err(error) => {
@@ -449,8 +582,25 @@ fn main() -> ExitCode {
         eprintln!("cannot restore Arena checkpoint: {error}");
         return ExitCode::from(1);
     }
+    let schedule_producers = match pulsevm_database::read_source_schedule(&database) {
+        Ok(schedule) => schedule.map(|schedule| schedule.producers.len()),
+        Err(error) => {
+            eprintln!("cannot read the checkpoint's migration schedule: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let arena_rows = match parse_framed_tables(&database.pack_deltas(true, &chain_id)) {
-        Ok(tables) => tables,
+        Ok(mut tables) => {
+            let removed = exclude_migration_schedule_rows(&mut tables);
+            match check_excluded_counts(removed, schedule_producers) {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(1);
+                }
+            }
+            tables
+        }
         Err(error) => {
             eprintln!("cannot parse Arena SHiP snapshot: {error}");
             return ExitCode::from(1);
@@ -478,6 +628,43 @@ fn main() -> ExitCode {
         let right_rows = arena_rows.get(name);
         let left = left_rows.map(|rows| hash_rows(rows));
         let right = right_rows.map(|rows| hash_rows(rows));
+        // global_property is a different byte shape on the two sides by design
+        // (PulseVM has no proposed schedule and no deferred-transaction fields,
+        // 14 bytes shorter), so a byte hash can never match. Compare it field
+        // by field instead, which still fails on any real difference.
+        if name == "global_property" {
+            match (left_rows.map(Vec::as_slice), right_rows.map(Vec::as_slice)) {
+                (Some([(_, source)]), Some([(_, target)])) => {
+                    match pulsevm_database::global_property_rows_equivalent(source, target) {
+                        Ok(ignored) => {
+                            println!(
+                                "table {name}: equal field by field; ignored the Leap-only fields (proposed-schedule prefix, deferred_trx_expiration_window={}, max_transaction_delay={}); nodeos row {} bytes, PulseVM row {} bytes",
+                                ignored.deferred_trx_expiration_window,
+                                ignored.max_transaction_delay,
+                                source.len(),
+                                target.len()
+                            );
+                            if let Some(value) = &right {
+                                report_tables.insert(name.to_owned(), value.clone());
+                            }
+                        }
+                        Err(error) => {
+                            mismatch = true;
+                            eprintln!("table {name}: {error}");
+                        }
+                    }
+                }
+                _ => {
+                    mismatch = true;
+                    eprintln!(
+                        "table {name}: expected exactly one row on each side, nodeos={:?} arena={:?}",
+                        left_rows.map(|rows| rows.len()),
+                        right_rows.map(|rows| rows.len())
+                    );
+                }
+            }
+            continue;
+        }
         if left != right {
             mismatch = true;
             eprintln!("table {name}: nodeos={left:?} arena={right:?}");

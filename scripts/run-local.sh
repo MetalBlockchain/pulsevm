@@ -10,9 +10,16 @@
 #     plugin handshake.
 #   * PULSEVM_MIGRATION_CHECKPOINT (optional) — an Arena checkpoint emitted by
 #     `xpr_import_check`. When set, every VM node restores this state instead
-#     of authoring normal Arena genesis state.
+#     of authoring normal Arena genesis state. Also set
+#     PULSEVM_LOCAL_CHECKPOINT_SHA256 to the checkpoint hash you derived
+#     yourself (from your own Leap snapshot at H); the node refuses to
+#     restore otherwise.
 #   * PULSEVM_GENESIS_PATH (optional) — genesis JSON to use. Set this to
 #     tools/xpr-chainbase-export/xpr-mainnet-genesis.json for XPR Mainnet.
+#   * PULSEVM_GENESIS_INITIAL_KEY (optional) — overrides the migration
+#     genesis initial key, which seeds the new chain's producer schedule.
+#     Required for migration boots unless the genesis file already names a
+#     key the producing nodes hold.
 #   * go, protoc, and LLVM 22 (`LLVM_SYS_221_PREFIX`) for the plugin build.
 #
 # This script automates the deterministic setup (build + stage the plugin,
@@ -43,6 +50,12 @@ if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
 fi
 if [[ "$RUNNER_REASSIGN_PORTS_IF_USED" == "true" ]]; then
   RUNNER_START_ARGS+=(--reassign-ports-if-used)
+fi
+# Space-separated extra flags appended to `control start` (e.g.
+# "--dynamic-ports" for shared hosts). Empty by default; no behavior change.
+if [[ -n "${PULSEVM_RUNNER_START_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  RUNNER_START_ARGS+=(${PULSEVM_RUNNER_START_EXTRA_ARGS})
 fi
 
 if [[ -z "${METALGO_EXEC_PATH:-}" || ! -x "${METALGO_EXEC_PATH:-}" ]]; then
@@ -135,21 +148,51 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     echo "error: migration manifest does not exist: $MIGRATION_MANIFEST" >&2
     exit 1
   fi
+  # The node refuses a migration restore unless the operator supplies the
+  # checkpoint hash it derived itself (from its own Leap snapshot at H, via
+  # xpr_import_check --leap-snapshot), independent of the delivered bundle.
+  if [[ -z "${PULSEVM_LOCAL_CHECKPOINT_SHA256:-}" ]]; then
+    echo "error: PULSEVM_LOCAL_CHECKPOINT_SHA256 is required: the checkpoint hash you derived yourself" >&2
+    exit 1
+  fi
+  # The committee is pinned by the published source schedule hash, a fact from
+  # outside the bundle. The genesis creator supplies it (see
+  # xpr_snapshot_schedule); the node refuses a restore without it.
+  if [[ -z "${PULSEVM_SCHEDULE_SHA256:-}" ]]; then
+    echo "error: PULSEVM_SCHEDULE_SHA256 is required: the published hash of the source chain's active schedule" >&2
+    exit 1
+  fi
   CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256 | select(type == "string" and test("^[[:xdigit:]]{64}$"))' "$MIGRATION_MANIFEST")"
   MIGRATION_GENESIS="$(mktemp "${TMPDIR:-/tmp}/pulsevm-xpr-migration-genesis.XXXXXX")"
-  jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-    '. + {migration_checkpoint_sha256: $checkpoint_sha256}' \
-    "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+  # A migration restore starts a new producer schedule seeded from the
+  # migration genesis initial key. PULSEVM_GENESIS_INITIAL_KEY overrides that
+  # key (e.g. with the source fixture's key for rehearsals, or the real
+  # producer key in a migration ceremony): without it the schedule names a
+  # key no node holds and every build fails closed at the signing gate.
+  if [[ -n "${PULSEVM_GENESIS_INITIAL_KEY:-}" ]]; then
+    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
+      --arg initial_key "$PULSEVM_GENESIS_INITIAL_KEY" \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key}' \
+      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+    echo "==> Migration genesis initial key overridden with PULSEVM_GENESIS_INITIAL_KEY"
+  else
+    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
+      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
+      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256}' \
+      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
+  fi
   # This development key corresponds to genesis.json's initial_key. Override it
   # for a real producer deployment; it is part of the node-local VM config.
   CHAIN_CONFIG="$(jq -cn \
     --arg checkpoint "$PULSEVM_MIGRATION_CHECKPOINT" \
     --arg manifest "$MIGRATION_MANIFEST" \
+    --arg local_sha "$PULSEVM_LOCAL_CHECKPOINT_SHA256" \
     --arg producer_key "$PRODUCER_KEY" \
     --arg producer_name "$PRODUCER_NAME" \
     --arg system_account "$SYSTEM_ACCOUNT" \
     --argjson native_system_contract "$NATIVE_SYSTEM_CONTRACT" \
-    '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest}')"
+    '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest, migration_local_checkpoint_sha256: $local_sha}')"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \

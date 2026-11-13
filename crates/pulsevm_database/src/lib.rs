@@ -5,7 +5,19 @@ mod objects;
 mod pod;
 mod ram_monitor;
 mod snapshot;
+mod source_schedule;
 mod xpr_import;
+
+pub use crate::source_schedule::{
+    SourceSchedule,
+    SourceScheduleMember,
+    pack_schedule_hash,
+    read_source_schedule,
+    roster_schedule_hash,
+    verify_schedule_pin,
+    verify_source_schedule_binding,
+    write_source_schedule,
+};
 
 pub use crate::pod::{
     CpuLimitResult,
@@ -71,22 +83,43 @@ pub use crate::{
     xpr_import::{
         DeferredTransactionSidecar,
         DeferredTransactionSidecarRow,
+        IgnoredGlobalPropertyFields,
         ImportSummary,
         InputTransactionSidecarRow,
+        MigrationHaltRosterEntry,
         MigrationManifest,
+        MigrationMemoAccount,
         StateHistoryEntry,
         StateHistoryWindowSummary,
+        StateProducerKey,
         TableDelta,
         TableDeltaRow,
         XprImportError,
+        antelope_slot_to_unix_micros,
         apply_state_history_delta,
         apply_state_history_delta_with_sidecar,
         apply_state_history_log_window,
         apply_state_history_log_window_with_sidecars,
+        check_halt_inclusion_window,
+        check_halt_roster_against_state,
+        check_no_arena_deferred_due_in_window,
+        check_no_deferred_due_in_window,
+        global_property_rows_equivalent,
         hydrate_full_state,
         hydrate_full_state_with_deferred_transactions,
         inspect_state_history_log,
+        manifest_pause_window_us,
+        migration_halt_roster_template,
+        migration_state_producer_keys,
+        packed_source_block_schedule_version,
         parse_initial_state_history_log,
+        redenominate_source_tables,
+        verify_memo_names_exist,
+        verify_migration_halt_block,
+        verify_migration_halt_commitment,
+        verify_migration_halt_pair,
+        verify_migration_memo_names,
+        verify_migration_post_chain,
     },
 };
 pub use pulsevm_chaindb::DeferredTransaction;
@@ -97,6 +130,19 @@ pub use pulsevm_chain_types::{
     ChainConfigV0,
     ElasticLimitParameters,
     GenesisState,
+    HALT_CONFIRMATION_DOMAIN_V3,
+    HALT_DECLARATION_DOMAIN,
+    HALT_DOMAIN,
+    HALT_DOMAIN_V2,
+    HaltCommitment,
+    HaltConfirmation,
+    HaltContractCeremony,
+    HaltContractVote,
+    HaltDeclaration,
+    HaltDeclarationMember,
+    HaltRosterEntry,
+    HaltSignature,
+    HaltWeight,
     KeyWeight,
     Microseconds,
     PermissionLevel,

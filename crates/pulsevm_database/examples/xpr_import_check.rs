@@ -8,18 +8,55 @@ use pulsevm_database::{
     Database,
     DeferredTransactionSidecar,
     MigrationManifest,
+    SourceSchedule,
     hydrate_full_state_with_deferred_transactions,
     parse_initial_state_history_log,
+    write_source_schedule,
 };
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json]"
+        "Usage: xpr_import_check <chain_state_history.log> <arena-directory> [checkpoint-file] [deferred-transactions.json] [--leap-snapshot snapshot.bin --schedule-sha256 HEX] [--no-deferred-sidecar]\n\
+         --leap-snapshot reads H's active producer schedule from the Leap snapshot the state history was exported from and\n\
+         writes it into the checkpoint, so the checkpoint hash binds the committee. Required for any checkpoint a cutover\n\
+         restores from.\n\
+         --schedule-sha256 is the published hash of the source chain's active schedule (print it with xpr_snapshot_schedule\n\
+         from any current snapshot, publish it ahead, and pin it in the genesis); the conversion refuses a snapshot whose\n\
+         committee hashes to anything else.\n\
+         A checkpoint also needs the complete deferred-transaction sidecar (v2, with source_chain_id): without it the\n\
+         replay-protection set and action sequences are lost and the hash differs from every BP that had it.\n\
+         --no-deferred-sidecar waives that for rehearsal fixtures only."
     );
 }
 
 fn main() -> ExitCode {
-    let mut args = env::args_os();
+    // `--leap-snapshot PATH` may appear anywhere; everything else is
+    // positional, as before.
+    let mut raw: Vec<std::ffi::OsString> = env::args_os().collect();
+    let mut leap_snapshot_path = None;
+    if let Some(position) = raw.iter().position(|arg| arg == "--leap-snapshot") {
+        if position + 1 >= raw.len() {
+            usage();
+            return ExitCode::from(2);
+        }
+        leap_snapshot_path = Some(raw.remove(position + 1));
+        raw.remove(position);
+    }
+    let mut schedule_sha256_arg: Option<String> = None;
+    if let Some(position) = raw.iter().position(|arg| arg == "--schedule-sha256") {
+        if position + 1 >= raw.len() {
+            usage();
+            return ExitCode::from(2);
+        }
+        schedule_sha256_arg = raw.remove(position + 1).into_string().ok();
+        raw.remove(position);
+    }
+    let mut no_deferred_sidecar = false;
+    if let Some(position) = raw.iter().position(|arg| arg == "--no-deferred-sidecar") {
+        no_deferred_sidecar = true;
+        raw.remove(position);
+    }
+    let mut args = raw.into_iter();
     let _program = args.next();
     let Some(log_path) = args.next() else {
         usage();
@@ -70,6 +107,41 @@ fn main() -> ExitCode {
         }
         None => None,
     };
+    // A checkpoint a cutover restores from must carry the complete sidecar:
+    // a sidecar-less conversion silently drops the replay-protection set and
+    // action sequences, so that BP lands on a different hash than the rest.
+    if checkpoint_path.is_some() && !no_deferred_sidecar {
+        match &deferred_transactions {
+            None => {
+                eprintln!(
+                    "refusing to write a migration checkpoint without the deferred-transaction sidecar (pass it as the fourth argument, or --no-deferred-sidecar for a rehearsal fixture)"
+                );
+                return ExitCode::from(1);
+            }
+            Some((_, sidecar)) if sidecar.source_chain_id.is_none() => {
+                eprintln!(
+                    "refusing to write a migration checkpoint from a legacy sidecar without source_chain_id: re-export with the v2 sidecar plugin"
+                );
+                return ExitCode::from(1);
+            }
+            Some(_) => {}
+        }
+    } else if checkpoint_path.is_some() {
+        eprintln!(
+            "WARNING: --no-deferred-sidecar: this checkpoint is for rehearsal only and will not match a fleet that converted with the sidecar"
+        );
+    }
+    // A leftover arena would fail with a duplicate-account error or, worse,
+    // hash something other than this export: start from an empty directory.
+    if let Ok(mut existing) = fs::read_dir(&database_path)
+        && existing.next().is_some()
+    {
+        eprintln!(
+            "refusing a non-empty arena directory {}: convert into a fresh one",
+            database_path.to_string_lossy()
+        );
+        return ExitCode::from(1);
+    }
     for delta in &entry.deltas {
         eprintln!(
             "XPR table {:<30} rows={} payload-bytes={}",
@@ -109,6 +181,68 @@ fn main() -> ExitCode {
                 }
                 if let Err(error) = database.set_revision(i64::from(source_block)) {
                     eprintln!("cannot set migration checkpoint revision: {error}");
+                    return ExitCode::from(1);
+                }
+                // The committee at H, read from the Leap snapshot (never from
+                // an API capture) and written into the state the checkpoint
+                // hash covers. It must be for the very block the state
+                // history was anchored at.
+                if let Some(path) = &leap_snapshot_path {
+                    let snapshot = match fs::read(path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            eprintln!("cannot read {}: {error}", path.to_string_lossy());
+                            return ExitCode::from(1);
+                        }
+                    };
+                    let schedule = match SourceSchedule::from_snapshot_bytes(&snapshot) {
+                        Ok(schedule) => schedule,
+                        Err(error) => {
+                            eprintln!("cannot read the source schedule from the snapshot: {error}");
+                            return ExitCode::from(1);
+                        }
+                    };
+                    // The committee must be the published one: a fact from
+                    // outside this bundle, not something the snapshot (or an
+                    // exporter) can state for itself.
+                    let Some(expected_schedule) = schedule_sha256_arg.as_deref() else {
+                        eprintln!(
+                            "refusing to write a migration checkpoint without --schedule-sha256: pin the published source schedule hash (xpr_snapshot_schedule prints it)"
+                        );
+                        return ExitCode::from(1);
+                    };
+                    let actual_schedule = hex::encode(schedule.schedule_sha256());
+                    if !expected_schedule.eq_ignore_ascii_case(&actual_schedule) {
+                        eprintln!(
+                            "the snapshot's committee (schedule v{}) hashes to {actual_schedule}, not the published {expected_schedule}: refusing",
+                            schedule.schedule_version
+                        );
+                        return ExitCode::from(1);
+                    }
+                    if schedule.head_block_id != entry.block_id {
+                        eprintln!(
+                            "the Leap snapshot head {} is not the state-history block {}: wrong snapshot for this export",
+                            hex::encode(schedule.head_block_id),
+                            hex::encode(entry.block_id)
+                        );
+                        return ExitCode::from(1);
+                    }
+                    if let Err(error) = write_source_schedule(&database, &schedule) {
+                        eprintln!("cannot write the source schedule into the checkpoint: {error}");
+                        return ExitCode::from(1);
+                    }
+                    println!(
+                        "source schedule: {} producers, version {}, bound into the checkpoint",
+                        schedule.producers.len(),
+                        schedule.schedule_version
+                    );
+                } else {
+                    // A schedule-less checkpoint can be hashed and pinned
+                    // into a genesis, burning a ceremony round before the
+                    // restore gate refuses it. Refuse to produce one.
+                    eprintln!(
+                        "refusing to write a migration checkpoint without --leap-snapshot: it would carry no source schedule and the restore gate would refuse it"
+                    );
                     return ExitCode::from(1);
                 }
                 let checkpoint = match database.snapshot_bytes() {

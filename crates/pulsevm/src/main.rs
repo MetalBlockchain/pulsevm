@@ -617,6 +617,9 @@ impl Vm for VirtualMachine {
                 abort_on_fatal_consistency("block building", &error)
             }
             Err(error) => {
+                // A failed build is otherwise silent: MetalGo only retries on
+                // new mempool activity, so log the cause where operators look.
+                error!("could not build block: {error}");
                 return Err(Status::internal(format!("could not build block: {error}")));
             }
         };

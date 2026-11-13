@@ -80,8 +80,8 @@ use crate::{
         },
         state_sync,
         subjective_billing::{
+            SharedSubjectiveBilling,
             SubjectiveBill,
-            SubjectiveBilling,
         },
         transaction::{
             ACTION_RETURN_VALUE_FEATURE_DIGEST,
@@ -112,6 +112,10 @@ use pulsevm_constants::{
     MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER,
 };
 
+/// Written into the database directory once a migration restore has passed
+/// every restore-only check; names the checkpoint hash it covers.
+const RESTORE_VERIFIED_MARKER: &str = "migration-restore-verified";
+
 const DISABLE_DEFERRED_TRXS_STAGE_1_FEATURE_DIGEST: [u8; 32] = [
     0xfc, 0xe5, 0x7d, 0x23, 0x31, 0x66, 0x73, 0x53, 0xa0, 0xea, 0xc6, 0xb4, 0x20, 0x9b, 0x67, 0xb8,
     0x43, 0xa7, 0x26, 0x2a, 0x84, 0x8a, 0xf0, 0xa4, 0x9a, 0x6e, 0x2f, 0xa9, 0xf6, 0x58, 0x4e, 0xb4,
@@ -130,11 +134,6 @@ static PARALLEL_WAVE_TELEMETRY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("PULSEVM_PARALLEL_WAVE_TELEMETRY").is_some());
 static XPR_BATCHED_REPLAY_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("PULSEVM_XPR_BATCHED_REPLAY").as_deref() == Ok("1"));
-static XPR_TRACE_ACTION_RECEIPTS_BLOCK: LazyLock<Option<u32>> = LazyLock::new(|| {
-    std::env::var("XPR_REPLAY_TRACE_ACTION_RECEIPTS_BLOCK")
-        .ok()
-        .and_then(|value| value.parse().ok())
-});
 use pulsevm_crypto::{
     Bytes,
     Digest,
@@ -621,6 +620,10 @@ pub struct Controller {
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
     node_config: Option<NodeConfig>,
+    // Set when a refused migration boot discarded the arena it was about to
+    // run on. `shutdown` must then not close (and so re-persist) the database,
+    // or the discarded state would be written straight back to disk.
+    state_discarded: bool,
 
     // Consensus-critical upgrade schedule supplied in `upgrade_bytes` at VM
     // initialization. MetalGo sources it from each node's chain configuration,
@@ -677,7 +680,7 @@ pub struct Controller {
 
     // Local-only CPU/NET retained for transactions whose consensus state was
     // rolled back after an execution failure.
-    subjective_billing: SubjectiveBilling,
+    subjective_billing: SharedSubjectiveBilling,
 }
 
 /// Read-only state required for mempool admission. See
@@ -693,6 +696,9 @@ pub struct MempoolAdmissionState {
     db: Database,
     chain_id: Id,
     protocol_upgrade_schedule: ProtocolUpgradeSchedule,
+    /// The controller's own ledger, so admission applies the same node-local
+    /// bill execution subtracts from the payer.
+    subjective_billing: SharedSubjectiveBilling,
 }
 
 impl MempoolAdmissionState {
@@ -781,7 +787,13 @@ impl MempoolAdmissionState {
         // cannot afford the transaction is refused here instead of occupying a
         // mempool slot and a block builder's time before failing the same
         // objective checks at execution.
-        Self::check_payer_resource_window(&self.db, packed_transaction, transaction)?;
+        Self::check_payer_resource_window(
+            &self.db,
+            &self.subjective_billing,
+            pending_block_timestamp,
+            packed_transaction,
+            transaction,
+        )?;
 
         if self
             .db
@@ -812,6 +824,8 @@ impl MempoolAdmissionState {
     /// (limit `-1`) and greylisting are handled as at execution.
     fn check_payer_resource_window(
         db: &Database,
+        subjective_billing: &SharedSubjectiveBilling,
+        pending_block_timestamp: &BlockTimestamp,
         packed_transaction: &PackedTransaction,
         transaction: &Transaction,
     ) -> Result<(), ChainError> {
@@ -821,16 +835,38 @@ impl MempoolAdmissionState {
         let payer = Name::new(payer);
         let chain_config = db.chain_config()?;
 
+        // Execution subtracts the node-local bill that this payer's earlier
+        // failed transactions left behind (`TransactionContext::
+        // set_subjective_bill`), so the budget it enforces is the available CPU
+        // minus that bill. Check the same figure here.
+        let bill = subjective_billing.get_bill(
+            payer.as_u64(),
+            pending_block_timestamp.slot(),
+            db.get_account_cpu_usage_average_window()?,
+            db.get_account_net_usage_average_window()?,
+        );
+        let billed_note = |bill: u64| {
+            if bill > 0 {
+                format!(" (after a node-local bill of {bill} from earlier failed transactions)")
+            } else {
+                String::new()
+            }
+        };
+
         let (cpu_limit, _) = ResourceLimitsManager::get_account_cpu_limit(
             db,
             &payer,
             Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
         )?;
         let min_cpu = chain_config.min_transaction_cpu_usage as u64;
-        if cpu_limit >= 0 && (cpu_limit as u64) < min_cpu {
+        let cpu_available = (cpu_limit as u64).saturating_sub(bill.cpu);
+        if cpu_limit >= 0 && cpu_available < min_cpu {
             return Err(ChainError::TransactionError(format!(
-                "payer {} cannot afford the transaction: available CPU {} is below the {} minimum",
-                payer, cpu_limit, min_cpu
+                "payer {} cannot afford the transaction: available CPU {}{} is below the {} minimum",
+                payer,
+                cpu_available,
+                billed_note(bill.cpu),
+                min_cpu
             )));
         }
 
@@ -852,10 +888,14 @@ impl MempoolAdmissionState {
             &payer,
             Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
         )?;
-        if net_limit >= 0 && (net_limit as u64) < net_usage {
+        let net_available = (net_limit as u64).saturating_sub(bill.net);
+        if net_limit >= 0 && net_available < net_usage {
             return Err(ChainError::TransactionError(format!(
-                "payer {} cannot afford the transaction: available NET {} is below its {} bytes",
-                payer, net_limit, net_usage
+                "payer {} cannot afford the transaction: available NET {}{} is below its {} bytes",
+                payer,
+                net_available,
+                billed_note(bill.net),
+                net_usage
             )));
         }
         Ok(())
@@ -1127,6 +1167,7 @@ impl Controller {
             trace_log: None,
             chain_state_log: None,
             node_config: None,
+            state_discarded: false,
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
             db_path: None,
             snapshot_cache: None,
@@ -1138,7 +1179,7 @@ impl Controller {
 
             pending_chain: Vec::new(),
             blocks_executed: 0,
-            subjective_billing: SubjectiveBilling::default(),
+            subjective_billing: SharedSubjectiveBilling::default(),
         }
     }
 
@@ -1289,6 +1330,62 @@ impl Controller {
         upgrade_bytes: &[u8],
         db_path: &str,
     ) -> Result<(), ChainError> {
+        // A migration restore installs the checkpoint on disk before the
+        // checks that follow it (deferred inventory, pause window, schedule
+        // binding) have run. If one of them refuses the boot, the restored
+        // state must not survive: the next start would see a database past
+        // the checkpoint revision, take the "reuse" branch, and skip the
+        // checks that just failed. State this call created is discarded on
+        // error; state that was already there is never touched.
+        let state_file = Database::arena_state_file(std::path::Path::new(db_path));
+        let existed = state_file.exists();
+        self.state_discarded = false;
+        let result = self.initialize_with_protocol_upgrades_inner(
+            chain_id,
+            config_bytes,
+            genesis_bytes,
+            upgrade_bytes,
+            db_path,
+        );
+        if result.is_err() && !existed && state_file.exists() && self.restoring_migration() {
+            self.discard_restored_state(&state_file);
+        }
+        result
+    }
+
+    /// Remove an arena a refused migration boot must not leave behind, and keep
+    /// `shutdown` from writing it back. A failed removal is logged at error
+    /// level: the next start would see that state, and the marker check (not
+    /// this call) is what still refuses to reuse it unverified.
+    fn discard_restored_state(&mut self, state_file: &std::path::Path) {
+        self.state_discarded = true;
+        match fs::remove_file(state_file) {
+            Ok(()) => info!(
+                "migration boot refused: discarded the restored state {}",
+                state_file.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => error!(
+                "migration boot refused and the restored state {} could not be discarded: {error}",
+                state_file.display()
+            ),
+        }
+    }
+
+    fn restoring_migration(&self) -> bool {
+        self.node_config
+            .as_ref()
+            .is_some_and(|config| config.migration_checkpoint.is_some())
+    }
+
+    fn initialize_with_protocol_upgrades_inner(
+        &mut self,
+        chain_id: &Id,
+        config_bytes: &[u8],
+        genesis_bytes: &[u8],
+        upgrade_bytes: &[u8],
+        db_path: &str,
+    ) -> Result<(), ChainError> {
         self.subjective_billing.clear();
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
@@ -1300,10 +1397,9 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
         })?;
         self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
-            ChainError::ParseError(format!(
-                "failed to parse node config JSON: {} - {}",
-                e, config_json
-            ))
+            // The config carries the producer's private key: never echo it.
+            // serde's message already names the line and column.
+            ChainError::ParseError(format!("failed to parse node config JSON: {e}"))
         })?);
 
         Self::ensure_no_incomplete_state_sync(db_path)?;
@@ -1334,8 +1430,23 @@ impl Controller {
             .as_ref()
             .and_then(|config| config.migration_manifest.as_ref());
         let mut migration_source_block = None;
+        let migration_roster: Option<Vec<pulsevm_database::HaltRosterEntry>>;
         if let (Some(checkpoint), Some(manifest_path)) = (migration_checkpoint, migration_manifest)
         {
+            // The manifest is untrusted JSON: bound it before reading it.
+            const MAX_MIGRATION_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
+            let manifest_len = fs::metadata(manifest_path)
+                .map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "failed to stat migration manifest {manifest_path}: {e}"
+                    ))
+                })?
+                .len();
+            if manifest_len > MAX_MIGRATION_MANIFEST_BYTES {
+                return Err(ChainError::GenesisError(format!(
+                    "migration manifest {manifest_path} is {manifest_len} bytes, over the {MAX_MIGRATION_MANIFEST_BYTES} byte limit"
+                )));
+            }
             let manifest_bytes = fs::read(manifest_path).map_err(|e| {
                 ChainError::GenesisError(format!(
                     "failed to read migration manifest {manifest_path}: {e}"
@@ -1347,17 +1458,18 @@ impl Controller {
                         "failed to parse migration manifest {manifest_path}: {e}"
                     ))
                 })?;
-            manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
-                ChainError::GenesisError(format!(
-                    "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
-                ))
-            })?;
             let expected_checkpoint_sha256 =
                 rust_genesis.migration_checkpoint_sha256.ok_or_else(|| {
                     ChainError::GenesisError(
                         "migration genesis is missing migration_checkpoint_sha256".into(),
                     )
                 })?;
+            // The migration's successor identity is committed by the
+            // migration genesis itself (deterministic and known to the
+            // ceremony), not by the platform-assigned chain id, which the
+            // launcher may allocate. The two-step confirmation binds this
+            // derived id; platform divergence stays on the warning path.
+            let migration_derived_chain_id = Id::new(rust_genesis.compute_ceremony_chain_id());
             if manifest.checkpoint_sha256 != hex::encode(expected_checkpoint_sha256) {
                 return Err(ChainError::GenesisError(format!(
                     "migration manifest checkpoint hash {} does not match migration genesis {}",
@@ -1365,11 +1477,169 @@ impl Controller {
                     hex::encode(expected_checkpoint_sha256)
                 )));
             }
+            // Self-derivation: the checkpoint this node restores must be the
+            // one this operator derived from its own snapshot. The genesis
+            // pin and the manifest only say what the delivered bundle
+            // claims; the locally derived hash is the independent fact.
+            let local_checkpoint_sha256 = self
+                .node_config
+                .as_ref()
+                .and_then(|config| config.migration_local_checkpoint_sha256.as_deref())
+                .ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration restore requires migration_local_checkpoint_sha256: derive the checkpoint from your own Leap snapshot at H and configure its hash"
+                            .into(),
+                    )
+                })?;
+            if !local_checkpoint_sha256
+                .eq_ignore_ascii_case(&hex::encode(expected_checkpoint_sha256))
+            {
+                return Err(ChainError::GenesisError(format!(
+                    "locally derived checkpoint hash {local_checkpoint_sha256} does not match the migration genesis {}: refusing a checkpoint this operator did not derive",
+                    hex::encode(expected_checkpoint_sha256)
+                )));
+            }
+            // The recorded committee must be the published source schedule:
+            // a fact pinned in the genesis from outside the bundle. Free to
+            // check, so it runs before the whole-file hash.
+            // A manifest with no declaration at all is refused for that
+            // reason just below; the pin is checked once a pair is present.
+            if manifest.halt_declaration.is_some() {
+                let recorded_committee = manifest.halt_schedule.as_deref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration manifest records no source committee to compare with the published schedule"
+                            .into(),
+                    )
+                })?;
+                let recorded_version = manifest.halt_schedule_version.ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration manifest records no schedule version".into(),
+                    )
+                })?;
+                pulsevm_database::verify_schedule_pin(
+                    recorded_version,
+                    recorded_committee,
+                    rust_genesis.migration_schedule_sha256.as_ref(),
+                )
+                .map_err(ChainError::GenesisError)?;
+            }
+            // The free comparisons above run first; this hashes the whole
+            // (multi-gigabyte) checkpoint, so it only runs once they pass.
+            manifest.verify_checkpoint_path(checkpoint).map_err(|e| {
+                ChainError::GenesisError(format!(
+                    "migration manifest {manifest_path} rejected checkpoint {checkpoint}: {e}"
+                ))
+            })?;
             migration_source_block = Self::migration_source_block(&manifest)?;
+            // The new network only promotes state the old network agreed to
+            // freeze: when the manifest carries the producers' signed halt
+            // commitment, verify it against the terminal block before the
+            // checkpoint is trusted. The two-step pair is mandatory: a
+            // manifest without the declaration and its confirmation restores
+            // nothing, and a legacy commitment without a roster proves no
+            // schedule quorum. Both versions verify against the attached
+            // weighted roster under the strict two-thirds quorum.
+            {
+                if manifest.halt_declaration.is_none() {
+                    return Err(ChainError::GenesisError(
+                        "migration restore requires the two-step cutover pair: manifest carries no halt declaration"
+                            .into(),
+                    ));
+                }
+                let source_block = migration_source_block.as_ref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration halt proof requires an attached source block".into(),
+                    )
+                })?;
+                let source_id = source_block.id()?;
+                let checkpoint_bytes = hex::decode(&manifest.checkpoint_sha256).map_err(|e| {
+                    ChainError::GenesisError(format!(
+                        "migration manifest checkpoint hash invalid: {e}"
+                    ))
+                })?;
+                let checkpoint_arr: [u8; 32] = checkpoint_bytes.try_into().map_err(|_| {
+                    ChainError::GenesisError(
+                        "migration manifest checkpoint hash has the wrong length".into(),
+                    )
+                })?;
+                // The two-step cutover pair is mandatory: the declaration
+                // commits the source schedule to H before H exists, the
+                // confirmation chains H, the checkpoint, this chain's id,
+                // and the platform id wallets sign under to that
+                // declaration, and pre-commitment timing must be provable
+                // (on-chain ceremony or recorded declaration inclusion).
+                // Every ceremony vote must sit under H's schedule version.
+                // The declared set feeds the checkpoint-state cross-check
+                // below.
+                let roster = pulsevm_database::verify_migration_halt_pair(
+                    &manifest,
+                    source_block.block_num(),
+                    &source_id.0.0,
+                    &checkpoint_arr,
+                    &migration_derived_chain_id.0.0,
+                    source_block.signed_block_header.header.schedule_version,
+                    Some(&chain_id.0.0),
+                )
+                .map_err(ChainError::GenesisError)?;
+                migration_roster = Some(roster);
+                // Audit trail: what the old schedule committed to, in
+                // whose favor, over which terminal block — re-derivable
+                // by anyone holding the manifest.
+                if let Some(declaration) = manifest.halt_declaration.as_ref() {
+                    let digest = declaration.digest().map(hex::encode).unwrap_or_default();
+                    let successor = manifest
+                        .halt_confirmation
+                        .as_ref()
+                        .map(|confirmation| confirmation.new_chain_id.clone())
+                        .unwrap_or_default();
+                    info!(
+                        "migration cutover pair verified: declaration {digest} over height {} ({} members) confirms to {successor}",
+                        declaration.last_height,
+                        declaration.validator_set.len(),
+                    );
+                }
+                if manifest.halt_commitment.is_some() {
+                    pulsevm_database::verify_migration_halt_commitment(
+                        &manifest,
+                        source_block.block_num(),
+                        &source_id.0.0,
+                        &checkpoint_arr,
+                    )
+                    .map_err(ChainError::GenesisError)?;
+                }
+            }
             if self.db.revision() <= 0 {
+                // Hash the bytes while restoring them: the manifest hash was
+                // checked on the path earlier, and a file swapped since would
+                // otherwise be installed on the strength of its own envelope.
+                let manifest_checkpoint_sha256: [u8; 32] = hex::decode(&manifest.checkpoint_sha256)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        ChainError::GenesisError(
+                            "migration manifest checkpoint hash is not 32 bytes of hex".into(),
+                        )
+                    })?;
+                // A marker left by an earlier restore describes state that is
+                // about to be replaced: clear it before the new restore starts,
+                // so a crash part-way cannot pair an old marker with new state.
+                let stale_marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                match fs::remove_file(&stale_marker) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ChainError::GenesisError(format!(
+                            "cannot clear the previous restore marker {}: {error}",
+                            stale_marker.display()
+                        )));
+                    }
+                }
                 let header = self
                     .db
-                    .restore_from_path(std::path::Path::new(checkpoint))
+                    .restore_from_path_checked(
+                        std::path::Path::new(checkpoint),
+                        Some(&manifest_checkpoint_sha256),
+                    )
                     .map_err(|e| {
                         ChainError::GenesisError(format!(
                             "failed to restore migration checkpoint {checkpoint}: {e}"
@@ -1397,6 +1667,29 @@ impl Controller {
                         )));
                     }
                 }
+                // Pause-window deferred inventory at restore, not just at
+                // export: the export-side check runs only when a sidecar is
+                // staged, but these are the rows actually promoted — a row
+                // due between H and P would have executed on a post-H block
+                // and set its transaction root, so the boot fails closed
+                // here with the row named instead of at the emptiness gate.
+                // Only the two-step pair stages a window (H..P); legacy
+                // manifests carry no post-H proof to check against.
+                if migration_roster.is_some() {
+                    let (window_start, window_end) =
+                        pulsevm_database::manifest_pause_window_us(&manifest).map_err(|error| {
+                            ChainError::GenesisError(format!(
+                                "migration pause window unreadable: {error}"
+                            ))
+                        })?;
+                    let restored = self.db.arena_deferred_transactions();
+                    pulsevm_database::check_no_arena_deferred_due_in_window(
+                        &restored,
+                        window_start,
+                        window_end,
+                    )
+                    .map_err(ChainError::GenesisError)?;
+                }
                 // Leap's second deferred-transaction retirement feature removes all
                 // pending generated transactions when activated. A checkpoint made
                 // before that activation can still carry rows, so normalize them
@@ -1421,6 +1714,17 @@ impl Controller {
                         );
                     }
                 }
+                // Every restore-only check above has passed: record that, so a
+                // crash or restart before the node builds its first block cannot
+                // fall into the "reuse" branch below and skip them. The marker
+                // names the checkpoint it covers.
+                let marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                fs::write(&marker, hex::encode(expected_checkpoint_sha256)).map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "cannot record the verified restore at {}: {error}",
+                        marker.display()
+                    ))
+                })?;
                 info!(
                     "restored migration Arena checkpoint {} at revision {} from manifest {}",
                     checkpoint, header.revision, manifest_path
@@ -1432,6 +1736,47 @@ impl Controller {
                     manifest.checkpoint_revision
                 )));
             } else {
+                // An arena already on disk at exactly the checkpoint's
+                // revision has built nothing since the restore, so it must
+                // still serialize to the checkpoint the pin names: re-derive
+                // its hash instead of trusting a file that was there before
+                // this boot. Past that revision the chain has advanced and the
+                // local state is the node's own.
+                if self.db.revision() == manifest.checkpoint_revision {
+                    // The restore-only checks (deferred ids, the pause-window
+                    // inventory, stage-2 retirement) run only on a fresh
+                    // restore. An arena at the checkpoint revision without the
+                    // marker that a completed restore writes came from a boot
+                    // that did not finish them: discard it so the next start
+                    // restores and verifies from the checkpoint again.
+                    let marker = std::path::Path::new(db_path).join(RESTORE_VERIFIED_MARKER);
+                    let verified = fs::read_to_string(&marker)
+                        .map(|recorded| {
+                            recorded
+                                .trim()
+                                .eq_ignore_ascii_case(&hex::encode(expected_checkpoint_sha256))
+                        })
+                        .unwrap_or(false);
+                    if !verified {
+                        let arena = Database::arena_state_file(std::path::Path::new(db_path));
+                        self.discard_restored_state(&arena);
+                        return Err(ChainError::GenesisError(
+                            "the existing arena is at the checkpoint revision but no completed restore verified it (a previous boot did not finish): it was discarded, restart to restore the checkpoint again"
+                                .into(),
+                        ));
+                    }
+                    // Hashed as a stream: the in-memory snapshot is many
+                    // gigabytes on mainnet-size state.
+                    let existing_sha256 = self.db.snapshot_sha256()?;
+                    if existing_sha256 != expected_checkpoint_sha256 {
+                        return Err(ChainError::GenesisError(format!(
+                            "the existing arena at revision {} hashes to {} but the migration genesis pins {}: refusing to reuse a database that is not the checkpoint",
+                            self.db.revision(),
+                            hex::encode(existing_sha256),
+                            hex::encode(expected_checkpoint_sha256)
+                        )));
+                    }
+                }
                 info!(
                     "reusing migration Arena at revision {} without restoring checkpoint {}",
                     self.db.revision(),
@@ -1446,6 +1791,62 @@ impl Controller {
                         manifest.import_summary.input_transactions
                     )));
                 }
+            }
+            // The producers table is NOT the schedule: on mainnet it carries
+            // every active row (standbys included) while the schedule names
+            // only the committee, so no membership check touches it.
+            // The committee is the one the Leap snapshot states for H: the
+            // converter wrote its `block_state` schedule into the checkpoint
+            // rows, so the checkpoint hash the ceremony confirmed covers it
+            // and each BP derives it from its own snapshot. The schedule the
+            // manifest records (which the pair verification above walked H
+            // and the post-H window against, and matched to the declaration)
+            // must equal it entry for entry and in order, and it must be for
+            // exactly H with H's schedule version and no pending change.
+            // An exporter-supplied schedule that the checkpoint does not
+            // contain fails here.
+            if let Some(roster) = migration_roster.as_ref() {
+                let source_block = migration_source_block.as_ref().ok_or_else(|| {
+                    ChainError::GenesisError(
+                        "migration schedule binding requires an attached source block".into(),
+                    )
+                })?;
+                let source_id = source_block.id()?;
+                let schedule = pulsevm_database::verify_source_schedule_binding(
+                    &self.db,
+                    manifest.halt_schedule.as_deref(),
+                    &source_id.0.0,
+                    source_block.signed_block_header.header.schedule_version,
+                )
+                .map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "migration schedule is not bound by the checkpoint: {error}"
+                    ))
+                })?;
+                info!(
+                    "migration halt roster verified against the checkpoint-bound schedule: {} declared, {} scheduled (version {})",
+                    roster.len(),
+                    schedule.producers.len(),
+                    schedule.schedule_version
+                );
+            }
+            // Memo-vehicle inclusion closes the other half of the timing
+            // proof: the pair verifier re-decoded the recorded memo names
+            // to the declaration digest with creation required before H,
+            // and here every recorded name must exist in the restored
+            // checkpoint state — names that decode but name no account fail
+            // here, so a bare asserted inclusion height can never boot.
+            match pulsevm_database::verify_memo_names_exist(&self.db, &manifest).map_err(
+                |error| {
+                    ChainError::GenesisError(format!(
+                        "migration memo inclusion proof rejected: {error}"
+                    ))
+                },
+            )? {
+                0 => {}
+                proven => info!(
+                    "migration memo inclusion proven: {proven} declaration accounts in checkpoint state"
+                ),
             }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
@@ -1891,6 +2292,12 @@ impl Controller {
         // database so shutdown leaves no speculative state behind.
         self.clear_pending()?;
 
+        // A refused migration boot discarded its arena: closing would
+        // checkpoint the in-memory copy straight back to disk.
+        if self.state_discarded {
+            info!("shutting down controller without persisting the discarded migration state");
+            return Ok(());
+        }
         // Explicitly close the database
         info!("shutting down controller and closing database");
         self.db.close()?;
@@ -3595,25 +4002,6 @@ impl Controller {
                 )));
             }
 
-            if *XPR_TRACE_ACTION_RECEIPTS_BLOCK == Some(block.block_num()) {
-                eprintln!(
-                    "action receipt trace transaction={}",
-                    receipt.transaction_id()
-                );
-                for trace in &result.trace.action_traces {
-                    if let Some(action_receipt) = &trace.receipt {
-                        eprintln!(
-                            "  ordinal={} creator={} action={}::{} digest={} receipt={}",
-                            trace.action_ordinal,
-                            trace.creator_action_ordinal,
-                            trace.act.account(),
-                            trace.act.name(),
-                            action_receipt.digest()?,
-                            action_receipt,
-                        );
-                    }
-                }
-            }
             // Add trace to traces
             if collect_transaction_traces {
                 transaction_traces.push(result.trace.clone());
@@ -3660,11 +4048,6 @@ impl Controller {
         }
 
         let merkle_started = replay_profiling.then(Instant::now);
-        if *XPR_TRACE_ACTION_RECEIPTS_BLOCK == Some(block.block_num()) {
-            for (index, digest) in action_receipt_digests.iter().enumerate() {
-                eprintln!("action receipt digest index={index} digest={digest}");
-            }
-        }
         let transaction_mroot = self.calculate_trx_merkle(&transaction_receipts)?;
         let action_mroot = self.calculate_action_merkle(&mut action_receipt_digests)?;
         let merkle_elapsed = merkle_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -3772,6 +4155,7 @@ impl Controller {
             db: self.db.clone(),
             chain_id: self.chain_id.clone(),
             protocol_upgrade_schedule: self.protocol_upgrade_schedule.clone(),
+            subjective_billing: self.subjective_billing.clone(),
         }
     }
 
@@ -4925,6 +5309,23 @@ impl Controller {
         self.db.clone()
     }
 
+    /// The node-local CPU bill, in points, that `account` carries from earlier
+    /// failed input transactions right now. It never reaches consensus state;
+    /// RPC reports it so a payer can see why a transaction it can otherwise
+    /// afford is being refused.
+    pub fn subjective_cpu_bill(&self, account: &Name) -> Result<u64, ChainError> {
+        let now: BlockTimestamp = TimePoint::now().into();
+        Ok(self
+            .subjective_billing
+            .get_bill(
+                account.as_u64(),
+                now.slot(),
+                self.db.get_account_cpu_usage_average_window()?,
+                self.db.get_account_net_usage_average_window()?,
+            )
+            .cpu)
+    }
+
     /// Best-effort migration replay look-ahead for direct WASM receivers.
     ///
     /// Compilation is state-independent and can run on the runtime's worker
@@ -5295,6 +5696,7 @@ mod tests {
                 NewAccount,
                 SetAbi,
                 SetCode,
+                UpdateAuth,
             },
             transaction::{
                 Action,
@@ -5660,6 +6062,90 @@ mod tests {
                 .0,
             after.code_sequence as u32
         );
+        Ok(())
+    }
+
+    // The start function writes a byte; apply asserts it is there, so the
+    // transaction only succeeds if the deferred start function really ran.
+    const START_SECTION_WAT: &str = r#"(module
+        (import "env" "pulse_assert" (func $assert (param i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 8) "start did not run\00")
+        (func $init (i32.store8 (i32.const 100) (i32.const 1)))
+        (start $init)
+        (func (export "apply") (param i64 i64 i64)
+            (call $assert (i32.load8_u (i32.const 100)) (i32.const 8) (i32.const 17))))"#;
+
+    #[cfg(feature = "protocol_feature_wasm_start_sections")]
+    fn init_controller_with_upgrades(
+        upgrades: &[u8],
+    ) -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize_with_protocol_upgrades(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            upgrades,
+            temp_path.path().to_str().unwrap(),
+        )?;
+        Ok((controller, private_key, chain_id, temp_path))
+    }
+
+    #[tokio::test]
+    async fn setcode_with_a_start_section_is_refused_before_protocol_v2() -> Result<(), ChainError>
+    {
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let wasm = wat::parse_str(START_SECTION_WAT).expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let result = controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        );
+        assert!(
+            result.is_err(),
+            "a start section must not deploy under protocol version 1"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "protocol_feature_wasm_start_sections")]
+    #[tokio::test]
+    async fn setcode_with_a_start_section_deploys_and_runs_under_protocol_v2()
+    -> Result<(), ChainError> {
+        let (mut controller, private_key, chain_id, _temp) = init_controller_with_upgrades(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )?;
+        let wasm = wat::parse_str(START_SECTION_WAT).expect("valid wasm");
+        let timestamp = *controller.last_accepted_block().timestamp();
+        controller.execute_transaction(
+            &set_code(&private_key, PULSE_NAME, wasm, chain_id)?,
+            &timestamp,
+            &BlockStatus::Building,
+        )?;
+        let transaction = call_contract(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("anything")?,
+            &7u8,
+            chain_id,
+        )?;
+        let result =
+            controller.execute_transaction(&transaction, &timestamp, &BlockStatus::Building)?;
+        assert_eq!(result.trace.action_traces.len(), 1);
         Ok(())
     }
 
@@ -10263,6 +10749,12 @@ mod tests {
                 .unwrap();
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        // The restore requires the cutover pair even for synthetic
+        // fixtures: single-member roster signed by the genesis key. Built
+        // early so the checkpoint can stage the producers table row the
+        // roster cross-check binds against.
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
         let temp = get_temp_dir();
         let checkpoint_dir = temp.path().join("checkpoint-source");
         let checkpoint_path = temp.path().join("migration.snapshot");
@@ -10273,6 +10765,20 @@ mod tests {
         checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
         checkpoint_db.create_account(migrated.as_u64(), 42)?;
         checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // Real XPR checkpoints always carry the producers table; the
+        // restore fails closed without it, so the fixture stages the row
+        // for the pair's single member.
+        seed_producers_table(&mut checkpoint_db, &[("pulse", &pair_key)])?;
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
         checkpoint_db.set_revision(42)?;
         let checkpoint = checkpoint_db.snapshot_bytes()?;
         fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
@@ -10282,17 +10788,6 @@ mod tests {
             ))
         })?;
         let manifest_path = temp.path().join("migration.manifest.json");
-        let mut previous = [0u8; 32];
-        previous[..4].copy_from_slice(&41u32.to_be_bytes());
-        let source_block = SignedBlock::new(
-            Id::new(previous),
-            BlockTimestamp::new(1_700_000_000),
-            PULSE_NAME,
-            VecDeque::new(),
-            Digest::default(),
-            Digest::default(),
-        );
-        let source_block_id = source_block.id()?;
         let mut manifest = MigrationManifest::new(
             b"controller migration test source",
             source_block_id.0.0,
@@ -10315,6 +10810,7 @@ mod tests {
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
             "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
             "migration_manifest": manifest_path,
         })
         .to_string()
@@ -10322,7 +10818,20 @@ mod tests {
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
-        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        // The pair key was built up front so the checkpoint could stage
+        // the producers table row it binds against.
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &mut migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
         let target_path = temp.path().join("target");
         let mut controller = Controller::new();
         controller.initialize(
@@ -10359,8 +10868,14 @@ mod tests {
         assert_eq!(restarted.last_accepted_block().id()?, source_block_id);
         restarted.shutdown()?;
 
-        manifest.import_summary.input_transactions = 2;
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+        // Mutate the file in place so the attached pair survives: only the
+        // dedupe count diverges, and the restore must fail on that.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to re-read manifest: {e}")))?;
+        let mut mismatched: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        mismatched["import_summary"]["input_transactions"] = json!(2);
+        fs::write(&manifest_path, serde_json::to_vec(&mismatched).unwrap()).map_err(|e| {
             ChainError::InternalError(format!(
                 "failed to write mismatched migration manifest {}: {e}",
                 manifest_path.display()
@@ -10379,6 +10894,2139 @@ mod tests {
             error
                 .to_string()
                 .contains("input-transaction dedupe rows but manifest commits")
+        );
+
+        // The confirmation binds the configured platform id (fixed above),
+        // not the derived genesis id: booting the same manifest under a
+        // different platform id fails closed instead of verifying wallets
+        // under an id the ceremony never committed to.
+        let foreign_platform = Id::new([0x99; 32]);
+        let foreign_path = temp.path().join("foreign-platform-target");
+        let platform_error = Controller::new()
+            .initialize(
+                &foreign_platform,
+                &config_bytes,
+                &migration_genesis,
+                foreign_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            platform_error.to_string().contains("platform chain id"),
+            "unexpected error: {platform_error}"
+        );
+        Ok(())
+    }
+
+    // A checkpoint without the XPR producers table still boots: the table
+    // carries every active row while the schedule names only the
+    // committee, so it is not a membership source. The pair itself
+    // verifies — the committee is pinned by the snapshot-bound schedule.
+    #[tokio::test]
+    async fn migration_restore_boots_checkpoint_without_producers_table() -> Result<(), ChainError>
+    {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let temp = get_temp_dir();
+        let checkpoint_dir = temp.path().join("table-less-source");
+        let checkpoint_path = temp.path().join("table-less.snapshot");
+        let mut checkpoint_db = Database::new(checkpoint_dir.to_str().unwrap(), 1024 * 1024)
+            .map_err(ChainError::InternalError)?;
+        checkpoint_db.add_indices()?;
+        checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
+        checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // Deliberately no producers table: the table carries every active
+        // row while the schedule names only the committee, so it is not a
+        // membership source and the restore must not need it.
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
+        checkpoint_db.set_revision(42)?;
+        let checkpoint = checkpoint_db.snapshot_bytes()?;
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("table-less.manifest.json");
+        let mut manifest = MigrationManifest::new(
+            b"controller table-less migration test",
+            source_block_id.0.0,
+            &checkpoint,
+            42,
+            pulsevm_database::ImportSummary {
+                input_transactions: 1,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &mut migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        let target_path = temp.path().join("table-less-target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), 42);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        controller.shutdown()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_fictional_memo_accounts() -> Result<(), ChainError> {
+        // Names that decode but name no checkpoint account fail the
+        // inclusion proof at restore: a bare asserted inclusion height
+        // can never boot.
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&private_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let temp = get_temp_dir();
+        let checkpoint_dir = temp.path().join("fictional-memo-source");
+        let checkpoint_path = temp.path().join("fictional-memo.snapshot");
+        let mut checkpoint_db = Database::new(checkpoint_dir.to_str().unwrap(), 1024 * 1024)
+            .map_err(ChainError::InternalError)?;
+        checkpoint_db.add_indices()?;
+        checkpoint_db.create_account(PULSE_NAME.as_u64(), 7)?;
+        checkpoint_db.record_transaction(&[0x77; 32], 1_700_003_600)?;
+        // H and its committee are fixed before the checkpoint is hashed: the
+        // schedule rides inside the checkpoint, exactly as the converter
+        // writes it from the Leap snapshot.
+        let (source_block, source_block_id) = fixture_source_block()?;
+        seed_source_schedule(
+            &checkpoint_db,
+            &[("pulse", &pair_key)],
+            &source_block,
+            &source_block_id,
+        )?;
+        checkpoint_db.set_revision(42)?;
+        let checkpoint = checkpoint_db.snapshot_bytes()?;
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("fictional-memo.manifest.json");
+        let mut manifest = MigrationManifest::new(
+            b"controller fictional memo migration test",
+            source_block_id.0.0,
+            &checkpoint,
+            42,
+            pulsevm_database::ImportSummary {
+                input_transactions: 1,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+            "migration_checkpoint": checkpoint_path,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint_path),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        attach_halt_pair(
+            manifest_path.to_str().unwrap(),
+            &mut migration_genesis,
+            &chain_id.0.0,
+            source_block.block_num(),
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        // Names that decode to the recorded declaration digest but name no
+        // checkpoint account: the pair verify passes the re-decode and the
+        // restore must fail at the existence binding.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let declaration: pulsevm_database::HaltDeclaration =
+            serde_json::from_value(manifest["halt_declaration"].clone()).map_err(|e| {
+                ChainError::InternalError(format!("fixture declaration unreadable: {e}"))
+            })?;
+        let digest_hex = hex::encode(declaration.digest().map_err(|e| {
+            ChainError::InternalError(format!("fixture declaration digest failed: {e:?}"))
+        })?);
+        let letters: String = digest_hex
+            .bytes()
+            .map(|b| {
+                let nibble = if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                (b'a' + nibble) as char
+            })
+            .collect();
+        let names: Vec<String> = letters
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|chunk| format!("ha{}", chunk.iter().collect::<String>()))
+            .collect();
+        manifest["halt_memo_accounts"] = serde_json::Value::Array(
+            names
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "created_slot": 1u32}))
+                .collect(),
+        );
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).map_err(|e| {
+                ChainError::InternalError(format!("failed to encode manifest: {e}"))
+            })?,
+        )
+        .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        let target_path = temp.path().join("fictional-memo-target");
+        let error = Controller::new()
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not exist in checkpoint state"),
+            "a fictional memo account must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // A migration restore starts a new producer schedule seeded from the
+    // migration genesis initial key (the source schedule is deliberately not
+    // carried over). The producing node must hold that key: with a foreign
+    // key every build fails closed at the signing gate instead of emitting
+    // an unverifiable block. These tests pin both sides with a
+    // self-contained checkpoint.
+    /// Seed the XPR `eosio/producers` schedule table into a fixture
+    /// database so synthetic fixtures look like real XPR checkpoints
+    /// (which always carry this table): every member is written active
+    /// with exactly the schedule key the declaration names. The table is
+    /// not a membership source — the recorded schedule is — so the restore
+    /// no longer reads it; it stays staged here for fixture realism.
+    /// Canonical fixture schedule order: names sorted, then the producer that
+    /// authored H swapped into the position Antelope's slot rule assigns to
+    /// H's timestamp (`(slot % (n * 12)) / 12`). The checkpoint's source
+    /// schedule and the manifest's recorded schedule are both built from this
+    /// one function, so the gate's slot checks and the checkpoint binding
+    /// agree by construction.
+    fn fixture_schedule_order(
+        names: &[&str],
+        halt_slot: u32,
+        halt_producer: u64,
+    ) -> Result<Vec<String>, ChainError> {
+        let mut ordered: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        ordered.sort();
+        let members = ordered.len().max(1) as u64;
+        let position = ((u64::from(halt_slot) % (members * 12)) / 12) as usize;
+        let halt_member = ordered
+            .iter()
+            .position(|name| {
+                Name::from_str(name)
+                    .map(|parsed| parsed.as_u64() == halt_producer)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                ChainError::InternalError("fixture H producer is not a schedule member".into())
+            })?;
+        ordered.swap(position, halt_member);
+        Ok(ordered)
+    }
+
+    /// The synthetic source block H the inline migration fixtures share.
+    fn fixture_source_block() -> Result<(SignedBlock, Id), ChainError> {
+        let mut previous = [0u8; 32];
+        previous[..4].copy_from_slice(&41u32.to_be_bytes());
+        let source_block = SignedBlock::new(
+            Id::new(previous),
+            BlockTimestamp::new(1_700_000_000),
+            PULSE_NAME,
+            VecDeque::new(),
+            Digest::default(),
+            Digest::default(),
+        );
+        let source_block_id = source_block.id()?;
+        Ok((source_block, source_block_id))
+    }
+
+    /// Write H's committee into the checkpoint the way the converter does
+    /// from the Leap snapshot: for exactly H, at H's schedule version,
+    /// nothing pending, in slot-consistent schedule order.
+    fn seed_source_schedule(
+        db: &Database,
+        members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+        source_block: &SignedBlock,
+        source_block_id: &Id,
+    ) -> Result<(), ChainError> {
+        let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+        let header = &source_block.signed_block_header.header;
+        let order =
+            fixture_schedule_order(&names, header.timestamp.slot(), header.producer.as_u64())?;
+        let mut producers = Vec::with_capacity(order.len());
+        for name in &order {
+            let (_, key) = members
+                .iter()
+                .find(|(member, _)| member == name)
+                .ok_or_else(|| ChainError::InternalError("fixture member lost".into()))?;
+            producers.push(pulsevm_database::SourceScheduleMember {
+                producer: Name::from_str(name)?.as_u64(),
+                key: key.public_key().compressed(),
+            });
+        }
+        pulsevm_database::write_source_schedule(
+            db,
+            &pulsevm_database::SourceSchedule {
+                head_block_id: source_block_id.0.0,
+                head_block_num: source_block.block_num(),
+                schedule_version: header.schedule_version,
+                pending_schedule_staged: false,
+                producers,
+            },
+        )
+        .map_err(ChainError::InternalError)
+    }
+
+    fn seed_producers_table(
+        db: &mut Database,
+        members: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+    ) -> Result<(), ChainError> {
+        use pulsevm_database::{
+            StateHistoryEntry,
+            TableDelta,
+            TableDeltaRow,
+        };
+        fn varuint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+        // Head-only mainnet shape: owner, total_votes (ignored by the
+        // gate), K1 key-type varuint, 33-byte compressed schedule key,
+        // is_active, url, unpaid_blocks, last_claim_time, location.
+        fn producer_row(owner: u64, key: &[u8; 33]) -> Vec<u8> {
+            let mut row = Vec::new();
+            row.extend_from_slice(&owner.to_le_bytes());
+            row.extend_from_slice(&1.0f64.to_le_bytes());
+            varuint(0, &mut row);
+            row.extend_from_slice(key);
+            row.push(1);
+            varuint(3, &mut row);
+            row.extend_from_slice(b"url");
+            row.extend_from_slice(&0u32.to_le_bytes());
+            row.extend_from_slice(&0i64.to_le_bytes());
+            row.extend_from_slice(&0u16.to_le_bytes());
+            row
+        }
+        let system = Name::from_str("eosio")
+            .map_err(|e| ChainError::InternalError(format!("bad system name: {e}")))?
+            .as_u64();
+        let producers = Name::from_str("producers")
+            .map_err(|e| ChainError::InternalError(format!("bad table name: {e}")))?
+            .as_u64();
+        let payer = 55u64;
+        let mut table_row = vec![0u8];
+        for value in [system, system, producers, payer] {
+            table_row.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut deltas = vec![TableDelta {
+            name: "contract_table".into(),
+            rows: vec![TableDeltaRow {
+                present: true,
+                data: table_row,
+            }],
+        }];
+        for (producer, key) in members {
+            let owner = Name::from_str(producer)
+                .map_err(|e| ChainError::InternalError(format!("bad producer name: {e}")))?
+                .as_u64();
+            let mut kv_row = vec![0u8];
+            for value in [system, system, producers, owner, payer] {
+                kv_row.extend_from_slice(&value.to_le_bytes());
+            }
+            let value = producer_row(owner, &key.public_key().compressed());
+            assert!(value.len() < 128);
+            kv_row.push(value.len() as u8);
+            kv_row.extend_from_slice(&value);
+            deltas.push(TableDelta {
+                name: "contract_row".into(),
+                rows: vec![TableDeltaRow {
+                    present: true,
+                    data: kv_row,
+                }],
+            });
+        }
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [0; 32],
+            deltas,
+        };
+        pulsevm_database::hydrate_full_state(db, &entry)
+            .map_err(|e| ChainError::InternalError(format!("seed producers table: {e}")))?;
+        Ok(())
+    }
+
+    /// The hash an operator would derive independently: here, the hash of
+    /// the checkpoint file the fixture just built.
+    fn local_checkpoint_sha256(path: impl AsRef<std::path::Path>) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(
+            std::fs::read(path).expect("fixture checkpoint readable"),
+        ))
+    }
+
+    // Build a real source chain so the checkpoint carries complete state
+    // (accounts, permissions, resources, chain config): fresh genesis,
+    // one accepted block, then a portable snapshot of that state.
+    // `extra_producers` stages additional XPR schedule-table rows next to
+    // the genesis producer so multi-member declarations bind against
+    // checkpoint state.
+    async fn migration_checkpoint_with_schedule_key(
+        temp: &TempDir,
+        schedule_key: &PrivateKey,
+        extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
+        migration_checkpoint_with_options(temp, schedule_key, extra_producers, true).await
+    }
+
+    /// As above, with control over whether the checkpoint carries the source
+    /// schedule the converter writes from the Leap snapshot (`false` models a
+    /// checkpoint converted without `--leap-snapshot`).
+    async fn migration_checkpoint_with_options(
+        temp: &TempDir,
+        schedule_key: &PrivateKey,
+        extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
+        carry_source_schedule: bool,
+    ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
+        // Build a real source chain so the checkpoint carries complete state
+        // (accounts, permissions, resources, chain config): fresh genesis,
+        // one accepted block, then a portable snapshot of that state.
+        let genesis_bytes = generate_genesis(schedule_key);
+        let source_chain_id =
+            Id::new(pulsevm_database::GenesisState::from_bytes(&genesis_bytes)?.compute_chain_id());
+        let source_config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let source_path = temp.path().join("source");
+        let mut source = Controller::new();
+        source.initialize(
+            &source_chain_id,
+            &source_config,
+            &genesis_bytes,
+            source_path.to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut source_mempool = Mempool::new();
+        source_mempool.add_transaction(create_account_with_expiration(
+            schedule_key,
+            Name::from_str("alice")?,
+            source_chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = source.build_block(&mut source_mempool).await?;
+        source.accept_block(&first.id()?, &mut source_mempool)?;
+        let source_block = source.last_accepted_block().clone();
+        let source_block_id = source_block.id()?;
+        let source_revision = source.database().revision();
+        let imported_transactions = source.database().arena_transaction_count() as u64;
+        // Stage the XPR schedule table the restore binds the transported
+        // roster against: the genesis producer plus any extra pair members
+        // the caller stages. A checkpoint without this table fails closed
+        // at restore, so fixtures carry it like real XPR state does.
+        let schedule_k1 = pulsevm_crypto::k1::K1PrivateKey::from_string(&schedule_key.to_string())
+            .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        let mut members: Vec<(&str, &pulsevm_crypto::k1::K1PrivateKey)> =
+            Vec::with_capacity(extra_producers.len() + 1);
+        members.push(("pulse", &schedule_k1));
+        members.extend_from_slice(extra_producers);
+        let mut seed_db = source.database();
+        seed_producers_table(&mut seed_db, &members)?;
+        if carry_source_schedule {
+            seed_source_schedule(&seed_db, &members, &source_block, &source_block_id)?;
+        }
+        let checkpoint = seed_db.snapshot_bytes()?;
+        source.shutdown()?;
+        drop(source);
+        let checkpoint_path = temp.path().join("migration.snapshot");
+        fs::write(&checkpoint_path, &checkpoint).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration checkpoint {}: {e}",
+                checkpoint_path.display()
+            ))
+        })?;
+        let manifest_path = temp.path().join("migration.manifest.json");
+        let mut manifest = MigrationManifest::new(
+            b"controller migration schedule test source",
+            source_block_id.0.0,
+            &checkpoint,
+            source_revision,
+            pulsevm_database::ImportSummary {
+                input_transactions: imported_transactions,
+                ..Default::default()
+            },
+        );
+        manifest.source_block = Some(hex::encode(source_block.pack()?));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).map_err(|e| {
+            ChainError::InternalError(format!(
+                "failed to write migration manifest {}: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        let mut migration_genesis: serde_json::Value =
+            serde_json::from_slice(&genesis_bytes).unwrap();
+        migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
+        let migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
+        let genesis_state = pulsevm_database::GenesisState::from_bytes(&migration_genesis)?;
+        let chain_id = Id::new(genesis_state.compute_chain_id());
+        Ok((
+            checkpoint_path.to_str().unwrap().to_string(),
+            manifest_path.to_str().unwrap().to_string(),
+            migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block.block_num(),
+            source_revision,
+            source_chain_id.0.0,
+        ))
+    }
+
+    // Attaches a valid two-step cutover pair plus the mandatory on-chain
+    // ceremony evidence, matching the roster shape the ceremony exporter
+    // produces: members carry (producer, schedule key, weight) and only
+    // `sign_subset` indices sign, so the declared set, the transport
+    // roster, and the recomputed tally agree. Votes and finalization land
+    // in the block before H; no freshness window is claimed. The attested
+    // schedule version and every vote version come from H's actual packed
+    // header via the same prefix parser the offline verifier uses, so the
+    // controller tests pin the parser offset against the decoded block the
+    // restore gate reads. The platform binding commits the configured
+    // platform id, exactly as production does (the rehearsal configures
+    // the derived id as the platform; other tests pass a foreign id to
+    // prove the binding is checked, not assumed).
+    /// Pack one synthetic post-H empty block: `pulsevm_core::block` wire
+    /// layout, signed by the schedule key over the header digest. Mirrors
+    /// the handover's real post-H headers; the restore gate walks it.
+    fn pack_post_block(
+        previous: &[u8; 32],
+        slot: u32,
+        producer: u64,
+        signing: &pulsevm_crypto::K1PrivateKey,
+        schedule_version: u32,
+        root: [u8; 32],
+        schedule_hash: [u8; 32],
+    ) -> Result<(String, [u8; 32]), ChainError> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&slot.to_le_bytes());
+        header.extend_from_slice(&producer.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(previous);
+        header.extend_from_slice(&[0u8; 32]);
+        header.extend_from_slice(&[0u8; 32]);
+        header.extend_from_slice(&schedule_version.to_le_bytes());
+        header.push(0); // no schedule change
+        header.push(0); // no header extensions
+        let header_digest = pulsevm_crypto::Digest::hash(&header).0;
+        // Leap's producer signature digest over the recorded root and
+        // schedule hash, exactly as the restore gate recomputes it.
+        let mut digest_and_root = Vec::with_capacity(64);
+        digest_and_root.extend_from_slice(&header_digest);
+        digest_and_root.extend_from_slice(&root);
+        let bound = pulsevm_crypto::Digest::hash(&digest_and_root).0;
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&bound);
+        bound_and_schedule.extend_from_slice(&schedule_hash);
+        let digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let mut packed = Vec::with_capacity(64 + header.len() + 99);
+        packed.extend_from_slice(&root);
+        packed.extend_from_slice(&schedule_hash);
+        packed.extend_from_slice(&header);
+        packed.push(0); // K1 tag
+        packed.extend_from_slice(&signing.sign(&digest).compact65());
+        packed.push(0); // no transactions
+        packed.push(0); // no block extensions
+        let num =
+            u32::from_be_bytes(previous[0..4].try_into().map_err(|_| {
+                ChainError::InternalError("fixture post-H parent id malformed".into())
+            })?) + 1;
+        let mut id = header_digest;
+        id[0..4].copy_from_slice(&num.to_be_bytes());
+        // The entry carries the header-derived block id, which the gate
+        // recomputes from the packed header and requires to match exactly.
+        packed.extend_from_slice(&id);
+        Ok((hex::encode(&packed), id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_halt_pair(
+        manifest_path: &str,
+        migration_genesis: &mut Vec<u8>,
+        source_chain_id: &[u8; 32],
+        source_block_num: u32,
+        source_block_id: &Id,
+        keys: &[pulsevm_crypto::K1PrivateKey],
+        producers: &[&str],
+        sign_subset: &[usize],
+        platform_chain_id: &[u8; 32],
+    ) -> Result<(), ChainError> {
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let checkpoint_hex = manifest["checkpoint_sha256"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?
+            .to_string();
+        // H's real schedule version, read from the attached packed header
+        // with the same prefix parser the offline verifier uses: the
+        // attested version and every vote pin to exactly this, which also
+        // golden-tests the parser offset against the decoded block below.
+        let packed = manifest["source_block"].as_str().ok_or_else(|| {
+            ChainError::InternalError("manifest has no attached source block".into())
+        })?;
+        let header_schedule_version =
+            pulsevm_database::packed_source_block_schedule_version(packed).map_err(|error| {
+                ChainError::InternalError(format!(
+                    "manifest source block schedule version unreadable: {error}"
+                ))
+            })?;
+        // The ceremony roster is the frozen schedule: one member, one vote.
+        let mut members = Vec::with_capacity(producers.len());
+        for (producer, key) in producers.iter().zip(keys.iter()) {
+            members.push(pulsevm_database::HaltDeclarationMember {
+                producer: producer.to_string(),
+                key: key.public_key().to_string(),
+                weight: pulsevm_chain_types::HaltWeight::MEMBER,
+            });
+        }
+        pulsevm_database::HaltDeclaration::sort_members(&mut members);
+        let unsigned = pulsevm_database::HaltDeclaration {
+            version: pulsevm_database::HaltDeclaration::VERSION,
+            source_chain_id: hex::encode(source_chain_id),
+            last_height: source_block_num,
+            validator_set: members,
+            // The fixture pair carries the on-chain ceremony (contract
+            // "cutover"), so the declaration binds that account.
+            ceremony_contract: Some("cutover".to_string()),
+            signatures: Vec::new(),
+        };
+        let decl_digest = unsigned.digest()?;
+        let mut signatures = Vec::with_capacity(sign_subset.len());
+        for &index in sign_subset {
+            signatures.push(pulsevm_database::HaltSignature {
+                producer: producers[index].to_string(),
+                key: keys[index].public_key().to_string(),
+                signature: keys[index].sign(&decl_digest).to_string(),
+            });
+        }
+        let declaration = pulsevm_database::HaltDeclaration {
+            signatures: signatures.clone(),
+            ..unsigned
+        };
+        // Slot-derived production: in Antelope's DPoS schedule the producer
+        // for a slot is `recorded[(slot % (n * 12)) / 12]`, and the gate checks
+        // exactly that for H and every post-H block. The recorded schedule is
+        // the declared set (unit weights) ordered so H's own producer holds
+        // the slot H was produced in; the post-H producers then fall out of
+        // the same rule.
+        let source_bytes = hex::decode(manifest["source_block"].as_str().ok_or_else(|| {
+            ChainError::InternalError("manifest has no attached source block".into())
+        })?)
+        .map_err(|e| {
+            ChainError::InternalError(format!("fixture source block is not hexadecimal: {e}"))
+        })?;
+        let halt_slot = u32::from_le_bytes(source_bytes[0..4].try_into().map_err(|_| {
+            ChainError::InternalError("fixture source block shorter than its timestamp slot".into())
+        })?);
+        let halt_producer = u64::from_le_bytes(source_bytes[4..12].try_into().map_err(|_| {
+            ChainError::InternalError("fixture source block shorter than its producer".into())
+        })?);
+        let members = producers.len().max(1);
+        let slot_position = |slot: u32| ((u64::from(slot) % (members as u64 * 12)) / 12) as usize;
+        // The same canonical order the checkpoint's source schedule carries.
+        let order_names = fixture_schedule_order(producers, halt_slot, halt_producer)?;
+        let order: Vec<usize> = order_names
+            .iter()
+            .map(|name| {
+                producers
+                    .iter()
+                    .position(|producer| producer == name)
+                    .ok_or_else(|| ChainError::InternalError("fixture member lost".into()))
+            })
+            .collect::<Result<_, _>>()?;
+        manifest["halt_schedule"] = json!(
+            order
+                .iter()
+                .map(|&member| {
+                    json!({
+                        "producer": producers[member],
+                        "key": keys[member].public_key().to_string(),
+                        "weight": "1",
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        // The published schedule hash pinned in the genesis: the recorded
+        // committee in schedule order. The genesis (and with it the ceremony
+        // chain id the confirmation binds) is updated here, before the
+        // confirmation is built.
+        let pin_members = order
+            .iter()
+            .map(|&member| {
+                let name = crate::chain::name::Name::from_str(producers[member])
+                    .map(|name| name.as_u64())
+                    .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))?;
+                Ok((name, keys[member].public_key().compressed()))
+            })
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        let schedule_pin =
+            pulsevm_database::pack_schedule_hash(header_schedule_version, &pin_members);
+        let mut genesis_json: serde_json::Value = serde_json::from_slice(migration_genesis)
+            .map_err(|e| ChainError::InternalError(format!("fixture genesis unreadable: {e}")))?;
+        genesis_json["migration_schedule_sha256"] = json!(hex::encode(schedule_pin));
+        *migration_genesis = serde_json::to_vec(&genesis_json).unwrap();
+        let new_chain_id = pulsevm_database::GenesisState::from_bytes(migration_genesis)?
+            .compute_ceremony_chain_id();
+        // Post-H emptiness window: two signed empty blocks hash-linked from
+        // H (pause head P = H + 2 in the fixture), proving nothing landed
+        // after the freeze. Slots advance past H's slot so the staged window
+        // is time-ordered like a real freeze (the restore gate derives the
+        // deferred inventory bounds from these slots).
+        let post_producer = |index: usize| {
+            crate::chain::name::Name::from_str(producers[index])
+                .map(|name| name.as_u64())
+                .map_err(|e| ChainError::InternalError(format!("bad fixture producer: {e}")))
+        };
+        // The staged headers name a fixed schedule hash: the gate binds
+        // the exact (root, hash) pair through the producer signature, so
+        // any consistent value exercises the real check.
+        // For a changed schedule it is the hash of the recorded set (H's
+        // signature commits to it, and the gate requires it).
+        let fixture_sched_hash = pulsevm_database::pack_schedule_hash(
+            header_schedule_version,
+            &order
+                .iter()
+                .map(|&member| {
+                    Ok((
+                        post_producer(member)?,
+                        keys[member].public_key().compressed(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ChainError>>()?,
+        );
+        let first = order[slot_position(halt_slot + 1)];
+        let (post_next, next_id) = pack_post_block(
+            &source_block_id.0.0,
+            halt_slot + 1,
+            post_producer(first)?,
+            &keys[first],
+            header_schedule_version,
+            [0xA1; 32],
+            fixture_sched_hash,
+        )?;
+        let second = order[slot_position(halt_slot + 2)];
+        let (post_last, pause_block_id) = pack_post_block(
+            &next_id,
+            halt_slot + 2,
+            post_producer(second)?,
+            &keys[second],
+            header_schedule_version,
+            [0xB2; 32],
+            fixture_sched_hash,
+        )?;
+        manifest["halt_post_blocks"] = json!([post_next, post_last]);
+        let template = pulsevm_database::HaltConfirmation {
+            version: pulsevm_database::HaltConfirmation::VERSION,
+            declaration_digest: hex::encode(declaration.digest()?),
+            halt_height: source_block_num,
+            // The pair stages two post-H headers below (H+1, H+2), so the
+            // attested pause head is exactly H+2.
+            pause_height: source_block_num
+                .checked_add(2)
+                .ok_or_else(|| ChainError::InternalError("fixture pause head overflows".into()))?,
+            pause_block_id: hex::encode(pause_block_id),
+            halt_block_id: hex::encode(source_block_id.as_bytes()),
+            checkpoint_sha256: checkpoint_hex.to_string(),
+            new_chain_id: hex::encode(new_chain_id),
+            platform_chain_id: hex::encode(platform_chain_id),
+            signatures: Vec::new(),
+        };
+        let conf_digest = template.digest()?;
+        let mut confirmations = Vec::with_capacity(sign_subset.len());
+        for &index in sign_subset {
+            confirmations.push(pulsevm_database::HaltSignature {
+                producer: producers[index].to_string(),
+                key: keys[index].public_key().to_string(),
+                signature: keys[index].sign(&conf_digest).to_string(),
+            });
+        }
+        let confirmation = pulsevm_database::HaltConfirmation {
+            signatures: confirmations,
+            ..template
+        };
+        let prior = source_block_num.saturating_sub(1);
+        let mut votes = Vec::with_capacity(sign_subset.len());
+        for (position, &index) in sign_subset.iter().enumerate() {
+            votes.push(pulsevm_database::HaltContractVote {
+                producer: producers[index].to_string(),
+                block: prior,
+                schedule_version: header_schedule_version,
+                key: keys[index].public_key().to_string(),
+                signature: signatures[position].signature.clone(),
+            });
+        }
+        // Count quorum over the frozen schedule: each member weighs 1, so
+        // the totals are member counts, not vote weights.
+        let ceremony = pulsevm_database::HaltContractCeremony {
+            contract: "cutover".to_string(),
+            declaration_digest: hex::encode(decl_digest),
+            total_weight: pulsevm_chain_types::HaltWeight(producers.len() as u128),
+            voted_weight: pulsevm_chain_types::HaltWeight(sign_subset.len() as u128),
+            finalized: true,
+            finalized_block: prior,
+            init_time: 0,
+            votes,
+        };
+        manifest["halt_declaration"] = serde_json::to_value(&declaration)
+            .map_err(|e| ChainError::InternalError(format!("failed to encode declaration: {e}")))?;
+        manifest["halt_confirmation"] = serde_json::to_value(&confirmation).map_err(|e| {
+            ChainError::InternalError(format!("failed to encode confirmation: {e}"))
+        })?;
+        manifest["halt_contract_ceremony"] = serde_json::to_value(&ceremony)
+            .map_err(|e| ChainError::InternalError(format!("failed to encode ceremony: {e}")))?;
+        manifest["halt_schedule_version"] = json!(header_schedule_version);
+        // The fixture checkpoint carries no proposed schedule (synthetic
+        // state never stages one): attest the absence the gate requires.
+        manifest["halt_proposed_schedule"] = json!(false);
+        // The cutover block entry: H's real header bytes (decoded from the
+        // staged source block), signed over Leap's true digest with H's own
+        // header-state inputs by the schedule key for H's producer. The
+        // gate re-derives the H id from this entry and requires it to
+        // equal the terminal block the confirmation binds.
+        const FIXTURE_H_ROOT: [u8; 32] = [0xC1; 32];
+        let mut position = 0;
+        let decoded = SignedBlock::read(&source_bytes, &mut position).map_err(|error| {
+            ChainError::InternalError(format!("fixture source block cannot be decoded: {error}"))
+        })?;
+        if position != source_bytes.len() {
+            return Err(ChainError::InternalError(
+                "fixture source block has trailing bytes".into(),
+            ));
+        }
+        let halt_header = decoded.signed_block_header.header;
+        let halt_header_bytes = halt_header.pack().map_err(|error| {
+            ChainError::InternalError(format!("fixture H header cannot be packed: {error}"))
+        })?;
+        let halt_header_digest = pulsevm_crypto::Digest::hash(&halt_header_bytes).0;
+        let halt_bound = {
+            let mut digest_and_root = Vec::with_capacity(64);
+            digest_and_root.extend_from_slice(&halt_header_digest);
+            digest_and_root.extend_from_slice(&FIXTURE_H_ROOT);
+            pulsevm_crypto::Digest::hash(&digest_and_root).0
+        };
+        let mut bound_and_schedule = Vec::with_capacity(64);
+        bound_and_schedule.extend_from_slice(&halt_bound);
+        bound_and_schedule.extend_from_slice(&fixture_sched_hash);
+        let halt_digest = pulsevm_crypto::Digest::hash(&bound_and_schedule).0;
+        let halt_producer = halt_header.producer.to_string();
+        let halt_key_index = producers
+            .iter()
+            .position(|name| *name == halt_producer.as_str())
+            .ok_or_else(|| {
+                ChainError::InternalError(format!(
+                    "fixture H producer {halt_producer} is not in the recorded schedule"
+                ))
+            })?;
+        // No counts: the staged source block may carry traffic, which the
+        // H entry does not stage — it proves the anchor, not emptiness.
+        let mut halt_entry = Vec::with_capacity(64 + halt_header_bytes.len() + 98);
+        halt_entry.extend_from_slice(&FIXTURE_H_ROOT);
+        halt_entry.extend_from_slice(&fixture_sched_hash);
+        halt_entry.extend_from_slice(&halt_header_bytes);
+        halt_entry.push(0); // K1 tag
+        halt_entry.extend_from_slice(&keys[halt_key_index].sign(&halt_digest).compact65());
+        halt_entry.extend_from_slice(&source_block_id.0.0);
+        manifest["halt_h_block"] = json!(hex::encode(&halt_entry));
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
+    // Signs the old network's halt commitment over a migration source block
+    // with the schedule key, as the halt ceremony does. When tamper is set
+    // the signature is corrupted to prove the restore fails closed.
+    fn attach_halt_commitment(
+        manifest_path: &str,
+        source_block_num: u32,
+        source_block_id: &Id,
+        schedule_key_wif: &str,
+        tamper: bool,
+    ) -> Result<(), ChainError> {
+        let signing_key = pulsevm_crypto::K1PrivateKey::from_string(schedule_key_wif)
+            .map_err(|e| ChainError::InternalError(format!("bad schedule key: {e:?}")))?;
+        let producer_key = signing_key.public_key().to_string();
+        let digest =
+            pulsevm_database::HaltCommitment::digest(source_block_num, &source_block_id.0.0);
+        let mut signature = signing_key.sign(&digest).to_string();
+        if tamper {
+            signature.pop();
+            signature.push('1');
+        }
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        manifest["halt_commitment"] = json!({
+            "version": 1,
+            "halt_height": source_block_num,
+            "halt_block_id": hex::encode(source_block_id.as_bytes()),
+            "producer_keys": [producer_key.clone()],
+            "signatures": [{
+                "producer": "pulse",
+                "key": producer_key,
+                "signature": signature,
+            }],
+        });
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_builds_with_matching_schedule_key() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        // A realistic head-relative expiry: TimePointSec::maximum() exceeds
+        // the deployment max_transaction_lifetime and is dropped at build.
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.block_num(), source_block_num + 1);
+        assert_eq!(*block.previous_id(), source_block_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_to_produce_with_foreign_schedule_key()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let foreign_key = PrivateKey::random();
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let pair_key = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad fixture schedule key: {e:?}")))?;
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pair_key],
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": foreign_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("bob")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let error = controller.build_block(&mut mempool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "a node without the schedule key must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The two-step pair is mandatory: a manifest carrying only a legacy
+    // halt commitment, and no declaration, refuses to restore.
+    #[tokio::test]
+    async fn migration_restore_rejects_manifest_without_halt_pair() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            _source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        attach_halt_commitment(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("two-step cutover pair"),
+            "a manifest without the pair must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // A corrupted halt commitment fails the restore closed even when the
+    // pair verifies: no signature, no promotion.
+    #[tokio::test]
+    async fn migration_restore_rejects_tampered_halt_commitment() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let pair_keys = [pulse_k1];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &pair_keys,
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &pair_keys,
+            &["pulse"],
+            &[0],
+            false,
+        )?;
+        // Corrupt one commitment signature in place; the rostered quorum no
+        // longer verifies.
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let signature = manifest["halt_commitment"]["signatures"][0]["signature"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("commitment has no signature".into()))?;
+        let mut tampered = signature.to_string();
+        tampered.pop();
+        tampered.push('1');
+        manifest["halt_commitment"]["signatures"][0]["signature"] = json!(tampered);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a tampered commitment must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // Attaches a version 2 checkpoint-bound halt commitment plus a weighted
+    // roster, as the on-chain ceremony exporter does. Only `sign_subset`
+    // indices sign; when `tamper_checkpoint` is set the binding points at a
+    // different checkpoint so the restore must fail closed.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_halt_commitment_v2(
+        manifest_path: &str,
+        source_block_num: u32,
+        source_block_id: &Id,
+        keys: &[pulsevm_crypto::K1PrivateKey],
+        producers: &[&str],
+        sign_subset: &[usize],
+        tamper_checkpoint: bool,
+    ) -> Result<(), ChainError> {
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        let checkpoint_hex = manifest["checkpoint_sha256"]
+            .as_str()
+            .ok_or_else(|| ChainError::InternalError("manifest has no checkpoint hash".into()))?;
+        let mut checkpoint = hex::decode(checkpoint_hex)
+            .map_err(|e| ChainError::InternalError(format!("bad checkpoint hash: {e}")))?;
+        if tamper_checkpoint {
+            checkpoint[0] ^= 0xff;
+        }
+        let checkpoint_arr: [u8; 32] = checkpoint
+            .clone()
+            .try_into()
+            .map_err(|_| ChainError::InternalError("bad checkpoint hash length".into()))?;
+        let digest = pulsevm_database::HaltCommitment::digest_v2(
+            source_block_num,
+            &source_block_id.0.0,
+            &checkpoint_arr,
+        );
+        let mut signatures = Vec::new();
+        for &index in sign_subset {
+            signatures.push(json!({
+                "producer": producers[index],
+                "key": keys[index].public_key().to_string(),
+                "signature": keys[index].sign(&digest).to_string(),
+            }));
+        }
+        // Unit schedule weights: the legacy commitment vehicle tallies the
+        // same count quorum as the pair. Sorted by producer, mirroring the
+        // declaration's member order, so the transport roster matches the
+        // declared set entry-wise regardless of caller order.
+        let mut roster: Vec<serde_json::Value> = keys
+            .iter()
+            .zip(producers.iter())
+            .map(|(key, producer)| {
+                json!({
+                    "producer": producer,
+                    "key": key.public_key().to_string(),
+                    "weight": "1",
+                })
+            })
+            .collect();
+        roster.sort_by(|a, b| {
+            a["producer"]
+                .as_str()
+                .cmp(&b["producer"].as_str())
+                .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+        });
+        manifest["halt_roster"] = json!(roster);
+        manifest["halt_commitment"] = json!({
+            "version": 2,
+            "halt_height": source_block_num,
+            "halt_block_id": hex::encode(source_block_id.as_bytes()),
+            "checkpoint_sha256": hex::encode(&checkpoint),
+            "producer_keys": [],
+            "signatures": signatures,
+        });
+        manifest["version"] = json!(2);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        Ok(())
+    }
+
+    fn halt_v2_keys() -> Result<Vec<pulsevm_crypto::K1PrivateKey>, ChainError> {
+        ["halt-restore-1", "halt-restore-2"]
+            .iter()
+            .map(|seed| {
+                pulsevm_crypto::K1PrivateKey::from_seed_string(seed)
+                    .map_err(|e| ChainError::InternalError(format!("bad test key: {e:?}")))
+            })
+            .collect()
+    }
+
+    // A version 2 checkpoint-bound commitment with a weighted roster quorum
+    // restores and builds: the ceremony path, not just the v1 single key.
+    #[tokio::test]
+    async fn migration_restore_accepts_v2_weighted_quorum() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+        )
+        .await?;
+        // The declared set must equal the full checkpoint schedule, both
+        // ways: pulse produced H, so it is a member of the frozen set.
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &migration_genesis,
+            target_path.to_str().unwrap(),
+        )?;
+        assert_eq!(controller.database().revision(), source_revision);
+        assert_eq!(controller.last_accepted_block().id()?, source_block_id);
+        Ok(())
+    }
+
+    // Paul's attack on the committee: the exporter records and declares a set
+    // it controls (H's real producer plus two outsiders), the outsiders sign
+    // three of three, and the staged window is a plausible empty chain. Every
+    // link the pair verifier walks is internally consistent. The checkpoint,
+    // though, carries the real committee the Leap snapshot stated for H, and
+    // the checkpoint hash is what the fleet agreed on, so the recorded set is
+    // refused at restore.
+    #[tokio::test]
+    async fn migration_restore_refuses_a_forged_committee_the_checkpoint_does_not_carry()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let real = halt_v2_keys()?;
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &real[0]), ("prod.b", &real[1])],
+        )
+        .await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let forged = [
+            pulse_k1,
+            pulsevm_crypto::K1PrivateKey::random(),
+            pulsevm_crypto::K1PrivateKey::random(),
+        ];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &forged,
+            &["pulse", "mal.a", "mal.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("forged-target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a committee the checkpoint does not carry must not boot");
+        assert!(
+            error.to_string().contains("not bound by the checkpoint"),
+            "expected the checkpoint binding to refuse the forged committee, got: {error}"
+        );
+        let _ = source_revision;
+        Ok(())
+    }
+
+    /// Boot a fully valid migration with the locally derived hash replaced by
+    /// `edit`, returning the refusal.
+    async fn migration_boot_refusal(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        migration_boot_refusal_with(edit, |_| {}).await
+    }
+
+    /// As [`migration_boot_refusal`], also editing the migration genesis.
+    async fn migration_boot_refusal_with(
+        edit: impl FnOnce(&mut serde_json::Value),
+        edit_genesis: impl FnOnce(&mut serde_json::Value),
+    ) -> String {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let mut config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        });
+        edit(&mut config);
+        let mut genesis_json: serde_json::Value =
+            serde_json::from_slice(&migration_genesis).unwrap();
+        edit_genesis(&mut genesis_json);
+        let migration_genesis = serde_json::to_vec(&genesis_json).unwrap();
+        let target_path = temp.path().join("self-derivation-target");
+        let mut controller = Controller::new();
+        controller
+            .initialize(
+                &chain_id,
+                &config.to_string().into_bytes(),
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("the boot must be refused")
+            .to_string()
+    }
+
+    // A node restarted before it built its first block finds an arena exactly
+    // at the checkpoint revision; it is reused only after re-deriving the
+    // checkpoint hash from it, and a legitimate restart must pass that.
+    #[tokio::test]
+    async fn migration_restart_at_the_checkpoint_revision_reuses_the_verified_arena() {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("restart-target");
+        let mut first = Controller::new();
+        first
+            .initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect("first boot restores the checkpoint");
+        assert_eq!(first.database().revision(), source_revision);
+        drop(first);
+        let mut again = Controller::new();
+        again
+            .initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect("a restart at the checkpoint revision reuses the verified arena");
+        assert_eq!(again.database().revision(), source_revision);
+    }
+
+    // A boot that restored the checkpoint but never finished verifying it (a
+    // crash) must not leave a database the next start reuses: with no
+    // verified-restore marker the arena is discarded and the next start
+    // restores and verifies from the checkpoint again.
+    #[tokio::test]
+    async fn migration_crash_before_the_restore_is_verified_forces_a_fresh_restore() {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+                .unwrap();
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys().unwrap();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            true,
+        )
+        .await
+        .unwrap();
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .unwrap();
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &[pulse_k1, keys[0].clone(), keys[1].clone()],
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )
+        .unwrap();
+        let config = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("crash-target");
+        let boot = |controller: &mut Controller| {
+            controller.initialize(
+                &chain_id,
+                &config,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+        };
+        let mut first = Controller::new();
+        boot(&mut first).expect("first boot restores and verifies");
+        drop(first);
+        let marker = target_path.join(RESTORE_VERIFIED_MARKER);
+        assert!(marker.exists(), "a verified restore leaves its marker");
+        // Simulate the crash: the arena is on disk, the marker never landed.
+        std::fs::remove_file(&marker).unwrap();
+        let mut second = Controller::new();
+        let error = boot(&mut second).expect_err("an unverified arena must not be reused");
+        assert!(
+            error.to_string().contains("did not finish"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "the unverified arena was not discarded"
+        );
+        // MetalGo may call Shutdown after a failed Initialize: closing the
+        // database must not write the discarded arena back to disk.
+        second.shutdown().expect("shutdown after a refused boot");
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "shutdown re-persisted the arena a refused boot had discarded"
+        );
+        // The next start restores from the checkpoint and verifies it fully.
+        let mut third = Controller::new();
+        boot(&mut third).expect("the restart restores the checkpoint again");
+        assert_eq!(third.database().revision(), source_revision);
+        assert!(marker.exists());
+    }
+
+    // Self-derivation: a delivered checkpoint is only restored when this
+    // operator's own derived hash is configured and equal.
+    #[tokio::test]
+    async fn migration_restore_requires_the_operators_own_checkpoint_hash() {
+        let error = migration_boot_refusal(|config| {
+            config
+                .as_object_mut()
+                .unwrap()
+                .remove("migration_local_checkpoint_sha256");
+        })
+        .await;
+        assert!(
+            error.contains("requires migration_local_checkpoint_sha256"),
+            "expected the missing-local-hash refusal, got: {error}"
+        );
+    }
+
+    // The committee is pinned by a published schedule hash in the genesis: a
+    // genesis without it, or with another, is refused before anything heavy.
+    #[tokio::test]
+    async fn migration_restore_requires_the_published_schedule_pin() {
+        let missing = migration_boot_refusal_with(
+            |_| {},
+            |genesis| {
+                genesis
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("migration_schedule_sha256");
+            },
+        )
+        .await;
+        assert!(
+            missing.contains("carries no migration_schedule_sha256"),
+            "expected the missing-pin refusal, got: {missing}"
+        );
+        let wrong = migration_boot_refusal_with(
+            |_| {},
+            |genesis| {
+                genesis["migration_schedule_sha256"] = json!("cd".repeat(32));
+            },
+        )
+        .await;
+        assert!(
+            wrong.contains("not the published schedule"),
+            "expected the wrong-pin refusal, got: {wrong}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_restore_refuses_a_checkpoint_the_operator_did_not_derive() {
+        let error = migration_boot_refusal(|config| {
+            config["migration_local_checkpoint_sha256"] = json!("ab".repeat(32));
+        })
+        .await;
+        assert!(
+            error.contains("did not derive"),
+            "expected the mismatch refusal, got: {error}"
+        );
+    }
+
+    // A checkpoint converted without the Leap snapshot carries no committee, so
+    // there is nothing for the recorded schedule to be bound to: it refuses.
+    #[tokio::test]
+    async fn migration_restore_refuses_a_checkpoint_without_the_source_schedule()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_options(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+            false,
+        )
+        .await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("unbound-target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a checkpoint with no source schedule must not boot");
+        assert!(
+            error.to_string().contains("no source schedule"),
+            "expected the missing-schedule refusal, got: {error}"
+        );
+        // The refused boot must not leave the restored state behind, or the
+        // next start would reuse it and skip the checks that just failed.
+        assert!(
+            !Database::arena_state_file(&target_path).exists(),
+            "a refused migration boot left restored state on disk"
+        );
+        let mut restarted = Controller::new();
+        let again = restarted
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .expect_err("a restart must be refused the same way");
+        assert!(
+            again.to_string().contains("no source schedule"),
+            "restart took a different path: {again}"
+        );
+        Ok(())
+    }
+
+    // Quorum shortfall on the weighted path refuses promotion: one of three
+    // weight units cannot carry a two-thirds quorum.
+    #[tokio::test]
+    async fn migration_restore_rejects_v2_quorum_shortfall() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let keys = halt_v2_keys()?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(
+            &temp,
+            &schedule_key,
+            &[("prod.a", &keys[0]), ("prod.b", &keys[1])],
+        )
+        .await?;
+        // One of three weight units cannot carry a two-thirds quorum: the
+        // pair itself carries 3/3 (so the failure under test is the
+        // commitment's), while the commitment signs with one member.
+        let all_keys = [pulse_k1, keys[0].clone(), keys[1].clone()];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[0, 1, 2],
+            &chain_id.0.0,
+        )?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &all_keys,
+            &["pulse", "prod.a", "prod.b"],
+            &[2],
+            false,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a quorum shortfall must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // A version 2 commitment bound to a different checkpoint cannot promote
+    // this checkpoint: the binding is cryptographic, not advisory.
+    #[tokio::test]
+    async fn migration_restore_rejects_v2_checkpoint_mismatch() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            source_block_id,
+            source_block_num,
+            _source_revision,
+            source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+            "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+        )
+        .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+        let pair_keys = [pulse_k1];
+        attach_halt_pair(
+            &manifest_path,
+            &mut migration_genesis,
+            &source_chain_id,
+            source_block_num,
+            &source_block_id,
+            &pair_keys,
+            &["pulse"],
+            &[0],
+            &chain_id.0.0,
+        )?;
+        attach_halt_commitment_v2(
+            &manifest_path,
+            source_block_num,
+            &source_block_id,
+            &pair_keys,
+            &["pulse"],
+            &[0],
+            true,
+        )?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("halt commitment"),
+            "a checkpoint mismatch must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // An unsupported manifest version fails closed before any checkpoint is
+    // trusted, even when every other field is well-formed.
+    #[tokio::test]
+    async fn migration_restore_rejects_unsupported_manifest_version() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            mut migration_genesis,
+            chain_id,
+            _source_block_id,
+            _source_block_num,
+            _source_revision,
+            _source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+        manifest["version"] = json!(99);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+            "migration_checkpoint": checkpoint,
+            "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+            "migration_manifest": manifest_path,
+        })
+        .to_string()
+        .into_bytes();
+        let target_path = temp.path().join("target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(
+                &chain_id,
+                &config_bytes,
+                &migration_genesis,
+                target_path.to_str().unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("migration manifest"),
+            "an unsupported manifest version must fail closed, got: {error}"
+        );
+        Ok(())
+    }
+
+    // The bullish rehearsal rotates an account's authority before the halt
+    // and re-checks it after promotion: pin updateauth execution, the path
+    // that pre-halt traffic relies on.
+    #[tokio::test]
+    async fn updateauth_rotates_active_authority() -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let genesis_bytes = generate_genesis(&schedule_key);
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": schedule_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp.path().to_str().unwrap(),
+        )?;
+        let now = TimePointSec::now().sec_since_epoch();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account_with_expiration(
+            &schedule_key,
+            Name::from_str("alice")?,
+            chain_id,
+            TimePointSec::new(now + 1800),
+        )?);
+        let first = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&first.id()?, &mut mempool)?;
+
+        let rotated_key = PrivateKey::random();
+        let rotation = Authority::new(
+            1,
+            vec![KeyWeight::new(rotated_key.get_public_key().into_k1(), 1)],
+            vec![],
+            vec![],
+        );
+        let alice = Name::from_str("alice")?;
+        let rotate = Transaction::new(
+            TransactionHeader::new(
+                TimePointSec::new(now + 1800),
+                0,
+                0,
+                0u32.into(),
+                0,
+                0u32.into(),
+            ),
+            vec![],
+            vec![Action::new(
+                PULSE_NAME,
+                UPDATEAUTH_NAME,
+                UpdateAuth {
+                    account: alice,
+                    permission: ACTIVE_NAME,
+                    parent: Name::from_str("owner")?,
+                    auth: rotation.clone(),
+                }
+                .pack()
+                .unwrap(),
+                vec![PermissionLevel::new(alice.as_u64(), ACTIVE_NAME.as_u64())],
+            )],
+        )
+        .sign(&schedule_key, &chain_id)?;
+        mempool.add_transaction(PackedTransaction::from_signed_transaction(rotate)?);
+        let second = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&second.id()?, &mut mempool)?;
+        assert_eq!(
+            controller
+                .database()
+                .arena_permission_authority(alice.as_u64(), ACTIVE_NAME.as_u64()),
+            Some(rotation)
         );
         Ok(())
     }
@@ -11682,6 +14330,161 @@ mod tests {
                 .database()
                 .is_known_unexpired_transaction(&packed.id().0.0)?
         );
+        Ok(())
+    }
+
+    /// `getAccount` shows the bill through `Controller::subjective_cpu_bill`,
+    /// which reads at the current time like any later transaction would.
+    #[tokio::test]
+    async fn the_rpc_accessor_reports_the_live_subjective_cpu_bill() -> Result<(), ChainError> {
+        let (controller, _private_key, _chain_id, _temp) = init_test_controller()?;
+        let alice = Name::from_str("alice")?;
+        assert_eq!(
+            controller.subjective_cpu_bill(&alice)?,
+            0,
+            "no failures, no bill"
+        );
+
+        let db = controller.database();
+        let now: BlockTimestamp = TimePoint::now().into();
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            5_000_000,
+            0,
+            now.slot(),
+            db.get_account_cpu_usage_average_window()?,
+            db.get_account_net_usage_average_window()?,
+        );
+        let shown = controller.subjective_cpu_bill(&alice)?;
+        assert!(
+            (4_900_000..=5_000_100).contains(&shown),
+            "the bill is shown, give or take decay and the ledger's round-up"
+        );
+        assert_eq!(
+            controller.subjective_cpu_bill(&Name::from_str("bob")?)?,
+            0,
+            "another account carries nothing"
+        );
+        Ok(())
+    }
+
+    /// Execution subtracts a node-local bill (left by the payer's earlier failed
+    /// transactions) from the payer's available CPU, so a payer whose bill
+    /// exceeds its allowance runs with a limit of 0 and everything it sends is
+    /// dropped at block build. Admission has to apply the same bill, or it
+    /// admits the transaction every time and the payer is never told why.
+    #[tokio::test]
+    async fn mempool_admission_applies_the_payers_subjective_bill() -> Result<(), ChainError> {
+        let (mut controller, private_key, _chain_id, _temp) = init_test_controller()?;
+        let ts = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+
+        let alice = Name::from_str("alice")?;
+        let bob = Name::from_str("bob")?;
+        for name in [alice, bob] {
+            controller.execute_transaction(
+                &create_account(&private_key, name, chain_id)?,
+                &ts,
+                &BlockStatus::Building,
+            )?;
+        }
+        // Finite stakes for both, so alice's allowance is a real number.
+        {
+            let mut db = controller.database();
+            db.set_account_limits(bob.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            db.set_account_limits(alice.as_u64(), 8 * 1024, 1_000_000, 1_000_000)?;
+            ResourceLimitsManager::process_account_limit_updates(&mut db)?;
+        }
+        let trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            alice,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("a payer that can afford the transaction is admitted");
+
+        let db = controller.database();
+        let (available, _) = ResourceLimitsManager::get_account_cpu_limit(
+            &db,
+            &alice,
+            Some(MAXIMUM_ELASTIC_RESOURCE_MULTIPLIER),
+        )?;
+        let available = available as u64;
+        let min_cpu = db.chain_config()?.min_transaction_cpu_usage as u64;
+        assert!(
+            available > min_cpu,
+            "the fixture must start with room to spare"
+        );
+        let cpu_window = db.get_account_cpu_usage_average_window()?;
+        let net_window = db.get_account_net_usage_average_window()?;
+        let slot = ts.slot();
+
+        // A bill that leaves a little more than the minimum: still affordable.
+        // (The ledger rounds up, so test with a margin rather than the exact edge.)
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            available - min_cpu - 10,
+            0,
+            slot,
+            cpu_window,
+            net_window,
+        );
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("available CPU just above the minimum is still admitted");
+
+        // A little more and execution would run with less than the minimum.
+        controller.subjective_billing.bill_failure(
+            alice.as_u64(),
+            20,
+            0,
+            slot,
+            cpu_window,
+            net_window,
+        );
+        let error = controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect_err("a payer whose bill leaves under the minimum must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("payer alice cannot afford") && message.contains("node-local bill"),
+            "the refusal must say the bill is the reason: {message}"
+        );
+        // Read at the slot the bill was written (the ledger decays and prunes
+        // by the ordinal it is read at, so a wall-clock read years after this
+        // test chain's genesis would find it fully decayed).
+        let carried = controller
+            .subjective_billing
+            .get_bill(alice.as_u64(), slot, cpu_window, net_window)
+            .cpu;
+        assert!(
+            carried > available - min_cpu,
+            "the ledger carries the bill that explains the refusal"
+        );
+
+        // The bill is per payer: bob is unaffected.
+        let bob_trx = call_contract_as(
+            &private_key,
+            PULSE_NAME,
+            Name::from_str("nop")?,
+            &Vec::<u8>::new(),
+            bob,
+            chain_id,
+        )?;
+        controller
+            .validate_transaction_for_mempool(&bob_trx, &ts)
+            .expect("another payer is not charged for alice's failures");
+
+        // Clearing the ledger (as a restart or reset does) lifts the refusal.
+        controller.subjective_billing.clear();
+        assert_eq!(controller.subjective_cpu_bill(&alice)?, 0);
+        controller
+            .validate_transaction_for_mempool(&trx, &ts)
+            .expect("admitted again once the bill is gone");
         Ok(())
     }
 

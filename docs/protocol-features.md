@@ -18,17 +18,18 @@ those build flags never activate chain behavior. Protocol features are not
 runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
-> **Current status:** the genesis, minimum-supported, and maximum-supported
-> protocol versions are all `1`. Both normal and `nightly` builds therefore
-> report maximum version `1`; `nightly` does not aggregate any unfinished
-> `protocol_feature_*` flag yet. `Baseline` is the only feature, and no
-> post-genesis behavior is gated. Schedule parsing, height selection,
-> fail-closed support checks, and RPC observability are wired, but the feature
-> helper has no production call site yet. A schedule that activates version `2`
-> or later makes the current binary refuse transaction admission, block
-> building, verification, replay, and state-sync application at that height.
-> Do not schedule version `2` until a
-> released binary reports support for it.
+> **Current status:** the genesis and minimum-supported protocol versions are
+> `1`. A normal (stable) build reports maximum version `1`, so `Baseline` is
+> the only feature it implements and no post-genesis behavior is active. A
+> build compiled with `--features nightly` reports maximum version `2` and
+> additionally implements `CpuUnitsInPoints` (see
+> [section 13](#13-cpuunitsinpoints-version-2)). Schedule parsing, height
+> selection, fail-closed support checks, and RPC observability are wired. A
+> schedule that activates a version the binary does not support makes it
+> refuse transaction admission, block building, verification, replay, and
+> state-sync application at that height. Do not schedule version `2` on a
+> chain whose validators run stable builds, and do not schedule it at all until
+> a released binary reports support for it.
 
 The code is authoritative. Start with
 [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
@@ -740,3 +741,75 @@ The feature-to-version pattern is inspired by
 [nearcore's protocol feature model](https://github.com/near/nearcore/blob/53f338792c7eeb0df43a6f37bb55578371bebcba/core/primitives-core/src/version.rs),
 but PulseVM's implementation and this repository's tests define PulseVM's
 behavior.
+
+## 13. `CpuUnitsInPoints` (version 2)
+
+Version 2 carries two changes. This section covers the CPU units; the start
+section rule is at the end of the section.
+
+Two CPU figures that a transaction or a governance call states are in the
+unit the chain bills and limits in, metering points (`POINTS_PER_US` = 38,000
+per microsecond of reference compute), not microseconds. Both rules were wrong
+in the same way before: they treated a microsecond-style number as a point
+count.
+
+| Rule | Before (version 1) | From the activation height (version 2) |
+|---|---|---|
+| A transaction header's `max_cpu_usage_ms` | The byte is a point count: at most 255 points, so the transaction can never pay the 100,000-point minimum bill. | `ms * 1000 * POINTS_PER_US` points, as Leap multiplies by 1000. The header can still only lower the limit, never raise it. |
+| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused ("CPU parameters are metering points, not microseconds"). |
+
+The second rule is a guard against one specific mistake (applying XPR's numbers
+after a migration), not a proof that a configuration is sensible: a
+`min_transaction_cpu_usage` at or above the floor with other caps still in
+microseconds is not detected. After any `setparams`, check `getInfo`
+(`block_cpu_limit`, `virtual_block_cpu_limit`).
+
+Imported XPR transactions that carry a header cap (for example multisig
+proposals) can only execute once the activation height is reached.
+
+**Availability.** Code is behind the Cargo flag
+`protocol_feature_cpu_units_in_points`, collected by `nightly`. A stable build
+does not contain it and reports maximum version 1. To use it on a chain:
+
+1. Run a binary built with `--features nightly` on every validator.
+2. Put `{"protocol_upgrades":[{"protocol_version":2,"activation_height":N}]}` in
+   the chain's upgrade bytes, with `N` after the first block (activation must be
+   strictly after genesis). Every validator must load the same bytes.
+3. Blocks before `N` run the version 1 rules unchanged, because they already
+   ran under them.
+
+For a chain created by the XPR cutover, schedule it at the first height the new
+chain can reach (`N = 2`) so no block ever runs the old rule. Promoting the
+feature to a stable release (raising `STABLE_PROTOCOL_VERSION`, section 9.3) is
+a separate release decision.
+
+Tests: `header_cpu_limit_tests` (`transaction_context.rs`) covers the unit
+conversion on both sides of the activation height;
+`webassembly/tests/privileged.rs` covers the floor, including exactly at
+`POINTS_PER_US`, and that a refused call changes nothing.
+
+### `WasmStartSections` (also version 2)
+
+Before version 2 `setcode` rejects a module that declares a WASM start section.
+XPR accepts them, so contracts compiled for XPR that use one (some toolchains
+emit it for global constructors) could not be redeployed here. From the
+activation height a new `setcode` may declare a start section.
+
+This is safe to allow because the runtime already handled the case: the start
+function is deferred until the module is instantiated for an action and runs
+under the same instruction metering as `apply`, so a start function cannot run
+for free or unbounded. Code installed before activation is unchanged, and
+blocks before the activation height keep refusing start sections, so replay
+agrees on both sides of the boundary.
+
+Code is behind the Cargo flag `protocol_feature_wasm_start_sections`, collected
+by `nightly`. A stable binary that reaches the activation height refuses the
+block ("WASM start sections were not compiled into this binary") rather than
+guessing, so version 2 must only be scheduled on chains whose validators all run
+a nightly build, exactly as for the CPU units.
+
+Tests: `pulsevm_wasm_validation` covers the validator entry point;
+`webassembly/tests/privileged.rs` covers the gate on both sides of the activation
+height; `setcode_with_a_start_section_*` in `controller.rs` deploys and executes
+a start-section contract on a real version 2 chain (nightly) and shows the
+refusal under version 1.
