@@ -628,6 +628,43 @@ fn main() -> ExitCode {
         let right_rows = arena_rows.get(name);
         let left = left_rows.map(|rows| hash_rows(rows));
         let right = right_rows.map(|rows| hash_rows(rows));
+        // global_property is a different byte shape on the two sides by design
+        // (PulseVM has no proposed schedule and no deferred-transaction fields,
+        // 14 bytes shorter), so a byte hash can never match. Compare it field
+        // by field instead, which still fails on any real difference.
+        if name == "global_property" {
+            match (left_rows.map(Vec::as_slice), right_rows.map(Vec::as_slice)) {
+                (Some([(_, source)]), Some([(_, target)])) => {
+                    match pulsevm_database::global_property_rows_equivalent(source, target) {
+                        Ok(ignored) => {
+                            println!(
+                                "table {name}: equal field by field; ignored the Leap-only fields (proposed-schedule prefix, deferred_trx_expiration_window={}, max_transaction_delay={}); nodeos row {} bytes, PulseVM row {} bytes",
+                                ignored.deferred_trx_expiration_window,
+                                ignored.max_transaction_delay,
+                                source.len(),
+                                target.len()
+                            );
+                            if let Some(value) = &right {
+                                report_tables.insert(name.to_owned(), value.clone());
+                            }
+                        }
+                        Err(error) => {
+                            mismatch = true;
+                            eprintln!("table {name}: {error}");
+                        }
+                    }
+                }
+                _ => {
+                    mismatch = true;
+                    eprintln!(
+                        "table {name}: expected exactly one row on each side, nodeos={:?} arena={:?}",
+                        left_rows.map(|rows| rows.len()),
+                        right_rows.map(|rows| rows.len())
+                    );
+                }
+            }
+            continue;
+        }
         if left != right {
             mismatch = true;
             eprintln!("table {name}: nodeos={left:?} arena={right:?}");

@@ -69,9 +69,15 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// The chain-state tables, in the fixed order `create_deltas.cpp` emits them.
 /// A table appears in the stream only when it has entries for the block.
-const TABLE_ORDER: [&str; 16] = [
+///
+/// `contract_index_double` and `contract_index_long_double` belong here, between
+/// `contract_index256` and `global_property`, as in Leap. They were collected
+/// below but left out of this list, so the stream silently dropped every
+/// double-keyed secondary index row even though the state held it: a restored
+/// checkpoint exported with no such table, and an indexer never saw them.
+const TABLE_ORDER: [&str; 18] = [
     "account",
     "account_metadata",
     "code",
@@ -80,6 +86,8 @@ const TABLE_ORDER: [&str; 16] = [
     "contract_index64",
     "contract_index128",
     "contract_index256",
+    "contract_index_double",
+    "contract_index_long_double",
     "global_property",
     "protocol_state",
     "permission",

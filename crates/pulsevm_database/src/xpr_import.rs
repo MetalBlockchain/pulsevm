@@ -3974,7 +3974,7 @@ fn decode_global_property_layout(
 ) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
     let (config, source_chain_id, _) =
         decode_global_property_layout_at(row, has_producer_schedule, legacy_config_fields)?;
-    Ok((config, source_chain_id))
+    Ok((redenominate_cpu_caps(config), source_chain_id))
 }
 
 /// As [`decode_global_property_layout`], also returning the byte offset of the
@@ -4052,7 +4052,7 @@ fn decode_global_property_layout_at(
         }
     }
     row.finish()?;
-    Ok((redenominate_cpu_caps(config), source_chain_id, cpu_offset))
+    Ok((config, source_chain_id, cpu_offset))
 }
 
 /// PulseVM's CPU limits are denominated in metering points (about 1/38000 us
@@ -4146,6 +4146,63 @@ fn redenominate_resource_rows(rows: &mut [PortableRow]) -> Result<(), XprImportE
         }
     }
     Ok(())
+}
+
+/// The Leap-only parts of a source `global_property` row that PulseVM's own row
+/// shape does not carry, as found when the two rows were compared.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IgnoredGlobalPropertyFields {
+    pub deferred_trx_expiration_window: u32,
+    pub max_transaction_delay: u32,
+}
+
+/// Whether a nodeos `global_property` row and PulseVM's export of the same state
+/// agree, field by field, apart from what PulseVM structurally does not have.
+///
+/// The two rows are different byte shapes on purpose. Leap 5 prefixes the chain
+/// config with an optional proposed-schedule block number and a proposed
+/// producer-authority schedule (6 bytes when empty) and carries two
+/// deferred-transaction fields (`deferred_trx_expiration_window`,
+/// `max_transaction_delay`, 8 bytes); PulseVM has no deferred transactions and
+/// keeps its schedule elsewhere, so its row is 14 bytes shorter. A byte compare
+/// can therefore only ever fail on this table, which teaches an operator to
+/// wave a FAILED through. This decodes both with the importer's own decoder and
+/// compares the chain id and every other configuration field (CPU caps
+/// included, after the converter's redenomination), so a real divergence still
+/// fails. The two ignored values are returned so the caller can print them.
+pub fn global_property_rows_equivalent(
+    source: &[u8],
+    target: &[u8],
+) -> Result<IgnoredGlobalPropertyFields, String> {
+    let decode = |name: &str, row: &[u8]| {
+        decode_global_property_as_stored(row)
+            .map_err(|error| format!("{name} global_property row does not decode: {error}"))
+    };
+    let (source_config, source_chain) = decode("nodeos", source)?;
+    let (target_config, target_chain) = decode("PulseVM", target)?;
+    // The nodeos row is in XPR units; the target was converted. Convert the
+    // source the way the importer does and compare against the target as stored.
+    let source_config = redenominate_cpu_caps(source_config);
+    if source_chain != target_chain {
+        return Err(format!(
+            "global_property chain id differs: nodeos {} vs PulseVM {}",
+            hex::encode(source_chain),
+            hex::encode(target_chain)
+        ));
+    }
+    let ignored = IgnoredGlobalPropertyFields {
+        deferred_trx_expiration_window: source_config.deferred_trx_expiration_window,
+        max_transaction_delay: source_config.max_transaction_delay,
+    };
+    let mut expected = source_config;
+    expected.deferred_trx_expiration_window = target_config.deferred_trx_expiration_window;
+    expected.max_transaction_delay = target_config.max_transaction_delay;
+    if expected != target_config {
+        return Err(format!(
+            "global_property configuration differs beyond the Leap-only fields:\n  nodeos (redenominated): {expected:?}\n  PulseVM:                {target_config:?}"
+        ));
+    }
+    Ok(ignored)
 }
 
 /// Apply the converter's CPU redenomination to the raw SHiP rows of a source
@@ -4247,6 +4304,33 @@ fn global_property_cpu_offset(bytes: &[u8]) -> Result<usize, XprImportError> {
         }
         match decode_global_property_layout_at(row, has_schedule, legacy_fields) {
             Ok((_, _, offset)) => return Ok(offset),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.expect("three layouts were attempted"))
+}
+
+/// Decode a `global_property` row exactly as stored, with the CPU caps left as
+/// they are (no redenomination). The importer's own decoder converts them, which
+/// is right for importing but would hide a wrong cap if used to *check* a
+/// converted state.
+fn decode_global_property_as_stored(
+    bytes: &[u8],
+) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
+    // The same three layouts, in the same order, as `decode_global_property`.
+    let mut first_error = None;
+    for (has_schedule, legacy_fields) in [(true, false), (true, true), (false, true)] {
+        let mut row = RowCursor::new(bytes);
+        let version = row.varuint()?;
+        if version != 1 {
+            return Err(bad(format!(
+                "unsupported XPR global_property version {version}"
+            )));
+        }
+        match decode_global_property_layout_at(row, has_schedule, legacy_fields) {
+            Ok((config, chain_id, _)) => return Ok((config, chain_id)),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -5936,6 +6020,155 @@ mod tests {
             db.arena_idx_long_double_payer(code, scope, table, 71),
             Some(payer)
         );
+
+        // The rows must also survive what a node actually does with a
+        // checkpoint: snapshot it, restore it into a fresh database, and
+        // export it. The table compare reads the restored state, so a table
+        // lost in persistence would show up there as "no rows on the target".
+        db.set_revision(7).unwrap();
+        let snapshot = db.snapshot_bytes().unwrap();
+        let restore_dir = TempDir::new().unwrap();
+        let mut restored =
+            Database::new(restore_dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        restored.add_indices().unwrap();
+        let snapshot_path = restore_dir.path().join("checkpoint.snapshot");
+        std::fs::write(&snapshot_path, &snapshot).unwrap();
+        restored.restore_from_path(&snapshot_path).unwrap();
+        assert_eq!(
+            restored.arena_idx_double_payer(code, scope, table, 70),
+            Some(payer),
+            "the double secondary index row must survive snapshot and restore"
+        );
+        assert_eq!(
+            restored.arena_idx_long_double_payer(code, scope, table, 71),
+            Some(payer)
+        );
+        let exported = restored.pack_deltas(true, &[0u8; 32]);
+        for (name, rows) in [
+            ("contract_index64", 1),
+            ("contract_index128", 1),
+            ("contract_index256", 1),
+            ("contract_index_double", 1),
+            ("contract_index_long_double", 1),
+        ] {
+            assert_eq!(
+                exported_row_count(&exported, name),
+                Some(rows),
+                "{name} in the exported state"
+            );
+        }
+    }
+
+    /// The rows of one table in a framed SHiP delta export, or `None` if the
+    /// table is absent from it.
+    fn exported_rows(bytes: &[u8], table: &str) -> Option<Vec<Vec<u8>>> {
+        fn uvar(bytes: &[u8], pos: &mut usize) -> usize {
+            let (mut value, mut shift) = (0usize, 0);
+            loop {
+                let byte = bytes[*pos];
+                *pos += 1;
+                value |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
+        let mut pos = 0;
+        let tables = uvar(bytes, &mut pos);
+        for _ in 0..tables {
+            assert_eq!(uvar(bytes, &mut pos), 0, "delta version");
+            let name_len = uvar(bytes, &mut pos);
+            let name = std::str::from_utf8(&bytes[pos..pos + name_len]).unwrap();
+            pos += name_len;
+            let row_count = uvar(bytes, &mut pos);
+            let mut rows = Vec::new();
+            for _ in 0..row_count {
+                pos += 1; // present flag
+                let len = uvar(bytes, &mut pos);
+                rows.push(bytes[pos..pos + len].to_vec());
+                pos += len;
+            }
+            if name == table {
+                return Some(rows);
+            }
+        }
+        None
+    }
+
+    fn exported_row_count(bytes: &[u8], table: &str) -> Option<usize> {
+        exported_rows(bytes, table).map(|rows| rows.len())
+    }
+
+    /// A real Leap 5 `global_property` row (157 bytes) and PulseVM's export of
+    /// the same configuration (143 bytes).
+    fn leap_and_pulse_global_property_rows() -> (Vec<u8>, Vec<u8>) {
+        let leap = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
+        let PortableRow::GlobalProperty {
+            config,
+            source_chain_id,
+        } = decode_global_property(&leap).unwrap()
+        else {
+            panic!("expected global_property row");
+        };
+        let dir = TempDir::new().unwrap();
+        let db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        db.set_global_properties(&config).unwrap();
+        let exported = db.pack_deltas(true, &source_chain_id);
+        let mut rows =
+            exported_rows(&exported, "global_property").expect("global_property is exported");
+        assert_eq!(rows.len(), 1);
+        (leap, rows.remove(0))
+    }
+
+    #[test]
+    fn leap_and_pulse_global_property_rows_are_equivalent_apart_from_the_leap_only_fields() {
+        let (leap, pulse) = leap_and_pulse_global_property_rows();
+        assert_eq!(leap.len(), 157);
+        assert_eq!(
+            pulse.len(),
+            143,
+            "PulseVM's row is the 14-byte-shorter shape"
+        );
+        assert_ne!(leap, pulse, "a byte compare cannot succeed on this table");
+        let ignored = global_property_rows_equivalent(&leap, &pulse).expect("equivalent");
+        assert_eq!(
+            ignored,
+            IgnoredGlobalPropertyFields {
+                deferred_trx_expiration_window: 600,
+                max_transaction_delay: 3_888_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_real_global_property_divergence_still_fails_the_equivalence() {
+        let (leap, pulse) = leap_and_pulse_global_property_rows();
+
+        // Another chain id.
+        let mut other_chain = pulse.clone();
+        let chain_at = other_chain.len() - 32 - 1 - 44;
+        other_chain[chain_at] ^= 0xff;
+        let error = global_property_rows_equivalent(&leap, &other_chain).unwrap_err();
+        assert!(error.contains("chain id"), "{error}");
+
+        // A configuration field the two must agree on: the first byte of
+        // max_block_net_usage, right after the two version bytes.
+        let mut other_config = pulse.clone();
+        other_config[2] ^= 0x01;
+        let error = global_property_rows_equivalent(&leap, &other_config).unwrap_err();
+        assert!(error.contains("configuration differs"), "{error}");
+
+        // The converted CPU caps are compared, not skipped.
+        let mut other_cap = pulse.clone();
+        let cap_at = 2 + 8 + 4 * 6; // max_block_cpu_usage
+        other_cap[cap_at] ^= 0x01;
+        let error = global_property_rows_equivalent(&leap, &other_cap).unwrap_err();
+        assert!(error.contains("configuration differs"), "{error}");
+
+        // Garbage on either side is an error, not a pass.
+        assert!(global_property_rows_equivalent(&leap, &[1, 2, 3]).is_err());
+        assert!(global_property_rows_equivalent(&[], &pulse).is_err());
     }
 
     #[test]

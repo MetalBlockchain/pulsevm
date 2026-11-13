@@ -83,6 +83,7 @@ pub use crate::{
     xpr_import::{
         DeferredTransactionSidecar,
         DeferredTransactionSidecarRow,
+        IgnoredGlobalPropertyFields,
         ImportSummary,
         InputTransactionSidecarRow,
         MigrationHaltRosterEntry,
@@ -103,6 +104,7 @@ pub use crate::{
         check_halt_roster_against_state,
         check_no_arena_deferred_due_in_window,
         check_no_deferred_due_in_window,
+        global_property_rows_equivalent,
         hydrate_full_state,
         hydrate_full_state_with_deferred_transactions,
         inspect_state_history_log,
