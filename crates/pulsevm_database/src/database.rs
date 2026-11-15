@@ -887,12 +887,24 @@ pub use speculation::{
     SpeculativeWave,
 };
 
+/// Result of replaying the write-ahead log when a database was opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalRecovery {
+    /// Accepted blocks reapplied on top of the checkpoint.
+    pub blocks_recovered: usize,
+    /// The log ended in a partial record, which was discarded.
+    pub torn_tail_discarded: bool,
+}
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
     /// and restore at the same path without threading the config back down from
     /// the controller.
     path: String,
+    /// What opening this directory had to repair after an unclean stop, for the
+    /// controller to report. Zero for a clean open.
+    wal_recovery: WalRecovery,
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
@@ -1000,6 +1012,13 @@ const SHARED_MEMORY_FILE: &str = "arena_snapshot.bin";
 /// survives a restart (including a state-synced node, whose block log does not
 /// start at genesis).
 const ARENA_STATE_FILE: &str = "arena_state.bin";
+/// Changes since the last checkpoint, one framed record per accepted block. A
+/// clean shutdown folds them into the checkpoint; a crash is recovered by
+/// replaying them onto it.
+const ARENA_WAL_FILE: &str = "arena_wal.bin";
+/// Past this size the next flush writes a new checkpoint instead, so the log
+/// (and the replay after a crash) stays bounded.
+pub const DEFAULT_ARENA_WAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const ARENA_METADATA_FILE: &str = "arena_metadata.json";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1065,10 +1084,15 @@ impl Database {
         // restart, or a state-synced node). A fresh directory starts empty and the
         // controller authors genesis.
         let state_file = Path::new(path).join(ARENA_STATE_FILE);
+        let mut wal_recovery = WalRecovery::default();
         if state_file.exists() {
             backend
                 .reload_from(&state_file)
                 .map_err(|e| format!("arena reload {}: {e:?}", state_file.display()))?;
+            // A node that was killed has a log of the blocks accepted since
+            // the checkpoint. Without a checkpoint to apply it to, a log is
+            // meaningless, so it is only read next to one.
+            wal_recovery = Self::recover_wal(&backend, Path::new(path))?;
         }
         let protocol_records = match fs::read(Path::new(path).join(PROTOCOL_RECORDS_FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1078,6 +1102,7 @@ impl Database {
         };
         Ok(Database {
             path: path.to_string(),
+            wal_recovery,
             backend,
             system_accounts,
             native_system_contract: metadata
@@ -1095,6 +1120,91 @@ impl Database {
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
             ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
         })
+    }
+
+    /// Replay the write-ahead log onto the checkpoint just loaded and cut off a
+    /// torn final frame so later appends land on a clean boundary.
+    fn recover_wal(
+        backend: &crate::backend::ChainDatabase,
+        dir: &Path,
+    ) -> Result<WalRecovery, String> {
+        let wal = dir.join(ARENA_WAL_FILE);
+        let replay = backend
+            .replay_log_after(&wal, backend.revision())
+            .map_err(|e| format!("arena write-ahead log {}: {e:?}", wal.display()))?;
+        if replay.torn_tail {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .map_err(|e| format!("open {} to trim: {e}", wal.display()))?;
+            file.set_len(replay.valid_len)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("trim {}: {e}", wal.display()))?;
+        }
+        Ok(WalRecovery {
+            blocks_recovered: replay.frames_applied,
+            torn_tail_discarded: replay.torn_tail,
+        })
+    }
+
+    pub fn wal_recovery(&self) -> WalRecovery {
+        self.wal_recovery
+    }
+
+    fn wal_file(&self) -> Option<std::path::PathBuf> {
+        (!self.path.is_empty()).then(|| Path::new(&self.path).join(ARENA_WAL_FILE))
+    }
+
+    /// Remove the log. Only valid right after the checkpoint file was replaced
+    /// by one that already contains everything the log held (or that replaces
+    /// it wholesale, as state sync does): a log left behind would be replayed
+    /// onto a state it does not follow.
+    fn discard_wal(&self) -> Result<(), ChainError> {
+        let Some(wal) = self.wal_file() else {
+            return Ok(());
+        };
+        match fs::remove_file(&wal) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ChainError::InternalError(format!(
+                "remove {}: {e}",
+                wal.display()
+            ))),
+        }
+    }
+
+    /// Make the committed arena durable: the checkpoint file, then drop the
+    /// log it supersedes. A crash between the two leaves a log of frames the
+    /// checkpoint already covers, which recovery skips by revision.
+    pub fn checkpoint_to_disk(&self) -> Result<(), ChainError> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir)
+            .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
+        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
+            .map_err(ChainError::InternalError)?;
+        self.backend
+            .checkpoint(&dir.join(ARENA_STATE_FILE))
+            .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))?;
+        self.discard_wal()
+    }
+
+    /// Append what the last accepted block changed to the log and fsync it, so
+    /// a kill right after leaves the node able to restart at this block. Once
+    /// the log grows past `max_wal_bytes`, write a new checkpoint instead.
+    /// Call with no open undo session: the delta is cut from live state.
+    /// A database with no directory (unit tests) has nothing to make durable.
+    pub fn arena_flush_wal(&self, max_wal_bytes: u64) -> Result<(), ChainError> {
+        let Some(wal) = self.wal_file() else {
+            return Ok(());
+        };
+        let size = fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        if size >= max_wal_bytes {
+            return self.checkpoint_to_disk();
+        }
+        self.arena_flush_delta(&wal)
     }
 
     /// Clone this database handle with an isolated dependency recorder.
@@ -2627,17 +2737,7 @@ impl Database {
         // Persist the committed arena to disk so the next open reloads it, matching
         // chainbase's mapped `shared_memory.bin`. The directory may not exist yet
         // for a never-opened default database, so create it first.
-        if self.path.is_empty() {
-            return Ok(());
-        }
-        let dir = Path::new(&self.path);
-        fs::create_dir_all(dir)
-            .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
-        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
-            .map_err(ChainError::InternalError)?;
-        self.backend
-            .checkpoint(&dir.join(ARENA_STATE_FILE))
-            .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))
+        self.checkpoint_to_disk()
     }
 
     /// Capture a snapshot of the committed arena state, wrapped in the transport
@@ -2654,8 +2754,10 @@ impl Database {
             ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
         })?;
         let file = dir.join(SHARED_MEMORY_FILE);
+        // Export only: the write-ahead log must still see every change made
+        // before this call, so the flush bookkeeping stays as it is.
         self.backend
-            .checkpoint(&file)
+            .checkpoint_unmarked(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
         let snapshot = Self::read_sparse_snapshot(&file, revision);
         let _ = fs::remove_file(&file);
@@ -2675,8 +2777,10 @@ impl Database {
             ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
         })?;
         let file = dir.join(SHARED_MEMORY_FILE);
+        // Export only: the write-ahead log must still see every change made
+        // before this call, so the flush bookkeeping stays as it is.
         self.backend
-            .checkpoint(&file)
+            .checkpoint_unmarked(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
         let result = Self::stream_snapshot_sha256(&file, revision);
         let _ = fs::remove_file(&file);
@@ -2812,6 +2916,8 @@ impl Database {
         staged.persist(&dest).map_err(|e| {
             ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
         })?;
+        // The restored state replaces everything, including what the log held.
+        self.discard_wal()?;
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
@@ -2901,6 +3007,8 @@ impl Database {
         staged.persist(&dest).map_err(|e| {
             ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
         })?;
+        // The restored state replaces everything, including what the log held.
+        self.discard_wal()?;
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
@@ -8257,6 +8365,7 @@ impl Default for Database {
     fn default() -> Self {
         Self {
             path: String::new(),
+            wal_recovery: WalRecovery::default(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
             system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
             native_system_contract: true,

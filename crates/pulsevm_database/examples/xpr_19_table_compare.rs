@@ -638,9 +638,14 @@ fn main() -> ExitCode {
                     match pulsevm_database::global_property_rows_equivalent(source, target) {
                         Ok(ignored) => {
                             println!(
-                                "table {name}: equal field by field; ignored the Leap-only fields (proposed-schedule prefix, deferred_trx_expiration_window={}, max_transaction_delay={}); nodeos row {} bytes, PulseVM row {} bytes",
+                                "table {name}: equal field by field; ignored the Leap-only fields (proposed-schedule prefix, deferred_trx_expiration_window={}, max_transaction_delay={}); {}; nodeos row {} bytes, PulseVM row {} bytes",
                                 ignored.deferred_trx_expiration_window,
                                 ignored.max_transaction_delay,
+                                if ignored.wasm_configuration_compared {
+                                    "the eleven WASM limits were compared and match"
+                                } else {
+                                    "the nodeos row states no WASM limits (older format), so none were compared"
+                                },
                                 source.len(),
                                 target.len()
                             );

@@ -357,6 +357,63 @@ mod protocol_v2 {
         );
     }
 
+    fn apply(h: &mut Host, min: u32, tx: u32, block: u32) -> Result<(), RuntimeError> {
+        let mut cfg = h.db.chain_config().unwrap();
+        cfg.min_transaction_cpu_usage = min;
+        cfg.max_transaction_cpu_usage = tx;
+        cfg.max_block_cpu_usage = block;
+        let packed = cfg.pack().unwrap();
+        h.write(OUT, &packed);
+        set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32)
+    }
+
+    // Paul's finding: mainnet's global row holds a 200,000 block cap and a
+    // 150,000 transaction cap (microseconds). A proposal that copies the row and
+    // only raises the minimum bill to 38,000 passes the floor and leaves every
+    // cap a few microseconds of compute: block_cpu_limit 200,000, and every
+    // ordinary transaction (s1check bills 362,028) is dropped.
+    #[test]
+    fn a_proposal_that_only_raises_the_minimum_is_refused_and_changes_nothing() {
+        let mut h = v2_host();
+        let before = h.db.chain_config().unwrap().pack().unwrap();
+        let error = apply(&mut h, 38_000, 150_000, 200_000)
+            .expect_err("microsecond caps under a point-denominated minimum must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("max_transaction_cpu_usage 150000")
+                && text.contains("min_transaction_cpu_usage 38000")
+                && text.contains("metering points"),
+            "the refusal names the cap, the minimum and the unit mistake: {text}"
+        );
+        assert_eq!(
+            h.db.chain_config().unwrap().pack().unwrap(),
+            before,
+            "a refused call changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_transaction_cap_must_be_at_least_a_hundred_minimum_bills() {
+        let min = 38_000u32;
+        let floor = 100 * min;
+        for (tx, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
+            let mut h = v2_host();
+            // The chain already requires the transaction cap to sit below the
+            // block cap minus the minimum bill, so give the block cap room and
+            // it is never the binding one.
+            let result = apply(&mut h, min, tx, tx + min + 1);
+            assert_eq!(result.is_ok(), accepted, "max_transaction_cpu_usage = {tx}");
+        }
+    }
+
+    #[test]
+    fn the_converted_chains_own_figures_are_far_above_the_guard() {
+        // 3e9 / 1e9 / 100,000 is what the migration converter writes: a ratio
+        // of 10,000 against the minimum, a hundred times the guard.
+        let mut h = v2_host();
+        apply(&mut h, 100_000, 1_000_000_000, 3_000_000_000).unwrap();
+    }
+
     #[test]
     fn the_floor_is_exactly_one_microsecond_of_metering() {
         let floor = crate::config::POINTS_PER_US as u32;

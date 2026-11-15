@@ -233,6 +233,26 @@ struct PauseState {
     nodeos_url: String,
     host_header: String,
     producer_api_url: String,
+    /// The ceremony contract, so a degraded voter can ask the chain whether this
+    /// round is still the finalized one. Absent in a state written before it was
+    /// recorded; that state can be enforced but not verified.
+    #[serde(default)]
+    contract: Option<String>,
+}
+
+/// How a recorded state relates to the round a config describes.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordedRound {
+    /// No usable record.
+    None,
+    /// The same round. `identical` is false when only the endpoints moved, in
+    /// which case the record is rewritten with the new ones.
+    ThisRound { identical: bool },
+    /// The same declaration, but P or the schedule version differ. Neither is
+    /// covered by the declaration's quorum, so no vote agreed to the change.
+    Changed(PauseState),
+    /// A different declaration: an earlier round, now replaced.
+    Other(PauseState),
 }
 
 impl PauseState {
@@ -254,13 +274,60 @@ impl PauseState {
             nodeos_url: config.inner.nodeos_url.clone(),
             host_header: config.inner.host_header.clone(),
             producer_api_url: stop.producer_api_url.clone()?,
+            contract: Some(config.inner.contract.clone()),
         })
+    }
+
+    /// Same ceremony: the declaration digest (which covers H and the member
+    /// set), the chain and this producer.
+    fn same_declaration(&self, config: &LoadedConfig) -> bool {
+        Self::from_config(config).is_some_and(|expected| {
+            self.digest == expected.digest
+                && self.source_chain_id == expected.source_chain_id
+                && self.producer == expected.producer
+                && self.height == expected.height
+        })
+    }
+
+    /// Same ceremony and the same parameters the fleet acts on. P and the
+    /// schedule version are outside the digest, so the declaration's quorum does
+    /// not cover them; only matching confirmations do.
+    fn same_round(&self, config: &LoadedConfig) -> bool {
+        self.same_declaration(config)
+            && Self::from_config(config).is_some_and(|expected| {
+                self.pause_height == expected.pause_height
+                    && self.schedule_version == expected.schedule_version
+            })
     }
 
     /// Whether this recorded state belongs to the round `config` describes.
     fn describes(&self, config: &LoadedConfig) -> bool {
         Self::from_config(config).is_some_and(|expected| *self == expected)
     }
+}
+
+fn classify_recorded_round(path: &std::path::Path, config: &LoadedConfig) -> RecordedRound {
+    let Some(state) = read_pause_state(path) else {
+        return RecordedRound::None;
+    };
+    if state.describes(config) {
+        RecordedRound::ThisRound { identical: true }
+    } else if state.same_round(config) {
+        RecordedRound::ThisRound { identical: false }
+    } else if state.same_declaration(config) {
+        RecordedRound::Changed(state)
+    } else {
+        RecordedRound::Other(state)
+    }
+}
+
+/// Move a record of an earlier round aside, keeping it for the audit trail: it
+/// is evidence that a pause was once armed, and must not be silently deleted.
+fn supersede_pause_state(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let aside = path.with_extension("finalized.superseded");
+    std::fs::rename(path, &aside)
+        .map_err(|error| format!("move {} aside: {error}", path.display()))?;
+    Ok(aside)
 }
 
 /// The recorded state, or `None` if the file is absent, unreadable, not this
@@ -2422,6 +2489,42 @@ fn poll_interval_secs(poll_secs: u64, head_num: u32, height: u32, pause_holding:
     }
 }
 
+/// Write the pause state once this voter's ceremony is seen finalized.
+///
+/// A dry run never writes it: it enforces nothing, and a record it left would
+/// make a later degraded start pause the real producer. A failed write is an
+/// alarm, because until it lands a restart forgets the pause.
+fn persist_pause_state(
+    config: &LoadedConfig,
+    dry_run: bool,
+    persisted: &mut bool,
+    note: &mut String,
+    polls: &mut u64,
+) {
+    if dry_run {
+        *persisted = true;
+        return;
+    }
+    let Some(state) = PauseState::from_config(config) else {
+        *persisted = true;
+        return;
+    };
+    match write_pause_state(&config.finalized_marker, &state) {
+        Ok(()) => {
+            *persisted = true;
+            log_line!("pause state saved to {}", config.finalized_marker.display());
+        }
+        Err(error) => note_throttled(
+            note,
+            polls,
+            &format!(
+                "ALARM event=cutover.pause_state_unsaved producer={} outcome=failure: could not save the pause state, will retry every poll; until it lands a restart or a config failure forgets the pause: {error}",
+                config.inner.producer
+            ),
+        ),
+    }
+}
+
 async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(), String> {
     validate_stop_config(&config.inner.stop_producer)?;
     // The agreed pause head is validated at startup, but the loop takes it
@@ -2437,15 +2540,62 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
     // Restored from the state file, but only if it describes exactly this round,
     // so a restart does not drop the fallback pause until one chain read
     // succeeds and a different round never inherits it.
-    let mut finalized_seen =
-        read_pause_state(&config.finalized_marker).is_some_and(|state| state.describes(config));
-    let mut state_persisted = finalized_seen;
+    let mut finalized_seen = false;
+    let mut state_persisted = false;
     let mut state_note = String::new();
-    if finalized_seen {
-        log_line!(
-            "ceremony finalization restored from {}",
-            config.finalized_marker.display()
-        );
+    match classify_recorded_round(&config.finalized_marker, config) {
+        RecordedRound::None => {}
+        RecordedRound::ThisRound { identical } => {
+            finalized_seen = true;
+            // Rewritten with the current endpoints when they moved.
+            state_persisted = identical;
+            log_line!(
+                "ceremony finalization restored from {}",
+                config.finalized_marker.display()
+            );
+        }
+        RecordedRound::Changed(old) => {
+            // The ceremony quorum voted on a declaration that says nothing about
+            // P or the schedule version. If this voter already armed a pause for
+            // the old values, the rest of the fleet may be paused at them;
+            // signing a confirmation for different ones would be a vote nobody
+            // agreed to. Make the operator acknowledge the change.
+            return Err(format!(
+                "{} records this declaration finalized with P={} and schedule version {}, but the config now says P={} and schedule version {}. P and the schedule version are not covered by the declaration's quorum, so the change is not agreed. If every voter really is moving to the new values, move {} aside (it is kept as the record) and restart; otherwise restore the old values",
+                config.finalized_marker.display(),
+                old.pause_height,
+                old.schedule_version,
+                config.inner.pause_height.unwrap_or(0),
+                config.inner.schedule_version,
+                config.finalized_marker.display()
+            ));
+        }
+        RecordedRound::Other(old) => {
+            // A different declaration is a new round. The old record must not
+            // outlive it: a later config failure would enforce an abandoned
+            // round's P on a live chain.
+            if dry_run {
+                log_line!(
+                    "DRY RUN: {} records an earlier round (P={}); a real run would move it aside",
+                    config.finalized_marker.display(),
+                    old.pause_height
+                );
+            } else {
+                match supersede_pause_state(&config.finalized_marker) {
+                    Ok(aside) => log_line!(
+                        "{} recorded an earlier round (P={}); this config describes a different declaration, so it was moved to {}",
+                        config.finalized_marker.display(),
+                        old.pause_height,
+                        aside.display()
+                    ),
+                    Err(error) => {
+                        return Err(format!(
+                            "an earlier round's record cannot be moved aside ({error}): refusing to run with it in place, because a later config failure would enforce its pause"
+                        ));
+                    }
+                }
+            }
+        }
     }
     if let Some(error) = &config.fed_inputs_error {
         log_line!(
@@ -2491,6 +2641,18 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                             log_line!("producer pause failed, retrying: {pause_error}");
                         }
                     }
+                }
+                // The state file is what lets a restart (or a broken config) keep
+                // the pause. A failed write must keep being retried while the
+                // chain reads fail too, or a restart in that window loses it.
+                if finalized_seen && !state_persisted {
+                    persist_pause_state(
+                        config,
+                        dry_run,
+                        &mut state_persisted,
+                        &mut state_note,
+                        &mut polls,
+                    );
                 }
                 tokio::time::sleep(Duration::from_secs(config.inner.poll_secs)).await;
                 continue;
@@ -2599,24 +2761,17 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
         // read failure does not lose it).
         if own_finalized(config, &view) {
             finalized_seen = true;
-            // Keep trying until the write lands: a read-only config directory
-            // is fixed by an operator some time after the first failure.
-            if !state_persisted {
-                match PauseState::from_config(config) {
-                    Some(state) => match write_pause_state(&config.finalized_marker, &state) {
-                        Ok(()) => {
-                            state_persisted = true;
-                            log_line!("pause state saved to {}", config.finalized_marker.display());
-                        }
-                        Err(error) => note_throttled(
-                            &mut state_note,
-                            &mut polls,
-                            &format!("could not save the pause state, will retry: {error}"),
-                        ),
-                    },
-                    None => state_persisted = true,
-                }
-            }
+        }
+        // Keep trying until the write lands: a read-only config directory is
+        // fixed by an operator some time after the first failure.
+        if finalized_seen && !state_persisted {
+            persist_pause_state(
+                config,
+                dry_run,
+                &mut state_persisted,
+                &mut state_note,
+                &mut polls,
+            );
         }
         if !dry_run
             && finalized_seen
@@ -2843,7 +2998,51 @@ fn degraded_plan(config_path: &str, load_error: &str) -> DegradedPlan {
 
 /// Hold the producer paused using only the recorded state: no keys, no
 /// roster, no ceremony reads. Runs until killed (or `max_polls`, for tests).
-async fn run_pause_only(state: &PauseState, max_polls: u64) -> Result<(), String> {
+/// Whether the chain still shows the recorded round as the finalized ceremony.
+#[derive(Debug, PartialEq, Eq)]
+enum RoundStatus {
+    /// The chain says this is the finalized ceremony the state was armed for.
+    Armed,
+    /// The chain shows something else: the round was replaced or never stood.
+    Replaced(String),
+    /// Could not tell (old record, unreadable table). Enforce: pausing for a
+    /// round that may be abandoned is the lesser failure next to letting a
+    /// producer build past a P the fleet really agreed.
+    Unverifiable(String),
+}
+
+async fn recorded_round_status(client: &reqwest::Client, state: &PauseState) -> RoundStatus {
+    let Some(contract) = &state.contract else {
+        return RoundStatus::Unverifiable(
+            "the record predates contract recording, so it cannot be checked against the chain"
+                .to_string(),
+        );
+    };
+    let rows = match get_table_rows(client, &state.nodeos_url, contract, "ceremony").await {
+        Ok(rows) => rows,
+        Err(error) => return RoundStatus::Unverifiable(error),
+    };
+    let Some(row) = rows.first() else {
+        return RoundStatus::Replaced("the chain holds no ceremony".to_string());
+    };
+    match parse_ceremony_row(row) {
+        Err(error) => RoundStatus::Unverifiable(error),
+        Ok(ceremony)
+            if ceremony.finalized
+                && ceremony.digest == state.digest
+                && ceremony.h == state.height
+                && ceremony.source_chain_id == state.source_chain_id =>
+        {
+            RoundStatus::Armed
+        }
+        Ok(ceremony) => RoundStatus::Replaced(format!(
+            "the chain's ceremony is declaration {} at H={} (finalized={}), not the recorded {} at H={}",
+            ceremony.digest, ceremony.h, ceremony.finalized, state.digest, state.height
+        )),
+    }
+}
+
+async fn run_pause_only(state: &PauseState, dry_run: bool, max_polls: u64) -> Result<(), String> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::HOST,
@@ -2866,7 +3065,39 @@ async fn run_pause_only(state: &PauseState, max_polls: u64) -> Result<(), String
         }
         match get_info(&client, &state.nodeos_url).await {
             Ok((head, _, chain_id)) if chain_id == state.source_chain_id => {
-                if head >= state.pause_height {
+                // The record may belong to a round that has since been replaced
+                // (an aborted round re-declared). Ask the chain before
+                // enforcing a pause on a live producer, every poll, so a round
+                // replaced while this voter runs stops being enforced too.
+                match recorded_round_status(&client, state).await {
+                    RoundStatus::Armed => {}
+                    RoundStatus::Replaced(why) => {
+                        log_line!(
+                            "ALARM event=cutover.voter_stale_state producer={} outcome=failure: the recorded round is no longer the finalized ceremony on chain ({why}); not enforcing its pause. Fix the config and restart the voter for the current round",
+                            state.producer
+                        );
+                        return Err(format!(
+                            "the recorded round is no longer the finalized ceremony on chain: {why}"
+                        ));
+                    }
+                    RoundStatus::Unverifiable(why) => note_throttled(
+                        &mut last_note,
+                        &mut polls,
+                        &format!(
+                            "could not confirm the recorded round on chain ({why}); enforcing it anyway"
+                        ),
+                    ),
+                }
+                if head >= state.pause_height && dry_run {
+                    note_throttled(
+                        &mut last_note,
+                        &mut polls,
+                        &format!(
+                            "DRY RUN: would pause the local producer at P={} (head {head}) from the recorded state; nothing was sent",
+                            state.pause_height
+                        ),
+                    );
+                } else if head >= state.pause_height {
                     match pause_producer(&client, &state.producer_api_url).await {
                         Ok(()) => {
                             if !holding {
@@ -2960,7 +3191,11 @@ async fn main() -> ExitCode {
                         state.producer,
                         finalized_marker_path(&config_path).display()
                     );
-                    match run_pause_only(&state, max_polls).await {
+                    // The flag works here too. A config that does not parse
+                    // cannot say whether it asked for a dry run, so only the
+                    // command line and a config that does parse count.
+                    let dry = dry_run || load_config(&config_path).is_ok_and(|raw| raw.dry_run);
+                    match run_pause_only(&state, dry, max_polls).await {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(error) => {
                             eprintln!("xpr_cutover_voter: {error}");
@@ -4296,7 +4531,7 @@ mod tests {
         let mut live = state.clone();
         live.nodeos_url = url.clone();
         live.producer_api_url = url;
-        run_pause_only(&live, 2).await.unwrap();
+        run_pause_only(&live, false, 2).await.unwrap();
         assert_eq!(pause_calls(&seen), 2, "the pause is re-asserted every poll");
 
         // Head before P: nothing to pause yet.
@@ -4307,7 +4542,7 @@ mod tests {
         let mut early = state.clone();
         early.nodeos_url = url.clone();
         early.producer_api_url = url;
-        run_pause_only(&early, 2).await.unwrap();
+        run_pause_only(&early, false, 2).await.unwrap();
         assert_eq!(pause_calls(&seen), 0, "never pauses before P");
 
         // A node on another chain is not paused on the record's say-so.
@@ -4315,8 +4550,312 @@ mod tests {
         let mut foreign = state.clone();
         foreign.nodeos_url = url.clone();
         foreign.producer_api_url = url;
-        run_pause_only(&foreign, 2).await.unwrap();
+        run_pause_only(&foreign, false, 2).await.unwrap();
         assert_eq!(pause_calls(&seen), 0, "never pauses a different chain");
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("voter-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An armed config whose state file lives in `dir` and whose node refuses
+    /// connections, so every chain read fails fast.
+    fn offline_config(dir: &std::path::Path) -> LoadedConfig {
+        let mut config = armed_config();
+        config.finalized_marker = dir.join("voter.json.finalized");
+        config.inner.nodeos_url = "http://127.0.0.1:1".to_string();
+        config.inner.poll_secs = 0;
+        config
+    }
+
+    #[test]
+    fn a_recorded_round_is_classified_against_the_config() {
+        let dir = scratch_dir("classify");
+        let config = offline_config(&dir);
+        let path = &config.finalized_marker;
+        let state = PauseState::from_config(&config).unwrap();
+
+        assert_eq!(
+            classify_recorded_round(path, &config),
+            RecordedRound::None,
+            "no file"
+        );
+        write_pause_state(path, &state).unwrap();
+        assert_eq!(
+            classify_recorded_round(path, &config),
+            RecordedRound::ThisRound { identical: true }
+        );
+
+        // Only the endpoints moved: still this round, rewritten with the new ones.
+        let mut moved = offline_config(&dir);
+        moved.inner.nodeos_url = "http://127.0.0.1:2".to_string();
+        assert_eq!(
+            classify_recorded_round(path, &moved),
+            RecordedRound::ThisRound { identical: false }
+        );
+
+        // The same declaration with a different P or schedule version: the
+        // quorum on the declaration does not cover either.
+        let mut other_p = offline_config(&dir);
+        other_p.inner.pause_height = Some(other_p.inner.pause_height.unwrap() + 1);
+        assert_eq!(
+            classify_recorded_round(path, &other_p),
+            RecordedRound::Changed(state.clone())
+        );
+        let mut other_schedule = offline_config(&dir);
+        other_schedule.inner.schedule_version += 1;
+        assert!(matches!(
+            classify_recorded_round(path, &other_schedule),
+            RecordedRound::Changed(_)
+        ));
+
+        // A different declaration is a new round.
+        let mut other_round = offline_config(&dir);
+        other_round.expected_digest[0] ^= 1;
+        assert_eq!(
+            classify_recorded_round(path, &other_round),
+            RecordedRound::Other(state)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Paul changed P by one with the same declaration and the voter signed a
+    // different confirmation: the declaration's quorum says nothing about P.
+    #[tokio::test]
+    async fn a_changed_pause_height_for_a_finalized_declaration_is_refused() {
+        let dir = scratch_dir("changed-p");
+        let config = offline_config(&dir);
+        write_pause_state(
+            &config.finalized_marker,
+            &PauseState::from_config(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut changed = offline_config(&dir);
+        changed.inner.pause_height = Some(changed.inner.pause_height.unwrap() + 1);
+        let error = run(&changed, false, 1).await.unwrap_err();
+        assert!(
+            error.contains("not covered by the declaration's quorum"),
+            "{error}"
+        );
+        assert!(
+            config.finalized_marker.exists(),
+            "the record is left in place for the operator to move"
+        );
+        // A dry run refuses too: it is read-only and the message is the point.
+        assert!(run(&changed, true, 1).await.is_err());
+        // Acknowledged by moving it aside, the new value runs.
+        std::fs::rename(
+            &config.finalized_marker,
+            dir.join("voter.json.finalized.acknowledged"),
+        )
+        .unwrap();
+        run(&changed, false, 1).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A record of an earlier round must not survive a new declaration, or a
+    // later config failure would enforce an abandoned round's pause.
+    #[tokio::test]
+    async fn a_new_declaration_moves_the_earlier_record_aside() {
+        let dir = scratch_dir("superseded");
+        let old = offline_config(&dir);
+        let old_state = PauseState::from_config(&old).unwrap();
+        write_pause_state(&old.finalized_marker, &old_state).unwrap();
+
+        let mut next = offline_config(&dir);
+        next.expected_digest[0] ^= 1;
+        // A dry run leaves it alone.
+        run(&next, true, 1).await.unwrap();
+        assert!(old.finalized_marker.exists());
+
+        run(&next, false, 1).await.unwrap();
+        assert!(
+            !old.finalized_marker.exists(),
+            "the next config failure must find no record of the old round"
+        );
+        let aside = dir.join("voter.json.finalized.superseded");
+        assert_eq!(
+            read_pause_state(&aside),
+            Some(old_state),
+            "kept as the audit record"
+        );
+        // And so a degraded start for the new round has nothing to enforce.
+        assert!(matches!(
+            degraded_plan(
+                &old.finalized_marker
+                    .to_string_lossy()
+                    .replace(".finalized", ""),
+                "x"
+            ),
+            DegradedPlan::Refuse(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The dry-run voter enforces nothing, so it must not leave the record that
+    // would make a later degraded start pause the real producer.
+    #[test]
+    fn a_dry_run_never_writes_the_pause_state() {
+        let dir = scratch_dir("dry-persist");
+        let config = offline_config(&dir);
+        let (mut persisted, mut note, mut polls) = (false, String::new(), 1u64);
+        persist_pause_state(&config, true, &mut persisted, &mut note, &mut polls);
+        assert!(persisted, "nothing is owed");
+        assert!(!config.finalized_marker.exists());
+
+        let mut persisted = false;
+        persist_pause_state(&config, false, &mut persisted, &mut note, &mut polls);
+        assert!(persisted);
+        assert!(read_pause_state(&config.finalized_marker).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The write is retried on every poll, including polls where the chain reads
+    // fail. It used to be retried only after a successful read, so a write that
+    // failed once and reads that then failed left nothing on disk.
+    #[tokio::test]
+    async fn the_pause_state_write_is_retried_while_chain_reads_fail() {
+        let dir = scratch_dir("retry-offline");
+        let recorded = offline_config(&dir);
+        let mut earlier = PauseState::from_config(&recorded).unwrap();
+        // The record on disk predates an endpoint change, so this round must
+        // rewrite it, which it can only do from the failing-reads branch.
+        earlier.nodeos_url = "http://old-node:8888".to_string();
+        write_pause_state(&recorded.finalized_marker, &earlier).unwrap();
+        assert_ne!(
+            read_pause_state(&recorded.finalized_marker),
+            PauseState::from_config(&recorded)
+        );
+
+        run(&recorded, false, 2).await.unwrap();
+        assert_eq!(
+            read_pause_state(&recorded.finalized_marker),
+            PauseState::from_config(&recorded),
+            "rewritten although no chain read ever succeeded"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn ceremony_row(state: &PauseState, finalized: bool, digest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "h": state.height,
+            "source_chain_id": state.source_chain_id,
+            "schedule_version": state.schedule_version,
+            "finalized": finalized,
+            "declaration_digest": digest,
+            "init_time": "1700000000000000",
+        })
+    }
+
+    // Paul's finding: with the previous round's file and a broken config the
+    // voter enforced the previous round's P. It now asks the chain whether the
+    // recorded round is still the finalized one.
+    #[tokio::test]
+    async fn the_degraded_voter_stops_enforcing_a_round_the_chain_no_longer_shows() {
+        let state = PauseState::from_config(&armed_config()).unwrap();
+        let serve = |ceremony: Option<serde_json::Value>, head: u32| {
+            let chain = state.source_chain_id.clone();
+            move |path: &str, _: &serde_json::Value| match path {
+                "/v1/chain/get_info" => serde_json::json!({
+                    "head_block_num": head,
+                    "last_irreversible_block_num": head.saturating_sub(5),
+                    "chain_id": chain,
+                }),
+                "/v1/chain/get_table_rows" => match &ceremony {
+                    Some(row) => serde_json::json!({"rows": [row]}),
+                    None => serde_json::json!({"rows": []}),
+                },
+                "/v1/producer/paused" => serde_json::json!(true),
+                _ => serde_json::json!({}),
+            }
+        };
+        let pauses = |seen: &std::sync::Mutex<Vec<String>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/v1/producer/pause")
+                .count()
+        };
+        let at = |url: &str| {
+            let mut live = state.clone();
+            live.nodeos_url = url.to_string();
+            live.producer_api_url = url.to_string();
+            live
+        };
+        let past_p = state.pause_height + 3;
+
+        // The chain still shows exactly this round finalized: enforce.
+        let (url, seen) = spawn_http_server(serve(
+            Some(ceremony_row(&state, true, &state.digest)),
+            past_p,
+        ));
+        run_pause_only(&at(&url), false, 2).await.unwrap();
+        assert_eq!(pauses(&seen), 2);
+
+        // A different declaration is now the ceremony: the recorded round was
+        // replaced. Stop, and never touch the producer.
+        let (url, seen) = spawn_http_server(serve(
+            Some(ceremony_row(&state, true, &"ab".repeat(32))),
+            past_p,
+        ));
+        let error = run_pause_only(&at(&url), false, 5).await.unwrap_err();
+        assert!(
+            error.contains("no longer the finalized ceremony"),
+            "{error}"
+        );
+        assert_eq!(pauses(&seen), 0, "an abandoned round is not enforced");
+
+        // The same declaration but not finalized, and no ceremony at all, are
+        // both "not the finalized round".
+        let (url, seen) = spawn_http_server(serve(
+            Some(ceremony_row(&state, false, &state.digest)),
+            past_p,
+        ));
+        assert!(run_pause_only(&at(&url), false, 5).await.is_err());
+        assert_eq!(pauses(&seen), 0);
+        let (url, seen) = spawn_http_server(serve(None, past_p));
+        assert!(run_pause_only(&at(&url), false, 5).await.is_err());
+        assert_eq!(pauses(&seen), 0);
+
+        // A record that cannot be checked (written before the contract was
+        // recorded) is enforced rather than dropped.
+        let (url, seen) = spawn_http_server(serve(None, past_p));
+        let mut legacy = at(&url);
+        legacy.contract = None;
+        run_pause_only(&legacy, false, 2).await.unwrap();
+        assert_eq!(pauses(&seen), 2);
+    }
+
+    // The degraded voter used to call the real pause API even under --dry-run.
+    #[tokio::test]
+    async fn the_degraded_voter_honours_dry_run() {
+        let state = PauseState::from_config(&armed_config()).unwrap();
+        let chain = state.source_chain_id.clone();
+        let (url, seen) = spawn_http_server(move |path: &str, _: &serde_json::Value| match path {
+            "/v1/chain/get_info" => serde_json::json!({
+                "head_block_num": 500,
+                "last_irreversible_block_num": 495,
+                "chain_id": chain,
+            }),
+            _ => serde_json::json!({}),
+        });
+        let mut live = state.clone();
+        live.nodeos_url = url.clone();
+        live.producer_api_url = url;
+        live.contract = None;
+        run_pause_only(&live, true, 3).await.unwrap();
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.starts_with("/v1/producer/")),
+            "a dry run never touches the producer API"
+        );
     }
 
     fn armed_stop() -> StopConfig {

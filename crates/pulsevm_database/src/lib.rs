@@ -34,6 +34,7 @@ pub use crate::{
         ContractPrimaryKey,
         ContractPrimaryOverlay,
         ContractTableRamBilling,
+        DEFAULT_ARENA_WAL_MAX_BYTES,
         Database,
         DbRead,
         PermissionInfo,
@@ -43,6 +44,7 @@ pub use crate::{
         SpeculativeTransaction,
         SpeculativeWave,
         SystemAccountNames,
+        WalRecovery,
         restore_snapshot,
     },
     dependency::{

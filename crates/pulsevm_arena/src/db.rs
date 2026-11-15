@@ -82,6 +82,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DbError> {
 }
 
 /// Appends `[len][frame]` to the log and fsyncs.
+/// What [`Db::replay_log_after`] did with a write-ahead log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalReplay {
+    pub frames_applied: usize,
+    /// Frames already covered by the checkpoint the log was replayed onto.
+    pub frames_skipped: usize,
+    /// End of the last complete frame; everything after it is a torn write.
+    pub valid_len: u64,
+    pub torn_tail: bool,
+}
+
 fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -392,6 +403,23 @@ impl Db {
     /// leaves the previous checkpoint intact. Marks the tables flushed, so a
     /// following [`Db::flush_delta`] only records changes made after this.
     pub fn checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        self.write_checkpoint(path.as_ref())?;
+        for table in &mut self.tables {
+            table.mark_flushed();
+        }
+        Ok(())
+    }
+
+    /// Writes the same checkpoint as [`Db::checkpoint`] but leaves the flush
+    /// bookkeeping alone. Use it to export state (a snapshot for a peer, a hash)
+    /// from a database whose write-ahead log is live: marking the tables flushed
+    /// there would make the next [`Db::flush_delta`] skip every change made
+    /// before the export.
+    pub fn checkpoint_unmarked(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        self.write_checkpoint(path.as_ref())
+    }
+
+    fn write_checkpoint(&self, path: &Path) -> Result<(), DbError> {
         let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
         ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
 
@@ -408,11 +436,7 @@ impl Db {
             let len = (out.len() - start) as u64;
             out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
         }
-        write_atomic(path.as_ref(), &out)?;
-        for table in &mut self.tables {
-            table.mark_flushed();
-        }
-        Ok(())
+        write_atomic(path, &out)
     }
 
     /// Back-compat alias for [`Db::checkpoint`].
@@ -510,6 +534,74 @@ impl Db {
             self.set_revision(rev)?;
         }
         Ok(())
+    }
+
+    /// Replays the write-ahead log at `path` on top of state already loaded
+    /// at `after_revision` (a checkpoint). Frames at or below that revision are
+    /// already in the state and are skipped, so a log that outlived a newer
+    /// checkpoint is harmless. The frames that remain must follow on without a
+    /// gap, one revision at a time: a missing frame means lost changes, and
+    /// applying the later ones over it would build state no node agrees on.
+    ///
+    /// A torn final frame (a crash during the last flush) is ignored. The
+    /// returned `valid_len` is where the last complete frame ends, so the caller
+    /// can cut the file there before appending again; appending after the torn
+    /// bytes would hide every later frame behind a bad length prefix.
+    pub fn replay_log_after(
+        &mut self,
+        path: impl AsRef<Path>,
+        after_revision: i64,
+    ) -> Result<WalReplay, DbError> {
+        let data = match std::fs::read(path.as_ref()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WalReplay::default());
+            }
+            Err(e) => return Err(DbError::Io(e.to_string())),
+        };
+        let mut outcome = WalReplay::default();
+        let mut pos = 0usize;
+        let mut last_revision = after_revision;
+        let mut applied_any = false;
+        while pos < data.len() {
+            let Some(frame_len) = try_read_u64(&data, pos) else {
+                break; // torn length prefix
+            };
+            let frame_start = pos + 8;
+            let Some(frame_end) = usize::try_from(frame_len)
+                .ok()
+                .and_then(|len| frame_start.checked_add(len))
+                .filter(|end| *end <= data.len())
+            else {
+                break; // torn frame (or an impossible length)
+            };
+            let frame = &data[frame_start..frame_end];
+            let mut fp = 0usize;
+            let revision = read_i64(frame, &mut fp)?;
+            if revision <= after_revision {
+                outcome.frames_skipped += 1;
+            } else {
+                if revision != last_revision + 1 {
+                    return Err(DbError::Corrupted(format!(
+                        "write-ahead log jumps from revision {last_revision} to {revision}"
+                    )));
+                }
+                self.apply_frame(frame)?;
+                last_revision = revision;
+                applied_any = true;
+                outcome.frames_applied += 1;
+            }
+            pos = frame_end;
+        }
+        if applied_any {
+            for table in &mut self.tables {
+                table.mark_flushed();
+            }
+            self.set_revision(last_revision)?;
+        }
+        outcome.valid_len = pos as u64;
+        outcome.torn_tail = pos < data.len();
+        Ok(outcome)
     }
 
     fn apply_frame(&mut self, frame: &[u8]) -> Result<(), DbError> {

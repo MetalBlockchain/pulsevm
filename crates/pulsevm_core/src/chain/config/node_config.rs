@@ -75,6 +75,17 @@ pub struct NodeConfig {
     /// The database applies a hard upper bound to prevent unbounded labels.
     #[serde(default)]
     pub ram_usage_monitor_max_series: usize,
+    /// Size at which the arena's write-ahead log is folded into a new
+    /// checkpoint. The log is what lets a node killed between clean shutdowns
+    /// restart at its last accepted block; the checkpoint rewrites all state,
+    /// so this is the one place a long-running node pauses to write it. Lower
+    /// it to bound crash-recovery replay, raise it to checkpoint less often.
+    #[serde(default = "default_arena_wal_max_bytes")]
+    pub arena_wal_max_bytes: u64,
+}
+
+fn default_arena_wal_max_bytes() -> u64 {
+    pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
 }
 
 fn default_db_size() -> u64 {
@@ -112,6 +123,19 @@ mod tests {
         assert!(cfg.state_history_enabled);
         assert!(!cfg.allow_replay_recovery);
         assert_eq!(cfg.ram_usage_monitor_max_series, 0);
+        assert_eq!(
+            cfg.arena_wal_max_bytes,
+            pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_threshold_is_configurable() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","arena_wal_max_bytes":1048576}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.arena_wal_max_bytes, 1_048_576);
     }
 
     #[test]

@@ -58,7 +58,7 @@ safe rollout into a chain halt.
 | `GENESIS_PROTOCOL_VERSION` | Protocol version used before the first scheduled upgrade. It is currently `1`. |
 | `MIN_SUPPORTED_PROTOCOL_VERSION` | Oldest chain protocol this binary can execute. It is currently `1`. |
 | `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `1`. |
-| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `1`. |
+| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `2`. |
 | `PROTOCOL_VERSION` | Newest version this particular binary can execute: stable maximum normally, nightly maximum in a `nightly` build. It is not the version active at the current head. |
 | `protocol_feature_*` Cargo feature | Temporary compile-time gate that includes one unfinished implementation. It does not activate the implementation. |
 | `nightly` Cargo feature | Aggregate compile-time gate for all unfinished protocol implementations. It is unrelated to the Rust nightly toolchain. |
@@ -440,11 +440,10 @@ rollout normally means two rolling restarts: one to deploy supporting code, then
 one to load the canonical schedule. Leave enough time between those phases to
 verify every node before activation.
 
-With the code currently in this branch, no post-genesis upgrade can safely
-activate: a target must be greater than genesis version `1`, while this binary's
-maximum is still `1`. The parser accepts a future entry before activation, but
-the supporting binary must be deployed before that height. There is no released
-version-2 behavior yet.
+Version 2 exists only in a `nightly` build (section 13); a stable binary's
+maximum is still `1`, so a stable binary cannot activate it. The parser accepts a
+future entry before activation, but the supporting binary must be deployed
+before that height. There is no stable release of version 2 yet.
 
 ## 9. Adding a protocol feature
 
@@ -756,13 +755,19 @@ count.
 | Rule | Before (version 1) | From the activation height (version 2) |
 |---|---|---|
 | A transaction header's `max_cpu_usage_ms` | The byte is a point count: at most 255 points, so the transaction can never pay the 100,000-point minimum bill. | `ms * 1000 * POINTS_PER_US` points, as Leap multiplies by 1000. The header can still only lower the limit, never raise it. |
-| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused ("CPU parameters are metering points, not microseconds"). |
+| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused, and so is a `max_transaction_cpu_usage` under 100 times the minimum ("CPU parameters are metering points, not microseconds"). The block cap must already exceed the transaction cap, so the second rule bounds both. |
 
-The second rule is a guard against one specific mistake (applying XPR's numbers
-after a migration), not a proof that a configuration is sensible: a
-`min_transaction_cpu_usage` at or above the floor with other caps still in
-microseconds is not detected. After any `setparams`, check `getInfo`
-(`block_cpu_limit`, `virtual_block_cpu_limit`).
+The second rule guards against one specific mistake (applying XPR's numbers after
+a migration), not a proof that a configuration is sensible. Both checks are
+needed: XPR's global row holds a 200,000 block cap and a 150,000 transaction cap
+(microseconds), and a proposal that copies the row and raises only the minimum to
+38,000 clears the first check while leaving caps of a few microseconds, so every
+ordinary transaction is dropped (Paul Grey measured `block_cpu_limit` 200,000 and
+`s1check` failing on every node). The multiple, 100, is far below any real ratio:
+the converted chain's figures (3,000,000,000 / 1,000,000,000 / 100,000) are
+10,000 times the minimum. A configuration that passes can still be wrong, for
+example every figure scaled by the same wrong factor. After any `setparams`,
+check `getInfo` (`block_cpu_limit`, `virtual_block_cpu_limit`).
 
 Imported XPR transactions that carry a header cap (for example multisig
 proposals) can only execute once the activation height is reached.
@@ -773,15 +778,41 @@ does not contain it and reports maximum version 1. To use it on a chain:
 
 1. Run a binary built with `--features nightly` on every validator.
 2. Put `{"protocol_upgrades":[{"protocol_version":2,"activation_height":N}]}` in
-   the chain's upgrade bytes, with `N` after the first block (activation must be
-   strictly after genesis). Every validator must load the same bytes.
+   the chain's upgrade bytes. Every validator must load the same bytes.
 3. Blocks before `N` run the version 1 rules unchanged, because they already
    ran under them.
 
-For a chain created by the XPR cutover, schedule it at the first height the new
-chain can reach (`N = 2`) so no block ever runs the old rule. Promoting the
-feature to a stable release (raising `STABLE_PROTOCOL_VERSION`, section 9.3) is
-a separate release decision.
+**Choosing `N`.** An upgrade can only activate strictly after the height the
+chain started from, because the blocks up to that height ran somewhere else
+under other rules and no activation record for it can exist.
+
+| Chain | Started from | Smallest valid `N` |
+|---|---|---|
+| Fresh genesis | block 1 | 2 |
+| Restored from a migration checkpoint (the cutover chain) | `H`, the source block | `H + 1` |
+| State-synced node | the synced height, with the network's records | the network's schedule, unchanged |
+
+For the cutover chain that means `N = H + 1`, the first block the new chain
+produces, so no block ever runs the old rule. `N = 2` does not work there: it is
+at or below `H`, no record of it exists in the restored state, and every node
+refuses to boot with "configured protocol upgrade schedule does not match the 0
+activation record(s) persisted at chain height H". The message now also says
+which scheduled upgrades were never recorded and to use `H + 1`
+(`a_restored_chain_activates_version_two_at_h_plus_one_not_before`). Paul Grey
+ran this on five nodes: with `N = H+1`, `getInfo` showed `protocol_version` 1 and
+`next_protocol_upgrade {2, H+1}` before any transaction, and version 2 from
+`H+1` with the same schedule hash on all five.
+
+**The upgrade bytes are not bound to the genesis.** A validator started with
+empty or different bytes boots and runs the version 1 rules, which is a consensus
+split from the first block under version 2. The only thing an operator can
+compare is `getInfo.protocol_upgrade_schedule_hash`; check that it is identical
+on every node before the cut (the agent does, before LIVE). A node whose bytes
+disagree with the activation history already recorded in its state is refused at
+boot, so the split can only come from a node that has not yet passed activation.
+
+Promoting the feature to a stable release (raising `STABLE_PROTOCOL_VERSION`,
+section 9.3) is a separate release decision.
 
 Tests: `header_cpu_limit_tests` (`transaction_context.rs`) covers the unit
 conversion on both sides of the activation height;

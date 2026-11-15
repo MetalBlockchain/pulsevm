@@ -302,6 +302,24 @@ with no double-keyed secondary index rows although the state held them (a
 snapshot, restore and export round trip is now a test). Indexers reading the
 state-history stream see them too.
 
+`generated_transaction` was missing for the same reason, and a real snapshot
+showed it: mainnet at block 413,240,693 has 20 pending deferred transactions, the
+importer kept all 20 (from the chainbase sidecar), and the compare reported "20
+rows on nodeos, none in the arena" because the exporter had no slot for them. A
+fixture chain with no deferred transactions could not show it. The exporter now
+lists all 19 tables, and it debug-asserts that its table list and the tables it
+builds agree, so the next omission fails every test that exports instead of one
+comparison on a real snapshot.
+
+`global_property` also carries Leap's eleven `wasm_configuration` limits
+(`max_call_depth`, `max_module_bytes`, ...). PulseVM's are a build constant, so
+a source chain that changed one would migrate under limits it never ran with:
+contracts valid there could be refused here. The importer now refuses such a
+source ("XPR wasm_configuration differs from Pulse's fixed WASM limits (...)"),
+and the compare checks the eleven fields instead of skipping them (its line says
+whether they were compared; an older row format that states none is reported as
+such).
+
 ### Calibration of the factor
 
 The factor is a ratio of block caps, not a measurement of cost per microsecond.
@@ -414,6 +432,46 @@ equivalents.
    rostered signer) is archived with the manifest so any node can
    re-verify the gate decision offline later.
 
+## A node that is killed
+
+Paul Grey sent `kill -9` to a target node twelve minutes after the cut and it
+refused to start with `database revision 732011 does not match block log end
+732032`. The arena reached disk only on a clean shutdown, so a kill left the
+state at the restore revision while the block log (appended on every accepted
+block) had moved on, and the only recovery was an offline replay opt-in.
+
+Now every accepted block's state change is appended to `arena_wal.bin` in the
+database directory and fsynced, after the block log and the in-memory commit. On
+start the node loads `arena_state.bin` and replays the log onto it, so it comes
+back at its last accepted block with the exact state it had (the state root is
+compared in the tests). What to expect:
+
+- **Normal kill.** The start logs `the previous run did not shut down cleanly:
+  recovered N accepted block(s) from the arena write-ahead log`. Nothing to do.
+- **Killed between the block-log append and the state flush.** The block log is
+  one block ahead of a state that is otherwise intact. The node drops that one
+  block (it is re-fetched from peers) and starts, without the offline-replay
+  opt-in. State-history logs are rewound by the same block.
+- **Killed during the write.** A partial final record is discarded and the log is
+  trimmed to the last complete one before anything is appended.
+- **A clean stop** folds the log into the checkpoint and removes it.
+- **Bounded size.** When the log passes `arena_wal_max_bytes` (default 4 GiB) the
+  next block writes a new checkpoint instead and starts the log over. At
+  mainnet size that checkpoint is a pause of some seconds on that block, once per
+  threshold; lower the value to bound replay time after a crash, raise it to
+  checkpoint less often.
+- **A directory from before the log existed**, or one whose log was lost, is a
+  real mismatch if the gap is more than one block, and still needs the
+  offline-replay opt-in (`allow_replay_recovery`) or a fresh state sync.
+- A state-sync snapshot being served from a running node does not disturb the
+  log (exporting a checkpoint no longer resets its bookkeeping); installing a
+  synced state replaces the log with the new checkpoint.
+
+The tests kill a node by dropping the controller without closing it, on a fresh
+chain and on a chain restored from a migration checkpoint, repeatedly, with a
+torn final record, between the block-log append and the flush, and with a
+snapshot export in the middle.
+
 ## The voter after a failure: restart, degraded mode, state file
 
 - **A config fix needs a restart.** The voter reads its config at start. Fixing
@@ -423,11 +481,25 @@ equivalents.
   refuses to sign until it is restarted with the corrected file.
 - **State file.** Once the voter sees its own ceremony finalized it writes
   `<config>.finalized` (JSON). It is bound to the declaration digest, H, P, the
-  schedule version, the source chain id, the producer and the node and producer
-  API addresses, so a re-init that agrees a different P or schedule does not
-  start out "finalized": it needs its own quorum. The config directory must be
-  writable; a failed write is logged and retried every poll until it lands. A
-  file in the old format (a bare digest) is ignored and rewritten.
+  schedule version, the source chain id, the producer, the node and producer API
+  addresses and the ceremony contract. The config directory must be writable. A
+  failed write logs `ALARM event=cutover.pause_state_unsaved` and is retried on
+  every poll, including polls where the chain reads fail, until it lands: until
+  then a restart or a broken config forgets the pause. A file in the old format
+  (a bare digest) is ignored and rewritten. A dry run never writes it: it
+  enforces nothing, and a record it left would make a later degraded start pause
+  the real producer.
+- **A different declaration retires the old record.** If the config describes a
+  different declaration than the record (an aborted round re-declared), the
+  voter moves the old file to `<config>.finalized.superseded` at start and keeps
+  it as the audit record. Otherwise a later config failure would enforce an
+  abandoned round's P on a live chain.
+- **A changed P or schedule version is refused.** The declaration's quorum covers
+  H and the member set but not P or the schedule version. If the record says
+  this declaration finalized with P and the config now says P+1, the voter
+  refuses to start rather than sign a confirmation nobody agreed to: the fleet
+  may already be paused at the old P. If every voter really is moving to the new
+  value, move the state file aside (it stays as the record) and restart.
 - **A config that stops loading keeps the pause.** If the config cannot be
   loaded after the voter recorded a finalized round (malformed JSON, an
   unreadable key file, a failed validation), the voter does not exit: exiting
@@ -438,3 +510,16 @@ equivalents.
   that parses (an explicit stop), and the absence of a recorded round (the pause
   was never armed). `--preflight`, `--status` and `--print-digest` still exit 1
   on a bad config.
+- **Degraded mode checks the record against the chain.** Each poll it reads the
+  ceremony table (it needs only the node URL and the contract name from the
+  record) and enforces the pause only while the chain still shows that
+  declaration finalized. If the chain shows a different declaration, an
+  unfinalized one or none, it logs `ALARM event=cutover.voter_stale_state`, does
+  not touch the producer and exits 1, so a stale record cannot pause a live
+  chain. If the table cannot be read (or the record predates the contract field)
+  it enforces anyway: pausing for a round that may be abandoned is the lesser
+  failure next to letting a producer build past a P the fleet agreed.
+- **`--dry-run` applies to degraded mode.** The command-line flag (or
+  `dry_run` in a config that parses) makes it log what it would pause and send
+  nothing. A config that does not parse cannot say it asked for a dry run, so
+  only the flag counts then.

@@ -3972,8 +3972,9 @@ fn decode_global_property_layout(
     has_producer_schedule: bool,
     legacy_config_fields: bool,
 ) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
-    let (config, source_chain_id, _) =
+    let (config, source_chain_id, _, wasm_configuration) =
         decode_global_property_layout_at(row, has_producer_schedule, legacy_config_fields)?;
+    check_wasm_configuration(wasm_configuration)?;
     Ok((redenominate_cpu_caps(config), source_chain_id))
 }
 
@@ -3984,7 +3985,7 @@ fn decode_global_property_layout_at(
     mut row: RowCursor<'_>,
     has_producer_schedule: bool,
     legacy_config_fields: bool,
-) -> Result<(ChainConfigV0, [u8; 32], usize), XprImportError> {
+) -> Result<(ChainConfigV0, [u8; 32], usize, SourceWasmConfiguration), XprImportError> {
     if has_producer_schedule {
         // proposed_schedule_block_num is optional<uint32>.
         if row.bool()? {
@@ -4040,6 +4041,7 @@ fn decode_global_property_layout_at(
     let source_chain_id = row.fixed::<32>()?;
     // `wasm_configuration` is a binary extension in Leap 5: it has no
     // presence boolean, and is simply absent in the XPR-core pinned format.
+    let mut wasm_configuration = None;
     if row.remaining() != 0 {
         let wasm_version = row.varuint()?;
         if wasm_version != 0 {
@@ -4047,12 +4049,65 @@ fn decode_global_property_layout_at(
                 "unsupported XPR wasm_config version {wasm_version}"
             )));
         }
-        for _ in 0..11 {
-            row.u32()?;
+        let mut values = [0u32; 11];
+        for value in &mut values {
+            *value = row.u32()?;
         }
+        wasm_configuration = Some(values);
     }
     row.finish()?;
-    Ok((config, source_chain_id, cpu_offset))
+    Ok((config, source_chain_id, cpu_offset, wasm_configuration))
+}
+
+/// The eleven `wasm_config` limits a source row states, or `None` for the older
+/// row format that carries none.
+type SourceWasmConfiguration = Option<[u32; 11]>;
+
+/// The eleven `wasm_config` fields, in Leap's serialization order.
+const WASM_CONFIG_FIELDS: [&str; 11] = [
+    "max_mutable_global_bytes",
+    "max_table_elements",
+    "max_section_elements",
+    "max_linear_memory_init",
+    "max_func_local_bytes",
+    "max_nested_structures",
+    "max_symbol_bytes",
+    "max_module_bytes",
+    "max_code_bytes",
+    "max_pages",
+    "max_call_depth",
+];
+
+/// Name every WASM limit on which `source` differs from what this chain
+/// enforces, as `field: source vs Pulse`. Empty when they agree.
+fn wasm_configuration_differences(source: &[u32; 11]) -> Vec<String> {
+    WASM_CONFIG_FIELDS
+        .iter()
+        .zip(source.iter().zip(pulsevm_chaindb::WASM_CONFIG.iter()))
+        .filter(|(_, (source, pulse))| source != pulse)
+        .map(|(name, (source, pulse))| format!("{name}: {source} vs {pulse}"))
+        .collect()
+}
+
+/// PulseVM's WASM limits are a build constant, not chain state. A source chain
+/// that changed any of them would migrate under different limits than it ran
+/// with: contracts valid there could be refused here, or the reverse. Refuse the
+/// import instead of dropping the values the way an ignored field would. A row
+/// with no `wasm_configuration` (the older format) carries nothing to refuse.
+fn check_wasm_configuration(
+    wasm_configuration: SourceWasmConfiguration,
+) -> Result<(), XprImportError> {
+    let Some(source) = wasm_configuration else {
+        return Ok(());
+    };
+    let differences = wasm_configuration_differences(&source);
+    if differences.is_empty() {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "XPR wasm_configuration differs from Pulse's fixed WASM limits ({}); migrating would change which contracts are valid",
+        differences.join(", ")
+    )))
 }
 
 /// PulseVM's CPU limits are denominated in metering points (about 1/38000 us
@@ -4154,6 +4209,9 @@ fn redenominate_resource_rows(rows: &mut [PortableRow]) -> Result<(), XprImportE
 pub struct IgnoredGlobalPropertyFields {
     pub deferred_trx_expiration_window: u32,
     pub max_transaction_delay: u32,
+    /// Whether the nodeos row stated its `wasm_configuration` (and so it was
+    /// compared). `false` is the older row format, which has none to compare.
+    pub wasm_configuration_compared: bool,
 }
 
 /// Whether a nodeos `global_property` row and PulseVM's export of the same state
@@ -4178,8 +4236,8 @@ pub fn global_property_rows_equivalent(
         decode_global_property_as_stored(row)
             .map_err(|error| format!("{name} global_property row does not decode: {error}"))
     };
-    let (source_config, source_chain) = decode("nodeos", source)?;
-    let (target_config, target_chain) = decode("PulseVM", target)?;
+    let (source_config, source_chain, source_wasm) = decode("nodeos", source)?;
+    let (target_config, target_chain, target_wasm) = decode("PulseVM", target)?;
     // The nodeos row is in XPR units; the target was converted. Convert the
     // source the way the importer does and compare against the target as stored.
     let source_config = redenominate_cpu_caps(source_config);
@@ -4190,9 +4248,30 @@ pub fn global_property_rows_equivalent(
             hex::encode(target_chain)
         ));
     }
+    // The eleven WASM limits are part of the row and decide which contracts
+    // are valid, so they are compared, not skipped. The target always states
+    // them (they are fixed in this build); a source without them is the older
+    // format and is reported as such rather than treated as equal.
+    let target_wasm = target_wasm
+        .ok_or_else(|| "PulseVM global_property row carries no wasm_configuration".to_string())?;
+    if let Some(source_wasm) = source_wasm {
+        let differences = WASM_CONFIG_FIELDS
+            .iter()
+            .zip(source_wasm.iter().zip(target_wasm.iter()))
+            .filter(|(_, (source, target))| source != target)
+            .map(|(name, (source, target))| format!("{name}: nodeos {source} vs PulseVM {target}"))
+            .collect::<Vec<_>>();
+        if !differences.is_empty() {
+            return Err(format!(
+                "global_property wasm_configuration differs: {}",
+                differences.join(", ")
+            ));
+        }
+    }
     let ignored = IgnoredGlobalPropertyFields {
         deferred_trx_expiration_window: source_config.deferred_trx_expiration_window,
         max_transaction_delay: source_config.max_transaction_delay,
+        wasm_configuration_compared: source_wasm.is_some(),
     };
     let mut expected = source_config;
     expected.deferred_trx_expiration_window = target_config.deferred_trx_expiration_window;
@@ -4303,7 +4382,7 @@ fn global_property_cpu_offset(bytes: &[u8]) -> Result<usize, XprImportError> {
             )));
         }
         match decode_global_property_layout_at(row, has_schedule, legacy_fields) {
-            Ok((_, _, offset)) => return Ok(offset),
+            Ok((_, _, offset, _)) => return Ok(offset),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -4318,7 +4397,7 @@ fn global_property_cpu_offset(bytes: &[u8]) -> Result<usize, XprImportError> {
 /// converted state.
 fn decode_global_property_as_stored(
     bytes: &[u8],
-) -> Result<(ChainConfigV0, [u8; 32]), XprImportError> {
+) -> Result<(ChainConfigV0, [u8; 32], SourceWasmConfiguration), XprImportError> {
     // The same three layouts, in the same order, as `decode_global_property`.
     let mut first_error = None;
     for (has_schedule, legacy_fields) in [(true, false), (true, true), (false, true)] {
@@ -4330,7 +4409,7 @@ fn decode_global_property_as_stored(
             )));
         }
         match decode_global_property_layout_at(row, has_schedule, legacy_fields) {
-            Ok((config, chain_id, _)) => return Ok((config, chain_id)),
+            Ok((config, chain_id, _, wasm)) => return Ok((config, chain_id, wasm)),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -6137,8 +6216,59 @@ mod tests {
             IgnoredGlobalPropertyFields {
                 deferred_trx_expiration_window: 600,
                 max_transaction_delay: 3_888_000,
+                wasm_configuration_compared: true,
             }
         );
+    }
+
+    /// The Leap 5 row with its last `wasm_configuration` field (`max_call_depth`,
+    /// the final u32) set to `depth`.
+    fn leap_row_with_call_depth(depth: u32) -> Vec<u8> {
+        let (mut leap, _) = leap_and_pulse_global_property_rows();
+        let at = leap.len() - 4;
+        leap[at..].copy_from_slice(&depth.to_le_bytes());
+        leap
+    }
+
+    // The two rows differ in shape, so the compare decodes both. It used to read
+    // the eleven WASM limits and throw them away, so a source chain with a
+    // different limit compared equal and, worse, migrated under Pulse's fixed
+    // ones. They decide which contracts are valid.
+    #[test]
+    fn a_different_wasm_limit_is_a_difference_not_an_ignored_field() {
+        let (_, pulse) = leap_and_pulse_global_property_rows();
+        let source = leap_row_with_call_depth(300);
+        let error = global_property_rows_equivalent(&source, &pulse).unwrap_err();
+        assert!(
+            error.contains("wasm_configuration")
+                && error.contains("max_call_depth: nodeos 300 vs PulseVM 251"),
+            "{error}"
+        );
+        // Every field is covered, not just the last: change the first.
+        let (mut leap, _) = leap_and_pulse_global_property_rows();
+        let first = leap.len() - 44;
+        leap[first..first + 4].copy_from_slice(&1u32.to_le_bytes());
+        let error = global_property_rows_equivalent(&leap, &pulse).unwrap_err();
+        assert!(
+            error.contains("max_mutable_global_bytes: nodeos 1 vs PulseVM 1024"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_importer_refuses_a_source_whose_wasm_limits_differ_from_pulses() {
+        let text = match decode_global_property(&leap_row_with_call_depth(300)) {
+            Ok(_) => panic!("a source with different WASM limits must not import"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            text.contains("wasm_configuration differs")
+                && text.contains("max_call_depth: 300 vs 251"),
+            "{text}"
+        );
+        // The unmodified row, whose limits are Pulse's, still imports.
+        let (leap, _) = leap_and_pulse_global_property_rows();
+        assert!(decode_global_property(&leap).is_ok());
     }
 
     #[test]
@@ -7576,6 +7706,26 @@ mod tests {
         let first = convert(&entry, &sidecar);
         let second = convert(&entry, &sidecar);
         assert!(!first.is_empty());
+        // A pending deferred transaction must survive into what the table
+        // compare reads: the checkpoint restored and exported. It was imported
+        // and kept, but the exporter had no slot for it, so a real snapshot
+        // with deferred transactions compared as "20 rows on nodeos, none on
+        // the target".
+        {
+            let restore_dir = TempDir::new().unwrap();
+            let mut restored =
+                Database::new(restore_dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            restored.add_indices().unwrap();
+            let path = restore_dir.path().join("checkpoint.snapshot");
+            std::fs::write(&path, &first).unwrap();
+            restored.restore_from_path(&path).unwrap();
+            assert_eq!(restored.deferred_transaction_count(), 1);
+            let exported = restored.pack_deltas(true, &[0u8; 32]);
+            let rows = exported_rows(&exported, "generated_transaction")
+                .expect("generated_transaction must be in the exported state");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(&rows[0][33..65], &[0xD0u8; 32], "the transaction id");
+        }
         assert_eq!(
             first, second,
             "independent conversions of one real export must be byte-identical"

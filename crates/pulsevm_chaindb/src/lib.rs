@@ -26,6 +26,8 @@ use std::{
 
 mod history;
 
+pub use history::WASM_CONFIG;
+
 use pulsevm_arena::{
     ArenaObject,
     BlobRef,
@@ -5845,6 +5847,12 @@ impl ChainDatabase {
         self.lock().checkpoint(path)
     }
 
+    /// Write a checkpoint without resetting the write-ahead log's bookkeeping.
+    /// For exporting state (snapshots, hashes) from a running node.
+    pub fn checkpoint_unmarked(&self, path: &std::path::Path) -> Result<(), DbError> {
+        self.lock().checkpoint_unmarked(path)
+    }
+
     /// Load a checkpoint into this (freshly constructed, empty) database.
     pub fn load(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().load(path)
@@ -5873,6 +5881,16 @@ impl ChainDatabase {
     /// restoring the state a sequence of `flush_delta` calls recorded.
     pub fn replay_log(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().replay_log(path)
+    }
+
+    /// Replay the write-ahead log on top of the state loaded at
+    /// `after_revision`. See `pulsevm_arena::Db::replay_log_after`.
+    pub fn replay_log_after(
+        &self,
+        path: &std::path::Path,
+        after_revision: i64,
+    ) -> Result<pulsevm_arena::WalReplay, DbError> {
+        self.lock().replay_log_after(path, after_revision)
     }
 
     pub fn update_key_value_object(

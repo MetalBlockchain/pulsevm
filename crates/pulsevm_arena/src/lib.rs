@@ -20,6 +20,7 @@ mod table;
 pub use db::{
     Db,
     DbError,
+    WalReplay,
 };
 pub use object::{
     ArenaObject,

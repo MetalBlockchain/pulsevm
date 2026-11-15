@@ -269,8 +269,29 @@ fn validate_cpu_parameters_in_points(cfg: &ChainConfigV0) -> Result<(), ChainErr
             cfg.min_transaction_cpu_usage
         )));
     }
+    // The minimum alone is not enough. XPR's global row holds a 200,000 block
+    // cap and a 150,000 transaction cap (microseconds); a proposal that copies
+    // it and raises only the minimum clears the check above and leaves caps of
+    // a few microseconds of compute, so every ordinary transaction is dropped
+    // at block build. A transaction cap that cannot even hold
+    // `MIN_CAP_MULTIPLE` minimum-sized transactions is a unit mistake, not a
+    // policy: real figures are thousands of times the minimum (the converted
+    // chain's is 10,000x). The block cap must already exceed the transaction
+    // cap, so this bounds both.
+    let min_cap = u64::from(cfg.min_transaction_cpu_usage) * MIN_CAP_MULTIPLE;
+    if u64::from(cfg.max_transaction_cpu_usage) < min_cap {
+        return Err(ChainError::ActionValidationError(format!(
+            "max_transaction_cpu_usage {} is under {MIN_CAP_MULTIPLE} times min_transaction_cpu_usage {} ({min_cap}): CPU parameters are metering points, not microseconds, so a cap copied from XPR's row cannot hold ordinary transactions",
+            cfg.max_transaction_cpu_usage, cfg.min_transaction_cpu_usage
+        )));
+    }
     Ok(())
 }
+
+/// How many minimum-sized transactions the transaction CPU cap must be able to
+/// hold. A guard against unit mistakes, deliberately far below any real ratio.
+#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+const MIN_CAP_MULTIPLE: u64 = 100;
 
 pub fn set_blockchain_parameters_packed(
     mut env: FunctionEnvMut<WasmContext>,

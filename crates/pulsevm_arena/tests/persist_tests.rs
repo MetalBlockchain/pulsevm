@@ -196,3 +196,131 @@ fn torn_final_frame_is_ignored() {
         0
     );
 }
+
+// A node killed after some blocks restarts from its last checkpoint and the log
+// of the blocks since. Each frame is one revision; replay must apply exactly
+// the ones the checkpoint does not already contain.
+
+fn accepted(db: &mut Db, wal: &std::path::Path, revision: i64, name: u64) {
+    db.create::<Account>(|a| a.name = name).unwrap();
+    db.set_revision(revision).unwrap();
+    db.flush_delta(wal).unwrap();
+}
+
+#[test]
+fn replay_after_a_checkpoint_applies_only_the_frames_that_follow_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.checkpoint(&snap).unwrap();
+    accepted(&mut db, &wal, 2, 10);
+    accepted(&mut db, &wal, 3, 20);
+    accepted(&mut db, &wal, 4, 30);
+
+    let mut recovered = new_db();
+    recovered.load(&snap).unwrap();
+    let outcome = recovered.replay_log_after(&wal, 1).unwrap();
+    assert_eq!(outcome.frames_applied, 3);
+    assert_eq!(outcome.frames_skipped, 0);
+    assert!(!outcome.torn_tail);
+    assert_eq!(recovered.revision(), 4);
+    assert_eq!(recovered.state_root(), db.state_root());
+}
+
+#[test]
+fn a_log_older_than_the_checkpoint_is_skipped_not_reapplied() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.checkpoint(&snap).unwrap();
+    accepted(&mut db, &wal, 2, 10);
+    accepted(&mut db, &wal, 3, 20);
+    // A newer checkpoint landed but the process died before it removed the log.
+    db.checkpoint(&snap).unwrap();
+
+    let mut recovered = new_db();
+    recovered.load(&snap).unwrap();
+    let outcome = recovered.replay_log_after(&wal, 3).unwrap();
+    assert_eq!(outcome.frames_applied, 0);
+    assert_eq!(outcome.frames_skipped, 2);
+    assert_eq!(recovered.revision(), 3);
+    assert_eq!(recovered.state_root(), db.state_root());
+
+    // Frames that follow the new checkpoint still apply on top.
+    accepted(&mut db, &wal, 4, 30);
+    let mut again = new_db();
+    again.load(&snap).unwrap();
+    let outcome = again.replay_log_after(&wal, 3).unwrap();
+    assert_eq!((outcome.frames_applied, outcome.frames_skipped), (1, 2));
+    assert_eq!(again.state_root(), db.state_root());
+}
+
+#[test]
+fn a_missing_frame_is_refused_rather_than_replayed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.checkpoint(&snap).unwrap();
+    accepted(&mut db, &wal, 2, 10);
+    // Revision 3 never reached the log.
+    db.set_revision(3).unwrap();
+    accepted(&mut db, &wal, 4, 30);
+
+    let mut recovered = new_db();
+    recovered.load(&snap).unwrap();
+    let error = recovered.replay_log_after(&wal, 1).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("jumps from revision 2 to 4"),
+        "{error:?}"
+    );
+
+    // A log that starts after a gap from the checkpoint is refused the same way.
+    let mut late = new_db();
+    late.load(&snap).unwrap();
+    let error = late.replay_log_after(&wal, 0).unwrap_err();
+    assert!(format!("{error:?}").contains("jumps"), "{error:?}");
+}
+
+#[test]
+fn a_torn_tail_is_reported_with_where_the_good_records_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.checkpoint(&snap).unwrap();
+    accepted(&mut db, &wal, 2, 10);
+    let good_len = std::fs::metadata(&wal).unwrap().len();
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        f.write_all(&(1u64 << 40).to_le_bytes()).unwrap();
+        f.write_all(b"cut short").unwrap();
+    }
+
+    let mut recovered = new_db();
+    recovered.load(&snap).unwrap();
+    let outcome = recovered.replay_log_after(&wal, 1).unwrap();
+    assert!(outcome.torn_tail);
+    assert_eq!(outcome.valid_len, good_len);
+    assert_eq!(outcome.frames_applied, 1);
+    assert_eq!(recovered.state_root(), db.state_root());
+}
+
+#[test]
+fn replaying_a_log_that_does_not_exist_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = new_db();
+    let outcome = db.replay_log_after(dir.path().join("absent"), 5).unwrap();
+    assert_eq!(outcome.frames_applied + outcome.frames_skipped, 0);
+    assert!(!outcome.torn_tail);
+}

@@ -1975,10 +1975,28 @@ impl Controller {
             )?;
             self.db
                 .set_revision(self.last_accepted_block.block_num() as i64)?;
+            // A durable base for the write-ahead log to replay onto. Without
+            // it a node killed before its first clean shutdown would have a
+            // block log and nothing to rebuild the state from.
+            self.db.checkpoint_to_disk().map_err(|e| {
+                ChainError::GenesisError(format!("failed to persist the genesis state: {e}"))
+            })?;
             info!("database initialized successfully");
         }
 
         let revision = self.db.revision();
+        let wal_recovery = self.db.wal_recovery();
+        if wal_recovery.blocks_recovered > 0 || wal_recovery.torn_tail_discarded {
+            warn!(
+                "the previous run did not shut down cleanly: recovered {} accepted block(s) from the arena write-ahead log{}; state is at revision {revision}",
+                wal_recovery.blocks_recovered,
+                if wal_recovery.torn_tail_discarded {
+                    " and discarded a partial record at its end"
+                } else {
+                    ""
+                }
+            );
+        }
 
         let block_log_range = self.block_log.as_ref().unwrap().range();
         let genesis_height = self.last_accepted_block.block_num();
@@ -2017,7 +2035,17 @@ impl Controller {
                 let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
                     !config.state_history_enabled || config.allow_replay_recovery
                 });
-                if replay_recovery && revision >= i64::from(start) && revision <= i64::from(end) {
+                // The block log is appended before the arena commit is made
+                // durable, so a kill in that window leaves the log exactly one
+                // block ahead of a state that is otherwise intact. Dropping
+                // that one block is always safe (it is re-fetched from peers)
+                // and does not need the offline-replay opt-in.
+                let one_block_ahead =
+                    revision >= i64::from(start) && revision + 1 == i64::from(end);
+                if (replay_recovery || one_block_ahead)
+                    && revision >= i64::from(start)
+                    && revision <= i64::from(end)
+                {
                     if revision != end as i64 {
                         warn!(
                             "replay recovery is rewinding block log from {} to durable Arena revision {}",
@@ -2268,8 +2296,25 @@ impl Controller {
             stored == expected
         };
         if !matches {
+            // The common cause on a restored chain: an upgrade scheduled at or
+            // before the height the chain restarted from. Blocks up to that
+            // height were produced by the source chain under its own rules, so
+            // the upgrade can never have activated here and no record of it
+            // exists. Say what to change, because "does not match" alone sent
+            // an operator to look for a corrupted record.
+            let never_activated_here = expected
+                .iter()
+                .filter(|record| !stored.contains(record))
+                .count();
+            let hint = if never_activated_here > 0 {
+                format!(
+                    "; {never_activated_here} scheduled upgrade(s) activate at or before height {block_height} but were never recorded on this chain. A chain restored from a checkpoint (or state sync) can only activate an upgrade strictly after the height it started from: schedule it at that height + 1 or later (for a cutover chain restored at H, activation_height H+1)"
+                )
+            } else {
+                String::new()
+            };
             return Err(ChainError::BlockError(format!(
-                "configured protocol upgrade schedule does not match the {} activation record(s) persisted at chain height {block_height}",
+                "configured protocol upgrade schedule does not match the {} activation record(s) persisted at chain height {block_height}{hint}",
                 stored.len()
             )));
         }
@@ -3263,6 +3308,30 @@ impl Controller {
         self.last_accepted_block_id = accepted_block_id;
         self.header_signing_state = accepted_signing_state;
         self.db.commit(block.block_num() as i64)?;
+        // The block log already holds this block; make its state change
+        // durable too, so a kill from here on restarts at this block. The
+        // block is accepted and committed, so a failure cannot be undone:
+        // stop rather than keep running on state that would not survive.
+        let wal_max_bytes = self
+            .node_config
+            .as_ref()
+            .map_or(pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES, |config| {
+                config.arena_wal_max_bytes
+            });
+        // A bulk migration replay checkpoints for itself when it finishes and
+        // would pay an fsync per block for a log it never reads.
+        let migration_replay = self
+            .node_config
+            .as_ref()
+            .is_some_and(|config| !config.state_history_enabled);
+        if !migration_replay {
+            self.db.arena_flush_wal(wal_max_bytes).map_err(|error| {
+                ChainError::fatal_consistency(format!(
+                    "block {} was accepted but its state change could not be made durable: {error}",
+                    block.block_num()
+                ))
+            })?;
+        }
         for upgrade in self
             .protocol_upgrade_schedule
             .activated_upgrades(block.block_num())
@@ -5860,8 +5929,19 @@ mod tests {
         chain_id: Id,
         expiration: TimePointSec,
     ) -> Result<PackedTransaction, ChainError> {
+        create_account_with_cpu_cap(private_key, account, chain_id, expiration, 0)
+    }
+
+    /// `max_cpu_usage_ms` is the header byte a client sets to cap its own CPU.
+    fn create_account_with_cpu_cap(
+        private_key: &PrivateKey,
+        account: Name,
+        chain_id: Id,
+        expiration: TimePointSec,
+        max_cpu_usage_ms: u8,
+    ) -> Result<PackedTransaction, ChainError> {
         let trx = Transaction::new(
-            TransactionHeader::new(expiration, 0, 0, 0u32.into(), 0, 0u32.into()),
+            TransactionHeader::new(expiration, 0, 0, 0u32.into(), max_cpu_usage_ms, 0u32.into()),
             vec![],
             vec![Action::new(
                 Name::from_str("pulse")?,
@@ -6146,6 +6226,67 @@ mod tests {
         let result =
             controller.execute_transaction(&transaction, &timestamp, &BlockStatus::Building)?;
         assert_eq!(result.trace.action_traces.len(), 1);
+        Ok(())
+    }
+
+    // The start function runs when the module is instantiated for an action,
+    // so its work must be billed to that action like any other code. A start
+    // function that ran unmetered would let a contract do unbounded work for the
+    // minimum bill on every call.
+    #[cfg(feature = "protocol_feature_wasm_start_sections")]
+    #[tokio::test]
+    async fn a_start_function_is_metered_and_billed_to_the_action() -> Result<(), ChainError> {
+        const SPIN: &str = r#"(loop $again
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br_if $again (i32.lt_u (local.get $i) (i32.const 3000000))))"#;
+        let with_start = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (func $init (local $i i32) {SPIN})
+                (start $init)
+                (func (export "apply") (param i64 i64 i64)))"#
+        );
+        let without_start = r#"(module
+                (memory (export "memory") 1)
+                (func (export "apply") (param i64 i64 i64)))"#;
+
+        let (mut controller, private_key, chain_id, _temp) = init_controller_with_upgrades(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )?;
+        let timestamp = *controller.last_accepted_block().timestamp();
+        let mut billed = Vec::new();
+        for (name, wat_text) in [
+            ("withstart", with_start.as_str()),
+            ("nostart", without_start),
+        ] {
+            let account = Name::from_str(name)?;
+            controller.execute_transaction(
+                &create_account(&private_key, account, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            controller.execute_transaction(
+                &set_code(
+                    &private_key,
+                    account,
+                    wat::parse_str(wat_text).expect("valid wasm"),
+                    chain_id,
+                )?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            let result = controller.execute_transaction(
+                &call_contract(&private_key, account, Name::from_str("go")?, &1u8, chain_id)?,
+                &timestamp,
+                &BlockStatus::Building,
+            )?;
+            billed.push(u64::from(result.trace.receipt.cpu_usage_us));
+        }
+        let (with, without) = (billed[0], billed[1]);
+        assert!(
+            with > without * 10,
+            "a three-million-iteration start function must dominate the bill: with {with}, without {without}"
+        );
         Ok(())
     }
 
@@ -8718,6 +8859,9 @@ mod tests {
         assert_eq!(controller.trace_log().unwrap().range().unwrap().1, 3);
         assert_eq!(controller.chain_state_log().unwrap().range().unwrap().1, 3);
         drop(controller);
+        // A replay job's data directory has a checkpoint but no usable
+        // write-ahead log (a directory from before the log existed).
+        remove_arena_wal(db_path);
 
         let mut reopened = Controller::new();
         reopened.initialize(&chain_id, &config_bytes, &genesis_bytes, db_path)?;
@@ -8777,7 +8921,18 @@ mod tests {
         mempool.add_transaction(create_account(&private_key, orphan_account, chain_id)?);
         let orphan_block = controller.build_block(&mut mempool).await?;
         controller.accept_block(&orphan_block.id()?, &mut mempool)?;
+        mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("orphantwo")?,
+            chain_id,
+        )?);
+        let second_orphan = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&second_orphan.id()?, &mut mempool)?;
         drop(controller);
+        // No usable log: a directory from before the write-ahead log existed,
+        // or one whose log was lost. More than the one-block crash window is
+        // then a real mismatch, and it stays opt-in to rewind.
+        remove_arena_wal(db_path);
 
         let mut reopened = Controller::new();
         let error = reopened
@@ -8786,8 +8941,291 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("database revision 2 does not match block log end 3")
+                .contains("database revision 2 does not match block log end 4")
         );
+        Ok(())
+    }
+
+    fn remove_arena_wal(db_path: &str) {
+        let wal = std::path::Path::new(db_path).join("arena_wal.bin");
+        match std::fs::remove_file(&wal) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {}: {error}", wal.display()),
+        }
+    }
+
+    /// The byte offset where each complete frame of a write-ahead log ends.
+    fn wal_frame_ends(db_path: &str) -> Vec<usize> {
+        let data = std::fs::read(std::path::Path::new(db_path).join("arena_wal.bin"))
+            .expect("the log exists");
+        let (mut ends, mut at) = (Vec::new(), 0usize);
+        while at + 8 <= data.len() {
+            let len = u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
+            at += 8 + len;
+            ends.push(at);
+        }
+        ends
+    }
+
+    struct CrashChain {
+        chain_id: Id,
+        private_key: PrivateKey,
+        genesis: Vec<u8>,
+        config: Vec<u8>,
+        temp: TempDir,
+    }
+
+    impl CrashChain {
+        fn new(extra_config: serde_json::Value) -> Result<Self, ChainError> {
+            let chain_id =
+                Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                    .unwrap();
+            let private_key =
+                PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+            let mut config = json!({
+                "producer_name": "pulse",
+                "producer_key": private_key.to_string(),
+                "state_history_enabled": true,
+            });
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra_config.as_object().unwrap().clone());
+            Ok(Self {
+                chain_id,
+                genesis: generate_genesis(&private_key),
+                private_key,
+                config: config.to_string().into_bytes(),
+                temp: get_temp_dir(),
+            })
+        }
+
+        fn path(&self) -> &str {
+            self.temp.path().to_str().unwrap()
+        }
+
+        fn open(&self) -> Result<Controller, ChainError> {
+            let mut controller = Controller::new();
+            controller.initialize(&self.chain_id, &self.config, &self.genesis, self.path())?;
+            Ok(controller)
+        }
+
+        /// Accept one block that creates `name`.
+        async fn accept(&self, controller: &mut Controller, name: &str) -> Result<(), ChainError> {
+            let mut mempool = Mempool::new();
+            mempool.add_transaction(create_account(
+                &self.private_key,
+                Name::from_str(name)?,
+                self.chain_id,
+            )?);
+            let block = controller.build_block(&mut mempool).await?;
+            controller.accept_block(&block.id()?, &mut mempool)
+        }
+    }
+
+    // The failure Paul saw on the box: a node killed after the cut refused to
+    // start because the arena on disk was still at the restore revision while
+    // the block log had moved on. The arena used to reach disk only on a clean
+    // shutdown.
+    #[tokio::test]
+    async fn a_killed_node_restarts_at_its_last_accepted_block() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        for name in ["first", "second", "third"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        let root = controller.database().arena_state_root();
+        // No close(): this is what kill -9 leaves behind.
+        drop(controller);
+
+        let mut reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 4);
+        assert_eq!(reopened.database().revision(), 4);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 4);
+        assert_eq!(reopened.database().arena_state_root(), root);
+        for name in ["first", "second", "third"] {
+            assert!(
+                reopened
+                    .database()
+                    .arena_account_exists(Name::from_str(name)?.as_u64()),
+                "{name} must survive the kill"
+            );
+        }
+        // The recovered node is a working node: it takes the next block.
+        chain.accept(&mut reopened, "fourth").await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 5);
+        Ok(())
+    }
+
+    // Killed again and again: each recovery must leave a log the next one can
+    // extend, and a clean shutdown must fold the log into the checkpoint.
+    #[tokio::test]
+    async fn repeated_kills_and_a_clean_stop_all_keep_the_chain() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "one").await?;
+        drop(controller);
+
+        let mut controller = chain.open()?;
+        assert_eq!(controller.last_accepted_block().block_num(), 2);
+        chain.accept(&mut controller, "two").await?;
+        drop(controller);
+
+        let mut controller = chain.open()?;
+        assert_eq!(controller.last_accepted_block().block_num(), 3);
+        chain.accept(&mut controller, "three").await?;
+        controller.sync_accepted_logs()?;
+        controller.database().close()?;
+        assert!(
+            !std::path::Path::new(chain.path())
+                .join("arena_wal.bin")
+                .exists(),
+            "a clean shutdown folds the log into the checkpoint"
+        );
+        let root = controller.database().arena_state_root();
+        drop(controller);
+
+        let controller = chain.open()?;
+        assert_eq!(controller.last_accepted_block().block_num(), 4);
+        assert_eq!(controller.database().arena_state_root(), root);
+        Ok(())
+    }
+
+    // The block log is appended before the arena commit is durable. A kill in
+    // that window leaves the log one block ahead of intact state; the node
+    // drops that block (peers have it) instead of refusing to start, and does
+    // not need the offline-replay opt-in to do so.
+    #[tokio::test]
+    async fn a_kill_between_the_block_log_and_the_state_flush_drops_one_block()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "kept").await?;
+        chain.accept(&mut controller, "lost").await?;
+        drop(controller);
+
+        // The state flush for the last block never happened.
+        let ends = wal_frame_ends(chain.path());
+        assert_eq!(ends.len(), 2);
+        let wal = std::path::Path::new(chain.path()).join("arena_wal.bin");
+        let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        file.set_len(ends[0] as u64).unwrap();
+        drop(file);
+
+        let reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        assert_eq!(reopened.database().revision(), 2);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 2);
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
+        assert!(
+            reopened
+                .database()
+                .arena_account_exists(Name::from_str("kept")?.as_u64())
+        );
+        assert!(
+            !reopened
+                .database()
+                .arena_account_exists(Name::from_str("lost")?.as_u64())
+        );
+        Ok(())
+    }
+
+    // A kill in the middle of the log write leaves a partial record. It must be
+    // discarded, and the next block must be appended on a clean boundary, or
+    // the following restart would find every later record hidden behind it.
+    #[tokio::test]
+    async fn a_partial_log_record_is_discarded_and_later_records_survive() -> Result<(), ChainError>
+    {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "whole").await?;
+        drop(controller);
+
+        let wal = std::path::Path::new(chain.path()).join("arena_wal.bin");
+        let good_len = std::fs::metadata(&wal).unwrap().len();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+            // A length prefix promising far more bytes than were written.
+            file.write_all(&(1u64 << 20).to_le_bytes()).unwrap();
+            file.write_all(&[7u8; 13]).unwrap();
+        }
+
+        let mut controller = chain.open()?;
+        assert_eq!(controller.last_accepted_block().block_num(), 2);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), good_len);
+        chain.accept(&mut controller, "after").await?;
+        drop(controller);
+
+        let controller = chain.open()?;
+        assert_eq!(controller.last_accepted_block().block_num(), 3);
+        assert!(
+            controller
+                .database()
+                .arena_account_exists(Name::from_str("after")?.as_u64())
+        );
+        Ok(())
+    }
+
+    // Serving a snapshot to a syncing peer exports the arena from a running
+    // node, possibly while a built block is waiting to be accepted. That export
+    // must not make the log forget the rows that block wrote: it would then be
+    // accepted, flushed without them, and the next kill would restart with a
+    // block log that says the account exists and a state that does not have it.
+    #[tokio::test]
+    async fn exporting_a_snapshot_does_not_break_crash_recovery() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "before").await?;
+
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(create_account(
+            &chain.private_key,
+            Name::from_str("pending")?,
+            chain.chain_id,
+        )?);
+        let block = controller.build_block(&mut mempool).await?;
+        let _snapshot = controller.database().snapshot_bytes()?;
+        let _hash = controller.database().snapshot_sha256()?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        let root = controller.database().arena_state_root();
+        drop(controller);
+
+        let reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 3);
+        assert_eq!(reopened.database().arena_state_root(), root);
+        for name in ["before", "pending"] {
+            assert!(
+                reopened
+                    .database()
+                    .arena_account_exists(Name::from_str(name)?.as_u64()),
+                "{name} must survive"
+            );
+        }
+        Ok(())
+    }
+
+    // The log is bounded: past the configured size the next flush writes a new
+    // checkpoint and starts the log over, and a kill after that still recovers.
+    #[tokio::test]
+    async fn the_log_is_folded_into_a_checkpoint_past_its_size_limit() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({"arena_wal_max_bytes": 1}))?;
+        let mut controller = chain.open()?;
+        for name in ["a", "b", "c"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        // Block 2 started a log, block 3 found it over the limit and wrote a
+        // checkpoint instead (dropping the log), block 4 started a new one:
+        // the log never holds more than the blocks since the last checkpoint.
+        assert_eq!(wal_frame_ends(chain.path()).len(), 1);
+        let root = controller.database().arena_state_root();
+        drop(controller);
+
+        let reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 4);
+        assert_eq!(reopened.database().arena_state_root(), root);
         Ok(())
     }
 
@@ -11925,6 +12363,332 @@ mod tests {
         let block = controller.build_block(&mut mempool).await?;
         assert_eq!(block.block_num(), source_block_num + 1);
         assert_eq!(*block.previous_id(), source_block_id);
+        Ok(())
+    }
+
+    /// A chain restored from a migration checkpoint, ready to open with
+    /// whatever protocol upgrade bytes a test wants.
+    struct RestoredChain {
+        temp: TempDir,
+        schedule_key: PrivateKey,
+        config: Vec<u8>,
+        genesis: Vec<u8>,
+        chain_id: Id,
+        source_block_num: u32,
+    }
+
+    impl RestoredChain {
+        async fn new() -> Result<Self, ChainError> {
+            let schedule_key =
+                PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+            let temp = get_temp_dir();
+            let (
+                checkpoint,
+                manifest_path,
+                mut genesis,
+                chain_id,
+                source_block_id,
+                source_block_num,
+                _revision,
+                source_chain_id,
+            ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+            let pair_key = pulsevm_crypto::K1PrivateKey::from_string(&schedule_key.to_string())
+                .map_err(|e| {
+                    ChainError::InternalError(format!("bad fixture schedule key: {e:?}"))
+                })?;
+            attach_halt_pair(
+                &manifest_path,
+                &mut genesis,
+                &source_chain_id,
+                source_block_num,
+                &source_block_id,
+                &[pair_key],
+                &["pulse"],
+                &[0],
+                &chain_id.0.0,
+            )?;
+            let config = json!({
+                "producer_name": "pulse",
+                "producer_key": schedule_key.to_string(),
+                "migration_checkpoint": checkpoint,
+                "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+                "migration_manifest": manifest_path,
+            })
+            .to_string()
+            .into_bytes();
+            Ok(Self {
+                temp,
+                schedule_key,
+                config,
+                genesis,
+                chain_id,
+                source_block_num,
+            })
+        }
+
+        fn path(&self) -> String {
+            self.temp
+                .path()
+                .join("target")
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        fn open(&self, upgrades: &[u8]) -> Result<Controller, ChainError> {
+            let mut controller = Controller::new();
+            controller.initialize_with_protocol_upgrades(
+                &self.chain_id,
+                &self.config,
+                &self.genesis,
+                upgrades,
+                &self.path(),
+            )?;
+            Ok(controller)
+        }
+
+        async fn accept_account(
+            &self,
+            controller: &mut Controller,
+            name: &str,
+            max_cpu_usage_ms: u8,
+        ) -> Result<usize, ChainError> {
+            let now = TimePointSec::now().sec_since_epoch();
+            let mut mempool = Mempool::new();
+            mempool.add_transaction(create_account_with_cpu_cap(
+                &self.schedule_key,
+                Name::from_str(name)?,
+                self.chain_id,
+                TimePointSec::new(now + 1800),
+                max_cpu_usage_ms,
+            )?);
+            let block = controller.build_block(&mut mempool).await?;
+            let included = block.transactions.len();
+            controller.accept_block(&block.id()?, &mut mempool)?;
+            Ok(included)
+        }
+    }
+
+    // Paul killed a target node twelve minutes after the cut and it refused to
+    // start: the arena on disk was still at the restore revision while the
+    // block log had moved on. This is that sequence on a restored chain.
+    #[tokio::test]
+    async fn a_killed_node_on_a_restored_chain_restarts_where_it_stopped() -> Result<(), ChainError>
+    {
+        let chain = RestoredChain::new().await?;
+        let h = chain.source_block_num;
+        let mut controller = chain.open(&[])?;
+        assert_eq!(controller.database().revision(), i64::from(h));
+        chain.accept_account(&mut controller, "afterone", 0).await?;
+        chain.accept_account(&mut controller, "aftertwo", 0).await?;
+        let root = controller.database().arena_state_root();
+        // kill -9: no shutdown, no close.
+        drop(controller);
+
+        let mut reopened = chain.open(&[])?;
+        assert_eq!(reopened.last_accepted_block().block_num(), h + 2);
+        assert_eq!(reopened.database().revision(), i64::from(h) + 2);
+        assert_eq!(reopened.database().arena_state_root(), root);
+        for name in ["afterone", "aftertwo"] {
+            assert!(
+                reopened
+                    .database()
+                    .arena_account_exists(Name::from_str(name)?.as_u64())
+            );
+        }
+        chain.accept_account(&mut reopened, "afterkill", 0).await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), h + 3);
+        Ok(())
+    }
+
+    /// Seed a pending deferred transaction on a restored chain, the way the
+    /// importer leaves an XPR one (multisig proposals carry a header cap).
+    fn seed_deferred_account(
+        controller: &mut Controller,
+        chain: &RestoredChain,
+        name: &str,
+        max_cpu_usage_ms: u8,
+    ) -> Result<(), ChainError> {
+        let now = TimePointSec::now().sec_since_epoch();
+        let scheduled = create_account_with_cpu_cap(
+            &chain.schedule_key,
+            Name::from_str(name)?,
+            chain.chain_id,
+            TimePointSec::new(now + 1800),
+            max_cpu_usage_ms,
+        )?;
+        let trx_id: [u8; 32] = scheduled.id().as_bytes().try_into().unwrap();
+        controller.db.xpr_import_deferred_transaction(
+            PULSE_NAME.as_u64(),
+            7,
+            PULSE_NAME.as_u64(),
+            trx_id,
+            0,
+            i64::MAX,
+            0,
+            scheduled.packed_trx_bytes(),
+        )?;
+        ResourceLimitsManager::add_pending_ram_usage(
+            &mut controller.db,
+            &PULSE_NAME,
+            generated_transaction_billable_size(scheduled.packed_trx_bytes().len())?,
+        )?;
+        Ok(())
+    }
+
+    // An XPR deferred transaction that states a CPU cap in its header was
+    // scheduled under Leap's units. Under version 1 the cap reads as a point
+    // count and the transaction can never run; it must execute once the chain
+    // reaches the activation height. This carries one across the migration.
+    #[tokio::test]
+    async fn an_imported_deferred_transaction_with_a_header_cap_cannot_run_under_version_one()
+    -> Result<(), ChainError> {
+        let chain = RestoredChain::new().await?;
+        let mut controller = chain.open(&[])?;
+        seed_deferred_account(&mut controller, &chain, "deferredcap", 30)?;
+        let mut mempool = Mempool::new();
+        // Nothing runnable: the deferred transaction fails its own cap, so the
+        // block either carries no usable transaction or is not built.
+        let _ = controller.build_block(&mut mempool).await;
+        assert!(
+            !controller
+                .db
+                .is_account(Name::from_str("deferredcap")?.as_u64())?,
+            "the capped deferred transaction must not have executed under version 1"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+    #[tokio::test]
+    async fn an_imported_deferred_transaction_with_a_header_cap_runs_at_the_activation_height()
+    -> Result<(), ChainError> {
+        let chain = RestoredChain::new().await?;
+        let h = chain.source_block_num;
+        let upgrades = format!(
+            r#"{{"protocol_upgrades":[{{"protocol_version":2,"activation_height":{}}}]}}"#,
+            h + 1
+        )
+        .into_bytes();
+        let mut controller = chain.open(&upgrades)?;
+        seed_deferred_account(&mut controller, &chain, "deferredcap", 30)?;
+        let mut mempool = Mempool::new();
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(
+            block.block_num(),
+            h + 1,
+            "the first block is the activation"
+        );
+        assert_eq!(block.transactions.len(), 1);
+        controller.accept_block(&block.id()?, &mut mempool)?;
+        assert!(
+            controller
+                .db
+                .is_account(Name::from_str("deferredcap")?.as_u64())?
+        );
+        assert_eq!(controller.db.deferred_transaction_count(), 0);
+        // And a validator that did not build it agrees: same block, same state.
+        let chain_two = RestoredChain::new().await?;
+        let mut validator = chain_two.open(&upgrades)?;
+        seed_deferred_account(&mut validator, &chain_two, "deferredcap", 30)?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+        assert_eq!(
+            validator.database().arena_state_root(),
+            controller.database().arena_state_root()
+        );
+        Ok(())
+    }
+
+    // Under version 1 the header byte is a point count, so a transaction that
+    // asks for any cap at all can never pay its minimum bill and is dropped.
+    #[tokio::test]
+    async fn a_header_cpu_cap_drops_the_transaction_under_protocol_version_one()
+    -> Result<(), ChainError> {
+        let chain = RestoredChain::new().await?;
+        let mut controller = chain.open(&[])?;
+        // Dropped from the block, and a block with nothing in it is not built.
+        let error = chain
+            .accept_account(&mut controller, "capped", 30)
+            .await
+            .expect_err("the capped transaction cannot be included under version 1");
+        assert!(error.to_string().contains("no transactions"), "{error}");
+        assert_eq!(
+            chain.accept_account(&mut controller, "uncapped", 0).await?,
+            1
+        );
+        Ok(())
+    }
+
+    // Paul's finding: activation_height 2 refuses to boot a restored chain. It
+    // is correct to refuse (the chain never ran version 2 below H) but the
+    // message must say what to do, and H+1 must boot, switch at the right
+    // block, run a header-capped transaction, and survive a kill.
+    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+    #[tokio::test]
+    async fn a_restored_chain_activates_version_two_at_h_plus_one_not_before()
+    -> Result<(), ChainError> {
+        let chain = RestoredChain::new().await?;
+        let h = chain.source_block_num;
+        let upgrades = |n: u32| {
+            format!(r#"{{"protocol_upgrades":[{{"protocol_version":2,"activation_height":{n}}}]}}"#)
+                .into_bytes()
+        };
+
+        // N = 2 is at or below H.
+        let error = chain
+            .open(&upgrades(2))
+            .err()
+            .expect("an upgrade at or below H cannot boot")
+            .to_string();
+        assert!(
+            error.contains("does not match") && error.contains("activation_height H+1"),
+            "the refusal must tell the operator to use H+1: {error}"
+        );
+
+        // A refused start must not have touched the chain: the same directory
+        // boots with the right schedule.
+        let activation = h + 1;
+        let mut controller = chain.open(&upgrades(activation))?;
+        assert_eq!(controller.protocol_version(h), 1);
+        assert_eq!(controller.protocol_version(activation), 2);
+        let next = controller.next_protocol_upgrade(h).expect("scheduled");
+        assert_eq!(next.activation_height, activation);
+
+        // The first block under version 2 carries a transaction that sets the
+        // header cap. Under version 1 this transaction is dropped.
+        assert_eq!(
+            chain.accept_account(&mut controller, "capped", 30).await?,
+            1
+        );
+        assert_eq!(controller.last_accepted_block().block_num(), activation);
+        chain.accept_account(&mut controller, "tight", 1).await?;
+        drop(controller);
+
+        // Killed after activation: restarts at the same height with the same
+        // schedule and still reports version 2.
+        let mut reopened = chain.open(&upgrades(activation))?;
+        assert_eq!(reopened.last_accepted_block().block_num(), activation + 1);
+        assert_eq!(reopened.protocol_version(activation + 1), 2);
+        for name in ["capped", "tight"] {
+            assert!(
+                reopened
+                    .database()
+                    .arena_account_exists(Name::from_str(name)?.as_u64())
+            );
+        }
+        chain.accept_account(&mut reopened, "later", 255).await?;
+
+        // And a validator whose bytes disagree is refused, not silently run
+        // under version 1 rules.
+        drop(reopened);
+        assert!(
+            chain.open(&[]).is_err(),
+            "empty bytes must not run version 1 rules"
+        );
         Ok(())
     }
 
