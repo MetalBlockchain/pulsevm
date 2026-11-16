@@ -3039,6 +3039,12 @@ impl ApplyContext {
         Ok(creator.receiver().as_u64())
     }
 
+    /// See [`TransactionContext::find_ancestor`].
+    pub fn find_ancestor(&self, receiver: u64, action: u64) -> Result<(bool, u32), ChainError> {
+        self.trx_context
+            .find_ancestor(self.action_ordinal, receiver, action)
+    }
+
     pub fn get_pending_block_time(&self) -> &BlockTimestamp {
         &self.pending_block_timestamp
     }

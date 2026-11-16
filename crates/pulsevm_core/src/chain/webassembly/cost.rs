@@ -118,6 +118,14 @@ pub const BASE: u64 = 5;
 /// …): a few native arithmetic ops.
 pub const BUILTIN: u64 = 8;
 
+/// One level of the creator-chain walk in `has_ancestor`: a trace lookup by
+/// ordinal and two name comparisons. Billed per ancestor visited on top of
+/// [`BASE`], so a deep inline/notification chain pays for its own walk.
+#[inline]
+pub fn ancestor_walk(levels: u64) -> u64 {
+    5u64.saturating_mul(levels)
+}
+
 /// The heavier soft-float / int128 builtins — division, modulo, square root.
 pub const BUILTIN_DIV: u64 = 20;
 
@@ -228,5 +236,7 @@ mod tests {
         assert_eq!(alt_bn128_pair(u64::MAX), u64::MAX);
         assert_eq!((BASE, AUTH), (5, 40));
         assert_eq!(per_byte(100), 100);
+        assert_eq!((ancestor_walk(0), ancestor_walk(3)), (0, 15));
+        assert_eq!(ancestor_walk(u64::MAX), u64::MAX);
     }
 }
