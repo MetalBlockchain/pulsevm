@@ -398,11 +398,38 @@ mod protocol_v2 {
         let floor = 100 * min;
         for (tx, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
             let mut h = v2_host();
-            // The chain already requires the transaction cap to sit below the
-            // block cap minus the minimum bill, so give the block cap room and
-            // it is never the binding one.
-            let result = apply(&mut h, min, tx, tx + min + 1);
+            // The block cap must clear the transaction cap plus the minimum bill
+            // and 1000 minimum bills, so give it room and it is never the
+            // binding one here.
+            let result = apply(&mut h, min, tx, (tx + min + 1).max(1000 * min));
             assert_eq!(result.is_ok(), accepted, "max_transaction_cpu_usage = {tx}");
+        }
+    }
+
+    // Paul: a block cap of 3,838,001 (a transaction cap just over the guard plus
+    // one minimum bill) was accepted, which fits about ten ordinary transactions
+    // in a block. The block cap has its own floor.
+    #[test]
+    fn the_block_cap_must_hold_a_thousand_minimum_bills() {
+        let min = 38_000u32;
+        let floor = 1000 * min;
+        let tx = 100 * min; // exactly at the transaction guard
+        for (block, accepted) in [
+            (tx + min + 1, false), // Paul's accepted value, now refused
+            (floor - 1, false),
+            (floor, true),
+            (floor + 1, true),
+        ] {
+            let mut h = v2_host();
+            let result = apply(&mut h, min, tx, block);
+            assert_eq!(result.is_ok(), accepted, "max_block_cpu_usage = {block}");
+            if !accepted {
+                let text = result.unwrap_err().to_string();
+                assert!(
+                    text.contains("max_block_cpu_usage") && text.contains("a block that small"),
+                    "{text}"
+                );
+            }
         }
     }
 

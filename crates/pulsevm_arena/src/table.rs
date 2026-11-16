@@ -913,18 +913,20 @@ impl<T: ArenaObject> Table<T> {
             self.primary.set_len(next_id);
         }
         let count = read_u64(bytes, &mut pos)?;
+        // Read every changed row first, then remove all of the old versions from
+        // the indexes, then insert the new ones. A block can move a unique key
+        // from one row to another (or remove a row and give its key to a
+        // second); the live table did that in a safe order, but a replay that
+        // handles one row at a time in the order they were first touched can
+        // meet the new key while the old holder is still indexed, and would
+        // refuse a log that is perfectly good.
+        let mut changed: Vec<(usize, Option<T>)> = Vec::new();
         for _ in 0..count {
             let id = read_u64(bytes, &mut pos)? as usize;
             let tag = *bytes
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.take(id) {
-                for index in &mut self.secondaries {
-                    index.erase(&old);
-                }
-                self.row_count -= 1;
-            }
             if tag == 1 {
                 let end = pos
                     .checked_add(obj_size)
@@ -936,14 +938,28 @@ impl<T: ArenaObject> Table<T> {
                 if id >= self.primary.len() {
                     return Err(TableError::Corrupted("delta row id out of range"));
                 }
-                for index in &mut self.secondaries {
-                    if !index.try_insert(&obj) {
-                        return Err(TableError::Corrupted("delta secondary key conflict"));
-                    }
-                }
-                self.primary.insert(id, obj);
-                self.row_count += 1;
+                changed.push((id, Some(obj)));
+            } else {
+                changed.push((id, None));
             }
+        }
+        for (id, _) in &changed {
+            if let Some(old) = self.primary.take(*id) {
+                for index in &mut self.secondaries {
+                    index.erase(&old);
+                }
+                self.row_count -= 1;
+            }
+        }
+        for (id, row) in changed {
+            let Some(obj) = row else { continue };
+            for index in &mut self.secondaries {
+                if !index.try_insert(&obj) {
+                    return Err(TableError::Corrupted("delta secondary key conflict"));
+                }
+            }
+            self.primary.insert(id, obj);
+            self.row_count += 1;
         }
         // In-place patches (into bytes appended by earlier frames), then the tail.
         let patch_count = read_u64(bytes, &mut pos)?;
@@ -988,13 +1004,43 @@ impl<T: ArenaObject> Table<T> {
     /// yields an equal digest.
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
         use sha2::Digest;
+        hasher.update(b"arena-table-v2");
         hasher.update((self.row_count as u64).to_le_bytes());
+        let offsets = T::blob_ref_offsets();
+        let mut scratch = Vec::new();
         for (id, obj) in self.primary.iter_with_ids() {
             hasher.update((id as u64).to_le_bytes());
-            hasher.update(obj.as_bytes());
+            let raw = obj.as_bytes();
+            if offsets.is_empty() {
+                hasher.update(raw);
+                continue;
+            }
+            // The row with each blob reference blanked, then each blob's bytes
+            // in field order behind a length. What the row says is its logical
+            // content; where it is stored is not part of the state.
+            scratch.clear();
+            scratch.extend_from_slice(raw);
+            for &at in offsets {
+                scratch[at..at + std::mem::size_of::<BlobRef>()].fill(0);
+            }
+            hasher.update(&scratch);
+            for &at in offsets {
+                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+                hasher.update((len as u64).to_le_bytes());
+                if len > 0 {
+                    // A ref past the arena cannot be a live state; hash a marker
+                    // rather than panic, so a corrupt row changes the root.
+                    match off
+                        .checked_add(len)
+                        .and_then(|end| self.blobs.get(off..end))
+                    {
+                        Some(bytes) => hasher.update(bytes),
+                        None => hasher.update(b"dangling-blob-ref"),
+                    }
+                }
+            }
         }
-        hasher.update((self.blobs.len() as u64).to_le_bytes());
-        hasher.update(&self.blobs);
     }
 }
 
@@ -1150,6 +1196,9 @@ mod tests {
 
     impl ArenaObject for TestRow {
         const TYPE_ID: u16 = 1;
+        fn blob_ref_offsets() -> &'static [usize] {
+            &[]
+        }
 
         fn id(&self) -> ObjectId<Self> {
             self.id

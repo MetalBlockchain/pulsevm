@@ -216,6 +216,9 @@ impl IndexedBy<ResourceLimitsRow> for LimitsByOwnerHash {
 }
 impl ArenaObject for ResourceLimitsRow {
     const TYPE_ID: u16 = 17;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -482,6 +485,9 @@ impl IndexedBy<PermissionRow> for PermByCbId {
 }
 impl ArenaObject for PermissionRow {
     const TYPE_ID: u16 = 3;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[::std::mem::offset_of!(Self, auth)]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -539,6 +545,9 @@ impl IndexedBy<PermissionLinkRow> for LinkByPermissionName {
 }
 impl ArenaObject for PermissionLinkRow {
     const TYPE_ID: u16 = 5;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -578,6 +587,9 @@ impl IndexedBy<CodeRow> for CodeByHash {
 }
 impl ArenaObject for CodeRow {
     const TYPE_ID: u16 = 6;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[::std::mem::offset_of!(Self, code)]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -871,6 +883,9 @@ impl IndexedBy<DeferredTransactionRow> for DeferredByDelay {
 
 impl ArenaObject for DeferredTransactionRow {
     const TYPE_ID: u16 = 21;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[::std::mem::offset_of!(Self, packed_trx)]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1156,6 +1171,9 @@ impl IndexedBy<TransactionRow> for TxByExpiration {
 }
 impl ArenaObject for TransactionRow {
     const TYPE_ID: u16 = 15;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1210,6 +1228,9 @@ impl IndexedBy<ContractTableRow> for ContractTableByCodeScopeTable {
 }
 impl ArenaObject for ContractTableRow {
     const TYPE_ID: u16 = 7;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1242,6 +1263,9 @@ impl IndexedBy<ContractKeyValueRow> for ContractKvByScopePrimary {
 }
 impl ArenaObject for ContractKeyValueRow {
     const TYPE_ID: u16 = 8;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[::std::mem::offset_of!(Self, value)]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1281,6 +1305,9 @@ impl IndexedBy<ContractIndex64Row> for ContractIdx64BySecondary {
 }
 impl ArenaObject for ContractIndex64Row {
     const TYPE_ID: u16 = 9;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1331,6 +1358,9 @@ impl IndexedBy<ContractIndex128Row> for ContractIdx128BySecondary {
 }
 impl ArenaObject for ContractIndex128Row {
     const TYPE_ID: u16 = 10;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1388,6 +1418,9 @@ impl IndexedBy<ContractIndex256Row> for ContractIdx256BySecondary {
 }
 impl ArenaObject for ContractIndex256Row {
     const TYPE_ID: u16 = 11;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1461,6 +1494,9 @@ impl IndexedBy<ContractIndexDoubleRow> for ContractIdxDoubleBySecondary {
 }
 impl ArenaObject for ContractIndexDoubleRow {
     const TYPE_ID: u16 = 12;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1553,6 +1589,9 @@ impl IndexedBy<ContractIndexLongDoubleRow> for ContractIdxLongDoubleBySecondary 
 }
 impl ArenaObject for ContractIndexLongDoubleRow {
     const TYPE_ID: u16 = 13;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -1750,6 +1789,11 @@ impl ChainDatabase {
 
     pub fn state_root(&self) -> [u8; 32] {
         self.read().state_root()
+    }
+
+    /// Each table's own state hash, to name the table two nodes disagree on.
+    pub fn table_roots(&self) -> Vec<(&'static str, [u8; 32])> {
+        self.read().table_roots()
     }
 
     // ----- ported mutations -------------------------------------------------

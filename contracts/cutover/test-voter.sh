@@ -760,7 +760,7 @@ cp "$FLOW_BASE" "$DEG_CFG"
 python3 - "$FLOW_BASE.finalized" "$DEG_CFG.finalized" "$DEG_PORT" <<'PYEOF'
 import json, sys
 state = json.load(open(sys.argv[1]))
-assert state["format"] == 1 and state["pause_height"] > state["height"], state
+assert state["format"] == 2 and state["contract"] and state["pause_height"] > state["height"], state
 state["producer_api_url"] = f"http://127.0.0.1:{sys.argv[3]}"
 json.dump(state, open(sys.argv[2], "w"))
 PYEOF
@@ -786,6 +786,26 @@ cp "$DEG_CFG.finalized" "$KEYFAIL_CFG.finalized"
 KEYFAIL_PID=$!
 wait_for_log "$WORK/keyfail.log" "from the recorded state" "$KEYFAIL_PID" 40 || fail "an unreadable key file ended pause enforcement: $(tail -5 "$WORK/keyfail.log")"
 kill "$KEYFAIL_PID" 2>/dev/null || true; wait "$KEYFAIL_PID" 2>/dev/null || true
+# The declaration's quorum does not cover P. A config that changes P for a
+# declaration this voter already armed is refused, and the refusal must not end
+# pause enforcement: exiting lets a nodeos restart resume production past the P
+# the rest of the fleet is paused at. It holds the recorded pause and signs nothing.
+CHG_CFG="$WORK/voter-changed-p.json"
+python3 - "$FLOW_BASE" "$CHG_CFG" <<'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["pause_height"] = cfg["pause_height"] + 1
+json.dump(cfg, open(sys.argv[2], "w"))
+PYEOF
+cp "$DEG_CFG.finalized" "$CHG_CFG.finalized"
+"$VOTER_BIN" --config "$CHG_CFG" >"$WORK/changed-p.log" 2>&1 &
+CHG_PID=$!
+wait_for_log "$WORK/changed-p.log" "from the recorded state" "$CHG_PID" 40 || fail "a changed P ended pause enforcement: $(tail -5 "$WORK/changed-p.log")"
+kill -0 "$CHG_PID" 2>/dev/null || fail "the voter exited on a changed P instead of holding the pause: $(tail -5 "$WORK/changed-p.log")"
+grep -q "ALARM event=cutover.voter_changed_round" "$WORK/changed-p.log" || fail "no alarm for the changed P: $(head -5 "$WORK/changed-p.log")"
+! grep -qE "vote submitted|delivered to coordinator" "$WORK/changed-p.log" || fail "the voter signed for a P nobody agreed to"
+kill "$CHG_PID" 2>/dev/null || true; wait "$CHG_PID" 2>/dev/null || true
+pass "a changed P is refused, the recorded pause is held and nothing is signed"
 # The operator saying stop is honoured even with a record.
 DISABLED_CFG="$WORK/voter-disabled.json"
 python3 - "$FLOW_BASE" "$DISABLED_CFG" <<'PYEOF'

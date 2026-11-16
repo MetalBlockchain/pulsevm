@@ -1,0 +1,102 @@
+name: Resilience
+
+# What a node does when it is killed, restarted, fed damaged files or run hard,
+# checked against nodes that were not. These tests are in the ordinary suite too;
+# they are run again here, repeatedly and on their own, because the failures they
+# catch depend on timing (a kill landing in one window of an accept) or on
+# comparing a restarted node with one that never stopped, and a single green run
+# of a timing-dependent test proves little. Found by running real nodes
+# (kill -9 of the VM, restarts under load, corrupted logs); see
+# docs/xpr-cutover-operations.md, "A node that is killed".
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # A longer soak once a week.
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resilience:
+    name: resilience-linux-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+
+    steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
+
+      - name: Checkout source code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install Protobuf (protoc)
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-amd64-resilience-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The write-ahead log and the state root, below the controller: restarts
+      # against a node that never stops, every kind of damage to the log, unique
+      # keys moved between rows, and aborted blocks.
+      - name: Arena restart equivalence and log damage
+        run: cargo test -p pulsevm_arena --locked
+
+      # The controller: kill and restart on a fresh and on a restored chain, a
+      # producer feeding a follower that never stops and one that is killed or
+      # stopped at random, the activation block, state history on and off, and
+      # block time under load.
+      - name: Crash recovery and agreement between nodes
+        run: |
+          cargo test -p pulsevm_core --locked --lib -- --test-threads=1 \
+            a_killed_node repeated_kills a_kill_between \
+            a_partial_log damage_to_the_log exporting_a_snapshot the_log_is_folded \
+            history_log_tails state_history_ a_node_with_state_history_off \
+            nodes_that_restart_stay pacing_ checkpoint_folds_are_spread \
+            opted_in_replay replay_recovery
+
+      # The same on the nightly protocol profile, where version 2 can activate.
+      - name: Crash recovery on the nightly protocol profile
+        run: |
+          cargo test -p pulsevm_core --locked --lib --features nightly -- --test-threads=1 \
+            a_restored_chain_activates a_kill_before_the_activation_record \
+            an_imported_deferred a_start_function_is_metered
+
+      # A real SIGKILL of a separate process. Repeated: where the signal lands in
+      # an accept is different every run, and one pass covers few of the windows.
+      # Weekly and on request it soaks much longer.
+      - name: Real kill -9, repeated
+        env:
+          ROUNDS: ${{ github.event_name == 'schedule' && '60' || github.event_name == 'workflow_dispatch' && '60' || '8' }}
+        run: |
+          cargo test -p pulsevm_core --locked --lib --no-run
+          for round in $(seq 1 "$ROUNDS"); do
+            echo "::group::kill -9 round $round of $ROUNDS"
+            cargo test -p pulsevm_core --locked --lib -- --test-threads=1 \
+              a_process_killed_with_sigkill
+            echo "::endgroup::"
+          done

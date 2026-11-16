@@ -285,8 +285,24 @@ fn validate_cpu_parameters_in_points(cfg: &ChainConfigV0) -> Result<(), ChainErr
             cfg.max_transaction_cpu_usage, cfg.min_transaction_cpu_usage
         )));
     }
+    // The block cap has to hold many transactions, not one. The relation above
+    // only forces it past the transaction cap (plus the minimum bill), which a
+    // cap just over a hundred minimum bills satisfies while leaving room for
+    // about ten ordinary transactions in a block. Real figures are tens of
+    // thousands of times the minimum (the converted chain's is 30,000x).
+    let min_block_cap = u64::from(cfg.min_transaction_cpu_usage) * MIN_BLOCK_CAP_MULTIPLE;
+    if u64::from(cfg.max_block_cpu_usage) < min_block_cap {
+        return Err(ChainError::ActionValidationError(format!(
+            "max_block_cpu_usage {} is under {MIN_BLOCK_CAP_MULTIPLE} times min_transaction_cpu_usage {} ({min_block_cap}): CPU parameters are metering points, not microseconds, and a block that small cannot hold more than a few ordinary transactions",
+            cfg.max_block_cpu_usage, cfg.min_transaction_cpu_usage
+        )));
+    }
     Ok(())
 }
+
+/// How many minimum-sized transactions the block CPU cap must be able to hold.
+#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+const MIN_BLOCK_CAP_MULTIPLE: u64 = 1000;
 
 /// How many minimum-sized transactions the transaction CPU cap must be able to
 /// hold. A guard against unit mistakes, deliberately far below any real ratio.

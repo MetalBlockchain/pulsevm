@@ -47,6 +47,9 @@ impl IndexedBy<Account> for ByName {
 
 impl ArenaObject for Account {
     const TYPE_ID: u16 = 0;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -88,6 +91,9 @@ impl IndexedBy<HashAccount> for HashByName {
 
 impl ArenaObject for HashAccount {
     const TYPE_ID: u16 = 1;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }

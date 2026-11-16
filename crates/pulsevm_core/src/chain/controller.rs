@@ -1147,6 +1147,67 @@ struct CachedSnapshot {
     envelope: Vec<u8>,
 }
 
+/// The log size at which this node writes a checkpoint instead: the configured
+/// size plus up to half again, chosen from the node's identity.
+///
+/// Every node's log starts empty at the same height after a cut and grows at the
+/// same rate, so with one threshold they all fold on the same block. A fold
+/// rewrites all of state (about 4 seconds at mainnet size), and a whole network
+/// pausing for it at once is a stall. A fixed offset per node, rather than
+/// randomness at fold time, keeps a node's own schedule predictable and the
+/// spread permanent.
+pub(crate) fn jittered_wal_threshold(base: u64, producer: &[u8], data_dir: &[u8]) -> u64 {
+    use sha2::{
+        Digest,
+        Sha256,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(producer);
+    hasher.update([0]);
+    hasher.update(data_dir);
+    let digest = hasher.finalize();
+    let spread = u64::from(u16::from_le_bytes([digest[0], digest[1]]));
+    base.saturating_add(((u128::from(base) * u128::from(spread)) / (2 * 65_536)) as u64)
+}
+
+/// What a block producer should do about the clock before building.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlotPacing {
+    /// The next slot has begun: build now.
+    Ready,
+    /// The next slot begins shortly: wait this long, then build.
+    Wait(std::time::Duration),
+    /// The next slot is further ahead than a build should wait. The chain's time
+    /// has already run ahead of this node's clock.
+    TooFarAhead { slots_ahead: u32 },
+}
+
+/// Decide whether a block for `next_slot` can be built at `now_micros`.
+///
+/// A block's timestamp is the later of the clock and one slot past its parent.
+/// A builder asked for blocks faster than one per slot therefore stamps each one
+/// a slot further ahead of the clock than the last, and verifiers refuse a block
+/// more than `MAX_FUTURE_BLOCK_TIME_SLOTS` ahead of theirs: at about three blocks
+/// a second the chain ran ten seconds ahead in a few minutes and split. Waiting
+/// for the slot to arrive keeps timestamps at the clock, and a chain that has
+/// already drifted catches up instead of running further ahead.
+pub fn pace_block_build(next_slot: u32, now_micros: i64, max_wait_slots: u32) -> SlotPacing {
+    const SLOT_MICROS: i64 = 500_000;
+    let starts = BlockTimestamp::new(next_slot)
+        .to_time_point()
+        .time_since_epoch()
+        .count();
+    let early = starts.saturating_sub(now_micros);
+    if early <= 0 {
+        return SlotPacing::Ready;
+    }
+    let slots_ahead = u32::try_from((early + SLOT_MICROS - 1) / SLOT_MICROS).unwrap_or(u32::MAX);
+    if slots_ahead > max_wait_slots {
+        return SlotPacing::TooFarAhead { slots_ahead };
+    }
+    SlotPacing::Wait(std::time::Duration::from_micros(early as u64))
+}
+
 impl Controller {
     pub fn new() -> Self {
         // Create a temporary database
@@ -2134,6 +2195,36 @@ impl Controller {
                     }
                 }
 
+                // State history that was off while blocks were accepted cannot
+                // simply be turned back on: its logs must be contiguous, and the
+                // next block would be refused as skipping the ones in between
+                // ("missed a block in trace_log.log"), with a node that looks
+                // broken. Say what happened and what to do, before touching
+                // anything. It is a setting to keep fixed for a data directory.
+                if end > start
+                    && self
+                        .node_config
+                        .as_ref()
+                        .is_some_and(|config| config.state_history_enabled)
+                {
+                    for (name, log) in [
+                        ("trace", self.trace_log.as_ref()),
+                        ("chain state", self.chain_state_log.as_ref()),
+                    ] {
+                        let Some(log) = log else { continue };
+                        let last = log.range().map(|(_, last)| last);
+                        if last.is_none_or(|last| last < end) {
+                            return Err(ChainError::DatabaseError(format!(
+                                "state history is enabled but the {name} log ends at {} while the block log ends at {end}: state history was off while those blocks were accepted. Its logs must be contiguous, so it cannot be switched back on over the gap. Either leave state_history_enabled=false for this data directory, or stop the node, move the trace and chain-state log files out of the data directory (they start again at the next block, without the missing history), or resync",
+                                last.map_or_else(
+                                    || "nothing".to_string(),
+                                    |last| format!("block {last}")
+                                )
+                            )));
+                        }
+                    }
+                }
+
                 info!("block log contains blocks from {} to {}", start, end);
 
                 self.last_accepted_block = self.get_block_by_height(end)?.ok_or_else(|| {
@@ -2297,6 +2388,18 @@ impl Controller {
             .copied()
             .map(ProtocolUpgrade::activation_record)
             .collect()
+    }
+
+    /// An offline replay job: state history off and the replay opt-in on. Such a
+    /// job defers its block-log fsync and writes no per-block log, because it
+    /// checkpoints for itself when it finishes and re-runs from its source if it
+    /// dies. State history off alone is not this. It is an ordinary block
+    /// producer setting, and that node must be as durable as any other; it used to
+    /// be treated as a replay, which left it with no state between clean stops.
+    fn bulk_replay_mode(&self) -> bool {
+        self.node_config
+            .as_ref()
+            .is_some_and(|config| !config.state_history_enabled && config.allow_replay_recovery)
     }
 
     /// Write back the activation record for the last accepted block, if a kill
@@ -2875,6 +2978,14 @@ impl Controller {
         )))
     }
 
+    /// The first slot a block built on the preferred head may take.
+    pub fn next_block_slot(&self) -> Result<u32, ChainError> {
+        Ok(self
+            .timestamp_for_parent(&self.preferred_id)?
+            .slot()
+            .saturating_add(1))
+    }
+
     fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
         if *parent_id == self.last_accepted_block_id {
             return Ok(*self.last_accepted_block.timestamp());
@@ -3326,11 +3437,7 @@ impl Controller {
                 self.store_chain_state(block_id)?;
             }
             let block_log = self.block_log.as_ref().expect("block log was preflighted");
-            let migration_replay = self
-                .node_config
-                .as_ref()
-                .is_some_and(|config| !config.state_history_enabled);
-            let append = if migration_replay {
+            let append = if self.bulk_replay_mode() {
                 block_log.append_deferred_sync(*block_id, &packed_block)
             } else {
                 block_log.append(*block_id, &packed_block)
@@ -3372,19 +3479,19 @@ impl Controller {
         // durable too, so a kill from here on restarts at this block. The
         // block is accepted and committed, so a failure cannot be undone:
         // stop rather than keep running on state that would not survive.
-        let wal_max_bytes = self
-            .node_config
-            .as_ref()
-            .map_or(pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES, |config| {
-                config.arena_wal_max_bytes
-            });
+        let wal_max_bytes = self.node_config.as_ref().map_or(
+            pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES,
+            |config| {
+                jittered_wal_threshold(
+                    config.arena_wal_max_bytes,
+                    config.producer_name.to_string().as_bytes(),
+                    self.db_path.as_deref().unwrap_or("").as_bytes(),
+                )
+            },
+        );
         // A bulk migration replay checkpoints for itself when it finishes and
         // would pay an fsync per block for a log it never reads.
-        let migration_replay = self
-            .node_config
-            .as_ref()
-            .is_some_and(|config| !config.state_history_enabled);
-        if !migration_replay {
+        if !self.bulk_replay_mode() {
             self.db.arena_flush_wal(wal_max_bytes).map_err(|error| {
                 ChainError::fatal_consistency(format!(
                     "block {} was accepted but its state change could not be made durable: {error}",
@@ -6313,40 +6420,78 @@ mod tests {
         let (mut controller, private_key, chain_id, _temp) = init_controller_with_upgrades(
             br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
         )?;
-        let timestamp = *controller.last_accepted_block().timestamp();
-        let mut billed = Vec::new();
-        for (name, wat_text) in [
-            ("withstart", with_start.as_str()),
-            ("nostart", without_start),
-        ] {
-            let account = Name::from_str(name)?;
-            controller.execute_transaction(
-                &create_account(&private_key, account, chain_id)?,
-                &timestamp,
-                &BlockStatus::Building,
-            )?;
-            controller.execute_transaction(
-                &set_code(
-                    &private_key,
-                    account,
-                    wat::parse_str(wat_text).expect("valid wasm"),
-                    chain_id,
-                )?,
-                &timestamp,
-                &BlockStatus::Building,
-            )?;
-            let result = controller.execute_transaction(
-                &call_contract(&private_key, account, Name::from_str("go")?, &1u8, chain_id)?,
-                &timestamp,
-                &BlockStatus::Building,
-            )?;
-            billed.push(u64::from(result.trace.receipt.cpu_usage_us));
+        let with_name = Name::from_str("withstart")?;
+        let without_name = Name::from_str("nostart")?;
+        let now = TimePointSec::now().sec_since_epoch();
+
+        // Each step is a real block: built, then accepted, so what is read below
+        // is the receipt the chain committed, not a speculative trace.
+        let mut mempool = Mempool::new();
+        for name in [with_name, without_name] {
+            mempool.add_transaction(create_account_with_expiration(
+                &private_key,
+                name,
+                chain_id,
+                TimePointSec::new(now + 1800),
+            )?);
         }
-        let (with, without) = (billed[0], billed[1]);
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let mut mempool = Mempool::new();
+        for (name, wat_text) in [
+            (with_name, with_start.as_str()),
+            (without_name, without_start),
+        ] {
+            mempool.add_transaction(set_code(
+                &private_key,
+                name,
+                wat::parse_str(wat_text).expect("valid wasm"),
+                chain_id,
+            )?);
+        }
+        let block = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&block.id()?, &mut mempool)?;
+
+        let calls = [
+            call_contract(
+                &private_key,
+                with_name,
+                Name::from_str("go")?,
+                &1u8,
+                chain_id,
+            )?,
+            call_contract(
+                &private_key,
+                without_name,
+                Name::from_str("go")?,
+                &1u8,
+                chain_id,
+            )?,
+        ];
+        let mut mempool = Mempool::new();
+        for call in &calls {
+            mempool.add_transaction(call.clone());
+        }
+        let block = controller.build_block(&mut mempool).await?;
+        let billed = |id: &Id| -> u64 {
+            let receipt = block
+                .transactions
+                .iter()
+                .find(|receipt| receipt.transaction_id() == id)
+                .expect("the call is in the block");
+            assert!(matches!(
+                receipt.status(),
+                crate::chain::transaction::TransactionStatus::Executed
+            ));
+            u64::from(receipt.cpu_usage_us())
+        };
+        let (with, without) = (billed(&calls[0].id()), billed(&calls[1].id()));
         assert!(
             with > without * 10,
-            "a three-million-iteration start function must dominate the bill: with {with}, without {without}"
+            "a three-million-iteration start function must dominate the bill the block commits: with {with}, without {without}"
         );
+        controller.accept_block(&block.id()?, &mut mempool)?;
         Ok(())
     }
 
@@ -8786,11 +8931,15 @@ mod tests {
     #[tokio::test]
     async fn test_accept_can_omit_derived_state_history_for_migration() -> Result<(), ChainError> {
         let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
-        controller
-            .node_config
-            .as_mut()
-            .expect("test controller is initialized")
-            .state_history_enabled = false;
+        {
+            // A replay job: state history off and the replay opt-in on.
+            let config = controller
+                .node_config
+                .as_mut()
+                .expect("test controller is initialized");
+            config.state_history_enabled = false;
+            config.allow_replay_recovery = true;
+        }
 
         let trace_range_before = controller.trace_log().unwrap().range();
         let state_range_before = controller.chain_state_log().unwrap().range();
@@ -9019,10 +9168,11 @@ mod tests {
     fn wal_frame_ends(db_path: &str) -> Vec<usize> {
         let data = std::fs::read(std::path::Path::new(db_path).join("arena_wal.bin"))
             .expect("the log exists");
-        let (mut ends, mut at) = (Vec::new(), 0usize);
+        // An 8-byte header, then [length][payload][32-byte checksum] per record.
+        let (mut ends, mut at) = (Vec::new(), 8usize);
         while at + 8 <= data.len() {
             let len = u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
-            at += 8 + len;
+            at += 8 + len + 32;
             ends.push(at);
         }
         ends
@@ -9210,6 +9360,372 @@ mod tests {
         Ok(())
     }
 
+    // What an operator can do to the log by hand, or a disk can do to it. Each
+    // case is one Paul ran against a live node.
+    #[tokio::test]
+    async fn damage_to_the_log_is_either_survived_or_refused_by_name() -> Result<(), ChainError> {
+        let log_of = |chain: &CrashChain| std::path::Path::new(chain.path()).join("arena_wal.bin");
+
+        // A zero-length record header appended: the plugin used to hang at start-up
+        // with nothing logged. It is a torn write, trimmed, and the node starts.
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "one").await?;
+        drop(controller);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log_of(&chain))
+                .unwrap();
+            file.write_all(&0u64.to_le_bytes()).unwrap();
+        }
+        let mut reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        chain.accept(&mut reopened, "two").await?;
+        drop(reopened);
+
+        // A byte flipped in the middle of the log, with records after it: refused,
+        // by name, with the reason. Applying what follows would build state on a
+        // hole, and it used to be accepted silently.
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        for name in ["a", "b", "c"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        drop(controller);
+        let ends = wal_frame_ends(chain.path());
+        let mut bytes = std::fs::read(log_of(&chain)).unwrap();
+        let inside_second = (ends[0] + ends[1]) / 2;
+        bytes[inside_second] ^= 0x40;
+        std::fs::write(log_of(&chain), bytes).unwrap();
+        let error = chain
+            .open()
+            .err()
+            .expect("a damaged log must not start")
+            .to_string();
+        assert!(error.contains("fails its checksum"), "{error}");
+
+        // The same flip in the last record is what a crash mid-write leaves: that
+        // block is dropped (the block log, one ahead, is rewound) and the node starts.
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        for name in ["a", "b"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        drop(controller);
+        let ends = wal_frame_ends(chain.path());
+        let mut bytes = std::fs::read(log_of(&chain)).unwrap();
+        let inside_last = (ends[0] + ends[1]) / 2;
+        bytes[inside_last] ^= 0x40;
+        std::fs::write(log_of(&chain), bytes).unwrap();
+        let reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_folds_are_spread_across_nodes_and_never_below_the_setting() {
+        let base = 4 * 1024 * 1024 * 1024u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for node in 0..32 {
+            let threshold = jittered_wal_threshold(
+                base,
+                format!("producer{node}").as_bytes(),
+                format!("/data/node{node}").as_bytes(),
+            );
+            assert!(threshold >= base, "never folds earlier than configured");
+            assert!(threshold < base + base / 2, "at most half again");
+            seen.insert(threshold);
+        }
+        assert!(
+            seen.len() > 24,
+            "nodes get different thresholds: {}",
+            seen.len()
+        );
+        // A node's own threshold does not move between runs.
+        assert_eq!(
+            jittered_wal_threshold(base, b"pulse", b"/data"),
+            jittered_wal_threshold(base, b"pulse", b"/data")
+        );
+        assert_eq!(jittered_wal_threshold(0, b"a", b"b"), 0);
+        assert_eq!(jittered_wal_threshold(u64::MAX, b"a", b"b"), u64::MAX);
+    }
+
+    // State history off is an ordinary block-producer setting, not an offline
+    // replay. It used to defer the block-log fsync and write no per-block log, so
+    // a killed node came back with nothing since its last clean stop and had to
+    // re-fetch every block from its peers.
+    #[tokio::test]
+    async fn a_node_with_state_history_off_keeps_its_blocks_through_a_kill()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({"state_history_enabled": false}))?;
+        let mut controller = chain.open()?;
+        for name in ["one", "two", "three"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        let root = controller.database().arena_state_root();
+        drop(controller);
+
+        let mut reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 4);
+        assert_eq!(reopened.database().arena_state_root(), root);
+        chain.accept(&mut reopened, "four").await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 5);
+        Ok(())
+    }
+
+    // Paul's sustained-load stall: at about three blocks a second the chain ran
+    // ten seconds ahead of the clock and verifiers began refusing its blocks.
+    // This runs a producer against a virtual clock, once as the builder used to
+    // (take the next slot whenever asked) and once paced, and checks the one
+    // thing the network cares about: how far ahead of the clock block time gets.
+    #[test]
+    fn pacing_keeps_block_time_at_the_clock_under_load() {
+        const SLOT_US: i64 = 500_000;
+        let epoch = BlockTimestamp::new(10_000)
+            .to_time_point()
+            .time_since_epoch()
+            .count();
+        let slot_of = |micros: i64| ((micros - epoch) / SLOT_US) as i64 + 10_000;
+        // A new block is wanted every 300 ms of the clock (about 3.3 a second).
+        let request_every_us = 300_000i64;
+
+        let run = |paced: bool| -> i64 {
+            let mut now = epoch + 10;
+            let mut parent = slot_of(now);
+            let mut worst_ahead = 0i64;
+            for _ in 0..600 {
+                if paced {
+                    loop {
+                        match pace_block_build(parent as u32 + 1, now, 2) {
+                            SlotPacing::Ready => break,
+                            SlotPacing::Wait(wait) => now += wait.as_micros() as i64,
+                            SlotPacing::TooFarAhead { slots_ahead } => {
+                                panic!("a paced producer never gets {slots_ahead} slots ahead")
+                            }
+                        }
+                    }
+                }
+                // What build_block stamps: the clock, or one past the parent.
+                let stamped = slot_of(now).max(parent + 1);
+                worst_ahead = worst_ahead.max(stamped - slot_of(now));
+                parent = stamped;
+                now += request_every_us;
+            }
+            worst_ahead
+        };
+
+        let unpaced = run(false);
+        assert!(
+            unpaced > i64::from(MAX_FUTURE_BLOCK_TIME_SLOTS),
+            "the old builder runs past what verifiers accept: {unpaced} slots ahead"
+        );
+        let paced = run(true);
+        assert_eq!(
+            paced, 0,
+            "a paced builder never stamps a block ahead of the clock"
+        );
+    }
+
+    #[test]
+    fn pacing_waits_for_a_near_slot_and_refuses_a_distant_one() {
+        let slot = 20_000u32;
+        let starts = BlockTimestamp::new(slot)
+            .to_time_point()
+            .time_since_epoch()
+            .count();
+        assert_eq!(pace_block_build(slot, starts, 2), SlotPacing::Ready);
+        assert_eq!(pace_block_build(slot, starts + 1, 2), SlotPacing::Ready);
+        assert_eq!(
+            pace_block_build(slot, starts - 200_000, 2),
+            SlotPacing::Wait(std::time::Duration::from_micros(200_000))
+        );
+        // Exactly two slots early is the longest it will wait; one more is a
+        // chain that has already drifted, answered without sleeping.
+        assert!(matches!(
+            pace_block_build(slot, starts - 1_000_000, 2),
+            SlotPacing::Wait(_)
+        ));
+        assert_eq!(
+            pace_block_build(slot, starts - 1_000_001, 2),
+            SlotPacing::TooFarAhead { slots_ahead: 3 }
+        );
+        assert_eq!(
+            pace_block_build(slot, starts - 5_000_000, 2),
+            SlotPacing::TooFarAhead { slots_ahead: 10 }
+        );
+    }
+
+    // A contract that rewrites one table row with as many bytes as the action
+    // carries. Rewriting it at different sizes frees blob slots and reuses them,
+    // which is the state a restart used to lose track of.
+    const CHURN_WAT: &str = r#"(module
+        (import "env" "action_data_size" (func $size (result i32)))
+        (import "env" "read_action_data" (func $read (param i32 i32) (result i32)))
+        (import "env" "db_find_i64" (func $find (param i64 i64 i64 i64) (result i32)))
+        (import "env" "db_store_i64"
+            (func $store (param i64 i64 i64 i64 i32 i32) (result i32)))
+        (import "env" "db_update_i64" (func $update (param i32 i64 i32 i32)))
+        (memory (export "memory") 1)
+        (func (export "apply") (param $r i64) (param $c i64) (param $a i64)
+            (local $n i32) (local $itr i32)
+            (local.set $n (call $size))
+            (drop (call $read (i32.const 0) (local.get $n)))
+            (local.set $itr (call $find (local.get $r) (i64.const 1) (i64.const 2) (i64.const 1)))
+            (if (i32.lt_s (local.get $itr) (i32.const 0))
+                (then (drop (call $store (i64.const 1) (i64.const 2) (local.get $r)
+                    (i64.const 1) (i32.const 0) (local.get $n))))
+                (else (call $update (local.get $itr) (local.get $r)
+                    (i32.const 0) (local.get $n))))))"#;
+
+    // The thing five live nodes disagreed about: a node that restarted computed a
+    // different state root from its first transaction on, while the nodes that
+    // never stopped agreed with each other. A producer feeds two followers, one of
+    // which is killed or cleanly stopped at random points while the other runs
+    // throughout, and after every block all three must hold the same root. Each
+    // test above compares a node with itself; only this one compares it with a
+    // node that did not go through the restart.
+    #[tokio::test]
+    async fn nodes_that_restart_stay_in_agreement_with_nodes_that_never_stop()
+    -> Result<(), ChainError> {
+        let producer_chain = CrashChain::new(json!({}))?;
+        let steady_chain = CrashChain::new(json!({}))?;
+        let restarted_chain = CrashChain::new(json!({}))?;
+        let mut producer = producer_chain.open()?;
+        let mut steady = steady_chain.open()?;
+        let mut restarted = restarted_chain.open()?;
+        let churn = Name::from_str("churn")?;
+        let key = &producer_chain.private_key;
+        let chain_id = producer_chain.chain_id;
+        let now = TimePointSec::now().sec_since_epoch();
+
+        // Deterministic, so a failing step reproduces.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+
+        let mut restarts = (0u32, 0u32);
+        // Short enough that block time stays inside what a verifier accepts: this
+        // producer is not paced, and each block it builds is a slot past its
+        // parent (see `pacing_keeps_block_time_at_the_clock_under_load`).
+        for step in 0..18u32 {
+            let transaction = match step {
+                0 => create_account_with_expiration(
+                    key,
+                    churn,
+                    chain_id,
+                    TimePointSec::new(now + 1800),
+                )?,
+                1 => set_code(
+                    key,
+                    churn,
+                    wat::parse_str(CHURN_WAT).expect("valid wasm"),
+                    chain_id,
+                )?,
+                _ => {
+                    // A different number of bytes most blocks, so the row's blob is
+                    // freed and a differently sized one is taken.
+                    let length = 2 + (step as usize * 7 + next(5) as usize) % 13;
+                    let mut data = vec![step as u8; length];
+                    data[0] = (step >> 8) as u8;
+                    call_contract(key, churn, Name::from_str("go")?, &data, chain_id)?
+                }
+            };
+            let mut mempool = Mempool::new();
+            mempool.add_transaction(transaction);
+            let block = producer.build_block(&mut mempool).await?;
+            let id = block.id()?;
+            producer.accept_block(&id, &mut mempool)?;
+            for follower in [&mut steady, &mut restarted] {
+                let mut follower_mempool = Mempool::new();
+                follower.verify_block(&block, &mut follower_mempool).await?;
+                follower.accept_block(&id, &mut follower_mempool)?;
+            }
+            let expected = producer.database().arena_state_root();
+            assert_eq!(
+                steady.database().arena_state_root(),
+                expected,
+                "step {step}: the node that never stopped differs from the producer"
+            );
+            assert_eq!(
+                restarted.database().arena_state_root(),
+                expected,
+                "step {step}: the restarted node differs from the nodes that never stopped, in {:?}",
+                restarted
+                    .database()
+                    .arena_tables_differing_from(&steady.database())
+            );
+
+            match next(4) {
+                0 => {
+                    // kill -9
+                    drop(restarted);
+                    restarted = restarted_chain.open()?;
+                    restarts.0 += 1;
+                }
+                1 => {
+                    // a clean stop
+                    restarted.shutdown()?;
+                    drop(restarted);
+                    restarted = restarted_chain.open()?;
+                    restarts.1 += 1;
+                }
+                _ => {}
+            }
+            assert_eq!(
+                restarted.database().arena_state_root(),
+                expected,
+                "step {step}: the node differs from the others right after its restart"
+            );
+        }
+        assert!(
+            restarts.0 >= 2 && restarts.1 >= 2,
+            "both kinds of restart ran: {restarts:?}"
+        );
+        assert!(restarted.database().arena_account_exists(churn.as_u64()));
+        Ok(())
+    }
+
+    // State history that was off while blocks were accepted cannot be turned back
+    // on over the gap. Paul hit this: the node came up and then refused its next
+    // block as "missed a block in trace_log.log", and only a resync fixed it.
+    #[tokio::test]
+    async fn state_history_switched_back_on_over_a_gap_is_refused_at_start_with_the_fix()
+    -> Result<(), ChainError> {
+        let off = CrashChain::new(json!({"state_history_enabled": false}))?;
+        let mut controller = off.open()?;
+        off.accept(&mut controller, "quiet").await?;
+        off.accept(&mut controller, "quieter").await?;
+        drop(controller);
+
+        // Off again after the gap is fine.
+        let still_off = CrashChain::build(
+            json!({"state_history_enabled": false}),
+            None,
+            off.path().to_string(),
+        )?;
+        drop(still_off.open()?);
+
+        let on = CrashChain::build(json!({}), None, off.path().to_string())?;
+        let error = on
+            .open()
+            .err()
+            .expect("state history cannot be switched back on over a gap")
+            .to_string();
+        assert!(
+            error.contains("state history was off while those blocks were accepted")
+                && error.contains("move the trace and chain-state log files"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     // An accept writes the trace and chain-state logs before the block log, which
     // is the marker that the block is accepted. A kill after those two and before
     // the block log leaves their tails one block ahead of an otherwise consistent
@@ -9355,6 +9871,18 @@ mod tests {
         println!("OPENED {}", controller.last_accepted_block().block_num());
         // Bounded so a test that dies without killing it cannot leave it running.
         for _ in 0..3000 {
+            // Unpaced, so kills land at every point of an accept, but never so
+            // far ahead of the clock that the reference node below would refuse
+            // these blocks as too far in the future.
+            loop {
+                let now = TimePoint::now().time_since_epoch().count();
+                match pace_block_build(controller.next_block_slot()?, now, 6) {
+                    SlotPacing::TooFarAhead { .. } => {
+                        tokio::time::sleep(Duration::from_millis(500)).await
+                    }
+                    _ => break,
+                }
+            }
             let next = controller.last_accepted_block().block_num() + 1;
             chain.accept(&mut controller, &kill9_account(next)).await?;
             println!("ACCEPTED {next}");
@@ -9472,6 +10000,27 @@ mod tests {
                     "cycle {cycle}: block {block}'s account is missing after the kill"
                 );
             }
+            // The state must be the state, not merely a state that has the right
+            // accounts: a node that replays the same blocks and never stops has
+            // to hold exactly the same.
+            let reference_chain = CrashChain::new(json!({}))?;
+            let mut reference = reference_chain.open()?;
+            for height in 2..=tip {
+                let block = recovered
+                    .get_block_by_height(height)?
+                    .expect("the recovered node's log has the block");
+                let mut replay = Mempool::new();
+                reference.verify_block(&block, &mut replay).await?;
+                reference.accept_block(&block.id()?, &mut replay)?;
+            }
+            assert_eq!(
+                recovered.database().arena_state_root(),
+                reference.database().arena_state_root(),
+                "cycle {cycle}: the recovered node differs from one that never stopped, in {:?}",
+                recovered
+                    .database()
+                    .arena_tables_differing_from(&reference.database())
+            );
             // And the recovered node is a node: it takes the next block.
             chain
                 .accept(&mut recovered, &kill9_account(tip + 1))
@@ -12831,14 +13380,28 @@ mod tests {
         let mut controller = chain.open(&[])?;
         seed_deferred_account(&mut controller, &chain, "deferredcap", 30)?;
         let mut mempool = Mempool::new();
-        // Nothing runnable: the deferred transaction fails its own cap, so the
-        // block either carries no usable transaction or is not built.
-        let _ = controller.build_block(&mut mempool).await;
+        // The block is built, and carries the transaction as a hard failure: it
+        // asked for a cap that reads as 30 points, so it could not pay for itself.
+        let block = controller.build_block(&mut mempool).await?;
+        assert_eq!(block.transactions.len(), 1);
+        assert!(
+            matches!(
+                block.transactions[0].status(),
+                crate::chain::transaction::TransactionStatus::HardFail
+            ),
+            "retired as a failure, not executed and not silently skipped"
+        );
+        controller.accept_block(&block.id()?, &mut mempool)?;
         assert!(
             !controller
                 .db
                 .is_account(Name::from_str("deferredcap")?.as_u64())?,
             "the capped deferred transaction must not have executed under version 1"
+        );
+        assert_eq!(
+            controller.db.deferred_transaction_count(),
+            0,
+            "and it is retired, not left to fail again every block"
         );
         Ok(())
     }
@@ -14126,9 +14689,12 @@ mod tests {
         let private_key =
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let genesis_bytes = generate_genesis(&private_key);
+        // The blocks are appended to the block log directly, with no history
+        // logs behind them, so this fixture runs with state history off.
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
+            "state_history_enabled": false,
         })
         .to_string()
         .into_bytes();

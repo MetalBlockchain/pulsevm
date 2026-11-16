@@ -395,12 +395,48 @@ impl RpcService {
             let mut mempool = self.mempool.write().await;
             mempool.take_all()
         };
-        let result = {
+        // The pool is detached first, as ever, so ingress stays live whatever the
+        // controller is busy with. The slot is then waited for with the batch in
+        // hand and the controller write lock not yet taken: the wait is up to a
+        // second, and the controller must not be held for it. The batch goes back
+        // on every path, including a build that is refused for being too early.
+        let result = async {
+            self.wait_for_block_slot().await?;
             let mut controller = self.controller.write().await;
             controller.build_block(batch.transactions_mut()).await
-        };
+        }
+        .await;
         self.mempool.write().await.finish_batch(batch);
         result
+    }
+
+    /// Hold off building until the clock reaches the next block's slot.
+    ///
+    /// Blocks asked for faster than one per slot would each be stamped a slot
+    /// further ahead of the clock (a block takes the later of the clock and one
+    /// slot past its parent), and verifiers refuse blocks too far ahead of theirs,
+    /// which split a loaded network. A near slot is waited for. A slot already
+    /// further ahead than that means the chain has drifted; it is answered with an
+    /// error rather than a long sleep, and the block timer asks again every
+    /// half second while there are transactions, so the clock catches up.
+    async fn wait_for_block_slot(&self) -> Result<(), ChainError> {
+        const MAX_WAIT_SLOTS: u32 = 2;
+        let next_slot = self.controller.read().await.next_block_slot()?;
+        let now = pulsevm_core::time::TimePoint::now()
+            .time_since_epoch()
+            .count();
+        match pulsevm_core::controller::pace_block_build(next_slot, now, MAX_WAIT_SLOTS) {
+            pulsevm_core::controller::SlotPacing::Ready => Ok(()),
+            pulsevm_core::controller::SlotPacing::Wait(wait) => {
+                tokio::time::sleep(wait).await;
+                Ok(())
+            }
+            pulsevm_core::controller::SlotPacing::TooFarAhead { slots_ahead } => {
+                Err(ChainError::BlockError(format!(
+                    "not building yet: the next block's slot is {slots_ahead} slots ahead of this node's clock; waiting for the clock instead of stamping blocks further into the future"
+                )))
+            }
+        }
     }
 
     /// Verify a candidate using the same detached-batch policy as production.

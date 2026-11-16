@@ -21,6 +21,7 @@ pub use db::{
     Db,
     DbError,
     WalReplay,
+    sync_parent_dir,
 };
 pub use object::{
     ArenaObject,

@@ -119,10 +119,63 @@ pub(crate) fn abort_on_fatal_consistency(operation: &str, error: &ChainError) ->
     std::process::abort()
 }
 
+/// The log threshold for a `PULSEVM_LOG_LEVEL` value: info by default, and an
+/// unrecognised value also means info rather than silencing or flooding the log.
+fn log_level_filter(value: Option<&str>) -> spdlog::LevelFilter {
+    use spdlog::{
+        Level,
+        LevelFilter,
+    };
+    match value
+        .map(|text| text.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("trace") => LevelFilter::All,
+        Some("debug") => LevelFilter::MoreSevereEqual(Level::Debug),
+        Some("warn") | Some("warning") => LevelFilter::MoreSevereEqual(Level::Warn),
+        Some("error") => LevelFilter::MoreSevereEqual(Level::Error),
+        _ => LevelFilter::MoreSevereEqual(Level::Info),
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::log_level_filter;
+    use spdlog::{
+        Level,
+        LevelFilter,
+    };
+
+    #[test]
+    fn info_unless_asked_and_never_a_surprise() {
+        assert_eq!(
+            log_level_filter(None),
+            LevelFilter::MoreSevereEqual(Level::Info)
+        );
+        assert_eq!(
+            log_level_filter(Some("nonsense")),
+            LevelFilter::MoreSevereEqual(Level::Info)
+        );
+        assert_eq!(
+            log_level_filter(Some(" DEBUG ")),
+            LevelFilter::MoreSevereEqual(Level::Debug)
+        );
+        assert_eq!(log_level_filter(Some("trace")), LevelFilter::All);
+        assert_eq!(
+            log_level_filter(Some("warn")),
+            LevelFilter::MoreSevereEqual(Level::Warn)
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
-    // Initialize logging
-    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
+    // Initialize logging. Debug is opt-in (`PULSEVM_LOG_LEVEL=debug`): at debug
+    // the controller hashes the whole state after every block just to print it,
+    // which a production node should not pay for on every block.
+    spdlog::default_logger().set_level_filter(log_level_filter(
+        std::env::var("PULSEVM_LOG_LEVEL").ok().as_deref(),
+    ));
 
     let cancel = CancellationToken::new();
     let cancel_ws = cancel.clone();
@@ -438,6 +491,10 @@ impl Vm for VirtualMachine {
                 if error.is_fatal_consistency() {
                     abort_on_fatal_consistency("controller initialization", &error);
                 }
+                // MetalGo gets this as a gRPC status and the plugin used to say
+                // nothing of its own, so a node that could not start (a damaged
+                // log, say) looked like a hang with an empty log. Say why here.
+                spdlog::error!("controller initialization failed: {error}");
                 return Err(Status::internal(format!(
                     "could not initialize controller: {error}"
                 )));

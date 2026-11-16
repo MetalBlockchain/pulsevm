@@ -1164,7 +1164,13 @@ impl Database {
             return Ok(());
         };
         match fs::remove_file(&wal) {
-            Ok(()) => Ok(()),
+            // The unlink is only durable once the directory is. Before that a
+            // power loss can bring the log back next to a checkpoint that
+            // already covers it, which replay tolerates, but it should not be
+            // left to chance.
+            Ok(()) => pulsevm_arena::sync_parent_dir(&wal).map_err(|e| {
+                ChainError::InternalError(format!("sync after removing the log: {e:?}"))
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(ChainError::InternalError(format!(
                 "remove {}: {e}",
@@ -1453,8 +1459,13 @@ impl Database {
         .map_err(|e| format!("serialize database metadata: {e}"))?;
         let tmp = dir.join(format!("{ARENA_METADATA_FILE}.tmp"));
         fs::write(&tmp, metadata).map_err(|e| format!("write database metadata: {e}"))?;
-        fs::rename(&tmp, dir.join(ARENA_METADATA_FILE))
-            .map_err(|e| format!("install database metadata: {e}"))?;
+        fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("sync database metadata: {e}"))?;
+        let installed = dir.join(ARENA_METADATA_FILE);
+        fs::rename(&tmp, &installed).map_err(|e| format!("install database metadata: {e}"))?;
+        pulsevm_arena::sync_parent_dir(&installed)
+            .map_err(|e| format!("sync database metadata directory: {e:?}"))?;
         Ok(())
     }
 
@@ -1476,10 +1487,16 @@ impl Database {
         fs::write(staged.path(), encoded)
             .map_err(|e| ChainError::InternalError(format!("protocol records: write: {e}")))?;
         staged
-            .persist(dir.join(PROTOCOL_RECORDS_FILE))
-            .map_err(|e| {
-                ChainError::InternalError(format!("protocol records: install: {}", e.error))
-            })?;
+            .as_file()
+            .sync_all()
+            .map_err(|e| ChainError::InternalError(format!("protocol records: sync: {e}")))?;
+        let installed = dir.join(PROTOCOL_RECORDS_FILE);
+        staged.persist(&installed).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: install: {}", e.error))
+        })?;
+        pulsevm_arena::sync_parent_dir(&installed).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: sync directory: {e:?}"))
+        })?;
         Ok(())
     }
 
@@ -2455,6 +2472,17 @@ impl Database {
     /// State root of the stored database.
     pub fn arena_state_root(&self) -> Option<[u8; 32]> {
         Some(self.backend.state_root())
+    }
+
+    /// The tables whose state differs between two databases, by name. Empty when
+    /// the roots agree. For a failing comparison to say where to look.
+    pub fn arena_tables_differing_from(&self, other: &Database) -> Vec<&'static str> {
+        let (ours, theirs) = (self.backend.table_roots(), other.backend.table_roots());
+        ours.iter()
+            .zip(theirs.iter())
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.0)
+            .collect()
     }
 
     /// Canonical bytes used by the differential replay/fingerprint tools.

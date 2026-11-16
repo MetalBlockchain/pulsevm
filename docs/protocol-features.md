@@ -755,7 +755,7 @@ count.
 | Rule | Before (version 1) | From the activation height (version 2) |
 |---|---|---|
 | A transaction header's `max_cpu_usage_ms` | The byte is a point count: at most 255 points, so the transaction can never pay the 100,000-point minimum bill. | `ms * 1000 * POINTS_PER_US` points, as Leap multiplies by 1000. The header can still only lower the limit, never raise it. |
-| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused, and so is a `max_transaction_cpu_usage` under 100 times the minimum ("CPU parameters are metering points, not microseconds"). The block cap must already exceed the transaction cap, so the second rule bounds both. |
+| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused, a `max_transaction_cpu_usage` under 100 times the minimum is refused, and so is a `max_block_cpu_usage` under 1000 times it ("CPU parameters are metering points, not microseconds"). |
 
 The second rule guards against one specific mistake (applying XPR's numbers after
 a migration), not a proof that a configuration is sensible. Both checks are

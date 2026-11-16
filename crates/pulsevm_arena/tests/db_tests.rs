@@ -33,6 +33,9 @@ impl IndexedBy<Account> for AccountByName {
 }
 impl ArenaObject for Account {
     const TYPE_ID: u16 = 1;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -63,6 +66,9 @@ struct Resource {
 }
 impl ArenaObject for Resource {
     const TYPE_ID: u16 = 2;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -86,6 +92,9 @@ struct AccountTypeIdCollision {
 }
 impl ArenaObject for AccountTypeIdCollision {
     const TYPE_ID: u16 = Account::TYPE_ID;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }

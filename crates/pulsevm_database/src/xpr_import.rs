@@ -1998,6 +1998,43 @@ pub fn hydrate_full_state_with_deferred_transactions(
     entry: &StateHistoryEntry,
     deferred_transactions: Option<&DeferredTransactionSidecar>,
 ) -> Result<ImportSummary, XprImportError> {
+    hydrate_full_state_with_deferred_policy(
+        db,
+        entry,
+        deferred_transactions,
+        DeferredPolicy::Execute,
+    )
+}
+
+/// What the new chain does with the deferred transactions that were pending on
+/// the source when it halted. It has to be the same on every node, and it is:
+/// the policy decides what is written into the checkpoint, and every node pins
+/// the checkpoint's hash in its genesis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeferredPolicy {
+    /// Leave each row as the source had it: it runs when its delay has passed,
+    /// or is retired if it has expired (the documented design, and what an
+    /// EOSIO 2.x producer does).
+    #[default]
+    Execute,
+    /// Retire every pending row as expired in the first block, without running
+    /// it, refunding its RAM and keeping only its id, as a Leap 5 producer
+    /// does. Which of the two a cut wants depends on the source nodeos: a Leap
+    /// 5 source never runs them, so the new chain running them would do what the
+    /// source would not.
+    Expire,
+}
+
+/// The `expiration` written for a row the new chain must retire: the epoch, so
+/// the first block's ordinary expiry check applies and no new rule is needed.
+const EXPIRED_AT_IMPORT: i64 = 0;
+
+pub fn hydrate_full_state_with_deferred_policy(
+    db: &mut Database,
+    entry: &StateHistoryEntry,
+    deferred_transactions: Option<&DeferredTransactionSidecar>,
+    policy: DeferredPolicy,
+) -> Result<ImportSummary, XprImportError> {
     let mut rows = decode_portable_rows(entry)?;
     redenominate_resource_rows(&mut rows)?;
     validate_code_links(&rows, entry.block_id, deferred_transactions)?;
@@ -2020,7 +2057,10 @@ pub fn hydrate_full_state_with_deferred_transactions(
                     key.payer,
                     key.trx_id,
                     row.delay_until,
-                    row.expiration,
+                    match policy {
+                        DeferredPolicy::Execute => row.expiration,
+                        DeferredPolicy::Expire => EXPIRED_AT_IMPORT,
+                    },
                     row.published,
                     &key.packed_trx,
                 )
@@ -6609,6 +6649,67 @@ mod tests {
         assert_eq!(summary.deferred_transactions, 1);
         assert_eq!(db.deferred_transaction_count(), 1);
         assert!(!db.is_account(11).unwrap());
+    }
+
+    // What the new chain does with a deferred transaction pending at H is a
+    // choice the converter makes, not a side effect. Execute keeps the row as the
+    // source had it; Expire writes an expiration the first block's ordinary expiry
+    // check retires, so nothing runs. Everything else about the row, and the row
+    // itself, is kept either way: the generated_transaction compare is unchanged.
+    #[test]
+    fn the_deferred_policy_decides_what_is_written_for_each_pending_row() {
+        let mut generated = vec![0];
+        generated.extend_from_slice(&11u64.to_le_bytes());
+        generated.extend_from_slice(&12u64.to_le_bytes());
+        generated.extend_from_slice(&13u64.to_le_bytes());
+        generated.extend_from_slice(&14u64.to_le_bytes());
+        generated.extend_from_slice(&[15; 32]);
+        bytes(&mut generated, &[16, 17]);
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [42; 32],
+            deltas: vec![delta("generated_transaction", generated)],
+        };
+        let sidecar_json = format!(
+            r#"{{"version":2,"source_block_id":"{}","global_action_sequence":0,"input_transactions":[],"transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1000,"expiration":9000000000000,"published":500,"packed_trx":"1011"}}]}}"#,
+            hex::encode(entry.block_id),
+            (12u128 | ((13u128) << 64)),
+            hex::encode([15; 32]),
+        );
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(sidecar_json.as_bytes()).unwrap();
+
+        let import = |policy| {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state_with_deferred_policy(&mut db, &entry, Some(&sidecar), policy)
+                .unwrap();
+            (dir, db)
+        };
+
+        let (_keep, executes) = import(DeferredPolicy::Execute);
+        let row = executes.arena_deferred_transaction([15; 32]).unwrap();
+        assert_eq!(row.expiration, 9_000_000_000_000, "as the source had it");
+        assert_eq!(row.delay_until, 1000);
+
+        let (_keep, expires) = import(DeferredPolicy::Expire);
+        let row = expires.arena_deferred_transaction([15; 32]).unwrap();
+        assert_eq!(
+            row.expiration, 0,
+            "already expired when the first block looks"
+        );
+        assert_eq!(row.delay_until, 1000, "nothing else is rewritten");
+        assert_eq!(row.published, 500);
+        assert_eq!(expires.deferred_transaction_count(), 1, "the row is kept");
+
+        // The default entry point is the documented behaviour.
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        hydrate_full_state_with_deferred_transactions(&mut db, &entry, Some(&sidecar)).unwrap();
+        assert_eq!(
+            db.arena_deferred_transaction([15; 32]).unwrap().expiration,
+            9_000_000_000_000
+        );
+        assert_eq!(DeferredPolicy::default(), DeferredPolicy::Execute);
     }
 
     #[test]

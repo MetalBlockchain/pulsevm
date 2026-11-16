@@ -83,6 +83,7 @@ pub use crate::{
         peek_header as peek_snapshot_header,
     },
     xpr_import::{
+        DeferredPolicy,
         DeferredTransactionSidecar,
         DeferredTransactionSidecarRow,
         IgnoredGlobalPropertyFields,
@@ -108,6 +109,7 @@ pub use crate::{
         check_no_deferred_due_in_window,
         global_property_rows_equivalent,
         hydrate_full_state,
+        hydrate_full_state_with_deferred_policy,
         hydrate_full_state_with_deferred_transactions,
         inspect_state_history_log,
         manifest_pause_window_us,

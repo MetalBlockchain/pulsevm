@@ -493,6 +493,122 @@ and a log that agrees with the state, then takes the next block. It does not
 involve MetalGo or the plugin; a kill of those on a live network is still Paul's
 check.
 
+## Restarts, damaged files and load (round 11)
+
+Paul Grey ran `fa777b69` and `6425eb82` on live nodes: the compare against a real
+mainnet snapshot passed, and every one of 23 `kill -9` of MetalGo and the plugin
+came back without the opt-in. The runs also found what is below. How each was
+found says what the tests have to look like: they compare a restarted node with a
+node that never stopped, they kill at a chosen microsecond, they damage files, and
+they run at a realistic transaction rate. Every one of those now has a test, and
+the `Resilience` workflow runs them on every push and weekly.
+
+**The state root depended on where blobs sat in the arena.** A node that had
+restarted computed a different root from its first transaction on, and the nodes
+that never stopped agreed with each other (three roots, then five, across five
+nodes; checkpoints written at the same height differed in size). The root hashed
+each row's raw blob offsets and the whole blob arena, dead spans included, and a
+restart loses the free list, so the layout of a node that restarted stopped
+matching the others. The root now hashes each row with its blob references
+resolved to their bytes. It does not depend on allocation history. `state_root`
+is not in a block header and account reads agreed throughout, so the chain kept
+going; what it broke was comparing a restarted node's state, and a state-sync
+snapshot taken from one. The value of the root changed with this fix, so a root
+recorded by an earlier build does not match one computed now (the per-table
+chainbase roots in the golden replay are a separate, independent fingerprint and
+are unchanged). Every table type must say where its blob references are
+(`ArenaObject::blob_ref_offsets`, required with no default: a hand-written
+implementation that forgot one was exactly how the contract-row table kept
+diverging after the first fix). When two nodes disagree,
+`arena_tables_differing_from` names the table.
+
+**The log has a checksum and a version.** Each record is
+`[length][payload][SHA-256]` behind an 8-byte `PVMWAL02` header. A record cut
+short, or a final record whose checksum fails, is a crash and is dropped. A
+checksum failure with intact data after it is not a crash, and the node refuses to
+start naming it (a flipped byte used to be applied silently). A zero-length record
+header used to hang the plugin at start-up with nothing logged; it is a torn
+write and is trimmed, and a failed initialization is now logged by the plugin. A
+log from the earlier unchecksummed build is refused by name: stop that node
+cleanly with the build that wrote it, or resync. The directory is fsynced after
+the checkpoint's rename, the log's creation and its removal, and the protocol and
+metadata files', so a power loss cannot bring back a log the checkpoint replaced.
+Power loss itself is not run here (a `kill -9` cannot show a missing directory
+fsync).
+
+**Replay no longer trips over a block that moves a unique key.** Applying a
+logged block one row at a time, in the order the rows were first touched, failed
+with `delta secondary key conflict` when a block gave a row the key another row
+held (or removed a row and reused its key), although the live table had done it in
+a safe order. A node would have refused to start after a kill. A block is now
+applied in two phases, all the old rows out of the indexes and then the new ones
+in.
+
+**State history off is a normal setting, and switching it back on is refused.** It
+used to be treated as an offline replay: the block log was not fsynced and no
+per-block log was written, so a killed node came back with nothing since its last
+clean stop and re-fetched every block from its peers. Only state history off
+together with the replay opt-in (`allow_replay_recovery`) is a replay now. A
+node that ran with state history off and is then started with it on is refused at
+start with what to do: leave it off, or stop the node and move the trace and
+chain-state log files aside (they begin again at the next block, without the
+missing history), or resync. It was a node that came up and then refused its next
+block as `missed a block in trace_log.log`.
+
+**Block time under load.** A block's timestamp is the later of the clock and one
+slot past its parent. Asked for blocks faster than one per slot (about three a
+second), the builder stamped each a slot further ahead, and past 20 slots (10
+seconds) verifiers refused the block and the network split 2-2. The service now
+waits for the next slot, up to a second, before it detaches the pool and takes the
+controller lock; a chain already further ahead than that is answered with an error
+and retried on the next 500 ms tick, so the clock catches up instead of the chain
+running on. This changes only when this node builds, not what verifiers accept.
+
+**Checkpoints are staggered.** Every node's log starts empty at the same height
+after a cut and grows at the same rate, so with one threshold they all fold on
+the same block, and a fold at mainnet size is a pause of about 4 seconds (Paul
+measured 4.2 to 4.4 s for 2.09 GB). The threshold is now the configured
+`arena_wal_max_bytes` plus up to half again, chosen from the node's identity, so
+nodes fold at different times. A fold still pauses the node that does it. Raise
+the setting to fold less often, lower it to bound replay after a crash.
+Debug-level logging is now opt-in (`PULSEVM_LOG_LEVEL=debug`): it hashes the whole
+state after every block to print it, which is also why accept took about 0.5 ms
+longer than it should in the measurements.
+
+**Deferred transactions pending at H.** Whether they run on the new chain is a
+choice with a cost either way, and it is made when the checkpoint is converted.
+`xpr_import_check` leaves them as the source had them by default (they run when
+due, or are retired if expired, the design in `docs/xpr-achain-migration.md`
+section 13); `--expire-deferred` retires every one in the new chain's first block
+without running it, refunding its RAM and keeping only its id, which is what a
+Leap 5 producer does. A Leap 5.0.3 source expires them regardless of the
+protocol-feature list, so on a fixture of that kind the default makes the target
+run transactions the source would never run; on an EOSIO 2.x source (XPR's own
+nodes) running them is what the source does. Which one a real cut needs depends
+on the nodeos XPR mainnet actually runs, and that has to be confirmed, not
+assumed. The choice is part of the checkpoint and so of its hash: every BP must
+pass the same flag, and the pinned hash refuses a BP that did not. The vote scan
+reads a deferred receipt (a bare id): an expired one never ran and is skipped, an
+executed one cannot be inspected, and the scan stops only if the votes it found
+do not account for the weight the contract counted.
+
+**`setparams` also floors the block cap.** The transaction cap must be 100 times
+the minimum bill (round 10); the block cap must now be 1000 times it. A block cap
+just over the guard fit about ten ordinary transactions. The converted chain's
+figures are 10,000 and 30,000 times. Both are guards against unit mistakes, not
+proof that a configuration is sensible.
+
+**Operating notes.**
+- If the plugin is killed and MetalGo is left running, MetalGo does not relaunch
+  the plugin and the chain stays down until MetalGo is restarted. Supervise
+  MetalGo, not just the plugin.
+- A disk that fills stops the plugin and MetalGo shuts the chain down (no restart
+  loop); once there is space the node recovers on its own.
+- The `rewinding block log` line is printed twice at start-up. It is cosmetic.
+- A record `<config>.finalized` written by an earlier voter build (format 1) is
+  not read. Delete any such file before a real run: one paused Paul's live
+  producer for the previous round's P.
+
 ## The voter after a failure: restart, degraded mode, state file
 
 - **A config fix needs a restart.** The voter reads its config at start. Fixing
@@ -520,7 +636,13 @@ check.
   this declaration finalized with P and the config now says P+1, the voter
   refuses to start rather than sign a confirmation nobody agreed to: the fleet
   may already be paused at the old P. If every voter really is moving to the new
-  value, move the state file aside (it stays as the record) and restart.
+  value, move the state file aside (it stays as the record) and restart. The
+  refusal does not end the voter: it logs `ALARM event=cutover.voter_changed_round`
+  and keeps enforcing the pause recorded for the old P, signing nothing. Exiting
+  there let a nodeos restart resume production past P (head 887941 to 887975 in
+  Paul's run). The agent should independently refuse a confirmation whose pause
+  height differs from the event's stop height; the voter's own guard rests on the
+  state file, and deleting the file (as the refusal says to) removes it.
 - **A config that stops loading keeps the pause.** If the config cannot be
   loaded after the voter recorded a finalized round (malformed JSON, an
   unreadable key file, a failed validation), the voter does not exit: exiting

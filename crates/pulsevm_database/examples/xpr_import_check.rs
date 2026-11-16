@@ -6,10 +6,11 @@ use std::{
 
 use pulsevm_database::{
     Database,
+    DeferredPolicy,
     DeferredTransactionSidecar,
     MigrationManifest,
     SourceSchedule,
-    hydrate_full_state_with_deferred_transactions,
+    hydrate_full_state_with_deferred_policy,
     parse_initial_state_history_log,
     write_source_schedule,
 };
@@ -25,7 +26,9 @@ fn usage() {
          committee hashes to anything else.\n\
          A checkpoint also needs the complete deferred-transaction sidecar (v2, with source_chain_id): without it the\n\
          replay-protection set and action sequences are lost and the hash differs from every BP that had it.\n\
-         --no-deferred-sidecar waives that for rehearsal fixtures only."
+         --no-deferred-sidecar waives that for rehearsal fixtures only.
+         --expire-deferred retires every deferred transaction pending at H in the new chain's first block without running it
+         (what a Leap 5 source does); without it they run when due. The choice is part of the checkpoint and its hash."
     );
 }
 
@@ -49,6 +52,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         schedule_sha256_arg = raw.remove(position + 1).into_string().ok();
+        raw.remove(position);
+    }
+    // What the new chain does with the deferred transactions pending at H.
+    // Execute (the default) leaves them as the source had them; --expire-deferred
+    // retires them all in the first block without running them, as a Leap 5
+    // source would. It changes the checkpoint, so it changes its hash: every BP
+    // must pass the same choice, which the pinned hash enforces.
+    let mut deferred_policy = DeferredPolicy::Execute;
+    if let Some(position) = raw.iter().position(|arg| arg == "--expire-deferred") {
+        deferred_policy = DeferredPolicy::Expire;
         raw.remove(position);
     }
     let mut no_deferred_sidecar = false;
@@ -163,10 +176,11 @@ fn main() -> ExitCode {
         }
     };
 
-    match hydrate_full_state_with_deferred_transactions(
+    match hydrate_full_state_with_deferred_policy(
         &mut database,
         &entry,
         deferred_transactions.as_ref().map(|(_, sidecar)| sidecar),
+        deferred_policy,
     ) {
         Ok(summary) => {
             if let Some(checkpoint_path) = checkpoint_path {

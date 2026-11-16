@@ -127,6 +127,20 @@ pub trait ArenaObject:
     fn type_name() -> &'static str {
         std::any::type_name::<Self>()
     }
+
+    /// Byte offsets of this type's [`BlobRef`] fields, in field order.
+    ///
+    /// The state root must not depend on where a blob happens to sit in the
+    /// arena. Two nodes that reach the same state by different histories (one of
+    /// them restarted, so its free list is gone) lay their blobs out differently,
+    /// and hashing offsets or the arena itself made their roots disagree. The
+    /// hash resolves each ref at these offsets to its bytes instead. The derive
+    /// macro fills this in. A hand-written implementation has to answer, and
+    /// there is no default on purpose: one that forgot would still compile and
+    /// hash its blob offsets, and the state root of a node that had restarted
+    /// would quietly stop matching the others'. Return `&[]` for a type with no
+    /// `BlobRef` field, and `&[offset_of!(Self, field), ..]` for one with.
+    fn blob_ref_offsets() -> &'static [usize];
 }
 
 /// An ordered-unique secondary index declaration, the equivalent of a

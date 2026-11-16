@@ -74,6 +74,9 @@ impl IndexedBy<TableIdObject> for ByCodeScopeTable {
 }
 impl ArenaObject for TableIdObject {
     const TYPE_ID: u16 = 0;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -113,6 +116,9 @@ impl IndexedBy<KeyValueObject> for ByScopePrimary {
 }
 impl ArenaObject for KeyValueObject {
     const TYPE_ID: u16 = 1;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[::std::mem::offset_of!(Self, value)]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -162,6 +168,9 @@ impl IndexedBy<Index64Object> for Idx64BySecondary {
 }
 impl ArenaObject for Index64Object {
     const TYPE_ID: u16 = 2;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -221,6 +230,9 @@ impl IndexedBy<Index128Object> for Idx128BySecondary {
 }
 impl ArenaObject for Index128Object {
     const TYPE_ID: u16 = 4;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -290,6 +302,9 @@ impl IndexedBy<Index256Object> for Idx256BySecondary {
 }
 impl ArenaObject for Index256Object {
     const TYPE_ID: u16 = 5;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -376,6 +391,9 @@ impl IndexedBy<IndexDoubleObject> for IdxDoubleBySecondary {
 }
 impl ArenaObject for IndexDoubleObject {
     const TYPE_ID: u16 = 6;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -508,6 +526,9 @@ impl IndexedBy<IndexLongDoubleObject> for IdxLongDoubleBySecondary {
 }
 impl ArenaObject for IndexLongDoubleObject {
     const TYPE_ID: u16 = 7;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }
@@ -559,6 +580,9 @@ impl IndexedBy<ResourceUsageObject> for UsageByAccount {
 }
 impl ArenaObject for ResourceUsageObject {
     const TYPE_ID: u16 = 3;
+    fn blob_ref_offsets() -> &'static [usize] {
+        &[]
+    }
     fn id(&self) -> ObjectId<Self> {
         self.id
     }

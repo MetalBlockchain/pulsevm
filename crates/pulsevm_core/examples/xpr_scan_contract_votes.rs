@@ -259,8 +259,12 @@ async fn run(
     let mut merged: HashMap<(u32, String), HaltContractVote> = HashMap::new();
     let mut versions: HashMap<u32, u32> = HashMap::new();
     let mut stable_rounds = 0;
+    let mut uninspectable: std::collections::BTreeSet<(u32, String)> =
+        std::collections::BTreeSet::new();
     for round in 1..=4 {
-        let found = scan_once(&client, host_header, api, contract, from, to, &frozen).await?;
+        let pass = scan_once(&client, host_header, api, contract, from, to, &frozen).await?;
+        uninspectable.extend(pass.uninspectable);
+        let found = pass.votes;
         let mut fresh = 0;
         for (vote, version) in found {
             versions.insert(vote.block, version);
@@ -338,6 +342,26 @@ async fn run(
     if ceremony.h == 0 {
         return Err("ceremony singleton not initialized".to_string());
     }
+    if !uninspectable.is_empty() {
+        let found_weight: u128 = votes
+            .iter()
+            .map(|vote| vote.producer.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|producer| frozen.get(producer))
+            .map(|(_, weight)| weight.0)
+            .sum();
+        let uninspectable: Vec<(u32, String)> = uninspectable.into_iter().collect();
+        check_uninspectable_receipts_hide_no_vote(
+            found_weight,
+            ceremony.voted_weight.0,
+            &uninspectable,
+        )?;
+        eprintln!(
+            "note: {} deferred transaction(s) ran in the window and cannot be inspected; the votes found account for the contract's full counted weight, so none is hiding a vote",
+            uninspectable.len()
+        );
+    }
 
     let fragment = HaltContractCeremony {
         contract: contract.to_string(),
@@ -399,6 +423,62 @@ async fn run(
     Ok(())
 }
 
+/// What one pass over the window found.
+struct ScanPass {
+    votes: Vec<(HaltContractVote, u32)>,
+    /// Receipts of deferred transactions that ran and are reported by id only,
+    /// as `(block, transaction id)`.
+    uninspectable: Vec<(u32, String)>,
+}
+
+/// How a block's receipt can be read.
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiptBody<'a> {
+    /// The packed transaction, as for an ordinary input transaction.
+    Packed(&'a str),
+    /// A deferred transaction retired as expired: it never ran.
+    Expired,
+    /// A deferred transaction that ran. Leap reports it as a bare id.
+    Uninspectable(String),
+}
+
+/// Read one receipt of a `get_block` reply, or `None` if it has neither a
+/// packed transaction nor an id (a node that pruned the history).
+fn classify_receipt(entry: &serde_json::Value) -> Option<ReceiptBody<'_>> {
+    let trx = entry.get("trx").unwrap_or(entry);
+    if let Some(packed) = trx.get("packed_trx").and_then(serde_json::Value::as_str) {
+        return Some(ReceiptBody::Packed(packed));
+    }
+    let id = trx.as_str()?;
+    let expired = entry.get("status").and_then(serde_json::Value::as_str) == Some("expired");
+    Some(if expired {
+        ReceiptBody::Expired
+    } else {
+        ReceiptBody::Uninspectable(id.to_string())
+    })
+}
+
+/// A vote cannot be found inside a receipt that carries no actions. The votes
+/// that were found must therefore account for all the weight the contract
+/// counted; if they do not, one of those receipts may hold the missing vote and
+/// the scan cannot tell, so it stops instead of exporting a short vote set.
+fn check_uninspectable_receipts_hide_no_vote(
+    found_weight: u128,
+    counted_weight: u128,
+    uninspectable: &[(u32, String)],
+) -> Result<(), String> {
+    if uninspectable.is_empty() || found_weight >= counted_weight {
+        return Ok(());
+    }
+    let first = &uninspectable[0];
+    Err(format!(
+        "{} deferred transaction(s) ran in the window and are reported by id only (first: {} in block {}), and the votes found carry weight {found_weight} of the {counted_weight} the contract counted: a vote may be inside one that cannot be inspected",
+        uninspectable.len(),
+        first.1,
+        first.0
+    ))
+}
+
 /// One scan pass over [from, to]: every `cutover::vote` action plus the
 /// schedule version of each block that carried one.
 async fn scan_once(
@@ -409,11 +489,12 @@ async fn scan_once(
     from: u32,
     to: u32,
     frozen: &HashMap<String, (String, HaltWeight)>,
-) -> Result<Vec<(HaltContractVote, u32)>, String> {
+) -> Result<ScanPass, String> {
     let contract_name =
         Name::from_str(contract).map_err(|e| format!("bad contract name {contract}: {e:?}"))?;
     let vote_name = Name::from_str("vote").map_err(|e| format!("bad vote action name: {e:?}"))?;
     let mut found = Vec::new();
+    let mut uninspectable = Vec::new();
     let mut block_num = from;
     while block_num <= to {
         let block = post(
@@ -434,15 +515,24 @@ async fn scan_once(
             .and_then(|transactions| transactions.as_array())
             .ok_or_else(|| format!("block {block_num} has no transactions array"))?;
         for entry in transactions {
-            let trx = entry.get("trx").unwrap_or(entry);
-            let packed = trx
-                .get("packed_trx")
-                .and_then(|packed| packed.as_str())
-                .ok_or_else(|| {
-                    format!(
+            let packed = match classify_receipt(entry) {
+                Some(ReceiptBody::Packed(packed)) => packed,
+                // A deferred transaction retired as expired never ran, so
+                // it carried no action of anyone's.
+                Some(ReceiptBody::Expired) => continue,
+                // One that ran is reported by id alone, and its actions are
+                // not in the block. Note it: the tally check in `main` decides
+                // whether a vote could be hiding there.
+                Some(ReceiptBody::Uninspectable(id)) => {
+                    uninspectable.push((block_num, id));
+                    continue;
+                }
+                None => {
+                    return Err(format!(
                         "block {block_num} transaction is not in packed form; history may be pruned"
-                    )
-                })?;
+                    ));
+                }
+            };
             let bytes = hex::decode(packed)
                 .map_err(|e| format!("block {block_num} packed_trx invalid: {e}"))?;
             let mut pos = 0;
@@ -498,5 +588,58 @@ async fn scan_once(
             break;
         }
     }
-    Ok(found)
+    Ok(ScanPass {
+        votes: found,
+        uninspectable,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // The receipts a Leap block carries. An ordinary one holds the packed
+    // transaction; a deferred one holds a bare id. The scan halted a ceremony on
+    // the second kind.
+    #[test]
+    fn receipts_are_read_by_what_they_carry() {
+        let input = json!({"status": "executed", "trx": {"id": "aa", "packed_trx": "0102"}});
+        assert_eq!(classify_receipt(&input), Some(ReceiptBody::Packed("0102")));
+
+        let expired = json!({"status": "expired", "cpu_usage_us": 0, "trx": "bb"});
+        assert_eq!(classify_receipt(&expired), Some(ReceiptBody::Expired));
+
+        let ran = json!({"status": "executed", "trx": "cc"});
+        assert_eq!(
+            classify_receipt(&ran),
+            Some(ReceiptBody::Uninspectable("cc".to_string()))
+        );
+        let soft = json!({"status": "soft_fail", "trx": "dd"});
+        assert_eq!(
+            classify_receipt(&soft),
+            Some(ReceiptBody::Uninspectable("dd".to_string()))
+        );
+
+        // Neither a packed transaction nor an id: history that was pruned.
+        let pruned = json!({"status": "executed", "trx": {"id": "ee"}});
+        assert_eq!(classify_receipt(&pruned), None);
+        assert_eq!(classify_receipt(&json!({"status": "executed"})), None);
+    }
+
+    #[test]
+    fn a_receipt_that_cannot_be_read_cannot_hide_a_counted_vote() {
+        let ran = vec![(886316u32, "cc".to_string())];
+        // Nothing uninspectable: nothing to check.
+        assert!(check_uninspectable_receipts_hide_no_vote(1, 3, &[]).is_ok());
+        // Every counted vote was found, so nothing is hiding.
+        assert!(check_uninspectable_receipts_hide_no_vote(3, 3, &ran).is_ok());
+        // A counted vote was not found: it may be in the receipt that cannot be
+        // read, so the scan stops and names it.
+        let error = check_uninspectable_receipts_hide_no_vote(2, 3, &ran).unwrap_err();
+        assert!(
+            error.contains("886316") && error.contains("cc") && error.contains("2 of the 3"),
+            "{error}"
+        );
+    }
 }

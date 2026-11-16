@@ -207,7 +207,11 @@ fn finalized_marker_path(config_path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{config_path}.finalized"))
 }
 
-const PAUSE_STATE_FORMAT: u32 = 1;
+/// Format 2 records the ceremony contract, so a degraded voter can check the
+/// round against the chain. A format-1 record cannot be checked and is not read:
+/// it is how a record from an earlier round paused a live producer. Clear any
+/// `<config>.finalized` file written by an earlier build before a real run.
+const PAUSE_STATE_FORMAT: u32 = 2;
 
 /// What the voter keeps on disk once its ceremony is finalized.
 ///
@@ -234,10 +238,8 @@ struct PauseState {
     host_header: String,
     producer_api_url: String,
     /// The ceremony contract, so a degraded voter can ask the chain whether this
-    /// round is still the finalized one. Absent in a state written before it was
-    /// recorded; that state can be enforced but not verified.
-    #[serde(default)]
-    contract: Option<String>,
+    /// round is still the finalized one.
+    contract: String,
 }
 
 /// How a recorded state relates to the round a config describes.
@@ -274,7 +276,7 @@ impl PauseState {
             nodeos_url: config.inner.nodeos_url.clone(),
             host_header: config.inner.host_header.clone(),
             producer_api_url: stop.producer_api_url.clone()?,
-            contract: Some(config.inner.contract.clone()),
+            contract: config.inner.contract.clone(),
         })
     }
 
@@ -2416,6 +2418,38 @@ fn own_finalized(config: &LoadedConfig, view: &CeremonyView) -> bool {
     })
 }
 
+/// Marks a refusal to sign because P or the schedule version changed for a
+/// declaration this voter already armed. `main` turns it into holding the
+/// recorded pause, not an exit.
+const CHANGED_ROUND_PREFIX: &str = "changed round: ";
+
+/// Run the voter, and if it refuses because the round was changed under it,
+/// keep enforcing the pause it recorded instead of ending.
+///
+/// Exiting there would end pause enforcement while the refusal leaves the fleet
+/// paused at the old P, and a nodeos restart would then resume block production
+/// past it (Paul saw head 887941 go to 887975 that way). Nothing is signed.
+async fn run_holding_the_recorded_pause(
+    config: &LoadedConfig,
+    dry_run: bool,
+    max_polls: u64,
+) -> Result<(), String> {
+    match run(config, dry_run, max_polls).await {
+        Err(error) if error.starts_with(CHANGED_ROUND_PREFIX) => {
+            let Some(state) = read_pause_state(&config.finalized_marker) else {
+                return Err(error);
+            };
+            log_line!(
+                "ALARM event=cutover.voter_changed_round producer={} outcome=failure: {error}. Holding the pause recorded for P={} and signing nothing",
+                state.producer,
+                state.pause_height
+            );
+            run_pause_only(&state, dry_run, max_polls).await
+        }
+        other => other,
+    }
+}
+
 /// Marks an exit made because the published schedule pin went stale before
 /// H; `main` turns it into a distinct exit code so supervisors can alarm.
 const PIN_ABORT_PREFIX: &str = "schedule pin abort: ";
@@ -2561,7 +2595,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // signing a confirmation for different ones would be a vote nobody
             // agreed to. Make the operator acknowledge the change.
             return Err(format!(
-                "{} records this declaration finalized with P={} and schedule version {}, but the config now says P={} and schedule version {}. P and the schedule version are not covered by the declaration's quorum, so the change is not agreed. If every voter really is moving to the new values, move {} aside (it is kept as the record) and restart; otherwise restore the old values",
+                "{CHANGED_ROUND_PREFIX}{} records this declaration finalized with P={} and schedule version {}, but the config now says P={} and schedule version {}. P and the schedule version are not covered by the declaration's quorum, so the change is not agreed. If every voter really is moving to the new values, move {} aside (it is kept as the record) and restart; otherwise restore the old values",
                 config.finalized_marker.display(),
                 old.pause_height,
                 old.schedule_version,
@@ -3005,20 +3039,14 @@ enum RoundStatus {
     Armed,
     /// The chain shows something else: the round was replaced or never stood.
     Replaced(String),
-    /// Could not tell (old record, unreadable table). Enforce: pausing for a
+    /// Could not tell (the table could not be read). Enforce: pausing for a
     /// round that may be abandoned is the lesser failure next to letting a
     /// producer build past a P the fleet really agreed.
     Unverifiable(String),
 }
 
 async fn recorded_round_status(client: &reqwest::Client, state: &PauseState) -> RoundStatus {
-    let Some(contract) = &state.contract else {
-        return RoundStatus::Unverifiable(
-            "the record predates contract recording, so it cannot be checked against the chain"
-                .to_string(),
-        );
-    };
-    let rows = match get_table_rows(client, &state.nodeos_url, contract, "ceremony").await {
+    let rows = match get_table_rows(client, &state.nodeos_url, &state.contract, "ceremony").await {
         Ok(rows) => rows,
         Err(error) => return RoundStatus::Unverifiable(error),
     };
@@ -3224,7 +3252,8 @@ async fn main() -> ExitCode {
     if dry_run {
         log_line!("dry run: evaluating only, nothing will be signed or submitted");
     }
-    match run(&config, dry_run || config.inner.dry_run, max_polls).await {
+    match run_holding_the_recorded_pause(&config, dry_run || config.inner.dry_run, max_polls).await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("xpr_cutover_voter: {error}");
@@ -4821,12 +4850,20 @@ mod tests {
         assert!(run_pause_only(&at(&url), false, 5).await.is_err());
         assert_eq!(pauses(&seen), 0);
 
-        // A record that cannot be checked (written before the contract was
-        // recorded) is enforced rather than dropped.
-        let (url, seen) = spawn_http_server(serve(None, past_p));
-        let mut legacy = at(&url);
-        legacy.contract = None;
-        run_pause_only(&legacy, false, 2).await.unwrap();
+        // A record that cannot be checked (the table cannot be read) is enforced
+        // rather than dropped: here the node answers with no `rows` at all.
+        let chain = state.source_chain_id.clone();
+        let (url, seen) = spawn_http_server(move |path: &str, _: &serde_json::Value| match path {
+            "/v1/chain/get_info" => serde_json::json!({
+                "head_block_num": past_p,
+                "last_irreversible_block_num": past_p - 5,
+                "chain_id": chain,
+            }),
+            "/v1/producer/paused" => serde_json::json!(true),
+            // No `rows` at all: the table cannot be read.
+            _ => serde_json::json!({}),
+        });
+        run_pause_only(&at(&url), false, 2).await.unwrap();
         assert_eq!(pauses(&seen), 2);
     }
 
@@ -4846,7 +4883,6 @@ mod tests {
         let mut live = state.clone();
         live.nodeos_url = url.clone();
         live.producer_api_url = url;
-        live.contract = None;
         run_pause_only(&live, true, 3).await.unwrap();
         assert!(
             !seen
@@ -4856,6 +4892,83 @@ mod tests {
                 .any(|path| path.starts_with("/v1/producer/")),
             "a dry run never touches the producer API"
         );
+    }
+
+    // Paul: with the same declaration and P+1 the voter refused and exited, the
+    // unit did not restart it, and a nodeos restart then resumed production past
+    // P. It now keeps enforcing the recorded P and still signs nothing.
+    #[tokio::test]
+    async fn a_changed_pause_height_keeps_the_recorded_pause_instead_of_exiting() {
+        let dir = scratch_dir("changed-p-holds");
+        let mut recorded = offline_config(&dir);
+        let chain = recorded.inner.source_chain_id.clone();
+        let (url, seen) = spawn_http_server(move |path: &str, _: &serde_json::Value| match path {
+            "/v1/chain/get_info" => serde_json::json!({
+                "head_block_num": 500,
+                "last_irreversible_block_num": 495,
+                "chain_id": chain,
+            }),
+            "/v1/producer/paused" => serde_json::json!(true),
+            _ => serde_json::json!({}),
+        });
+        recorded.inner.nodeos_url = url.clone();
+        recorded.inner.stop_producer.producer_api_url = Some(url);
+        write_pause_state(
+            &recorded.finalized_marker,
+            &PauseState::from_config(&recorded).unwrap(),
+        )
+        .unwrap();
+
+        let mut changed = offline_config(&dir);
+        changed.inner.nodeos_url = recorded.inner.nodeos_url.clone();
+        changed.inner.stop_producer.producer_api_url =
+            recorded.inner.stop_producer.producer_api_url.clone();
+        changed.inner.pause_height = Some(changed.inner.pause_height.unwrap() + 1);
+
+        run_holding_the_recorded_pause(&changed, false, 3)
+            .await
+            .expect("it holds the recorded pause rather than failing");
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|path| path.as_str() == "/v1/producer/pause")
+                .count(),
+            3,
+            "the recorded pause is asserted every poll"
+        );
+        assert!(
+            !calls.iter().any(|path| path.contains("push_transaction")),
+            "and nothing is signed or submitted"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A record from before the contract was recorded cannot be checked against
+    // the chain, and one such record paused a live producer for the previous
+    // round's P. It is not read.
+    #[test]
+    fn a_record_from_an_earlier_build_is_not_enforced() {
+        let dir = scratch_dir("old-record");
+        let config = offline_config(&dir);
+        let mut old = serde_json::to_value(PauseState::from_config(&config).unwrap()).unwrap();
+        old["format"] = serde_json::json!(1);
+        old.as_object_mut().unwrap().remove("contract");
+        std::fs::write(&config.finalized_marker, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(read_pause_state(&config.finalized_marker).is_none());
+        assert_eq!(
+            classify_recorded_round(&config.finalized_marker, &config),
+            RecordedRound::None
+        );
+        let marker = config
+            .finalized_marker
+            .to_string_lossy()
+            .replace(".finalized", "");
+        assert!(matches!(
+            degraded_plan(&marker, "x"),
+            DegradedPlan::Refuse(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn armed_stop() -> StopConfig {
