@@ -2109,6 +2109,31 @@ impl Controller {
                     )));
                 }
 
+                // The trace and chain-state logs are written before the block log,
+                // which is the marker that a block was accepted. A kill after
+                // them and before it leaves their tails past the block log's end:
+                // an accept record that was never completed. Drop those tails on
+                // every start, not only on an opted-in replay, or the node's next
+                // block would be refused as appended twice.
+                for (name, log) in [
+                    ("trace", self.trace_log.as_ref()),
+                    ("chain state", self.chain_state_log.as_ref()),
+                ] {
+                    let Some(log) = log else { continue };
+                    if let Some((_, last)) = log.range()
+                        && last > end
+                    {
+                        warn!(
+                            "the {name} log holds block {last} but the block log ends at {end}: dropping the incomplete accept record"
+                        );
+                        log.truncate_after(end).map_err(|error| {
+                            ChainError::DatabaseError(format!(
+                                "failed to drop the {name} log tail past block {end}: {error}"
+                            ))
+                        })?;
+                    }
+                }
+
                 info!("block log contains blocks from {} to {}", start, end);
 
                 self.last_accepted_block = self.get_block_by_height(end)?.ok_or_else(|| {
@@ -8973,11 +8998,28 @@ mod tests {
         private_key: PrivateKey,
         genesis: Vec<u8>,
         config: Vec<u8>,
-        temp: TempDir,
+        /// Keeps a scratch directory alive; `None` when pointed at one.
+        _temp: Option<TempDir>,
+        dir: String,
     }
 
     impl CrashChain {
         fn new(extra_config: serde_json::Value) -> Result<Self, ChainError> {
+            let temp = get_temp_dir();
+            let dir = temp.path().to_str().unwrap().to_string();
+            Self::build(extra_config, Some(temp), dir)
+        }
+
+        /// The same chain over a directory some other process also uses.
+        fn at(dir: &str) -> Result<Self, ChainError> {
+            Self::build(json!({}), None, dir.to_string())
+        }
+
+        fn build(
+            extra_config: serde_json::Value,
+            temp: Option<TempDir>,
+            dir: String,
+        ) -> Result<Self, ChainError> {
             let chain_id =
                 Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                     .unwrap();
@@ -8997,12 +9039,13 @@ mod tests {
                 genesis: generate_genesis(&private_key),
                 private_key,
                 config: config.to_string().into_bytes(),
-                temp: get_temp_dir(),
+                _temp: temp,
+                dir,
             })
         }
 
         fn path(&self) -> &str {
-            self.temp.path().to_str().unwrap()
+            &self.dir
         }
 
         fn open(&self) -> Result<Controller, ChainError> {
@@ -9132,6 +9175,44 @@ mod tests {
         Ok(())
     }
 
+    // An accept writes the trace and chain-state logs before the block log, which
+    // is the marker that the block is accepted. A kill after those two and before
+    // the block log leaves their tails one block ahead of an otherwise consistent
+    // node. The restart used to leave the tails in place, and the node's next
+    // block then failed with "missed a block in trace_log.log: expected block 15,
+    // got 14". A real SIGKILL found it; this builds the same window by hand.
+    #[tokio::test]
+    async fn history_log_tails_past_the_block_log_are_dropped_on_restart() -> Result<(), ChainError>
+    {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "kept").await?;
+        chain.accept(&mut controller, "unpublished").await?;
+        // Block 3 reached the history logs but not the block log or the state.
+        controller.block_log()?.truncate_after(2).unwrap();
+        drop(controller);
+        let ends = wal_frame_ends(chain.path());
+        let wal = std::path::Path::new(chain.path()).join("arena_wal.bin");
+        let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        file.set_len(ends[0] as u64).unwrap();
+        drop(file);
+
+        let mut reopened = chain.open()?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        assert_eq!(reopened.database().revision(), 2);
+        assert_eq!(
+            reopened.trace_log().unwrap().range().unwrap().1,
+            2,
+            "the trace log must not keep a block the node never accepted"
+        );
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
+        // The node's next block is block 3 again, and it can be appended.
+        chain.accept(&mut reopened, "again").await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 3);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 3);
+        Ok(())
+    }
+
     // A kill in the middle of the log write leaves a partial record. It must be
     // discarded, and the next block must be appended on a clean boundary, or
     // the following restart would find every later record hidden behind it.
@@ -9203,6 +9284,167 @@ mod tests {
                     .arena_account_exists(Name::from_str(name)?.as_u64()),
                 "{name} must survive"
             );
+        }
+        Ok(())
+    }
+
+    /// One account per block, named from the block number, so a block's effect
+    /// can be looked for by name after a crash.
+    fn kill9_account(block_num: u32) -> String {
+        let mut name = String::from("kk");
+        let mut rest = block_num;
+        loop {
+            name.push((b'a' + (rest % 5) as u8) as char);
+            rest /= 5;
+            if rest == 0 {
+                return name;
+            }
+        }
+    }
+
+    const KILL9_DIR_ENV: &str = "PULSEVM_KILL9_CHILD_DIR";
+
+    // The child half of the kill -9 test below. Run normally it does nothing; the
+    // parent re-runs this test binary with the directory in the environment, and
+    // then this keeps accepting blocks until it is killed. It reports a block only
+    // after `accept_block` has returned, which is the moment the node tells the
+    // network the block is accepted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill9_child_producer() -> Result<(), ChainError> {
+        let Ok(dir) = std::env::var(KILL9_DIR_ENV) else {
+            return Ok(());
+        };
+        let chain = CrashChain::at(&dir)?;
+        let mut controller = chain.open()?;
+        println!("OPENED {}", controller.last_accepted_block().block_num());
+        // Bounded so a test that dies without killing it cannot leave it running.
+        for _ in 0..3000 {
+            let next = controller.last_accepted_block().block_num() + 1;
+            chain.accept(&mut controller, &kill9_account(next)).await?;
+            println!("ACCEPTED {next}");
+        }
+        Ok(())
+    }
+
+    /// Kills the child if the test ends first, so a failure cannot leak a process.
+    #[cfg(unix)]
+    struct ChildGuard(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // The real thing, not a simulation: a separate process accepts blocks, is sent
+    // SIGKILL at a different moment each cycle (sometimes mid-write, which is the
+    // case the torn-record and one-block-window tests construct by hand), and the
+    // data directory it leaves must reopen at a block the child had reported
+    // accepted, with every account those blocks created and a log that agrees with
+    // the state. This is Paul's `kill -9` of a target node, for the VM itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_killed_with_sigkill_restarts_at_a_block_it_had_accepted()
+    -> Result<(), ChainError> {
+        use std::{
+            io::{
+                BufRead,
+                BufReader,
+            },
+            process::{
+                Command,
+                Stdio,
+            },
+            sync::mpsc,
+            time::Duration,
+        };
+
+        let temp = get_temp_dir();
+        let dir = temp.path().to_str().unwrap().to_string();
+        let mut previous_tip = 1u32;
+
+        for cycle in 0..6u64 {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chain::controller::tests::kill9_child_producer",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(KILL9_DIR_ENV, &dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("re-run the test binary as the child");
+            let stdout = child.stdout.take().unwrap();
+            let mut guard = ChildGuard(child);
+            let (lines_tx, lines_rx) = mpsc::channel::<String>();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if lines_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Let it get going, then kill it at a different point each cycle.
+            let mut accepted = Vec::new();
+            let wanted = 2 + (cycle % 3) as usize;
+            while accepted.len() < wanted {
+                let line = lines_rx
+                    .recv_timeout(Duration::from_secs(120))
+                    .expect("the child must keep accepting blocks");
+                if let Some(number) = line.strip_prefix("ACCEPTED ") {
+                    accepted.push(number.trim().parse::<u32>().unwrap());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(cycle * 9));
+            // SIGKILL: no shutdown, no destructors, no flush.
+            guard.0.kill().expect("send SIGKILL");
+            guard.0.wait().expect("reap the child");
+            // Everything it wrote before dying is still in the pipe.
+            reader.join().unwrap();
+            for line in lines_rx.try_iter() {
+                if let Some(number) = line.strip_prefix("ACCEPTED ") {
+                    accepted.push(number.trim().parse::<u32>().unwrap());
+                }
+            }
+            let reported = *accepted.iter().max().expect("it accepted blocks");
+            assert!(reported > previous_tip, "cycle {cycle} made progress");
+
+            let chain = CrashChain::at(&dir)?;
+            let mut recovered = chain.open().unwrap_or_else(|error| {
+                panic!("cycle {cycle}: the killed node must restart: {error}")
+            });
+            let tip = recovered.last_accepted_block().block_num();
+            // Every block the child reported accepted is durable. The child may
+            // have accepted one more before the signal arrived without the
+            // parent reading its line, never fewer.
+            assert!(
+                tip >= reported && tip <= reported + 1,
+                "cycle {cycle}: recovered block {tip}, child reported {reported}"
+            );
+            assert_eq!(recovered.database().revision(), i64::from(tip));
+            assert_eq!(recovered.block_log()?.range().unwrap().1, tip);
+            for block in 2..=tip {
+                assert!(
+                    recovered
+                        .database()
+                        .arena_account_exists(Name::from_str(&kill9_account(block))?.as_u64()),
+                    "cycle {cycle}: block {block}'s account is missing after the kill"
+                );
+            }
+            // And the recovered node is a node: it takes the next block.
+            chain
+                .accept(&mut recovered, &kill9_account(tip + 1))
+                .await?;
+            previous_tip = tip + 1;
+            // Left open and dropped without a shutdown: the next cycle starts
+            // from exactly what this one leaves behind.
+            drop(recovered);
         }
         Ok(())
     }

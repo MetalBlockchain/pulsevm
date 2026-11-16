@@ -452,6 +452,13 @@ compared in the tests). What to expect:
   one block ahead of a state that is otherwise intact. The node drops that one
   block (it is re-fetched from peers) and starts, without the offline-replay
   opt-in. State-history logs are rewound by the same block.
+- **Killed between the history logs and the block log.** An accept writes the
+  trace and chain-state logs first and the block log last, which is the marker
+  that the block was accepted. A kill in between leaves those two logs one block
+  ahead. They are cut back to the block log's end on every start (the start logs
+  `dropping the incomplete accept record`); before this the node's next block was
+  refused as `missed a block in trace_log.log`. Found by the real `kill -9` test
+  below, not by the hand-built ones.
 - **Killed during the write.** A partial final record is discarded and the log is
   trimmed to the last complete one before anything is appended.
 - **A clean stop** folds the log into the checkpoint and removes it.
@@ -467,10 +474,17 @@ compared in the tests). What to expect:
   log (exporting a checkpoint no longer resets its bookkeeping); installing a
   synced state replaces the log with the new checkpoint.
 
-The tests kill a node by dropping the controller without closing it, on a fresh
-chain and on a chain restored from a migration checkpoint, repeatedly, with a
-torn final record, between the block-log append and the flush, and with a
-snapshot export in the middle.
+The tests kill a node two ways. Most drop the controller without closing it, on
+a fresh chain and on a chain restored from a migration checkpoint, with a torn
+final record, between the block-log append and the flush, and with a snapshot
+export in the middle. One is a real `kill -9`
+(`a_process_killed_with_sigkill_restarts_at_a_block_it_had_accepted`): it re-runs
+the test binary as a child that keeps accepting blocks, sends it SIGKILL at a
+different moment in each of six cycles, and requires the directory to reopen at a
+block the child had reported accepted, with every account those blocks created
+and a log that agrees with the state, then takes the next block. It does not
+involve MetalGo or the plugin; a kill of those on a live network is still Paul's
+check.
 
 ## The voter after a failure: restart, degraded mode, state file
 
