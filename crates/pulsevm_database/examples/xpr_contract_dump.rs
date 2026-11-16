@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Some(path) = env::var_os("XPR_DUMP_SHIP_SNAPSHOT") {
-        let bytes = database.pack_deltas(true, &[0; 32]);
+        let bytes = database.pack_deltas(true, &[0; 32], pulsevm_database::ShipRowShape::Leap5);
         fs::write(&path, &bytes)?;
         println!(
             "ship_snapshot bytes={} sha256={} output={}",

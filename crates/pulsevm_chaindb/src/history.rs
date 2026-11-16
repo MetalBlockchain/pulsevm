@@ -69,7 +69,58 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// Which chain-state wire shape a chain's SHiP stream (and a full-state export) uses.
+///
+/// PulseVM-native chains emit the 16-table stream and the 143-byte
+/// `global_property` row the frozen golden (`ship_golden.txt.gz`, captured from
+/// the PulseVM C++ node at 782d9a47) pins. Chains carrying Antelope state (an
+/// imported XPR checkpoint, or XPR history replay) must match Leap 5 nodeos:
+/// all 19 tables, and the 157-byte `global_property` row with the
+/// producer-authority schedule envelope and both deferred-transaction fields.
+/// Both shapes are exactly what the served SHiP ABI (`state_history/abi.rs`)
+/// describes for their chains; only the Leap 5 one decodes against it fully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShipRowShape {
+    /// The PulseVM-native shape (the frozen C++ golden).
+    PulseNative,
+    /// Leap 5 nodeos `create_deltas.cpp` / `serialization.hpp`.
+    Leap5,
+}
+
+impl ShipRowShape {
+    fn table_order(self) -> &'static [&'static str] {
+        match self {
+            ShipRowShape::PulseNative => &TABLE_ORDER,
+            ShipRowShape::Leap5 => &LEAP5_TABLE_ORDER,
+        }
+    }
+}
+
+/// Leap 5's 19 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// A table appears in the stream only when it has entries for the block.
+const LEAP5_TABLE_ORDER: [&str; 19] = [
+    "account",
+    "account_metadata",
+    "code",
+    "contract_table",
+    "contract_row",
+    "contract_index64",
+    "contract_index128",
+    "contract_index256",
+    "contract_index_double",
+    "contract_index_long_double",
+    "global_property",
+    "generated_transaction",
+    "protocol_state",
+    "permission",
+    "permission_link",
+    "resource_limits",
+    "resource_usage",
+    "resource_limits_state",
+    "resource_limits_config",
+];
+
+/// The 16 chain-state tables of the PulseVM-native shape, in emission order.
 /// A table appears in the stream only when it has entries for the block.
 const TABLE_ORDER: [&str; 16] = [
     "account",
@@ -298,8 +349,22 @@ fn ser_generated_transaction(s: &mut Ser, db: &Db, r: &DeferredTransactionRow) {
     s.bytes(packed);
 }
 
-fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) {
+fn ser_global_property(
+    s: &mut Ser,
+    r: &GlobalPropertyRow,
+    chain_id: &[u8; 32],
+    shape: ShipRowShape,
+) {
     s.uvar(1); // global_property_object history version = 1
+    if shape == ShipRowShape::Leap5 {
+        // Leap 5 serializes the optional proposed-schedule block number and the
+        // producer-authority schedule before the chain config. The arena keeps the
+        // producer schedule in the Controller, not in this row, so this emits the
+        // empty schedule: optional absent, schedule version 0, no producers.
+        s.bool(false);
+        s.u32(0);
+        s.uvar(0);
+    }
     // chain_config (history version 1).
     s.uvar(1);
     s.u64(r.max_block_net_usage);
@@ -314,6 +379,10 @@ fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) 
     s.u32(r.max_transaction_cpu_usage);
     s.u32(r.min_transaction_cpu_usage);
     s.u32(r.max_transaction_lifetime);
+    if shape == ShipRowShape::Leap5 {
+        s.u32(r.deferred_trx_expiration_window);
+        s.u32(r.max_transaction_delay);
+    }
     s.u32(r.max_inline_action_size);
     s.u16(r.max_inline_action_depth);
     s.u16(r.max_authority_depth);
@@ -732,7 +801,12 @@ fn frame_table(out: &mut Ser, name: &str, rows: &Rows) {
 /// stream. `full_snapshot` emits all live rows; otherwise the open undo
 /// session's per-block changes. `chain_id` supplies the one `global_property`
 /// field the arena does not store.
-pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn pack_deltas(
+    db: &Db,
+    full_snapshot: bool,
+    chain_id: &[u8; 32],
+    shape: ShipRowShape,
+) -> Vec<u8> {
     let tid_map = table_id_map(db, full_snapshot);
     let parent_names = permission_parent_names(db, full_snapshot);
 
@@ -823,7 +897,7 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         "global_property",
         collect_table::<GlobalPropertyRow, _>(db, full_snapshot, |_db, r| {
             let mut s = Ser::new();
-            ser_global_property(&mut s, r, chain_id);
+            ser_global_property(&mut s, r, chain_id, shape);
             s.buf
         }),
     );
@@ -885,15 +959,16 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         }),
     );
 
-    let num_tables = TABLE_ORDER
+    let order = shape.table_order();
+    let num_tables = order
         .iter()
         .filter(|name| !per_table[**name].is_empty())
         .count();
 
     let mut out = Ser::new();
     out.uvar(num_tables as u64);
-    for name in TABLE_ORDER {
-        frame_table(&mut out, name, &per_table[name]);
+    for name in order {
+        frame_table(&mut out, name, &per_table[*name]);
     }
     out.buf
 }
@@ -903,25 +978,48 @@ mod global_property_tests {
     use super::{
         GlobalPropertyRow,
         Ser,
+        ShipRowShape,
         ser_global_property,
     };
 
-    #[test]
-    fn global_property_matches_leap5_envelope() {
-        let row = GlobalPropertyRow {
+    fn row() -> GlobalPropertyRow {
+        GlobalPropertyRow {
             deferred_trx_expiration_window: 600,
             max_transaction_delay: 3_888_000,
             ..GlobalPropertyRow::default()
-        };
+        }
+    }
+
+    #[test]
+    fn global_property_pulse_native_matches_the_frozen_golden_shape() {
         let chain_id = [0xabu8; 32];
         let mut ser = Ser::new();
-        ser_global_property(&mut ser, &row, &chain_id);
+        ser_global_property(&mut ser, &row(), &chain_id, ShipRowShape::PulseNative);
 
-        // The replay fixture uses the 143-byte historical row shape: the
-        // producer schedule and deferred-transaction fields are not present.
+        // The PulseVM-native golden uses the 143-byte row: no producer-schedule
+        // envelope and no deferred-transaction fields.
         assert_eq!(ser.buf.len(), 143);
         assert_eq!(&ser.buf[..4], &[1, 1, 0, 0]);
         assert_eq!(&ser.buf[66..98], &chain_id);
+    }
+
+    #[test]
+    fn global_property_leap5_matches_nodeos() {
+        let chain_id = [0xabu8; 32];
+        let mut ser = Ser::new();
+        ser_global_property(&mut ser, &row(), &chain_id, ShipRowShape::Leap5);
+
+        // 157 bytes is the Leap 5 global_property row: the six-byte empty
+        // producer-schedule envelope and both deferred-transaction fields of
+        // chain_config are present (XPR mainnet: 600 and 3,888,000).
+        assert_eq!(ser.buf.len(), 157);
+        assert_eq!(&ser.buf[..8], &[1, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(u32::from_le_bytes(ser.buf[60..64].try_into().unwrap()), 600);
+        assert_eq!(
+            u32::from_le_bytes(ser.buf[64..68].try_into().unwrap()),
+            3_888_000
+        );
+        assert_eq!(&ser.buf[80..112], &chain_id);
     }
 }
 
@@ -931,11 +1029,13 @@ mod tests {
 
     use pulsevm_arena::{
         ArenaObject,
+        Db,
         ObjectId,
     };
 
     use super::{
         Ser,
+        ShipRowShape,
         collect_protocol_state,
         pack_deltas,
         ser_generated_transaction,
@@ -946,7 +1046,9 @@ mod tests {
         AccountMetaRow,
         ContractIndexDoubleRow,
         ContractIndexLongDoubleRow,
+        ContractTableRow,
         DeferredTransactionRow,
+        GlobalPropertyRow,
         PermissionRow,
         ProtocolFeatureRow,
     };
@@ -1006,7 +1108,10 @@ mod tests {
     #[test]
     fn empty_delta_has_no_tables() {
         let db = crate::build_registered_db().unwrap();
-        assert_eq!(pack_deltas(&db, false, &[0; 32]), [0]);
+        assert_eq!(
+            pack_deltas(&db, false, &[0; 32], ShipRowShape::PulseNative),
+            [0]
+        );
     }
 
     #[test]
@@ -1022,7 +1127,10 @@ mod tests {
             0, // protocol_state version
             0, // no activated protocol features
         ];
-        assert_eq!(pack_deltas(&db, true, &[0; 32]), expected);
+        assert_eq!(
+            pack_deltas(&db, true, &[0; 32], ShipRowShape::PulseNative),
+            expected
+        );
     }
 
     #[test]
@@ -1034,7 +1142,7 @@ mod tests {
         })
         .unwrap();
 
-        let tables = unpack_tables(&pack_deltas(&db, true, &[0; 32]));
+        let tables = unpack_tables(&pack_deltas(&db, true, &[0; 32], ShipRowShape::PulseNative));
         let permission = tables
             .iter()
             .find(|table| table.name == "permission")
@@ -1067,7 +1175,12 @@ mod tests {
         assert_eq!(created.raw(), 3);
         db.squash();
 
-        let tables = unpack_tables(&pack_deltas(&db, false, &[0; 32]));
+        let tables = unpack_tables(&pack_deltas(
+            &db,
+            false,
+            &[0; 32],
+            ShipRowShape::PulseNative,
+        ));
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "account_metadata");
         let rows: Vec<(bool, u64)> = tables[0]
@@ -1085,8 +1198,8 @@ mod tests {
             db.create::<AccountMetaRow>(|row| row.name = name).unwrap();
         }
 
-        let first = pack_deltas(&db, true, &[7; 32]);
-        let second = pack_deltas(&db, true, &[7; 32]);
+        let first = pack_deltas(&db, true, &[7; 32], ShipRowShape::PulseNative);
+        let second = pack_deltas(&db, true, &[7; 32], ShipRowShape::PulseNative);
         assert_eq!(first, second);
         let tables = unpack_tables(&first);
         let metadata = tables
@@ -1184,6 +1297,81 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(rows[0].1[72..76].try_into().unwrap()),
             43
+        );
+    }
+
+    /// A db with one row in each table the two shapes disagree on (#109): a float64
+    /// and a long-double secondary index row, a deferred transaction, and the
+    /// global property row.
+    fn db_with_leap5_only_rows() -> Db {
+        let mut db = crate::build_registered_db().unwrap();
+        let t_id = db
+            .create::<ContractTableRow>(|row| {
+                row.code = 11;
+                row.scope = 12;
+                row.table = 13;
+            })
+            .unwrap()
+            .id()
+            .raw();
+        db.create::<ContractIndexDoubleRow>(|row| {
+            row.t_id = t_id as i64;
+            row.primary_key = 1;
+            row.secondary_key = 2.5;
+        })
+        .unwrap();
+        db.create::<ContractIndexLongDoubleRow>(|row| {
+            row.t_id = t_id as i64;
+            row.primary_key = 2;
+        })
+        .unwrap();
+        db.create::<DeferredTransactionRow>(|row| {
+            row.sender = 1;
+            row.trx_id = [5; 32];
+        })
+        .unwrap();
+        db.create::<GlobalPropertyRow>(|row| {
+            row.deferred_trx_expiration_window = 600;
+            row.max_transaction_delay = 3_888_000;
+        })
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn leap5_shape_frames_all_19_tables_in_create_deltas_order() {
+        let db = db_with_leap5_only_rows();
+        let tables = unpack_tables(&pack_deltas(&db, true, &[9; 32], ShipRowShape::Leap5));
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "contract_table",
+                "contract_index_double",
+                "contract_index_long_double",
+                "global_property",
+                "generated_transaction",
+                "protocol_state",
+            ]
+        );
+        let gp = tables.iter().find(|t| t.name == "global_property").unwrap();
+        assert_eq!(gp.rows[0].1.len(), 157, "Leap 5 global_property row");
+    }
+
+    #[test]
+    fn pulse_native_shape_keeps_the_frozen_16_table_stream() {
+        let db = db_with_leap5_only_rows();
+        let tables = unpack_tables(&pack_deltas(&db, true, &[9; 32], ShipRowShape::PulseNative));
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["contract_table", "global_property", "protocol_state"]
+        );
+        let gp = tables.iter().find(|t| t.name == "global_property").unwrap();
+        assert_eq!(
+            gp.rows[0].1.len(),
+            143,
+            "PulseVM-native global_property row"
         );
     }
 }
