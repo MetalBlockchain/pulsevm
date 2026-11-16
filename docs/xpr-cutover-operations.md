@@ -459,6 +459,13 @@ compared in the tests). What to expect:
   `dropping the incomplete accept record`); before this the node's next block was
   refused as `missed a block in trace_log.log`. Found by the real `kill -9` test
   below, not by the hand-built ones.
+- **Killed at the activation block.** The activation record for a protocol
+  upgrade is written just after the block's state is flushed, so a kill between
+  the two left version 2 executed but unrecorded, and the boot check refused to
+  start. On start the node writes back the record for the last accepted block, and
+  only that one, and only when this node executed that block (the block log holds
+  more than its first block). An upgrade scheduled at or before the height a chain
+  restarted from was never executed here and is still refused (`N = H+1`, above).
 - **Killed during the write.** A partial final record is discarded and the log is
   trimmed to the last complete one before anything is appended.
 - **A clean stop** folds the log into the checkpoint and removes it.

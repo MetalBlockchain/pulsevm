@@ -2247,6 +2247,7 @@ impl Controller {
             }
         }
 
+        self.record_activation_lost_to_a_kill()?;
         self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)?;
         self.ensure_protocol_version_supported(self.last_accepted_block.block_num())?;
         let ram_usage_monitor_max_series = self
@@ -2296,6 +2297,40 @@ impl Controller {
             .copied()
             .map(ProtocolUpgrade::activation_record)
             .collect()
+    }
+
+    /// Write back the activation record for the last accepted block, if a kill
+    /// landed after that block's state was made durable and before its record
+    /// was written.
+    ///
+    /// This is deliberately the one case and nothing wider. The record is derived
+    /// state: this block activated an upgrade and this node executed it, so the
+    /// record is certain. An upgrade scheduled at or before the height a chain
+    /// started from (a restored checkpoint, or a state-synced height) was never
+    /// executed here, no record can be derived for it, and the boot check must
+    /// keep refusing it. `end > start` is what tells the two apart: the last
+    /// block is this node's own only when the log holds more than its first.
+    fn record_activation_lost_to_a_kill(&self) -> Result<(), ChainError> {
+        let Some((start, end)) = self.block_log.as_ref().and_then(|log| log.range()) else {
+            return Ok(());
+        };
+        if end <= start || end != self.last_accepted_block.block_num() {
+            return Ok(());
+        }
+        let stored = self.db.activated_protocol_features()?;
+        let before_last = self.configured_protocol_records(end - 1);
+        let through_last = self.configured_protocol_records(end);
+        if stored != before_last || through_last.len() == before_last.len() {
+            return Ok(());
+        }
+        for (digest, activation_height) in &through_last[before_last.len()..] {
+            self.db
+                .append_activated_protocol_feature(*digest, *activation_height)?;
+        }
+        warn!(
+            "block {end} activated a protocol upgrade whose record was lost to an unclean stop; recorded it again"
+        );
+        Ok(())
     }
 
     /// Bind the locally supplied schedule to the activation history committed
@@ -12669,22 +12704,29 @@ mod tests {
         }
 
         fn path(&self) -> String {
-            self.temp
-                .path()
-                .join("target")
-                .to_str()
-                .unwrap()
-                .to_string()
+            self.dir("target")
+        }
+
+        fn dir(&self, name: &str) -> String {
+            self.temp.path().join(name).to_str().unwrap().to_string()
         }
 
         fn open(&self, upgrades: &[u8]) -> Result<Controller, ChainError> {
+            self.open_in("target", upgrades)
+        }
+
+        /// A second node over the same checkpoint, genesis and source block, in
+        /// its own data directory. Two fixtures built separately each stamp
+        /// their source block with the current second, and agree only if both
+        /// happen to land in the same one.
+        fn open_in(&self, name: &str, upgrades: &[u8]) -> Result<Controller, ChainError> {
             let mut controller = Controller::new();
             controller.initialize_with_protocol_upgrades(
                 &self.chain_id,
                 &self.config,
                 &self.genesis,
                 upgrades,
-                &self.path(),
+                &self.dir(name),
             )?;
             Ok(controller)
         }
@@ -12830,9 +12872,8 @@ mod tests {
         );
         assert_eq!(controller.db.deferred_transaction_count(), 0);
         // And a validator that did not build it agrees: same block, same state.
-        let chain_two = RestoredChain::new().await?;
-        let mut validator = chain_two.open(&upgrades)?;
-        seed_deferred_account(&mut validator, &chain_two, "deferredcap", 30)?;
+        let mut validator = chain.open_in("validator", &upgrades)?;
+        seed_deferred_account(&mut validator, &chain, "deferredcap", 30)?;
         let mut validator_mempool = Mempool::new();
         validator
             .verify_block(&block, &mut validator_mempool)
@@ -12842,6 +12883,43 @@ mod tests {
             validator.database().arena_state_root(),
             controller.database().arena_state_root()
         );
+        Ok(())
+    }
+
+    // On an accepted block the state change is made durable first and the
+    // activation record is written after. A kill between them at the activation
+    // block leaves version 2 executed and in the state, with no record of it, and
+    // the boot check then refused to start. The first block of a cutover chain is
+    // that block. Recording it on start is safe only for the last block this node
+    // itself executed; anything older is the stale-schedule case and stays refused.
+    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+    #[tokio::test]
+    async fn a_kill_before_the_activation_record_is_written_does_not_stop_the_node()
+    -> Result<(), ChainError> {
+        let chain = RestoredChain::new().await?;
+        let h = chain.source_block_num;
+        let upgrades = format!(
+            r#"{{"protocol_upgrades":[{{"protocol_version":2,"activation_height":{}}}]}}"#,
+            h + 1
+        )
+        .into_bytes();
+        let mut controller = chain.open(&upgrades)?;
+        chain
+            .accept_account(&mut controller, "atactivation", 30)
+            .await?;
+        assert_eq!(controller.last_accepted_block().block_num(), h + 1);
+        drop(controller);
+        // The kill landed after the state was flushed and before the record.
+        let records = std::path::Path::new(&chain.path()).join("protocol_records.json");
+        assert!(records.exists(), "the activation was recorded");
+        std::fs::remove_file(&records).unwrap();
+
+        let mut reopened = chain.open(&upgrades)?;
+        assert_eq!(reopened.last_accepted_block().block_num(), h + 1);
+        assert_eq!(reopened.protocol_version(h + 1), 2);
+        assert!(records.exists(), "the record is written back");
+        chain.accept_account(&mut reopened, "afteract", 30).await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), h + 2);
         Ok(())
     }
 
