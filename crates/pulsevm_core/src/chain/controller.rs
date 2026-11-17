@@ -9618,6 +9618,44 @@ mod tests {
         );
     }
 
+    // The service waits for a slot at most MAX_WAIT_SLOTS (6, i.e. 3 s) ahead of
+    // its clock and refuses a slot further out; verifiers accept 20. A node whose
+    // clock runs behind its peers sees the next slot that far ahead, so these are
+    // the skews it rides out and the one it reports instead of sleeping through.
+    #[test]
+    fn pacing_rides_out_a_clock_three_seconds_behind_and_reports_more() {
+        const MAX_WAIT_SLOTS: u32 = 6;
+        let slot = 30_000u32;
+        let starts = BlockTimestamp::new(slot)
+            .to_time_point()
+            .time_since_epoch()
+            .count();
+        for slots_behind in [1i64, 5, 6] {
+            let now = starts - slots_behind * 500_000;
+            assert_eq!(
+                pace_block_build(slot, now, MAX_WAIT_SLOTS),
+                SlotPacing::Wait(std::time::Duration::from_micros(
+                    (slots_behind * 500_000) as u64
+                )),
+                "{slots_behind} slots behind is waited out"
+            );
+        }
+        // One microsecond past six slots is the first skew it refuses.
+        for slots_behind in [7i64, 10, 19] {
+            let now = starts - slots_behind * 500_000;
+            assert_eq!(
+                pace_block_build(slot, now, MAX_WAIT_SLOTS),
+                SlotPacing::TooFarAhead {
+                    slots_ahead: slots_behind as u32
+                },
+                "{slots_behind} slots behind is reported"
+            );
+        }
+        // The verifiers' own allowance (20 slots) is wider than the wait, so a
+        // block built after waiting is never one a peer would refuse as too new.
+        assert!(MAX_WAIT_SLOTS < 20);
+    }
+
     // A contract that rewrites one table row with as many bytes as the action
     // carries. Rewriting it at different sizes frees blob slots and reuses them,
     // which is the state a restart used to lose track of.

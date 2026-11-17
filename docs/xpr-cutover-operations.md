@@ -566,8 +566,8 @@ block as `missed a block in trace_log.log`.
 slot past its parent. Asked for blocks faster than one per slot (about three a
 second), the builder stamped each a slot further ahead, and past 20 slots (10
 seconds) verifiers refused the block and the network split 2-2. The service now
-waits for the next slot, up to a second, before it detaches the pool and takes the
-controller lock; a chain already further ahead than that is answered with an error
+waits for the next slot, up to six slots (3 seconds), before it takes the
+controller lock, having detached the pool first; a chain already further ahead than that is answered with an error
 and retried on the next 500 ms tick, so the clock catches up instead of the chain
 running on. This changes only when this node builds, not what verifiers accept.
 
@@ -575,7 +575,9 @@ running on. This changes only when this node builds, not what verifiers accept.
 after a cut and grows at the same rate, so with one threshold they all fold on
 the same block, and a fold at mainnet size is a pause of about 4 seconds (Paul
 measured 4.2 to 4.4 s for 2.09 GB). The threshold is now the configured
-`arena_wal_max_bytes` plus up to half again, chosen from the node's identity, so
+`arena_wal_max_bytes` plus up to as much again, chosen from the node's identity
+(the id the host gives the node, so hosts that share a producer name and a path
+still differ), so
 nodes fold at different times. A fold still pauses the node that does it. Raise
 the setting to fold less often, lower it to bound replay after a crash.
 Debug-level logging is now opt-in: it hashes the whole state after every block to
@@ -632,6 +634,58 @@ proof that a configuration is sensible.
 - A record `<config>.finalized` written by an earlier voter build (format 1) is
   not read. Delete any such file before a real run: one paused Paul's live
   producer for the previous round's P.
+
+## Power loss, a full disk, a dead plugin
+
+**Power loss: run MetalGo on pebbledb.** After a power cut a node can refuse to
+start with `proposervm height index (N) should never be lower than the inner
+height index (M)`. The cause is two durability levels in one process pair: this
+VM fsyncs every accepted block, while MetalGo's default database (`leveldb`)
+writes without fsync, so the host's index of accepted blocks can lose its last
+writes and come back behind the VM. MetalGo's repair
+(`proposervm/vm.go: repairAcceptedChainByHeight`) can roll its own index back when
+the VM is behind, never forward, so it refuses. MetalGo persists its index
+*before* it tells the VM to accept (`postForkBlock.Accept`: outer, then inner), so
+with synced writes the host can never be behind. `pebbledb` syncs each write
+(`database/pebbledb/db.go`, `Sync: true` by default; batches commit with it).
+
+Set `"db-type": "pebbledb"` in the node config for every node of the new network.
+`scripts/run-local.sh` does (override with `PULSEVM_NODE_DB_TYPE`), and
+`run-handover.sh verify-restarts` fails if a node is not on pebble. The type is
+chosen at the node's first start: an existing leveldb directory cannot be reopened
+as pebble, so this belongs in the T-14 node configuration, not in a later
+change. Cost: one fsync per MetalGo write, not measured here. What was and was
+not checked: the order and the sync options were read in MetalGo's source; a real
+power cut was not performed (it needs a machine or VM that can be powered off),
+and the plugin's own recovery from one is covered by the kill tests above only
+as far as a process kill goes, which does not lose unsynced pages.
+
+**A full disk, or a plugin that died.** Neither is tested here: there is no
+disk-full case in the test suite, and what the plugin does with a failed write is
+whatever its error path does, not a designed behavior. What is known from running
+the rehearsal network is that MetalGo does not relaunch a plugin that has exited,
+so a node whose plugin is gone keeps running without its chain until MetalGo
+itself is restarted. Free the space (or find why the plugin exited in its log),
+then restart MetalGo. The write-ahead log and block log recover as after a kill;
+that part is covered by the kill tests above.
+
+**Clock skew.** A node whose clock runs behind its peers sees the next slot that
+far ahead. It waits up to six slots (3 seconds) and reports a larger skew as an
+error each 500 ms tick instead of sleeping through it; verifiers accept a block up
+to 20 slots (10 seconds) ahead. Keep NTP running on every producer. The thresholds
+are tested (`pacing_rides_out_a_clock_three_seconds_behind_and_reports_more`).
+
+**Files the node rebuilds.** The `.index` files beside the state-history logs are
+rebuilt from the log on open when they lag it (`state_history/log.rs`, open-time
+recovery). How long that takes at mainnet size has not been measured here.
+
+**The checkpoint file a node writes for itself.** `arena_state.bin` is a node's own
+checkpoint and depends on that node's live layout, so two nodes at the same height
+can hold different bytes while holding the same state. What is compared between
+nodes is the canonical state root, and what a node serves or exports for state
+sync is the canonical form: the same bytes from any node at the same height
+(tests `an_export_is_the_same_bytes...` and `a_node_that_restarted_exports...`).
+Do not compare `arena_state.bin` files byte for byte.
 
 ## The voter after a failure: restart, degraded mode, state file
 

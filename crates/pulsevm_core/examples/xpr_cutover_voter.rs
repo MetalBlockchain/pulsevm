@@ -336,8 +336,23 @@ fn supersede_pause_state(path: &std::path::Path) -> Result<std::path::PathBuf, S
 /// format (an older bare-digest marker included) or not valid JSON.
 fn read_pause_state(path: &std::path::Path) -> Option<PauseState> {
     let text = std::fs::read_to_string(path).ok()?;
-    let state: PauseState = serde_json::from_str(&text).ok()?;
-    (state.format == PAUSE_STATE_FORMAT).then_some(state)
+    let Ok(state) = serde_json::from_str::<PauseState>(&text) else {
+        log_line!(
+            "WARN event=cutover.voter_state_ignored outcome=ignored: {} is not a pause state this build can read, so it is not used",
+            path.display()
+        );
+        return None;
+    };
+    if state.format != PAUSE_STATE_FORMAT {
+        log_line!(
+            "WARN event=cutover.voter_state_ignored outcome=ignored: {} was written by an earlier build (format {}, this build reads format {}) and cannot be checked against the chain, so it is not used",
+            path.display(),
+            state.format,
+            PAUSE_STATE_FORMAT
+        );
+        return None;
+    }
+    Some(state)
 }
 
 fn write_pause_state(path: &std::path::Path, state: &PauseState) -> Result<(), String> {

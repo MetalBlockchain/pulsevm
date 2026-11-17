@@ -64,6 +64,14 @@ fi
 if [[ "$RUNNER_REASSIGN_PORTS_IF_USED" == "true" ]]; then
   RUNNER_START_ARGS+=(--reassign-ports-if-used)
 fi
+# MetalGo's default database (leveldb) writes without fsync, while this VM
+# fsyncs every accepted block. After a power loss the host's proposervm index
+# can then be BEHIND the VM, and MetalGo refuses to start ("proposervm height
+# index should never be lower than the inner height index"). pebbledb syncs each
+# write, and proposervm persists its own index before the VM accepts, so the host
+# can never fall behind. See docs/xpr-cutover-operations.md, "Power loss".
+NODE_DB_TYPE="${PULSEVM_NODE_DB_TYPE:-pebbledb}"
+RUNNER_START_ARGS+=(--global-node-config "{\"db-type\":\"${NODE_DB_TYPE}\"}")
 # Space-separated extra flags appended to `control start` (e.g.
 # "--dynamic-ports" for shared hosts). Empty by default; no behavior change.
 if [[ -n "${PULSEVM_RUNNER_START_EXTRA_ARGS:-}" ]]; then

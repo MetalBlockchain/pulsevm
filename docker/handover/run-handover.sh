@@ -1932,6 +1932,14 @@ cmd_checkpoint() {
     # The export work dir must sit below /tmp for the nodeos-docker adapter.
     # mktemp -u reserves the name without creating it: export.sh requires a
     # non-existing work dir.
+    # How pending deferred transactions are converted. XPR mainnet (Leap 5) does
+    # not execute them, so the rehearsal retires them like a real cut would; set
+    # PULSEVM_DEFERRED_MODE=execute to rehearse the other mode.
+    case "${PULSEVM_DEFERRED_MODE:-expire}" in
+        expire) DEFERRED_FLAG="--expire-deferred" ;;
+        execute) DEFERRED_FLAG="" ;;
+        *) fail "PULSEVM_DEFERRED_MODE must be expire or execute" ;;
+    esac
     export_dir="$(mktemp -du /tmp/pulsevm-handover-export.XXXXXX)"
     echo "$export_dir" >"$WORK_DIR/export-dir"
     require_disk_headroom
@@ -1955,7 +1963,8 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$export_dir/arena" \
         "$export_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar) || fail "checkpoint import failed"
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar \
+        $DEFERRED_FLAG) || fail "checkpoint import failed"
     # Determinism on a REAL export: every BP converts its own export and the
     # fleet has to land on one checkpoint hash. Convert the same export a
     # second time in a separate process with a different working directory,
@@ -1970,7 +1979,8 @@ cmd_checkpoint() {
         "$export_dir/state-history/chain_state_history.log" \
         "$det_dir/arena" \
         "$det_dir/migration.snapshot" \
-        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar >"$det_dir/convert.log" 2>&1) \
+        --leap-snapshot "$(cat "$WORK_DIR/snapshot")" --schedule-sha256 "$SCHEDULE_SHA256" --no-deferred-sidecar \
+        $DEFERRED_FLAG >"$det_dir/convert.log" 2>&1) \
         || fail "second conversion failed (see $det_dir/convert.log)"
     first_sum="$(shasum -a 256 "$export_dir/migration.snapshot" | cut -d' ' -f1)"
     second_sum="$(shasum -a 256 "$det_dir/migration.snapshot" | cut -d' ' -f1)"
@@ -1987,6 +1997,13 @@ cmd_checkpoint() {
     (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) \
         || fail "attach tool build failed"
     manifest="$export_dir/migration.snapshot.manifest.json"
+    # The converter must have recorded the mode it was asked for: a validator
+    # reads it from the manifest, and the offline verifier below checks it
+    # against the checkpoint's rows.
+    recorded_mode="$(jq -r '.deferred_policy // "absent"' "$manifest")"
+    [[ "$recorded_mode" == "${PULSEVM_DEFERRED_MODE:-expire}" ]] \
+        || fail "manifest records deferred mode '$recorded_mode', expected '${PULSEVM_DEFERRED_MODE:-expire}'"
+    echo "handover: manifest records deferred mode $recorded_mode"
     # Fixture dev key doubles as the old schedule key (rehearsal only).
     halt_key="${DEV_KEY:-${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}}"
     if [[ "${TWO_STEP_CUTOVER:-1}" == "1" ]]; then
@@ -2462,6 +2479,21 @@ cmd_verify_restarts() {
     local rpc_url
     rpc_url="$(chain_rpc_url)" || true
     [[ -n "$rpc_url" ]] || fail "verify-restarts: the new network's RPC is not up (run start first)"
+
+    # The host must be running a database that syncs each write. With MetalGo's
+    # default (leveldb, no fsync) a power loss leaves the host's proposervm index
+    # behind this VM's fsynced chain and the node refuses to start. Pebble (which
+    # keeps an OPTIONS file in its directory) syncs; require it on every node.
+    local db_checked=0
+    for n in 1 2 3 4 5; do
+        [[ -d "$netdir/node$n/db" ]] || continue
+        find "$netdir/node$n/db" -name 'OPTIONS-*' -print -quit 2>/dev/null | grep -q . \
+            || fail "verify-restarts: node$n does not run pebbledb; a power loss could leave it unable to start"
+        db_checked=$((db_checked + 1))
+    done
+    # A check that found nothing to look at proves nothing.
+    [[ "$db_checked" -ge 1 ]] || fail "verify-restarts: found no node database directory to check the database type in $netdir"
+    echo "handover: verify-restarts: $db_checked node(s) run pebbledb (synced writes)"
 
     # Each answering node's chain RPC, found without the runner server: its
     # control API wedges after a boot (see direct_chain_rpc_url), while the nodes
