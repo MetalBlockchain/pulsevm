@@ -500,6 +500,11 @@ fn verify_roster_against_checkpoint(
             header.revision, manifest.checkpoint_revision
         ));
     }
+    let observed = pulsevm_database::observed_deferred_policy(&database)?;
+    println!(
+        "{}",
+        pulsevm_database::check_deferred_policy(manifest.deferred_policy.as_deref(), observed)?
+    );
     // Committee membership is pinned by the pair step above (the declaration
     // must equal the snapshot-bound recorded schedule exactly, both ways):
     // the producers table carries every active row while the schedule names

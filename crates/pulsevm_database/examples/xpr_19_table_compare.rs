@@ -582,6 +582,19 @@ fn main() -> ExitCode {
         eprintln!("cannot restore Arena checkpoint: {error}");
         return ExitCode::from(1);
     }
+    // Say which deferred mode the checkpoint was built with, from its rows, so a
+    // validator need not rebuild it to find out.
+    match pulsevm_database::observed_deferred_policy(&database) {
+        Ok(Some(policy)) => println!(
+            "deferred mode shown by the checkpoint rows: {}",
+            policy.as_str()
+        ),
+        Ok(None) => println!("deferred mode: the checkpoint holds no deferred rows"),
+        Err(error) => {
+            eprintln!("the checkpoint's deferred rows are inconsistent: {error}");
+            return ExitCode::from(1);
+        }
+    }
     let schedule_producers = match pulsevm_database::read_source_schedule(&database) {
         Ok(schedule) => schedule.map(|schedule| schedule.producers.len()),
         Err(error) => {

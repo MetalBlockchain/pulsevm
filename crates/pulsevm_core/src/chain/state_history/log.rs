@@ -1187,6 +1187,22 @@ fn rebuild_index(
 /// Returns (block_num, offset) pairs in file order. A wrong magic
 /// anywhere other than a torn tail is a hard error — that's not a
 /// crash artifact, it's corruption or a version mismatch.
+/// Whether every byte of `file` from `pos` to `len_total` is zero.
+fn rest_is_zero(file: &mut File, pos: u64, len_total: u64) -> Result<bool, ShLogError> {
+    file.seek(SeekFrom::Start(pos))?;
+    let mut remaining = len_total.saturating_sub(pos);
+    let mut chunk = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len() as u64) as usize;
+        file.read_exact(&mut chunk[..take])?;
+        if chunk[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take as u64;
+    }
+    Ok(true)
+}
+
 fn scan_entries(
     file: &mut File,
     start: u64,
@@ -1204,6 +1220,15 @@ fn scan_entries(
         }
         let header = StateHistoryLogHeader::read_at(file, pos)?;
         if header.magic != expect_magic {
+            // A power cut can leave the file longer than the data that reached
+            // it: the filesystem extended it, the writes never landed, and the
+            // tail reads as zeros. That is a write that did not happen, and is
+            // trimmed like any torn tail. Anything else that is not a header is
+            // real corruption and stays a hard error.
+            if header.magic == 0 && rest_is_zero(file, pos, len_total)? {
+                file.set_len(pos)?;
+                break;
+            }
             return Err(ShLogError::BadMagic {
                 at: pos,
                 found: header.magic,
@@ -1468,6 +1493,68 @@ mod tests {
         );
         // The surviving tail still reads back fine.
         log.read_block(new_last).unwrap();
+    }
+
+    // Power cut: the filesystem made the log longer but the data never landed, so
+    // the file ends in zeros. Paul's cut images had the trace index running to the
+    // last good block and 581 zero bytes after the log's last entry; the node
+    // refused to open it ("recovery is not contiguous at block 0"). Zeros are what
+    // a write that did not happen leaves; they are trimmed like any torn tail.
+    #[test]
+    fn a_zero_filled_tail_is_truncated_on_open_whatever_its_length() {
+        for zeros in [1usize, 47, 48, 49, 100, 581, 4096, 70_000] {
+            let (dir, magic) = setup(&format!("zerotail{zeros}"));
+            drop(StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap());
+            let raw = parse_raw(&dir.log_path(), magic);
+            let (last_num, _, _) = raw.last().unwrap().clone();
+            let good_len = std::fs::metadata(dir.log_path()).unwrap().len();
+            {
+                use std::io::Write;
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(dir.log_path())
+                    .unwrap();
+                file.write_all(&vec![0u8; zeros]).unwrap();
+            }
+
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic)
+                .unwrap_or_else(|error| panic!("{zeros} zero bytes must be trimmed: {error}"));
+            assert_eq!(log.range().unwrap().1, last_num, "{zeros} zero bytes");
+            assert_eq!(
+                std::fs::metadata(dir.log_path()).unwrap().len(),
+                good_len,
+                "{zeros} zero bytes are cut off the file"
+            );
+            log.read_block(last_num).unwrap();
+        }
+    }
+
+    // The same with the index ahead of nothing: only the log's tail is zeros and
+    // the index is as it was (the index is not fsynced, so after a power cut it
+    // can also end in zero records; both are rebuilt from what is in the log).
+    #[test]
+    fn zero_records_at_the_end_of_the_index_and_zeros_in_the_log_both_recover() {
+        let (dir, magic) = setup("zeroidx");
+        drop(StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap());
+        let raw = parse_raw(&dir.log_path(), magic);
+        let last_num = raw.last().unwrap().0;
+        {
+            use std::io::Write;
+            let mut log = OpenOptions::new()
+                .append(true)
+                .open(dir.log_path())
+                .unwrap();
+            log.write_all(&[0u8; 581]).unwrap();
+            let mut idx = OpenOptions::new()
+                .append(true)
+                .open(dir.idx_path())
+                .unwrap();
+            idx.write_all(&[0u8; 63 * IDX_RECORD_SIZE as usize])
+                .unwrap();
+        }
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", magic).unwrap();
+        assert_eq!(log.range().unwrap().1, last_num);
+        log.read_block(last_num).unwrap();
     }
 
     #[test]

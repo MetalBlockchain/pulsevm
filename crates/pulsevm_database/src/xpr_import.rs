@@ -181,6 +181,13 @@ pub struct MigrationManifest {
     pub source_chain_id: Option<String>,
     pub checkpoint_sha256: String,
     pub checkpoint_revision: i64,
+    /// What the converter did with the deferred transactions pending at H
+    /// (`execute` or `expire`, see [`DeferredPolicy`]). Recorded so a validator
+    /// can see which mode a checkpoint was built with without rebuilding it, and
+    /// checked against the checkpoint's own rows by the verifier and the compare.
+    /// Absent in manifests written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_policy: Option<String>,
     /// The old network's signed halt commitment. Optional for legacy
     /// manifests; when present the restore verifies it against the source
     /// block before trusting the checkpoint, so a node never promotes state
@@ -344,6 +351,7 @@ impl MigrationManifest {
             source_chain_id: None,
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
+            deferred_policy: None,
             deferred_transaction_sidecar_sha256: None,
             halt_commitment: None,
             halt_declaration: None,
@@ -362,6 +370,12 @@ impl MigrationManifest {
             halt_h_block: None,
             import_summary,
         }
+    }
+
+    /// Record the deferred-transaction mode this checkpoint was built with.
+    pub fn with_deferred_policy(mut self, policy: DeferredPolicy) -> Self {
+        self.deferred_policy = Some(policy.as_str().to_owned());
+        self
     }
 
     /// Bind this migration manifest to the exact chainbase sidecar verified
@@ -2025,9 +2039,92 @@ pub enum DeferredPolicy {
     Expire,
 }
 
-/// The `expiration` written for a row the new chain must retire: the epoch, so
-/// the first block's ordinary expiry check applies and no new rule is needed.
+impl DeferredPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeferredPolicy::Execute => "execute",
+            DeferredPolicy::Expire => "expire",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "execute" => Some(DeferredPolicy::Execute),
+            "expire" => Some(DeferredPolicy::Expire),
+            _ => None,
+        }
+    }
+}
+
+/// The `delay_until` and `expiration` written for a row the new chain must
+/// retire: the epoch for both. It is then due in the first block (a row whose
+/// delay had not passed would otherwise wait for it, up to a day) and already
+/// expired there, so the ordinary expiry path retires it without running it and
+/// no new rule is needed.
 const EXPIRED_AT_IMPORT: i64 = 0;
+
+/// The mode a restored checkpoint's deferred rows show, or `None` if it holds
+/// none. Rows written under `Expire` have both timestamps at the epoch, which no
+/// real row has; a mix of the two kinds is not a state any converter produces.
+pub fn observed_deferred_policy(db: &Database) -> Result<Option<DeferredPolicy>, String> {
+    let rows = db.arena_deferred_transactions();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let expired = rows
+        .iter()
+        .filter(|row| row.delay_until == EXPIRED_AT_IMPORT && row.expiration == EXPIRED_AT_IMPORT)
+        .count();
+    if expired == rows.len() {
+        Ok(Some(DeferredPolicy::Expire))
+    } else if expired == 0 {
+        Ok(Some(DeferredPolicy::Execute))
+    } else {
+        Err(format!(
+            "{expired} of {} deferred rows are expired-at-import and the rest are not: no converter produces this",
+            rows.len()
+        ))
+    }
+}
+
+/// Check what a manifest says about the deferred mode against what the restored
+/// checkpoint holds. Returns a line to print. A recorded mode that the rows do
+/// not show is an error: the manifest would be telling a validator something
+/// the checkpoint does not do.
+pub fn check_deferred_policy(
+    recorded: Option<&str>,
+    observed: Option<DeferredPolicy>,
+) -> Result<String, String> {
+    let recorded_policy = match recorded {
+        None => None,
+        Some(text) => Some(
+            DeferredPolicy::parse(text)
+                .ok_or_else(|| format!("the manifest records an unknown deferred mode {text:?}"))?,
+        ),
+    };
+    match (recorded_policy, observed) {
+        (Some(recorded), Some(observed)) if recorded != observed => Err(format!(
+            "the manifest records deferred mode {} but the checkpoint's deferred rows are {}",
+            recorded.as_str(),
+            observed.as_str()
+        )),
+        (Some(recorded), Some(_)) => Ok(format!(
+            "deferred mode {}: recorded in the manifest and shown by the checkpoint's rows",
+            recorded.as_str()
+        )),
+        (Some(recorded), None) => Ok(format!(
+            "deferred mode {} is recorded; the checkpoint holds no deferred rows, so there is nothing to confirm it against",
+            recorded.as_str()
+        )),
+        (None, Some(observed)) => Ok(format!(
+            "deferred mode not recorded in the manifest (an older manifest); the checkpoint's rows are {}",
+            observed.as_str()
+        )),
+        (None, None) => {
+            Ok("deferred mode not recorded; the checkpoint holds no deferred rows".to_owned())
+        }
+    }
+}
 
 pub fn hydrate_full_state_with_deferred_policy(
     db: &mut Database,
@@ -2056,7 +2153,10 @@ pub fn hydrate_full_state_with_deferred_policy(
                     key.sender_id,
                     key.payer,
                     key.trx_id,
-                    row.delay_until,
+                    match policy {
+                        DeferredPolicy::Execute => row.delay_until,
+                        DeferredPolicy::Expire => EXPIRED_AT_IMPORT,
+                    },
                     match policy {
                         DeferredPolicy::Execute => row.expiration,
                         DeferredPolicy::Expire => EXPIRED_AT_IMPORT,
@@ -6697,8 +6797,11 @@ mod tests {
             row.expiration, 0,
             "already expired when the first block looks"
         );
-        assert_eq!(row.delay_until, 1000, "nothing else is rewritten");
-        assert_eq!(row.published, 500);
+        assert_eq!(
+            row.delay_until, 0,
+            "and due in the first block, not after a delay that may be a day"
+        );
+        assert_eq!(row.published, 500, "nothing else is rewritten");
         assert_eq!(expires.deferred_transaction_count(), 1, "the row is kept");
 
         // The default entry point is the documented behaviour.
@@ -6710,6 +6813,83 @@ mod tests {
             9_000_000_000_000
         );
         assert_eq!(DeferredPolicy::default(), DeferredPolicy::Execute);
+    }
+
+    // The mode a checkpoint was built with must be knowable without rebuilding it:
+    // recorded in the manifest, and visible in the rows. The two have to agree.
+    #[test]
+    fn the_deferred_mode_is_recorded_and_checked_against_the_rows() {
+        let mut generated = vec![0];
+        generated.extend_from_slice(&11u64.to_le_bytes());
+        generated.extend_from_slice(&12u64.to_le_bytes());
+        generated.extend_from_slice(&13u64.to_le_bytes());
+        generated.extend_from_slice(&14u64.to_le_bytes());
+        generated.extend_from_slice(&[15; 32]);
+        bytes(&mut generated, &[16, 17]);
+        let entry = StateHistoryEntry {
+            magic: 0,
+            block_id: [42; 32],
+            deltas: vec![delta("generated_transaction", generated)],
+        };
+        let sidecar_json = format!(
+            r#"{{"version":2,"source_block_id":"{}","global_action_sequence":0,"input_transactions":[],"transactions":[{{"sender":11,"sender_id":"{}","payer":14,"trx_id":"{}","delay_until":1000,"expiration":9000000000000,"published":500,"packed_trx":"1011"}}]}}"#,
+            hex::encode(entry.block_id),
+            (12u128 | ((13u128) << 64)),
+            hex::encode([15; 32]),
+        );
+        let sidecar = DeferredTransactionSidecar::from_json_bytes(sidecar_json.as_bytes()).unwrap();
+        let build = |policy| {
+            let dir = TempDir::new().unwrap();
+            let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+            hydrate_full_state_with_deferred_policy(&mut db, &entry, Some(&sidecar), policy)
+                .unwrap();
+            (dir, db)
+        };
+        let (_a, executes) = build(DeferredPolicy::Execute);
+        let (_b, expires) = build(DeferredPolicy::Expire);
+        assert_eq!(
+            observed_deferred_policy(&executes).unwrap(),
+            Some(DeferredPolicy::Execute)
+        );
+        assert_eq!(
+            observed_deferred_policy(&expires).unwrap(),
+            Some(DeferredPolicy::Expire)
+        );
+
+        let manifest = |policy: Option<DeferredPolicy>| {
+            let base =
+                MigrationManifest::new(b"log", [1; 32], b"checkpoint", 7, ImportSummary::default());
+            match policy {
+                Some(policy) => base.with_deferred_policy(policy),
+                None => base,
+            }
+        };
+        // The field round-trips, and an older manifest without it still reads.
+        let recorded = manifest(Some(DeferredPolicy::Expire));
+        let json = serde_json::to_string(&recorded).unwrap();
+        assert!(json.contains("\"deferred_policy\":\"expire\""));
+        let back: MigrationManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.deferred_policy.as_deref(), Some("expire"));
+        let legacy: MigrationManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest(None)).unwrap()).unwrap();
+        assert_eq!(legacy.deferred_policy, None);
+
+        let observed_expire = observed_deferred_policy(&expires).unwrap();
+        let observed_execute = observed_deferred_policy(&executes).unwrap();
+        assert!(check_deferred_policy(Some("expire"), observed_expire).is_ok());
+        assert!(check_deferred_policy(Some("execute"), observed_execute).is_ok());
+        // A manifest that says one thing about a checkpoint that does the other.
+        let error = check_deferred_policy(Some("expire"), observed_execute).unwrap_err();
+        assert!(error.contains("records deferred mode expire"), "{error}");
+        assert!(check_deferred_policy(Some("execute"), observed_expire).is_err());
+        assert!(check_deferred_policy(Some("nonsense"), observed_expire).is_err());
+        // Older manifest, and a checkpoint with nothing to check.
+        assert!(
+            check_deferred_policy(None, observed_expire)
+                .unwrap()
+                .contains("not recorded")
+        );
+        assert!(check_deferred_policy(Some("expire"), None).is_ok());
     }
 
     #[test]

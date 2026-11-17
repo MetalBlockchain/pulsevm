@@ -280,7 +280,8 @@ fn main() -> ExitCode {
                     &checkpoint,
                     database.revision(),
                     summary,
-                );
+                )
+                .with_deferred_policy(deferred_policy);
                 if let Some((_, sidecar)) = &deferred_transactions
                     && let Some(source_chain_id) = &sidecar.source_chain_id
                 {

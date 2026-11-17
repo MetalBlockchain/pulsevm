@@ -605,6 +605,17 @@ reads a deferred receipt (a bare id): an expired one never ran and is skipped, a
 executed one cannot be inspected, and the scan stops only if the votes it found
 do not account for the weight the contract counted.
 
+The mode is recorded in the migration manifest (`deferred_policy`: `execute` or
+`expire`; absent in manifests from earlier builds). Under `expire` the converter
+sets both `delay_until` and `expiration` of every pending row to the epoch, so each
+is due in the first block (not after a delay that can be a day) and is already
+expired there. A validator does not have to rebuild the checkpoint to learn the
+mode: `xpr_verify_manifest` restores it and fails if the manifest names one mode
+and the rows show the other, and `xpr_19_table_compare` prints the mode its rows
+show. The restore-side check that no deferred row falls due inside the pause
+window passes trivially under `expire`, since every row is due at the epoch and
+is retired rather than run.
+
 **`setparams` also floors the block cap.** The transaction cap must be 100 times
 the minimum bill (round 10); the block cap must now be 1000 times it. A block cap
 just over the guard fit about ten ordinary transactions. The converted chain's

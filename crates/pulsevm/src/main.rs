@@ -119,6 +119,11 @@ pub(crate) fn abort_on_fatal_consistency(operation: &str, error: &ChainError) ->
     std::process::abort()
 }
 
+/// Whether a block is at or below the accepted head, so already decided.
+fn block_is_decided_history(block_height: u32, accepted_height: u32) -> bool {
+    block_height <= accepted_height
+}
+
 /// The log threshold for a `PULSEVM_LOG_LEVEL` value: info by default, and an
 /// unrecognised value also means info rather than silencing or flooding the log.
 fn log_level_filter(value: Option<&str>) -> spdlog::LevelFilter {
@@ -135,6 +140,19 @@ fn log_level_filter(value: Option<&str>) -> spdlog::LevelFilter {
         Some("warn") | Some("warning") => LevelFilter::MoreSevereEqual(Level::Warn),
         Some("error") => LevelFilter::MoreSevereEqual(Level::Error),
         _ => LevelFilter::MoreSevereEqual(Level::Info),
+    }
+}
+
+#[cfg(test)]
+mod decided_history_tests {
+    use super::block_is_decided_history;
+
+    #[test]
+    fn only_blocks_above_the_head_are_news() {
+        assert!(block_is_decided_history(10, 10), "the head itself");
+        assert!(block_is_decided_history(3, 10), "history");
+        assert!(!block_is_decided_history(11, 10), "the next block");
+        assert!(!block_is_decided_history(500, 10), "far ahead");
     }
 }
 
@@ -809,12 +827,32 @@ impl Vm for VirtualMachine {
                 if e.is_fatal_consistency() {
                     abort_on_fatal_consistency("block verification", &e);
                 }
-                warn!(
-                    "could not verify block with id {} and height {}: {:?}",
-                    block.id().unwrap_or_default(),
-                    block.block_num(),
-                    e
-                );
+                // A block at or below the accepted head is decided history: a
+                // peer's copy of a block this node already has, or a fork that
+                // lost. Refusing it is right and is not news, and at about seven
+                // a block it buried the warnings that are. A block above the head
+                // whose parent is unknown is still a warning.
+                let accepted = self
+                    .controller
+                    .read()
+                    .await
+                    .last_accepted_block()
+                    .block_num();
+                if block_is_decided_history(block.block_num(), accepted) {
+                    debug!(
+                        "refused block {} at height {} (accepted head {accepted}): {:?}",
+                        block.id().unwrap_or_default(),
+                        block.block_num(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "could not verify block with id {} and height {}: {:?}",
+                        block.id().unwrap_or_default(),
+                        block.block_num(),
+                        e
+                    );
+                }
 
                 return Err(Status::internal(format!(
                     "could not verify block with id {}: {}",
