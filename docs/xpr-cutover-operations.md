@@ -571,9 +571,15 @@ measured 4.2 to 4.4 s for 2.09 GB). The threshold is now the configured
 `arena_wal_max_bytes` plus up to half again, chosen from the node's identity, so
 nodes fold at different times. A fold still pauses the node that does it. Raise
 the setting to fold less often, lower it to bound replay after a crash.
-Debug-level logging is now opt-in (`PULSEVM_LOG_LEVEL=debug`): it hashes the whole
-state after every block to print it, which is also why accept took about 0.5 ms
-longer than it should in the measurements.
+Debug-level logging is now opt-in: it hashes the whole state after every block to
+print it, which is also why accept took about 0.5 ms longer than it should in
+the measurements. Set it with `log_level` in the chain config. A
+`PULSEVM_LOG_LEVEL` environment variable only works when the plugin binary is
+launched directly: MetalGo starts the plugin with a minimal environment of its own
+(only its engine address), so no variable set on the host reaches it. The same
+holds for `state_root_log_every` (chain config), which logs the state root at info
+level every N blocks so the nodes of a test network can be compared; it is off by
+default because the root is a hash of all state.
 
 **Deferred transactions pending at H.** Whether they run on the new chain is a
 choice with a cost either way, and it is made when the checkpoint is converted.

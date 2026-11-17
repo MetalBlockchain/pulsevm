@@ -37,6 +37,43 @@ XPR core checkout is needed: preflight and the
 deferred sidecar are mainnet provenance guards, and the fixture chain has
 no deferred activity, so the rehearsal skips them by design.
 
+## In CI, and the check after the cut
+
+`.github/workflows/cutover-e2e.yml` runs this whole rehearsal on every relevant
+change and nightly, in two scenarios (`clean`, and `chaos` with one validator
+dropped before H+1), on a hosted Linux runner: it builds the pinned Leap image,
+MetalGo, and the network runner, then runs `run-handover.sh start`. The evidence
+(logs, the manifest and boundary records, every node's chain log) is uploaded as
+an artifact.
+
+`run-handover.sh verify-restarts` runs on the clean scenario once `start` has
+passed. It kills validators with `kill -9` one at a time while the chain is being
+fed, lets the chain run on four of five, relaunches the node with its exact
+command line, and repeats (`RESTART_ROUNDS`, default 3). The feed is new accounts
+plus calls to a small contract (`fixtures/churn.wat`) that rewrites one table row
+at a varying size. The second half matters: account creation only appends rows,
+and a restart only changes a node's state layout if a contract row's slot has
+been freed and reused. Without those calls this check passed on a build with the
+original bug put back, so it proved nothing. It requires the five
+nodes to converge on one head each time, and at the end it compares the state
+root every node logged at every height they share. Same head is not enough: a
+node that had restarted once computed a different root from its first
+transaction on while heads and account reads agreed. Start the rehearsal with
+`PULSEVM_STATE_ROOT_LOG_EVERY=1` so the nodes log their roots (the variable is
+written into the chain config by `scripts/run-local.sh`; MetalGo does not pass
+its environment to the plugin, so it cannot be read from the environment there).
+
+The runner is the public `metal-network-runner` v1.9.0 plus one change, kept here
+as `patches/metal-network-runner-startup-timeout.patch`: a node restoring an
+imported checkpoint can take longer than the runner's three-second wait for the
+node to report itself, and the rehearsal needs that raised. Until it is upstream,
+a runner built without it reports a healthy node as failed. Build with
+`git apply` on the pinned commit, as the workflow does.
+
+Not covered by the CI job: the table compare against a real mainnet snapshot, the
+deferred-transaction sidecar and the mainnet provenance checks (the fixture chain
+has no deferred activity and no mainnet pins), and a power loss.
+
 ## Known delta vs the real migration
 
 Promotion currently re-identifies the chain: the migration genesis commits

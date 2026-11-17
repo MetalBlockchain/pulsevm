@@ -170,7 +170,9 @@ mod log_level_tests {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
-    // Initialize logging. Debug is opt-in (`PULSEVM_LOG_LEVEL=debug`): at debug
+    // Initialize logging. Debug is opt-in (`PULSEVM_LOG_LEVEL=debug` when the
+    // binary is launched directly, `log_level` in the chain config under a host
+    // such as MetalGo, which does not pass its environment to the plugin): at debug
     // the controller hashes the whole state after every block just to print it,
     // which a production node should not pay for on every block.
     spdlog::default_logger().set_level_filter(log_level_filter(
@@ -476,6 +478,14 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid chain id"))?;
+        // MetalGo starts the plugin with a minimal environment, so the log level
+        // an operator wants arrives in the chain config, not as a variable.
+        if let Some(level) = serde_json::from_slice::<serde_json::Value>(&config_bytes)
+            .ok()
+            .and_then(|config| config.get("log_level")?.as_str().map(str::to_owned))
+        {
+            spdlog::default_logger().set_level_filter(log_level_filter(Some(&level)));
+        }
         let controller = self.controller.clone();
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.

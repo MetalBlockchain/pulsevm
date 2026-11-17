@@ -2437,6 +2437,218 @@ PYEOF
     echo "handover: new network RPC: $rpc_url (left running; run stop to tear down)"
 }
 
+# After the cutover has passed and the new five-node network is live: kill -9
+# validators one at a time while the chain is busy, bring each back, and require
+# the five nodes to agree. Agreement means the same head AND the same state root
+# at every height they share. Round 11 found that a node that had restarted
+# computed a different root from its first transaction on while the chain went
+# on without noticing (the root is not in the block header), and that is
+# invisible to any check that looks at one node, or at heads, or at accounts.
+#
+# The roots come from the nodes' logs ("arena state root at block N"), so start
+# the rehearsal with PULSEVM_STATE_ROOT_LOG_EVERY=1.
+cmd_verify_restarts() {
+    local rounds="${RESTART_ROUNDS:-3}" netdir n round victim cmdline pid
+    # The boot step exports the rehearsal runner's endpoint for its own process;
+    # this is a separate invocation, so it must say where the runner is.
+    export METAL_NETWORK_RUNNER_ENDPOINT="127.0.0.1:${PULSEVM_RUNNER_PORT:-18080}"
+    export PULSEVM_PRODUCER_KEY="${PULSEVM_PRODUCER_KEY:-5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3}"
+    PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
+    [[ -x "$PROBE_BIN" ]] || (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) \
+        || fail "probe tool build failed"
+    netdir="$(newest_netdir)"
+    [[ -n "$netdir" ]] || fail "verify-restarts: no running network directory found"
+    NETBASE="$(basename "$netdir")"
+    local rpc_url
+    rpc_url="$(chain_rpc_url)" || true
+    [[ -n "$rpc_url" ]] || fail "verify-restarts: the new network's RPC is not up (run start first)"
+
+    # Each answering node's chain RPC, found without the runner server: its
+    # control API wedges after a boot (see direct_chain_rpc_url), while the nodes
+    # themselves serve. A node that is down simply does not appear.
+    node_rpc_urls() {
+        local node cfg port chains id url body
+        for node in 1 2 3 4 5; do
+            cfg="$netdir/node$node/configs/config.json"
+            [[ -f "$cfg" ]] || continue
+            port="$(jq -er '.["http-port"]' "$cfg" 2>/dev/null || true)"
+            [[ -n "$port" ]] || continue
+            chains="$(curl --fail --silent --max-time 3 -X POST "http://127.0.0.1:$port/ext/P" \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"platform.getBlockchains"}' 2>/dev/null \
+                | jq -r '.result.blockchains[]?.id // empty' 2>/dev/null || true)"
+            [[ -n "$chains" ]] || continue
+            while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                url="http://127.0.0.1:$port/ext/bc/$id/rpc"
+                body="$(curl --fail --silent --max-time 3 -X POST "$url" \
+                    -H 'Content-Type: application/json' \
+                    -d '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null || true)"
+                if printf '%s' "$body" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") else 1)' 2>/dev/null; then
+                    printf '%s\n' "$url"
+                    break
+                fi
+            done <<<"$chains"
+        done
+    }
+    head_of() { # $1=rpc url
+        rpc_call "$1" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])' 2>/dev/null || echo 0
+    }
+    # Heads of every node that answers; prints them space separated.
+    all_heads() {
+        local url out=""
+        for url in $(node_rpc_urls); do out="$out $(head_of "$url")"; done
+        printf '%s' "$out"
+    }
+    # Submit $2 fresh accounts named from prefix $1, spaced so blocks form.
+    send_txs() {
+        local prefix="$1" count="$2" i name info chain head head_id ref exp tx
+        info="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}')" \
+            || fail "verify-restarts: getInfo failed before submitting"
+        read -r chain head head_id <<<"$(printf '%s' "$info" \
+            | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
+        ref="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$head_id')[8:12], 'little'))")"
+        exp="$(($(date +%s) + 1800))"
+        for i in $(seq 1 "$count"); do
+            name="$(python3 -c "
+e = $RANDOM * 32768 + $RANDOM
+s = ''
+for _ in range(8):
+    s = '12345'[e % 5] + s
+    e //= 5
+print('$prefix' + s)")"
+            tx="$("$PROBE_BIN" newaccount "$chain" "$PULSEVM_PRODUCER_KEY" "$head" "$ref" "$exp" "$name")" \
+                || fail "verify-restarts: could not build a transaction"
+            rpc_call "$rpc_url" "$tx" >/dev/null || echo "handover: verify-restarts: a submission was refused (continuing)"
+            # Rewrite one contract table row every time, at a size that varies. A
+            # new account only appends. Rewriting a contract row frees its slot
+            # and takes one again, the free-and-reuse a restart used to lose
+            # track of: a node that had restarted laid its state out differently
+            # from one that had not, and hashed the difference. (A permission
+            # rewrite does not take this path and cannot show it.) The data
+            # carries a counter and the expiry varies, so every transaction has
+            # its own id.
+            churn_n=$((churn_n + 1))
+            data_hex="$(python3 -c "
+n = $churn_n
+length = 2 + (n * 7) % 13
+print((n.to_bytes(2, 'big') + bytes([n % 251]) * length).hex())")"
+            tx="$("$PROBE_BIN" raw "$chain" "$PULSEVM_PRODUCER_KEY" "$head" "$ref" \
+                "$((exp - churn_n - RANDOM % 1000))" "$churn_account" go "$churn_account" "$data_hex")" \
+                || fail "verify-restarts: could not build a contract call"
+            rpc_call "$rpc_url" "$tx" >/dev/null || echo "handover: verify-restarts: a contract call was refused (continuing)"
+            sleep 0.7
+        done
+    }
+    # Wait until every node answers and all report one head.
+    wait_converged() { # $1=label
+        local heads lo hi count
+        for _ in $(seq 1 90); do
+            heads="$(all_heads)"
+            count="$(wc -w <<<"$heads" | tr -d ' ')"
+            if [[ "$count" -ge 5 ]]; then
+                lo="$(tr ' ' '\n' <<<"$heads" | grep -v '^$' | sort -n | head -1)"
+                hi="$(tr ' ' '\n' <<<"$heads" | grep -v '^$' | sort -n | tail -1)"
+                if [[ "$lo" -gt 0 && "$lo" == "$hi" ]]; then
+                    echo "handover: verify-restarts: $1: five nodes at head $lo"
+                    return 0
+                fi
+            fi
+            sleep 3
+        done
+        fail "verify-restarts: $1: the five nodes did not converge on one head (heads:$(all_heads))"
+    }
+
+    # The account whose contract row is rewritten throughout: created, then given
+    # the churn contract, before any restart.
+    local churn_account="rschurn" churn_n=0
+    {
+        local info chain head head_id ref wasm_exp
+        info="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}')" \
+            || fail "verify-restarts: getInfo failed"
+        read -r chain head head_id <<<"$(printf '%s' "$info" \
+            | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
+        ref="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$head_id')[8:12], 'little'))")"
+        wasm_exp="$(($(date +%s) + 1800))"
+        rpc_call "$rpc_url" "$("$PROBE_BIN" newaccount "$chain" "$PULSEVM_PRODUCER_KEY" "$head" "$ref" "$wasm_exp" "$churn_account")" >/dev/null \
+            || fail "verify-restarts: could not create the churn account"
+        sleep 5
+        rpc_call "$rpc_url" "$("$PROBE_BIN" setcode "$chain" "$PULSEVM_PRODUCER_KEY" "$head" "$ref" "$((wasm_exp - 1))" \
+            "$churn_account" "$SCRIPT_DIR/fixtures/churn.wasm")" >/dev/null \
+            || fail "verify-restarts: could not deploy the churn contract"
+        sleep 5
+    }
+
+    echo "handover: verify-restarts: network dir $NETBASE, $rounds round(s)"
+    send_txs rs 4
+    wait_converged "before any restart"
+    for round in $(seq 1 "$rounds"); do
+        victim=$((6 - round)); [[ "$victim" -lt 2 ]] && victim=2
+        cmdline=""
+        for _ in $(seq 1 12); do
+            cmdline="$(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$victim/configs" | head -1 | sed -E 's/^ *[0-9]+ //' || true)"
+            [[ -n "$cmdline" ]] && break
+            sleep 2
+        done
+        [[ -n "$cmdline" ]] || fail "verify-restarts: node$victim is not running"
+        pid="$(ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$victim/configs" | head -1 | awk '{print $1}')"
+        send_txs rb 3
+        # kill -9 of the node process and the plugin it launched.
+        pkill -9 -P "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || fail "verify-restarts: could not kill node$victim ($pid)"
+        echo "handover: verify-restarts: round $round: kill -9 node$victim (pid $pid)"
+        # The chain keeps going on four of five while it is down.
+        send_txs rd 5
+        bash -c "$cmdline" >>"$WORK_DIR/node-restart-$victim.log" 2>&1 &
+        echo $! >>"$WORK_DIR/five-node.relaunched"
+        echo "handover: verify-restarts: round $round: node$victim relaunched"
+        send_txs ra 5
+        wait_converged "round $round, after node$victim came back"
+    done
+    send_txs rz 4
+    wait_converged "after every round"
+
+    # Same head is not enough. Same state at every height the nodes share is.
+    sleep 5
+    python3 - "$netdir" <<'PYEOF'
+import collections, glob, os, re, sys
+netdir = sys.argv[1]
+pat = re.compile(r"arena state root at block (\d+): ([0-9a-f]{64})")
+roots = collections.defaultdict(dict)  # height -> node -> root
+for path in glob.glob(os.path.join(netdir, "**", "*.log"), recursive=True):
+    m = re.search(r"/(node\d)/", path)
+    if not m:
+        continue
+    node = m.group(1)
+    with open(path, errors="replace") as f:
+        for line in f:
+            hit = pat.search(line)
+            if hit:
+                height, root = int(hit.group(1)), hit.group(2)
+                previous = roots[height].get(node)
+                if previous is not None and previous != root:
+                    print(f"node {node} logged two different roots for block {height}")
+                    sys.exit(1)
+                roots[height][node] = root
+shared = {h: n for h, n in roots.items() if len(n) >= 2}
+if len(shared) < 10:
+    print(f"only {len(shared)} heights have roots from two or more nodes: the debug log is "
+          "missing (start the rehearsal with PULSEVM_STATE_ROOT_LOG_EVERY=1) or the nodes did not run")
+    sys.exit(1)
+bad = {h: n for h, n in shared.items() if len(set(n.values())) != 1}
+nodes_seen = sorted({n for per in roots.values() for n in per})
+print(f"state roots compared at {len(shared)} shared heights across {nodes_seen}")
+if bad:
+    for h in sorted(bad)[:10]:
+        print(f"  block {h}: " + ", ".join(f"{n}={r[:12]}" for n, r in sorted(bad[h].items())))
+    print(f"FAIL: {len(bad)} of {len(shared)} shared heights have nodes with different state roots")
+    sys.exit(1)
+print("every node holds the same state root at every shared height")
+PYEOF
+    echo "handover: verify-restarts: PASS"
+}
+
 cmd_stop() {
     if [[ -f "$WORK_DIR/five-node.pid" ]]; then
         # Setsid group kill: exactly our supervisor tree, never a foreign
@@ -2472,8 +2684,11 @@ case "${1:-}" in
     resume-checkpoint) cmd_checkpoint ;;
     # Resume a checkpointed rehearsal from the five-node boot.
     resume-boot) cmd_boot "$(cat "${HANDOVER_WORK_DIR:-/tmp/pulsevm-handover}/checkpoint")" ;;
+    # After `start` has passed: kill -9 validators under load, bring them back,
+    # and require the five nodes to agree on head and on state root.
+    verify-restarts) cmd_verify_restarts ;;
     stop) cmd_stop ;;
-    *) echo "usage: run-handover.sh start|resume-checkpoint|resume-boot|stop" >&2
+    *) echo "usage: run-handover.sh start|resume-checkpoint|resume-boot|verify-restarts|stop" >&2
        echo "env: TERMINAL_HEIGHT (default 300, ~3 min at 0.5s blocks)," >&2
        echo "     HANDOVER_WORK_DIR, XPR_CORE_DIR, METALGO_EXEC_PATH," >&2
        echo "     LEAP_HTTP_PORT, LEAP_V1_HTTP_PORT, LEAP_V2_HTTP_PORT, SHADOW_RPC_PORT," >&2

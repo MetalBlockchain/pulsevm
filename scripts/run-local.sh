@@ -45,6 +45,19 @@ RUNNER_SERVER_ARGS=()
 RUNNER_NODE_BINARY_FLAG=""
 GENESIS_PATH="${PULSEVM_GENESIS_PATH:-$REPO/genesis.json}"
 
+# Logging for the VM travels in the per-chain config: MetalGo starts the plugin
+# with a minimal environment, so a variable set here never reaches it.
+add_vm_logging_config() { # $1=chain config json -> stdout
+  local config="$1"
+  if [[ -n "${PULSEVM_STATE_ROOT_LOG_EVERY:-}" ]]; then
+    config="$(jq -c --argjson n "$PULSEVM_STATE_ROOT_LOG_EVERY" '. + {state_root_log_every: $n}' <<<"$config")"
+  fi
+  if [[ -n "${PULSEVM_LOG_LEVEL:-}" ]]; then
+    config="$(jq -c --arg level "$PULSEVM_LOG_LEVEL" '. + {log_level: $level}' <<<"$config")"
+  fi
+  printf '%s' "$config"
+}
+
 if [[ -n "$RUNNER_ROOT_DATA_DIR" ]]; then
   RUNNER_START_ARGS+=(--root-data-dir "$RUNNER_ROOT_DATA_DIR")
 fi
@@ -134,6 +147,7 @@ CHAIN_CONFIG="$(jq -cn \
   --arg producer_name "$PRODUCER_NAME" \
   --arg producer_key "$PRODUCER_KEY" \
   '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key}')"
+CHAIN_CONFIG="$(add_vm_logging_config "$CHAIN_CONFIG")"
 BLOCKCHAIN_SPECS="$(jq -cn \
   --arg genesis "$GENESIS_PATH" \
   --arg chain_config "$CHAIN_CONFIG" \
@@ -193,6 +207,7 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     --arg system_account "$SYSTEM_ACCOUNT" \
     --argjson native_system_contract "$NATIVE_SYSTEM_CONTRACT" \
     '{system_account: $system_account, native_system_contract: $native_system_contract, producer_name: $producer_name, producer_key: $producer_key, migration_checkpoint: $checkpoint, migration_manifest: $manifest, migration_local_checkpoint_sha256: $local_sha}')"
+  CHAIN_CONFIG="$(add_vm_logging_config "$CHAIN_CONFIG")"
   BLOCKCHAIN_SPECS="$(jq -cn \
     --arg genesis "$MIGRATION_GENESIS" \
     --arg chain_config "$CHAIN_CONFIG" \

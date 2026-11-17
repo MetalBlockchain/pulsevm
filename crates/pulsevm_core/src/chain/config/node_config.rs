@@ -82,6 +82,19 @@ pub struct NodeConfig {
     /// it to bound crash-recovery replay, raise it to checkpoint less often.
     #[serde(default = "default_arena_wal_max_bytes")]
     pub arena_wal_max_bytes: u64,
+    /// Log the arena state root at info level every this many blocks. Zero (the
+    /// default) logs none. The root hashes all state, so it costs time in
+    /// proportion to it; it exists so the nodes of a test network can be
+    /// compared with each other. It is a setting here and not an environment
+    /// variable because a host such as MetalGo starts the plugin with a minimal
+    /// environment of its own.
+    #[serde(default)]
+    pub state_root_log_every: u64,
+    /// Log threshold: `trace`, `debug`, `info` (the default), `warn` or `error`.
+    /// At debug the controller also hashes all state after every block to print
+    /// it. Set here for the same reason as above.
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 fn default_arena_wal_max_bytes() -> u64 {
@@ -127,6 +140,18 @@ mod tests {
             cfg.arena_wal_max_bytes,
             pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
         );
+        assert_eq!(cfg.state_root_log_every, 0);
+        assert_eq!(cfg.log_level, None);
+    }
+
+    #[test]
+    fn logging_is_set_in_the_chain_config() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_root_log_every":1,"log_level":"debug"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.state_root_log_every, 1);
+        assert_eq!(cfg.log_level.as_deref(), Some("debug"));
     }
 
     #[test]

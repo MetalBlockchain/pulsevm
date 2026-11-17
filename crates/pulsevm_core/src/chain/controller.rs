@@ -3529,14 +3529,31 @@ impl Controller {
         }
 
         // Hashing the complete Arena is proportional to all live chain state.
-        // Never pay that cost unless debug output will actually consume it.
-        if spdlog::default_logger().should_log(spdlog::Level::Debug) {
+        // Never pay that cost unless something will actually consume it: debug
+        // output, or an operator who asked for the root at a fixed cadence
+        // (`state_root_log_every` in the chain config, off by default). The cadence logs at
+        // info level because a host such as MetalGo filters plugin output by its
+        // own level, and a cross-node comparison needs the lines to arrive.
+        let log_every = self
+            .node_config
+            .as_ref()
+            .map_or(0, |config| config.state_root_log_every);
+        let due = log_every > 0 && u64::from(block.block_num()) % log_every == 0;
+        if due || spdlog::default_logger().should_log(spdlog::Level::Debug) {
             if let Some(root) = self.db.arena_state_root() {
-                debug!(
-                    "arena state root at block {}: {}",
-                    block.block_num(),
-                    hex::encode(root)
-                );
+                if due {
+                    info!(
+                        "arena state root at block {}: {}",
+                        block.block_num(),
+                        hex::encode(root)
+                    );
+                } else {
+                    debug!(
+                        "arena state root at block {}: {}",
+                        block.block_num(),
+                        hex::encode(root)
+                    );
+                }
             }
         }
 
