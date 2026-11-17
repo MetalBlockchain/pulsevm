@@ -107,15 +107,62 @@ pub fn sync_parent_dir(path: &Path) -> Result<(), DbError> {
 /// Start of every write-ahead log: the format version. A log written before
 /// records carried a checksum has no such header and is refused by name, not
 /// misread.
-const WAL_MAGIC: &[u8; 8] = b"PVMWAL02";
+const WAL_MAGIC: &[u8; 8] = b"PVMWAL03";
 const WAL_DIGEST_LEN: usize = 32;
 
-fn wal_digest(payload: &[u8]) -> [u8; WAL_DIGEST_LEN] {
+/// The checksum of a record. It covers the length as well as the payload: with
+/// only the payload under it, a flipped bit in the length made a good record look
+/// cut short, and everything behind it was treated as a torn tail and deleted.
+fn wal_digest(len: u64, payload: &[u8]) -> [u8; WAL_DIGEST_LEN] {
     use sha2::{
         Digest,
         Sha256,
     };
-    Sha256::digest(payload).into()
+    let mut hasher = Sha256::new();
+    hasher.update(len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+/// Smallest payload a record can carry: a revision and a table count.
+const WAL_MIN_PAYLOAD: usize = 16;
+
+/// The record that starts at `pos`, if one that verifies does:
+/// `(payload start, payload end, record end)`.
+fn wal_record_at(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+    let len = try_read_u64(data, pos)?;
+    let payload_start = pos.checked_add(8)?;
+    let payload_end = payload_start.checked_add(usize::try_from(len).ok()?)?;
+    let record_end = payload_end.checked_add(WAL_DIGEST_LEN)?;
+    if record_end > data.len() {
+        return None;
+    }
+    if wal_digest(len, &data[payload_start..payload_end]) != data[payload_end..record_end] {
+        return None;
+    }
+    Some((payload_start, payload_end, record_end))
+}
+
+/// Where a record that verifies starts, anywhere in `data[from..]`.
+///
+/// This is how a cut-short log is told from a damaged one. A crash leaves a
+/// prefix of a record, then nothing or zeros: no intact record can follow it. If
+/// one does, whatever stopped the scan was not a crash, and the bytes behind it
+/// are data that must not be thrown away. Only run on the failure path; the cheap
+/// length test keeps it linear.
+fn wal_valid_record_follows(data: &[u8], from: usize) -> Option<usize> {
+    let mut pos = from;
+    while pos.checked_add(8 + WAL_MIN_PAYLOAD + WAL_DIGEST_LEN)? <= data.len() {
+        if let Some(len) = try_read_u64(data, pos)
+            && len >= WAL_MIN_PAYLOAD as u64
+            && len <= (data.len() - pos) as u64
+            && wal_record_at(data, pos).is_some()
+        {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
 }
 
 /// The complete records of a log, and what is left over after them.
@@ -161,33 +208,20 @@ fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
     let mut pos = WAL_MAGIC.len();
     scan.valid_len = pos;
     while pos < data.len() {
-        let Some(len) = try_read_u64(data, pos).and_then(|len| usize::try_from(len).ok()) else {
-            scan.torn_tail = true;
-            break;
-        };
-        let payload_start = pos + 8;
-        let Some(payload_end) = payload_start.checked_add(len) else {
-            scan.torn_tail = true;
-            break;
-        };
-        let Some(record_end) = payload_end.checked_add(WAL_DIGEST_LEN) else {
-            scan.torn_tail = true;
-            break;
-        };
-        if record_end > data.len() {
-            scan.torn_tail = true;
-            break;
-        }
-        let payload = &data[payload_start..payload_end];
-        if wal_digest(payload) != data[payload_end..record_end] {
-            if record_end == data.len() {
-                scan.torn_tail = true;
-                break;
+        let Some((payload_start, payload_end, record_end)) = wal_record_at(data, pos) else {
+            // The record at `pos` cannot be completed or does not verify. If an
+            // intact record starts anywhere after it, this is damage in the
+            // middle of the file, not a crash: refuse, and leave the file as it
+            // is. If none does, what is left is the remains of a write that was
+            // cut short (a partial record, zeros, anything), and goes.
+            if let Some(next) = wal_valid_record_follows(data, pos + 1) {
+                return Err(DbError::Corrupted(format!(
+                    "write-ahead log record at byte {pos} cannot be read and an intact record starts at byte {next}: the file was altered, not cut short, so nothing is discarded"
+                )));
             }
-            return Err(DbError::Corrupted(format!(
-                "write-ahead log record at byte {pos} fails its checksum and is followed by more data: the file was altered, not cut short"
-            )));
-        }
+            scan.torn_tail = true;
+            break;
+        };
         scan.records.push((payload_start, payload_end));
         pos = record_end;
         scan.valid_len = pos;
@@ -218,7 +252,7 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
     }
     record.extend_from_slice(&(frame.len() as u64).to_le_bytes());
     record.extend_from_slice(frame);
-    record.extend_from_slice(&wal_digest(frame));
+    record.extend_from_slice(&wal_digest(frame.len() as u64, frame));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -249,6 +283,7 @@ trait AbstractTable: Send + Sync {
     fn type_id_num(&self) -> u16;
     fn type_name(&self) -> &'static str;
     fn pack_into(&self, out: &mut Vec<u8>);
+    fn pack_canonical_into(&self, out: &mut Vec<u8>);
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn pack_delta(&self, out: &mut Vec<u8>);
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
@@ -294,6 +329,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn pack_into(&self, out: &mut Vec<u8>) {
         Table::pack_into(self, out)
+    }
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) {
+        Table::pack_canonical_into(self, out)
     }
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         Table::load_from(self, bytes)
@@ -531,7 +569,7 @@ impl Db {
     /// leaves the previous checkpoint intact. Marks the tables flushed, so a
     /// following [`Db::flush_delta`] only records changes made after this.
     pub fn checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
-        self.write_checkpoint(path.as_ref())?;
+        self.write_checkpoint(path.as_ref(), false)?;
         for table in &mut self.tables {
             table.mark_flushed();
         }
@@ -543,11 +581,16 @@ impl Db {
     /// from a database whose write-ahead log is live: marking the tables flushed
     /// there would make the next [`Db::flush_delta`] skip every change made
     /// before the export.
+    ///
+    /// The bytes are canonical: the same state gives the same file whatever the
+    /// history that built it (see `Table::pack_canonical_into`). A node's own
+    /// checkpoint ([`Db::checkpoint`]) is not, on purpose: the log that follows
+    /// it is written in terms of the live layout.
     pub fn checkpoint_unmarked(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
-        self.write_checkpoint(path.as_ref())
+        self.write_checkpoint(path.as_ref(), true)
     }
 
-    fn write_checkpoint(&self, path: &Path) -> Result<(), DbError> {
+    fn write_checkpoint(&self, path: &Path, canonical: bool) -> Result<(), DbError> {
         let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
         ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
 
@@ -560,7 +603,11 @@ impl Db {
             let len_at = out.len();
             out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
             let start = out.len();
-            table.pack_into(&mut out);
+            if canonical {
+                table.pack_canonical_into(&mut out);
+            } else {
+                table.pack_into(&mut out);
+            }
             let len = (out.len() - start) as u64;
             out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
         }

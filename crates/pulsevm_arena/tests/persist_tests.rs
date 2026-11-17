@@ -405,7 +405,7 @@ fn a_byte_flipped_in_the_middle_of_the_log_is_refused_not_applied() {
         .expect("a damaged record must not replay");
     let text = format!("{error:?}");
     assert!(
-        text.contains("fails its checksum") && text.contains("altered, not cut short"),
+        text.contains("cannot be read") && text.contains("altered, not cut short"),
         "{text}"
     );
 }
@@ -581,4 +581,91 @@ fn replaying_a_block_that_removes_a_row_and_reuses_its_key_succeeds() {
     recovered.load(&snap).unwrap();
     recovered.replay_log_after(&wal, 1).unwrap();
     assert_eq!(recovered.state_root(), db.state_root());
+}
+
+// Round 12. The checksum used to cover the payload but not the length in front of
+// it, and "this record cannot be completed" was always read as "the log was cut
+// short". A corrupted length in the middle of the file then made every valid
+// record after it look like a torn tail, and they were deleted from the file.
+
+/// Overwrite the length field of the record that starts at `start`.
+fn corrupt_length_at(wal: &std::path::Path, start: usize, value: u64) {
+    let mut data = std::fs::read(wal).unwrap();
+    data[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    std::fs::write(wal, data).unwrap();
+}
+
+#[test]
+fn a_corrupted_length_in_the_middle_refuses_and_leaves_the_file_alone() {
+    let (_dir, snap, wal, _db, ends) = three_block_log();
+    // The second record starts where the first ends. Make it claim to run far
+    // past the end of the file, as a flipped high bit would.
+    corrupt_length_at(&wal, ends[0], 1 << 40);
+    let before = std::fs::read(&wal).unwrap();
+    let error = recover(&snap, &wal)
+        .err()
+        .expect("valid records follow the damaged length, so this is not a torn tail");
+    assert!(
+        format!("{error:?}").contains("altered, not cut short"),
+        "{error:?}"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        before,
+        "nothing is cut off while valid records follow"
+    );
+
+    // A smaller wrong length that still lands inside the file is the same.
+    let (_dir2, snap2, wal2, _db2, ends2) = three_block_log();
+    corrupt_length_at(&wal2, ends2[0], 3);
+    assert!(recover(&snap2, &wal2).is_err());
+}
+
+#[test]
+fn a_zero_filled_tail_of_any_length_is_trimmed() {
+    // A filesystem that extends a file before the data lands leaves zeros. Paul
+    // found that only exactly 40 bytes was handled; 41, 100 and 4096 stopped the
+    // node as "altered".
+    for zeros in [1usize, 7, 8, 39, 40, 41, 100, 4096, 70_000] {
+        let (_dir, snap, wal, _db, ends) = three_block_log();
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+            f.write_all(&vec![0u8; zeros]).unwrap();
+        }
+        let (recovered, outcome) = recover(&snap, &wal)
+            .unwrap_or_else(|error| panic!("{zeros} zero bytes must be trimmed: {error:?}"));
+        assert!(outcome.torn_tail, "{zeros} zero bytes");
+        assert_eq!(outcome.valid_len, ends[2] as u64, "{zeros} zero bytes");
+        assert_eq!(recovered.revision(), 4, "{zeros} zero bytes");
+    }
+}
+
+#[test]
+fn a_record_cut_short_with_a_zero_filled_remainder_is_a_torn_tail() {
+    // The shape a torn write usually has: the start of the next record, then
+    // zeros where the rest was never written.
+    let (_dir, snap, wal, mut db, ends) = three_block_log();
+    accepted(&mut db, &wal, 5, 40);
+    let data = std::fs::read(&wal).unwrap();
+    let fifth_start = ends[2];
+    let mut torn = data[..fifth_start + 20].to_vec(); // 20 bytes of the record
+    torn.extend(vec![0u8; 500]);
+    std::fs::write(&wal, torn).unwrap();
+    let (recovered, outcome) = recover(&snap, &wal).unwrap();
+    assert!(outcome.torn_tail);
+    assert_eq!(outcome.valid_len, ends[2] as u64);
+    assert_eq!(recovered.revision(), 4);
+}
+
+#[test]
+fn garbage_after_the_last_good_record_is_trimmed_even_if_it_looks_like_a_length() {
+    let (_dir, snap, wal, _db, ends) = three_block_log();
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        f.write_all(&(1u64 << 50).to_le_bytes()).unwrap();
+        f.write_all(&[0xAB; 300]).unwrap();
+    }
+    let (_, outcome) = recover(&snap, &wal).unwrap();
+    assert!(outcome.torn_tail);
+    assert_eq!(outcome.valid_len, ends[2] as u64);
 }

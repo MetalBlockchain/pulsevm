@@ -602,6 +602,9 @@ enum TransactionResourceMode {
 }
 
 pub struct Controller {
+    /// The node's own id as the host reports it at initialization, kept only to
+    /// tell this node's checkpoint schedule from the others'.
+    node_identity: Vec<u8>,
     wasm_runtime: WasmRuntime,
     last_accepted_block: SignedBlock,
     last_accepted_block_id: Id,
@@ -1148,7 +1151,7 @@ struct CachedSnapshot {
 }
 
 /// The log size at which this node writes a checkpoint instead: the configured
-/// size plus up to half again, chosen from the node's identity.
+/// size plus up to as much again, chosen from the node's identity.
 ///
 /// Every node's log starts empty at the same height after a cut and grows at the
 /// same rate, so with one threshold they all fold on the same block. A fold
@@ -1156,7 +1159,12 @@ struct CachedSnapshot {
 /// pausing for it at once is a stall. A fixed offset per node, rather than
 /// randomness at fold time, keeps a node's own schedule predictable and the
 /// spread permanent.
-pub(crate) fn jittered_wal_threshold(base: u64, producer: &[u8], data_dir: &[u8]) -> u64 {
+pub(crate) fn jittered_wal_threshold(
+    base: u64,
+    producer: &[u8],
+    data_dir: &[u8],
+    node_identity: &[u8],
+) -> u64 {
     use sha2::{
         Digest,
         Sha256,
@@ -1165,9 +1173,11 @@ pub(crate) fn jittered_wal_threshold(base: u64, producer: &[u8], data_dir: &[u8]
     hasher.update(producer);
     hasher.update([0]);
     hasher.update(data_dir);
+    hasher.update([0]);
+    hasher.update(node_identity);
     let digest = hasher.finalize();
     let spread = u64::from(u16::from_le_bytes([digest[0], digest[1]]));
-    base.saturating_add(((u128::from(base) * u128::from(spread)) / (2 * 65_536)) as u64)
+    base.saturating_add(((u128::from(base) * u128::from(spread)) / 65_536) as u64)
 }
 
 /// What a block producer should do about the clock before building.
@@ -1209,11 +1219,19 @@ pub fn pace_block_build(next_slot: u32, now_micros: i64, max_wait_slots: u32) ->
 }
 
 impl Controller {
+    /// Record the id the host gave this node. It is the one input to the
+    /// checkpoint stagger that is unique per node even when two hosts share a
+    /// producer name and a data path, as the nodes of a migrated network do.
+    pub fn set_node_identity(&mut self, node_id: &[u8]) {
+        self.node_identity = node_id.to_vec();
+    }
+
     pub fn new() -> Self {
         // Create a temporary database
         let wasm_runtime = WasmRuntime::new().unwrap();
 
         Controller {
+            node_identity: Vec::new(),
             wasm_runtime,
             last_accepted_block: SignedBlock::default(),
             last_accepted_block_id: Id::default(),
@@ -2093,9 +2111,15 @@ impl Controller {
                 // the corresponding state. Either side being ahead means a
                 // prior publication was interrupted; choosing either tip would
                 // silently pair a block with the wrong state.
-                let replay_recovery = self.node_config.as_ref().is_some_and(|config| {
-                    !config.state_history_enabled || config.allow_replay_recovery
-                });
+                // Only the explicit opt-in. State history off is an ordinary
+                // block-producer setting: it used to count as consent here, and
+                // a node that was more than one block behind its own log was
+                // silently rewound (nine blocks, in one run) and told to refetch
+                // them, which loses accepted blocks if its peers do not have them.
+                let replay_recovery = self
+                    .node_config
+                    .as_ref()
+                    .is_some_and(|config| config.allow_replay_recovery);
                 // The block log is appended before the arena commit is made
                 // durable, so a kill in that window leaves the log exactly one
                 // block ahead of a state that is otherwise intact. Dropping
@@ -2213,13 +2237,13 @@ impl Controller {
                     ] {
                         let Some(log) = log else { continue };
                         let last = log.range().map(|(_, last)| last);
-                        if last.is_none_or(|last| last < end) {
+                        // An empty log is not a gap: it is a log that starts at
+                        // the next block, as one does on a state-synced node or
+                        // after the files were moved aside. Only a log that holds
+                        // history and stops short of the block log is a gap.
+                        if let Some(last) = last.filter(|last| *last < end) {
                             return Err(ChainError::DatabaseError(format!(
-                                "state history is enabled but the {name} log ends at {} while the block log ends at {end}: state history was off while those blocks were accepted. Its logs must be contiguous, so it cannot be switched back on over the gap. Either leave state_history_enabled=false for this data directory, or stop the node, move the trace and chain-state log files out of the data directory (they start again at the next block, without the missing history), or resync",
-                                last.map_or_else(
-                                    || "nothing".to_string(),
-                                    |last| format!("block {last}")
-                                )
+                                "state history is enabled but the {name} log ends at block {last} while the block log ends at {end}: state history was off while those blocks were accepted. Its logs must be contiguous, so it cannot be switched back on over the gap. Either leave state_history_enabled=false for this data directory, or stop the node and move the trace and chain-state log files out of the data directory (the history logs then start again at the next block, without the missing history), or resync"
                             )));
                         }
                     }
@@ -3486,6 +3510,7 @@ impl Controller {
                     config.arena_wal_max_bytes,
                     config.producer_name.to_string().as_bytes(),
                     self.db_path.as_deref().unwrap_or("").as_bytes(),
+                    &self.node_identity,
                 )
             },
         );
@@ -9421,7 +9446,7 @@ mod tests {
             .err()
             .expect("a damaged log must not start")
             .to_string();
-        assert!(error.contains("fails its checksum"), "{error}");
+        assert!(error.contains("altered, not cut short"), "{error}");
 
         // The same flip in the last record is what a crash mid-write leaves: that
         // block is dropped (the block log, one ahead, is rewound) and the node starts.
@@ -9451,9 +9476,10 @@ mod tests {
                 base,
                 format!("producer{node}").as_bytes(),
                 format!("/data/node{node}").as_bytes(),
+                &[],
             );
             assert!(threshold >= base, "never folds earlier than configured");
-            assert!(threshold < base + base / 2, "at most half again");
+            assert!(threshold < base * 2, "at most as much again");
             seen.insert(threshold);
         }
         assert!(
@@ -9463,11 +9489,28 @@ mod tests {
         );
         // A node's own threshold does not move between runs.
         assert_eq!(
-            jittered_wal_threshold(base, b"pulse", b"/data"),
-            jittered_wal_threshold(base, b"pulse", b"/data")
+            jittered_wal_threshold(base, b"pulse", b"/data", b"n"),
+            jittered_wal_threshold(base, b"pulse", b"/data", b"n")
         );
-        assert_eq!(jittered_wal_threshold(0, b"a", b"b"), 0);
-        assert_eq!(jittered_wal_threshold(u64::MAX, b"a", b"b"), u64::MAX);
+        assert_eq!(jittered_wal_threshold(0, b"a", b"b", b"c"), 0);
+        assert_eq!(jittered_wal_threshold(u64::MAX, b"a", b"b", b"c"), u64::MAX);
+
+        // The nodes of a migrated network share one producer name, and hosts can
+        // share a data path: same name and same path, only the node id differs.
+        let by_node: std::collections::BTreeSet<u64> = (0..16u8)
+            .map(|id| jittered_wal_threshold(base, b"eosio", b"/var/lib/pulsevm", &[id; 20]))
+            .collect();
+        assert!(
+            by_node.len() > 12,
+            "the node id separates otherwise identical nodes: {}",
+            by_node.len()
+        );
+        // With nothing but the same inputs there is nothing to separate them
+        // by, which is why the node id is an input.
+        assert_eq!(
+            jittered_wal_threshold(base, b"eosio", b"/var/lib/pulsevm", b""),
+            jittered_wal_threshold(base, b"eosio", b"/var/lib/pulsevm", b"")
+        );
     }
 
     // State history off is an ordinary block-producer setting, not an offline
@@ -9710,36 +9753,89 @@ mod tests {
     }
 
     // State history that was off while blocks were accepted cannot be turned back
-    // on over the gap. Paul hit this: the node came up and then refused its next
-    // block as "missed a block in trace_log.log", and only a resync fixed it.
+    // on over a gap in logs that hold history. Paul hit this: the node came up and
+    // then refused its next block as "missed a block in trace_log.log", and only a
+    // resync fixed it. The refusal names a fix (move the logs aside), and the fix
+    // has to work: round 11's first version refused an empty log too, so the node
+    // it told to move them aside was refused again.
     #[tokio::test]
-    async fn state_history_switched_back_on_over_a_gap_is_refused_at_start_with_the_fix()
+    async fn state_history_switched_back_on_over_a_gap_is_refused_and_the_named_fix_works()
     -> Result<(), ChainError> {
-        let off = CrashChain::new(json!({"state_history_enabled": false}))?;
+        let on = CrashChain::new(json!({}))?;
+        let mut controller = on.open()?;
+        on.accept(&mut controller, "withhist").await?;
+        on.accept(&mut controller, "withhist2").await?;
+        drop(controller);
+
+        // Off for two more blocks.
+        let off = CrashChain::build(
+            json!({"state_history_enabled": false}),
+            None,
+            on.path().to_string(),
+        )?;
         let mut controller = off.open()?;
         off.accept(&mut controller, "quiet").await?;
         off.accept(&mut controller, "quieter").await?;
         drop(controller);
 
         // Off again after the gap is fine.
-        let still_off = CrashChain::build(
-            json!({"state_history_enabled": false}),
-            None,
-            off.path().to_string(),
-        )?;
-        drop(still_off.open()?);
+        drop(off.open()?);
 
-        let on = CrashChain::build(json!({}), None, off.path().to_string())?;
+        // On over the gap: the logs hold blocks 2..3 and the block log ends at 5.
         let error = on
             .open()
             .err()
             .expect("state history cannot be switched back on over a gap")
             .to_string();
         assert!(
-            error.contains("state history was off while those blocks were accepted")
+            error.contains("ends at block 3")
+                && error.contains("block log ends at 5")
                 && error.contains("move the trace and chain-state log files"),
             "{error}"
         );
+
+        // The fix the message names: move the history logs out of the directory.
+        let mut moved = 0;
+        for entry in std::fs::read_dir(on.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.starts_with("trace_log") || name.starts_with("chain_state_log") {
+                std::fs::remove_file(&path).unwrap();
+                moved += 1;
+            }
+        }
+        assert!(moved >= 2, "the trace and chain-state log files were found");
+        let mut restarted = on.open()?;
+        assert_eq!(restarted.last_accepted_block().block_num(), 5);
+        // History starts again at the next block, and accepts it.
+        on.accept(&mut restarted, "afterfix").await?;
+        assert_eq!(restarted.last_accepted_block().block_num(), 6);
+        assert_eq!(restarted.trace_log().unwrap().range().unwrap().0, 6);
+        Ok(())
+    }
+
+    // Round 11: with state history off, a node whose arena was more than one block
+    // behind its own block log was silently rewound (nine blocks) and left to
+    // refetch them. Only the explicit replay opt-in may do that.
+    #[tokio::test]
+    async fn a_node_with_state_history_off_is_not_silently_rewound_by_more_than_a_block()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({"state_history_enabled": false}))?;
+        let mut controller = chain.open()?;
+        for name in ["one", "two", "three"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        drop(controller);
+        // Lose the log of accepted blocks: arena at its checkpoint (block 1), block
+        // log at 4.
+        let wal = std::path::Path::new(chain.path()).join("arena_wal.bin");
+        std::fs::remove_file(&wal).unwrap();
+        let error = chain
+            .open()
+            .err()
+            .expect("three blocks of gap is not a crash window")
+            .to_string();
+        assert!(error.contains("does not match block log end"), "{error}");
         Ok(())
     }
 

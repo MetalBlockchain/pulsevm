@@ -523,18 +523,25 @@ diverging after the first fix). When two nodes disagree,
 `arena_tables_differing_from` names the table.
 
 **The log has a checksum and a version.** Each record is
-`[length][payload][SHA-256]` behind an 8-byte `PVMWAL02` header. A record cut
-short, or a final record whose checksum fails, is a crash and is dropped. A
-checksum failure with intact data after it is not a crash, and the node refuses to
-start naming it (a flipped byte used to be applied silently). A zero-length record
-header used to hang the plugin at start-up with nothing logged; it is a torn
-write and is trimmed, and a failed initialization is now logged by the plugin. A
-log from the earlier unchecksummed build is refused by name: stop that node
-cleanly with the build that wrote it, or resync. The directory is fsynced after
-the checkpoint's rename, the log's creation and its removal, and the protocol and
-metadata files', so a power loss cannot bring back a log the checkpoint replaced.
-Power loss itself is not run here (a `kill -9` cannot show a missing directory
-fsync).
+`[length][payload][SHA-256 of length and payload]` behind an 8-byte `PVMWAL03`
+header. Whether damage is a crash or an alteration is decided by what follows it,
+not by the shape of the damage. If a record cannot be completed or does not
+verify, the node looks for any intact record after it. None: what is left is the
+remains of a write that was cut short (a partial record, zeros of any length,
+garbage), and it is trimmed. One: the file was altered in the middle, and the node
+refuses to start, naming the byte, **and leaves the file exactly as it is**. Round
+11 left two holes in this. The checksum did not cover the length, so one flipped
+length made every valid record behind it look like a torn tail and they were
+deleted from the file; and a zero-filled tail longer than exactly 40 bytes was
+refused as "altered", which is what a torn write on a filesystem that extends a
+file before the data lands looks like. A zero-length header used to hang the
+plugin at start-up with nothing logged; it is a torn write like the rest, and a
+failed initialization is now logged by the plugin. A log from an earlier build
+(`PVMWAL02` or none) is refused by name: stop that node cleanly with the build
+that wrote it, or resync. The directory is fsynced after the checkpoint's rename,
+the log's creation and its removal, and the protocol and metadata files', so a
+power loss cannot bring back a log the checkpoint replaced. Power loss itself is
+not run here (a `kill -9` cannot show a missing directory fsync).
 
 **Replay no longer trips over a block that moves a unique key.** Applying a
 logged block one row at a time, in the order the rows were first touched, failed

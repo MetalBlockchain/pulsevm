@@ -323,3 +323,127 @@ fn the_root_does_not_depend_on_where_the_blobs_sit() {
     roundabout.modify::<Doc>(id, |d| d.payload = other).unwrap();
     assert_ne!(direct.state_root(), roundabout.state_root());
 }
+
+// Paul stopped five nodes cleanly at one height: the roots agreed, but the five
+// checkpoint files differed in size and hash. A checkpoint is a dump of the arena
+// as it is laid out, dead blob spans included, so two nodes with the same state
+// and different histories write different bytes. That is fine for a node's own
+// file, which must match its own layout, but anything that hashes an *exported*
+// snapshot (state sync serves one and commits to its hash) would then differ
+// between nodes that agree on the state. An export is therefore written
+// canonically: same state, same bytes.
+
+fn export_bytes(db: &Db) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("export");
+    db.checkpoint_unmarked(&path).unwrap();
+    std::fs::read(&path).unwrap()
+}
+
+#[test]
+fn an_export_is_the_same_bytes_for_the_same_state_whatever_the_history() {
+    let mut direct = new_db();
+    direct.set_revision(1).unwrap();
+    for (key, payload) in [(7u64, &b"final-payload"[..]), (9, b"nine"), (11, b"")] {
+        let blob = direct.alloc_blob::<Doc>(payload).unwrap();
+        direct
+            .create::<Doc>(|d| {
+                d.key = key;
+                d.payload = blob;
+            })
+            .unwrap();
+    }
+
+    let mut roundabout = new_db();
+    roundabout.set_revision(1).unwrap();
+    // Junk first, freed; each row first written wrong and then rewritten, so the
+    // blobs land in different places and dead spans with other bytes are left.
+    let junk = roundabout
+        .alloc_blob::<Doc>(b"xxxxxxxxxxxxxxxxxxxx")
+        .unwrap();
+    roundabout.free_blob::<Doc>(junk).unwrap();
+    for (key, wrong, payload) in [
+        (7u64, &b"first-attempt"[..], &b"final-payload"[..]),
+        (9, b"zzzzzz", b"nine"),
+        (11, b"qq", b""),
+    ] {
+        let first = roundabout.alloc_blob::<Doc>(wrong).unwrap();
+        let id = roundabout
+            .create::<Doc>(|d| {
+                d.key = key;
+                d.payload = first;
+            })
+            .unwrap()
+            .id;
+        let moved = roundabout.realloc_blob::<Doc>(first, payload).unwrap();
+        roundabout.modify::<Doc>(id, |d| d.payload = moved).unwrap();
+    }
+
+    assert_eq!(direct.state_root(), roundabout.state_root());
+    assert_eq!(
+        export_bytes(&direct),
+        export_bytes(&roundabout),
+        "same state, same exported bytes"
+    );
+
+    // And the export loads back to the same state.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("export");
+    roundabout.checkpoint_unmarked(&path).unwrap();
+    let mut loaded = new_db();
+    loaded.load(&path).unwrap();
+    assert_eq!(loaded.state_root(), direct.state_root());
+}
+
+#[test]
+fn a_node_that_restarted_exports_the_bytes_of_one_that_did_not() {
+    for seed in 1..=6u64 {
+        let mut rng = Rng(0x2545f4914f6cdd1d ^ seed.wrapping_mul(0x9e3779b97f4a7c15));
+        let mut reference = new_db();
+        reference.set_revision(1).unwrap();
+        let mut subject = Subject::new();
+        let mut next_key = 0u64;
+        for round in 0..40i64 {
+            let revision = 2 + round;
+            let ops = random_ops(&mut rng, &mut next_key);
+            block(&mut reference, &ops, revision);
+            block(&mut subject.db, &ops, revision);
+            subject.accepted();
+            if rng.below(6) == 0 {
+                subject.crash_restart();
+            }
+            assert_eq!(
+                export_bytes(&subject.db),
+                export_bytes(&reference),
+                "seed {seed}, block {revision}: exported bytes differ"
+            );
+        }
+    }
+}
+
+// A node's own checkpoint, by contrast, keeps its live layout: the log that
+// follows it is written in terms of that layout.
+#[test]
+fn a_nodes_own_checkpoint_still_matches_its_live_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    let mut rng = Rng(77);
+    let mut next_key = 0;
+    for round in 0..10i64 {
+        let ops = random_ops(&mut rng, &mut next_key);
+        block(&mut db, &ops, 2 + round);
+    }
+    db.checkpoint(&snap).unwrap();
+    for round in 10..20i64 {
+        let ops = random_ops(&mut rng, &mut next_key);
+        block(&mut db, &ops, 2 + round);
+        db.flush_delta(&wal).unwrap();
+    }
+    let mut recovered = new_db();
+    recovered.load(&snap).unwrap();
+    recovered.replay_log_after(&wal, 11).unwrap();
+    assert_eq!(recovered.state_root(), db.state_root());
+}

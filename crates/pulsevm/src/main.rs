@@ -471,6 +471,7 @@ impl Vm for VirtualMachine {
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
         let upgrade_bytes = request.get_ref().upgrade_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
+        let node_identity = request.get_ref().node_id.clone();
         let server_addr = request.get_ref().server_addr.clone();
         let chain_id: Id = request
             .get_ref()
@@ -491,6 +492,7 @@ impl Vm for VirtualMachine {
         // the Tokio worker while MetalGo's RPC transport remains responsive.
         let admission_state = tokio::task::spawn_blocking(move || {
             let mut controller = controller.blocking_write();
+            controller.set_node_identity(&node_identity);
             if let Err(error) = controller.initialize_with_protocol_upgrades(
                 &chain_id,
                 &config_bytes,

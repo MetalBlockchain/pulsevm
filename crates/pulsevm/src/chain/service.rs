@@ -415,12 +415,14 @@ impl RpcService {
     /// Blocks asked for faster than one per slot would each be stamped a slot
     /// further ahead of the clock (a block takes the later of the clock and one
     /// slot past its parent), and verifiers refuse blocks too far ahead of theirs,
-    /// which split a loaded network. A near slot is waited for. A slot already
+    /// which split a loaded network. A near slot is waited for, up to three seconds
+    /// (six slots): that also absorbs a clock that runs a second or two behind the
+    /// node that built the parent, well inside the twenty slots verifiers allow. A slot already
     /// further ahead than that means the chain has drifted; it is answered with an
     /// error rather than a long sleep, and the block timer asks again every
     /// half second while there are transactions, so the clock catches up.
     async fn wait_for_block_slot(&self) -> Result<(), ChainError> {
-        const MAX_WAIT_SLOTS: u32 = 2;
+        const MAX_WAIT_SLOTS: u32 = 6;
         let next_slot = self.controller.read().await.next_block_slot()?;
         let now = pulsevm_core::time::TimePoint::now()
             .time_since_epoch()

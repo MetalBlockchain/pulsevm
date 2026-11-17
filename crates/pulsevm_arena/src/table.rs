@@ -806,6 +806,55 @@ impl<T: ArenaObject> Table<T> {
     /// raw bytes. No per-field encoding: the object is fixed-size POD, so its
     /// bytes go out with a single copy. The undo stack is deliberately not
     /// persisted — a snapshot is committed state.
+    /// As [`Table::pack_into`], but with the blob arena rewritten canonically:
+    /// each row's blobs repacked one after another in row order, and every
+    /// reference rewritten to match; an empty blob is always the default
+    /// reference. Two tables holding the same rows then pack to the same bytes
+    /// whatever their allocation history (dead spans, a lost free list), so a
+    /// hash of an exported snapshot agrees between nodes that agree on state.
+    ///
+    /// Only for export. The live arena keeps its own layout, and the write-ahead
+    /// log that follows a node's own checkpoint is written in terms of it.
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+        let offsets = T::blob_ref_offsets();
+        let mut blobs: Vec<u8> = Vec::new();
+        let mut scratch = Vec::new();
+        for (id, obj) in self.primary.iter_with_ids() {
+            out.extend_from_slice(&(id as u64).to_le_bytes());
+            let raw = obj.as_bytes();
+            if offsets.is_empty() {
+                out.extend_from_slice(raw);
+                continue;
+            }
+            scratch.clear();
+            scratch.extend_from_slice(raw);
+            for &at in offsets {
+                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+                let bytes = if len == 0 {
+                    &[][..]
+                } else {
+                    off.checked_add(len)
+                        .and_then(|end| self.blobs.get(off..end))
+                        .unwrap_or(&[])
+                };
+                let (new_off, new_len) = if bytes.is_empty() {
+                    (0u32, 0u32)
+                } else {
+                    (blobs.len() as u32, bytes.len() as u32)
+                };
+                blobs.extend_from_slice(bytes);
+                scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
+                scratch[at + 4..at + 8].copy_from_slice(&new_len.to_le_bytes());
+            }
+            out.extend_from_slice(&scratch);
+        }
+        out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&blobs);
+    }
+
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
