@@ -61,6 +61,11 @@ add_vm_logging_config() { # $1=chain config json -> stdout
   if [[ -n "${PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND:-}" ]]; then
     config="$(jq -c --argjson n "$PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND" '. + {state_sync_min_blocks_behind: $n}' <<<"$config")"
   fi
+  # TEST NETWORKS ONLY: hold each state-sync apply this long so a test can hit
+  # the window in which the host's state syncer is waiting.
+  if [[ -n "${PULSEVM_STATE_SYNC_APPLY_DELAY_MS:-}" ]]; then
+    config="$(jq -c --argjson n "$PULSEVM_STATE_SYNC_APPLY_DELAY_MS" '. + {state_sync_apply_delay_ms: $n}' <<<"$config")"
+  fi
   printf '%s' "$config"
 }
 
