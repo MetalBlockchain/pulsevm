@@ -55,6 +55,12 @@ add_vm_logging_config() { # $1=chain config json -> stdout
   if [[ -n "${PULSEVM_LOG_LEVEL:-}" ]]; then
     config="$(jq -c --arg level "$PULSEVM_LOG_LEVEL" '. + {log_level: $level}' <<<"$config")"
   fi
+  # How far behind a node must be before it state-syncs rather than fetching the
+  # missing blocks. The default (1024) is right for a real network; a test
+  # network lowers it so both paths can be exercised in minutes.
+  if [[ -n "${PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND:-}" ]]; then
+    config="$(jq -c --argjson n "$PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND" '. + {state_sync_min_blocks_behind: $n}' <<<"$config")"
+  fi
   printf '%s' "$config"
 }
 

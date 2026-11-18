@@ -649,16 +649,33 @@ the VM is behind, never forward, so it refuses. MetalGo persists its index
 with synced writes the host can never be behind. `pebbledb` syncs each write
 (`database/pebbledb/db.go`, `Sync: true` by default; batches commit with it).
 
-Set `"db-type": "pebbledb"` in the node config for every node of the new network.
-`scripts/run-local.sh` does (override with `PULSEVM_NODE_DB_TYPE`), and
-`run-handover.sh verify-restarts` fails if a node is not on pebble. The type is
-chosen at the node's first start: an existing leveldb directory cannot be reopened
-as pebble, so this belongs in the T-14 node configuration, not in a later
-change. Cost: one fsync per MetalGo write, not measured here. What was and was
-not checked: the order and the sync options were read in MetalGo's source; a real
-power cut was not performed (it needs a machine or VM that can be powered off),
-and the plugin's own recovery from one is covered by the kill tests above only
-as far as a process kill goes, which does not lose unsynced pages.
+Set `"db-type": "pebbledb"` in the node config for every node of the new network,
+and put it in the T-14 production node-config checklist: **today only
+`scripts/run-local.sh` sets it** (override with `PULSEVM_NODE_DB_TYPE`).
+MetalGo keeps leveldb in `<db>/<network>/v1.4.5` and pebble in
+`<db>/<network>/pebble`, so **changing `db-type` does not fail. It quietly opens
+an empty database beside the old one.** Paul measured both directions:
+
+- pebble to no flag: the node ran on a new, empty leveldb, unsynced, and nothing said so;
+- then back to pebble: refused with the proposervm height-index error above, the
+  power-loss refusal caused by configuration alone.
+
+So moving a node's database type means clearing its `chainData` too, and the type is
+chosen when the node first starts. The same class of mistake that pebble alone does
+not fix: a host database wiped or restored while `chainData` is kept, a `db-config`
+with `"sync": false`, or storage that does not honour flushes. `verify-restarts` now
+checks what the running node opened (the pebble directory is present, no leveldb
+`CURRENT` file beside it, and the node's own "opening pebble" log line shows
+`"sync":true`), not just that an `OPTIONS-*` file exists, which one left behind
+satisfied. Measured cost (Paul): about one `fdatasync` per accepted block, 206 to
+311 microseconds, 2.7 to 3.8 MB/min written; block build to accept time was not
+measurably different (consensus dominates). MetalGo's memory still grows on pebble
+(76 to 750 MB over 173 minutes on one node); whether it plateaus at the cache size
+is not measured.
+
+What was and was not checked: the order and the sync options were read in MetalGo's
+source, and Paul's recorded power-cut replay on pebble refused 0 of 230 images
+(against 99 of 155 on leveldb).
 
 **A full disk, or a plugin that died.** Neither is tested here: there is no
 disk-full case in the test suite, and what the plugin does with a failed write is
@@ -686,6 +703,84 @@ nodes is the canonical state root, and what a node serves or exports for state
 sync is the canonical form: the same bytes from any node at the same height
 (tests `an_export_is_the_same_bytes...` and `a_node_that_restarted_exports...`).
 Do not compare `arena_state.bin` files byte for byte.
+
+## State sync, damaged history logs and the write-ahead log (round 13)
+
+**A node that restarts could stall the chain.** While a node state-synced, the
+plugin answered the host's wait with "build a block" whenever the mempool held a
+transaction. The host's state syncer only accepts "sync finished", and it takes one
+notification per subscription, so it never listened for the end of the sync again:
+the node stayed in state sync until it was restarted by hand, and with another node
+also restarting the chain stalled. The plugin now keeps the engine state it is
+given and, while the engine has it state-syncing, reports nothing but the end of
+the sync (`next_engine_event` in `crates/pulsevm/src/main.rs`, four tests).
+
+**Nodes no longer state-sync for a few blocks.** A summary no more than
+`state_sync_min_blocks_behind` blocks (default 1024) ahead of the node's tip is
+skipped and the node fetches those blocks instead. Before, a node 5 blocks behind
+installed a snapshot, which rebases the block log and dropped its history (78 MB to
+3 MB). A fresh node and a node far behind still sync. Set it in the chain config
+(`0` syncs whenever a summary is ahead).
+
+**A cut during a state-sync install now recovers by itself.** The install swaps
+the arena, the block log and the history logs and marks the window with
+`state_sync_installing`. A cut inside it can leave pieces from two heights, so the
+node refused to start until its data was moved aside by hand (the host then logged
+`error creating chain ... EOF`). On start the node now moves everything in its data
+directory into `state_sync_abandoned/<time>/` (the two newest are kept, so the
+damage can be examined) and starts as a fresh node, which the host syncs again, and
+logs `ALARM event=state_sync.install_abandoned`. It only happens for a node that
+was being synced from others. Moving the data aside by hand, which Paul did, is the
+same recovery and rejoined in 2.2 s.
+
+**Zero tails on the history logs.** A power cut can leave the trace, chain-state or
+block log longer than its data, the tail all zeros. The node opens all three logs
+with magic 0, and a zero header matches magic 0, so the zeros were read as entries
+for block 0 and the node refused to start with `missed a block in trace_log.log`.
+The earlier fix only ran when the expected magic was not zero, which is never the
+case on a node. An all-zero remainder is now trimmed whatever the magic; zeros
+followed by data are still refused. The in-place case (the last entry zeroed) drops
+that entry.
+
+**The write-ahead log checksum is keyed** (`PVMWAL04`). A plain hash of length and
+payload can be computed by anyone, and a payload carries contract row bytes
+verbatim, so a transaction could store 56 bytes that read as a valid record. Inside
+a torn final record that proved the file "altered" and the node refused to start; one
+such row per block would keep it from recovering without a manual fix. The log now
+starts with a random 32-byte key and every digest includes it; a contract cannot read
+that file. A file of nothing but zeros (the window between removing the log at a
+fold and the next accept creating it) is an append that never happened, not a log
+from an earlier build. **This and the canonical export are format changes with no
+gate:** every producer must run and convert with the same build. Fine before launch;
+it is part of the launch checklist.
+
+**Exports refuse corruption.** A blob reference outside its arena, or a table whose
+blobs exceed 4 GiB, makes a canonical export fail instead of writing an empty blob or
+a truncated offset that looked like a valid snapshot.
+
+**The manifest must record the deferred mode.** `deferred_policy` is required: the
+verifier and the node's restore gate refuse a manifest without it or with an
+unknown value, as well as one that disagrees with the checkpoint's rows. It is not
+inside what the halt pair signs; the checkpoint hash the confirmation does bind
+already commits to the deferred rows, so an edited field can mislead a reader but
+cannot change what the chain does. Binding it into the confirmation digest would
+change the ceremony format and was not done.
+
+**Refused blocks are summarised, not hidden.** A node that is behind refuses every
+block of a peer that is ahead (about 1.3 million warnings in two hours). Lowering the
+level would hide a real failure among them. The first refusal in a ten-second window
+is logged in full; the rest are counted into one summary with how many, over which
+heights and why the first was refused.
+
+**How this is checked end to end.** The `faults` scenario of
+`.github/workflows/cutover-e2e.yml` (`VERIFY_FAULTS=1 run-handover.sh
+verify-restarts`) runs on the live five-node network: zero tails on the three
+history logs, a zero tail and then a flipped record in the write-ahead log (refused by
+name, file left alone, then put back), the install marker, a node state-syncing with
+transactions pending, and a node a few blocks behind; each must rejoin and agree
+with the nodes that never stopped, at all five nodes' roots. A real power cut
+replayed at every write needs a recording block device and is not reproducible on a
+hosted runner; Paul's box remains that check.
 
 ## The voter after a failure: restart, degraded mode, state file
 

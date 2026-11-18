@@ -299,8 +299,11 @@ arena, re-bases the block log, clears the trace and chain-state logs, and writes
 an atomically replaced, checksummed producer-schedule base for the re-based log.
 The marker is removed and its directory synced only after every companion file
 is installed. A failure after the arena swap is a fatal consistency error: the
-VM aborts, and the surviving marker makes every restart fail closed until the
-node's data is diagnosed and rebuilt or resynced. A re-based block log above
+VM aborts. On the next start the surviving marker means the pieces may come from
+two heights, so the node moves its own data into `state_sync_abandoned/` (kept, the
+two newest) and starts fresh to sync again, with an `ALARM` log line; see
+`docs/xpr-cutover-operations.md`, "State sync, damaged history logs and the
+write-ahead log". A re-based block log above
 genesis likewise cannot start without its valid producer-schedule sidecar.
 
 > **Operational invariant:** every validator, verifier, and state-sync node must

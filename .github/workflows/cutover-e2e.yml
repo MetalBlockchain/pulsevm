@@ -9,6 +9,10 @@ name: Cutover end to end
 # head AND on state root at every height they share (round 11: a restarted node
 # computed a different root and the chain did not notice).
 #
+# The faults scenario adds what a power cut or a hostile disk leaves behind (see
+# its step below). A real power cut, replayed at every write, is not reproducible
+# on a hosted runner (it needs a recording block device) and stays Paul's check.
+#
 # What it does not cover: the table compare against a real mainnet snapshot, the
 # deferred-transaction sidecar and the mainnet provenance checks (the fixture
 # chain has no deferred activity and no mainnet pins), and a power loss. Those
@@ -59,7 +63,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [ clean, chaos ]
+        scenario: [ clean, chaos, faults ]
     env:
       LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       XPR_NODEOS_IMAGE: pulsevm-leap:5.0.3-amd64
@@ -75,6 +79,10 @@ jobs:
       # One validator is dropped before H+1 in the chaos scenario, so H+1 must
       # finalize on four of five.
       CHAOS_KILL_NODE: ${{ matrix.scenario == 'chaos' && '1' || '0' }}
+      # The faults scenario makes a node a few blocks behind and another far
+      # behind within minutes, so the threshold at which a node state-syncs is
+      # lowered from its production default (1024 blocks). Empty elsewhere.
+      PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND: ${{ matrix.scenario == 'faults' && '10' || '' }}
 
     steps:
       # The rehearsal refuses to run below 12% free disk (Leap and MetalGo both
@@ -167,6 +175,25 @@ jobs:
           set -o pipefail
           ./docker/handover/run-handover.sh verify-restarts 2>&1 | tee "$RUNNER_TEMP/verify-restarts.log"
           grep -q '^handover: verify-restarts: PASS' "$RUNNER_TEMP/verify-restarts.log"
+
+      # What a power cut or a hostile disk leaves behind, made on the live
+      # network: zero tails on the three history logs, a zero tail and then a
+      # damaged record in the write-ahead log, the marker of an interrupted
+      # state-sync install, a node state-syncing with transactions pending, and a
+      # node a few blocks behind. Each node has to come back, join, and agree with
+      # the nodes that never stopped (head and state root at every shared height).
+      - name: Damage files, interrupt state sync, sync under load
+        if: ${{ matrix.scenario == 'faults' }}
+        env:
+          METALGO_EXEC_PATH: ${{ github.workspace }}/metalgo/build/metalgo
+          METAL_NETWORK_RUNNER_PATH: ${{ github.workspace }}/metal-network-runner/bin/metal-network-runner
+          RESTART_ROUNDS: '0'
+          VERIFY_FAULTS: '1'
+        run: |
+          set -o pipefail
+          ./docker/handover/run-handover.sh verify-restarts 2>&1 | tee "$RUNNER_TEMP/verify-faults.log"
+          grep -q '^handover: faults: PASS' "$RUNNER_TEMP/verify-faults.log"
+          grep -q '^handover: verify-restarts: PASS' "$RUNNER_TEMP/verify-faults.log"
 
       - name: Collect logs
         if: always()

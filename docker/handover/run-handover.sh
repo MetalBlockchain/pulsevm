@@ -2482,18 +2482,34 @@ cmd_verify_restarts() {
 
     # The host must be running a database that syncs each write. With MetalGo's
     # default (leveldb, no fsync) a power loss leaves the host's proposervm index
-    # behind this VM's fsynced chain and the node refuses to start. Pebble (which
-    # keeps an OPTIONS file in its directory) syncs; require it on every node.
-    local db_checked=0
+    # behind this VM's fsynced chain and the node refuses to start. MetalGo keeps
+    # pebble in <db>/<network>/pebble and leveldb in <db>/<network>/v1.4.5, and
+    # changing db-type does not fail: it opens an empty database beside the old
+    # one. So "an OPTIONS file exists" is not evidence (one is left behind), and
+    # the check is on what the RUNNING node opened: the pebble directory has to be
+    # there, a leveldb one must hold no data, and the node's own log of opening
+    # pebble must show synced writes.
+    local db_checked=0 dbroot ldb pebble_line
     for n in 1 2 3 4 5; do
-        [[ -d "$netdir/node$n/db" ]] || continue
-        find "$netdir/node$n/db" -name 'OPTIONS-*' -print -quit 2>/dev/null | grep -q . \
-            || fail "verify-restarts: node$n does not run pebbledb; a power loss could leave it unable to start"
+        dbroot="$netdir/node$n/db"
+        [[ -d "$dbroot" ]] || continue
+        find "$dbroot" -type d -name pebble -print -quit 2>/dev/null | grep -q . \
+            || fail "verify-restarts: node$n has no pebble database directory; a power loss could leave it unable to start"
+        ldb="$(find "$dbroot" -type f -name CURRENT -path '*v1.4.5*' -print -quit 2>/dev/null || true)"
+        [[ -z "$ldb" ]] \
+            || fail "verify-restarts: node$n also holds a leveldb database ($ldb): it was started under another db-type at some point, and the chain's host state is split"
+        pebble_line="$(grep -rh 'opening pebble' "$netdir/node$n/logs" 2>/dev/null | tail -1 || true)"
+        if [[ -n "$pebble_line" ]]; then
+            grep -q '"sync":true' <<<"$pebble_line" \
+                || fail "verify-restarts: node$n opened pebble without synced writes: $pebble_line"
+        else
+            echo "handover: verify-restarts: node$n: no 'opening pebble' line in its log (format changed?); relying on the directory check"
+        fi
         db_checked=$((db_checked + 1))
     done
     # A check that found nothing to look at proves nothing.
     [[ "$db_checked" -ge 1 ]] || fail "verify-restarts: found no node database directory to check the database type in $netdir"
-    echo "handover: verify-restarts: $db_checked node(s) run pebbledb (synced writes)"
+    echo "handover: verify-restarts: $db_checked node(s) run pebbledb with synced writes"
 
     # Each answering node's chain RPC, found without the runner server: its
     # control API wedges after a boot (see direct_chain_rpc_url), while the nodes
@@ -2612,6 +2628,201 @@ print((n.to_bytes(2, 'big') + bytes([n % 251]) * length).hex())")"
         sleep 5
     }
 
+    # ---- Fault stages (VERIFY_FAULTS=1) ------------------------------------
+    # What a real power cut or a hostile disk leaves behind, made on a live
+    # five-node network and judged the way every other check here is: the node
+    # has to come back, join, and agree with the nodes that never stopped. Each
+    # stage names the bug it exists for. A stage is only worth keeping once it
+    # has been shown to FAIL on the build with that bug put back.
+    node_pid_of() { ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$1/configs" | head -1 | awk '{print $1}'; }
+    node_cmd_of() { ps -eo pid,args | grep "[m]etalgo.*$NETBASE/node$1/configs" | head -1 | sed -E 's/^ *[0-9]+ //'; }
+    stop_node() { # kill -9 the node and its plugin; remember how to start it again
+        local cmd pid
+        cmd="$(node_cmd_of "$1")"; pid="$(node_pid_of "$1")"
+        [[ -n "$cmd" && -n "$pid" ]] || fail "faults: node$1 is not running"
+        printf '%s' "$cmd" >"$WORK_DIR/node-cmd-$1"
+        pkill -9 -P "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || fail "faults: could not kill node$1 ($pid)"
+        local _
+        for _ in $(seq 1 30); do
+            [[ -z "$(node_pid_of "$1")" ]] && return 0
+            sleep 1
+        done
+        fail "faults: node$1 did not stop"
+    }
+    start_node() {
+        bash -c "$(cat "$WORK_DIR/node-cmd-$1")" >>"$WORK_DIR/node-restart-$1.log" 2>&1 &
+        echo $! >>"$WORK_DIR/five-node.relaunched"
+    }
+    node_data_dir() { # the plugin's data directory for node $1 (holds block_log.log)
+        local f
+        f="$(find "$netdir/node$1" -name block_log.log -not -path '*state_sync_abandoned*' -print -quit 2>/dev/null)"
+        [[ -n "$f" ]] || fail "faults: found no plugin data directory for node$1"
+        dirname "$f"
+    }
+    log_count() { # occurrences of $2 in all of node $1's logs
+        local total=0 n
+        while IFS= read -r file; do
+            n="$(grep -c -- "$2" "$file" 2>/dev/null || true)"
+            total=$((total + ${n:-0}))
+        done < <(find "$netdir/node$1" -name '*.log' 2>/dev/null)
+        echo "$total"
+    }
+    expect_log_grew() { # node, text, count before, what it shows
+        local now; now="$(log_count "$1" "$2")"
+        [[ "$now" -gt "$3" ]] || fail "faults: node$1's log never shows '$2' ($4)"
+    }
+    expect_log_unchanged() { # node, text, count before, what it would mean
+        local now; now="$(log_count "$1" "$2")"
+        [[ "$now" -le "$3" ]] || fail "faults: node$1's log shows '$2' ($4)"
+    }
+    timed_converge() { # label
+        local t0=$SECONDS
+        wait_converged "$1"
+        echo "handover: faults: $1: rejoined in $((SECONDS - t0)) s"
+    }
+
+    run_fault_stages() {
+        local n dir f before wal good size_before
+
+        # 1. Zero tails (round 13). A power cut leaves a log longer than its data,
+        # the tail all zeros. The node opens its three logs with magic 0, which a
+        # zero header matches, so the zeros were read as entries for block 0 and the
+        # node refused to start.
+        n=4
+        stop_node "$n"
+        dir="$(node_data_dir "$n")"
+        for f in trace_log chain_state_log block_log; do
+            [[ -f "$dir/$f.log" ]] || fail "faults: node$n has no $f.log"
+            head -c 581 /dev/zero >>"$dir/$f.log"
+        done
+        before="$(log_count "$n" 'missed a block in')"
+        start_node "$n"
+        timed_converge "zero tails on node$n's trace, chain-state and block logs"
+        expect_log_unchanged "$n" 'missed a block in' "$before" "a zero tail was read as entries"
+        send_txs fz 3
+
+        # 2. The write-ahead log. A zero tail is trimmed; a flipped byte with intact
+        # records after it is damage, refused by name with the file left alone.
+        n=3
+        send_txs fw 6
+        stop_node "$n"
+        dir="$(node_data_dir "$n")"
+        wal="$dir/arena_wal.bin"
+        if [[ -f "$wal" && "$(wc -c <"$wal" | tr -d ' ')" -gt 400 ]]; then
+            good="$WORK_DIR/wal-good-$n"
+            cp "$wal" "$good"
+            head -c 100 /dev/zero >>"$wal"
+            start_node "$n"
+            timed_converge "a zero tail on node$n's write-ahead log"
+            send_txs fy 3
+            stop_node "$n"
+            dir="$(node_data_dir "$n")"; wal="$dir/arena_wal.bin"
+            [[ -f "$wal" ]] || fail "faults: node$n has no write-ahead log after the restart"
+            cp "$wal" "$good"
+            # Damage the middle of the SECOND record, so that intact records follow
+            # it: that is what separates damage from a torn tail. Needs three.
+            if ! python3 - "$wal" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+pos, records = 40, []  # 8 bytes of format and a 32-byte key
+while pos + 8 <= len(data):
+    (length,) = struct.unpack_from("<Q", data, pos)
+    end = pos + 8 + length + 32
+    if end > len(data):
+        break
+    records.append((pos, end))
+    pos = end
+if len(records) < 3:
+    sys.exit(3)
+start, end = records[1]
+data[(start + end) // 2] ^= 0x40
+open(path, "wb").write(data)
+PY
+            then
+                echo "handover: faults: node$n's write-ahead log holds fewer than three records; skipping the damaged-record stage"
+                cp "$good" "$wal"
+                start_node "$n"
+                timed_converge "node$n restarted"
+                send_txs fv 2
+                run_remaining_fault_stages
+                return 0
+            fi
+            damaged_sum="$(shasum -a 256 "$wal" | cut -d' ' -f1)"
+            before="$(log_count "$n" 'altered, not cut short')"
+            start_node "$n"
+            for _ in $(seq 1 60); do
+                [[ "$(log_count "$n" 'altered, not cut short')" -gt "$before" ]] && break
+                sleep 2
+            done
+            expect_log_grew "$n" 'altered, not cut short' "$before" "a damaged write-ahead log must be refused by name"
+            [[ "$(shasum -a 256 "$wal" | cut -d' ' -f1)" == "$damaged_sum" ]] \
+                || fail "faults: the damaged write-ahead log was modified instead of being left alone"
+            [[ -n "$(node_pid_of "$n")" ]] && stop_node "$n"
+            cp "$good" "$wal"
+            start_node "$n"
+            timed_converge "node$n after its write-ahead log was put back"
+        else
+            echo "handover: faults: node$n had no write-ahead log worth damaging (just folded); skipping the write-ahead stage"
+            start_node "$n"
+            timed_converge "node$n restarted"
+        fi
+
+        run_remaining_fault_stages
+    }
+
+    run_remaining_fault_stages() {
+        local n dir before size_before
+        # 3. A cut during a state-sync install leaves the marker. The node used to
+        # refuse to start until someone moved its data aside by hand.
+        n=2
+        stop_node "$n"
+        dir="$(node_data_dir "$n")"
+        printf 'PVMSYN01\0\0\0\0' >"$dir/state_sync_installing"
+        before="$(log_count "$n" 'state_sync.install_abandoned')"
+        start_node "$n"
+        timed_converge "node$n after an interrupted state-sync install"
+        expect_log_grew "$n" 'state_sync.install_abandoned' "$before" "the node must report that it started over"
+        find "$netdir/node$n" -type d -name state_sync_abandoned -print -quit | grep -q . \
+            || fail "faults: node$n kept no copy of the abandoned data"
+
+        # 4. A node that is far behind state-syncs while transactions are pending.
+        # The plugin used to answer "build a block" during the sync; the host's
+        # state syncer only accepts "sync finished", never asked for it again, and
+        # the node stayed in state sync until it was restarted by hand.
+        n=5
+        stop_node "$n"
+        send_txs fb 30
+        before="$(log_count "$n" 'unexpected message from the VM')"
+        size_before="$(log_count "$n" 'state sync finished')"
+        start_node "$n"
+        send_txs fl 25
+        timed_converge "node$n state-syncing with transactions pending"
+        expect_log_unchanged "$n" 'unexpected message from the VM' "$before" \
+            "the plugin sent a message the state syncer does not accept"
+        expect_log_grew "$n" 'state sync finished' "$size_before" \
+            "this stage is meant to run a state sync; none ran, so it proves nothing (is state_sync_min_blocks_behind low?)"
+
+        # 5. A node only a few blocks behind catches up by fetching them and keeps
+        # its block-log history; a snapshot install drops it.
+        n=4
+        dir="$(node_data_dir "$n")"
+        size_before="$(wc -c <"$dir/block_log.log" | tr -d ' ')"
+        before="$(log_count "$n" 'skipping state summary')"
+        stop_node "$n"
+        send_txs nb 2
+        start_node "$n"
+        timed_converge "node$n a few blocks behind"
+        dir="$(node_data_dir "$n")"
+        [[ "$(wc -c <"$dir/block_log.log" | tr -d ' ')" -ge "$size_before" ]] \
+            || fail "faults: node$n lost block-log history catching up a few blocks (a snapshot was installed)"
+        expect_log_grew "$n" 'skipping state summary' "$before" "a node a few blocks behind must skip the snapshot"
+        send_txs fe 4
+        wait_converged "after every fault"
+        echo "handover: faults: PASS"
+    }
+
     echo "handover: verify-restarts: network dir $NETBASE, $rounds round(s)"
     send_txs rs 4
     wait_converged "before any restart"
@@ -2641,6 +2852,10 @@ print((n.to_bytes(2, 'big') + bytes([n % 251]) * length).hex())")"
     send_txs rz 4
     wait_converged "after every round"
 
+    if [[ "${VERIFY_FAULTS:-0}" == "1" ]]; then
+        run_fault_stages
+    fi
+
     # Same head is not enough. Same state at every height the nodes share is.
     sleep 5
     python3 - "$netdir" <<'PYEOF'
@@ -2663,6 +2878,14 @@ for path in glob.glob(os.path.join(netdir, "**", "*.log"), recursive=True):
                     print(f"node {node} logged two different roots for block {height}")
                     sys.exit(1)
                 roots[height][node] = root
+nodes_with_roots = sorted({n for per in roots.values() for n in per})
+if len(nodes_with_roots) < 5:
+    print(f"state roots were logged by only {nodes_with_roots}: every one of the five nodes has to show its roots")
+    sys.exit(1)
+all_five = [h for h, per in roots.items() if len(per) >= 5]
+if len(all_five) < 10:
+    print(f"only {len(all_five)} heights have a root from all five nodes (need 10): a restarted node's roots after its restart are missing")
+    sys.exit(1)
 shared = {h: n for h, n in roots.items() if len(n) >= 2}
 if len(shared) < 10:
     print(f"only {len(shared)} heights have roots from two or more nodes: the debug log is "
