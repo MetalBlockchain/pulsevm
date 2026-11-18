@@ -2682,6 +2682,41 @@ print((n.to_bytes(2, 'big') + bytes([n % 251]) * length).hex())")"
         echo "handover: faults: $1: rejoined in $((SECONDS - t0)) s"
     }
 
+    # Submit transactions straight to ONE node's own pool for $2 seconds. The
+    # state-sync stall needs transactions in the restarting node's mempool; a
+    # transaction sent to another node reaches it, if at all, only by gossip. The
+    # first version of the state-sync stage sent to a different node and passed on
+    # a build with the stall put back. Prints how many the node accepted.
+    flood_node() { # node, seconds
+        local node="$1" stop_at=$((SECONDS + $2)) port chain_id url info chain head head_id ref exp tx name out accepted=0 tried=0
+        port="$(jq -er '.["http-port"]' "$netdir/node$node/configs/config.json")" || fail "faults: no http-port for node$node"
+        chain_id="$(sed -E 's#.*/ext/bc/([^/]+)/rpc.*#\1#' <<<"$rpc_url")"
+        url="http://127.0.0.1:$port/ext/bc/$chain_id/rpc"
+        while [[ $SECONDS -lt $stop_at ]]; do
+            info="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null)" || { sleep 1; continue; }
+            read -r chain head head_id <<<"$(printf '%s' "$info" \
+                | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])' 2>/dev/null)" || { sleep 1; continue; }
+            ref="$(python3 -c "import sys; print(int.from_bytes(bytes.fromhex('$head_id')[8:12], 'little'))")"
+            exp="$(($(date +%s) + 1800))"
+            name="$(python3 -c "
+e = $RANDOM * 32768 + $RANDOM
+s = ''
+for _ in range(8):
+    s = '12345'[e % 5] + s
+    e //= 5
+print('fl' + s)")"
+            tx="$("$PROBE_BIN" newaccount "$chain" "$PULSEVM_PRODUCER_KEY" "$head" "$ref" "$exp" "$name")" || continue
+            tried=$((tried + 1))
+            out="$(rpc_call "$url" "$tx" 2>/dev/null || true)"
+            if printf '%s' "$out" | python3 -c 'import json,sys; sys.exit(0 if "result" in json.load(sys.stdin) else 1)' 2>/dev/null; then
+                accepted=$((accepted + 1))
+            fi
+            sleep 0.3
+        done
+        echo "handover: faults: node$node's own pool took $accepted of $tried transactions sent straight to it"
+        echo "$accepted" >"$WORK_DIR/flood-accepted-$node"
+    }
+
     run_fault_stages() {
         local n dir f before wal good size_before
 
@@ -2773,7 +2808,7 @@ PY
     }
 
     run_remaining_fault_stages() {
-        local n dir before size_before
+        local n dir before size_before flood_pid
         # 3. A cut during a state-sync install leaves the marker. The node used to
         # refuse to start until someone moved its data aside by hand.
         n=2
@@ -2797,7 +2832,15 @@ PY
         before="$(log_count "$n" 'unexpected message from the VM')"
         size_before="$(log_count "$n" 'state sync finished')"
         start_node "$n"
+        # Transactions go to the restarting node's own pool while it syncs, and
+        # to the network as well.
+        rm -f "$WORK_DIR/flood-accepted-$n"
+        flood_node "$n" 45 &
+        flood_pid=$!
         send_txs fl 25
+        wait "$flood_pid"
+        [[ "$(cat "$WORK_DIR/flood-accepted-$n" 2>/dev/null || echo 0)" -ge 1 ]] \
+            || fail "faults: node$n accepted no transaction while it synced, so this stage cannot show the stall (it proves nothing)"
         timed_converge "node$n state-syncing with transactions pending"
         expect_log_unchanged "$n" 'unexpected message from the VM' "$before" \
             "the plugin sent a message the state syncer does not accept"
