@@ -104,21 +104,31 @@ pub fn sync_parent_dir(path: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Start of every write-ahead log: the format version. A log written before
-/// records carried a checksum has no such header and is refused by name, not
-/// misread.
-const WAL_MAGIC: &[u8; 8] = b"PVMWAL03";
+/// Start of every write-ahead log: the format version, then a random key chosen
+/// when the file is created. A log written before records carried a checksum, or
+/// before the key, has a different start and is refused by name, not misread.
+const WAL_MAGIC: &[u8; 8] = b"PVMWAL04";
+const WAL_KEY_LEN: usize = 32;
+const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + WAL_KEY_LEN;
 const WAL_DIGEST_LEN: usize = 32;
 
 /// The checksum of a record. It covers the length as well as the payload: with
 /// only the payload under it, a flipped bit in the length made a good record look
 /// cut short, and everything behind it was treated as a torn tail and deleted.
-fn wal_digest(len: u64, payload: &[u8]) -> [u8; WAL_DIGEST_LEN] {
+///
+/// It is also keyed with the file's own random key. A plain hash can be computed
+/// by anyone, and the payload carries contract row bytes verbatim, so a
+/// transaction could store 56 bytes that read as a valid record. Found inside a
+/// torn final record, such a "record" proved the file was altered and the node
+/// refused to start. The key lives only in this file's header, which a contract
+/// cannot read, so no payload can contain a record that verifies.
+fn wal_digest(key: &[u8], len: u64, payload: &[u8]) -> [u8; WAL_DIGEST_LEN] {
     use sha2::{
         Digest,
         Sha256,
     };
     let mut hasher = Sha256::new();
+    hasher.update(key);
     hasher.update(len.to_le_bytes());
     hasher.update(payload);
     hasher.finalize().into()
@@ -129,7 +139,7 @@ const WAL_MIN_PAYLOAD: usize = 16;
 
 /// The record that starts at `pos`, if one that verifies does:
 /// `(payload start, payload end, record end)`.
-fn wal_record_at(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+fn wal_record_at(data: &[u8], key: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
     let len = try_read_u64(data, pos)?;
     let payload_start = pos.checked_add(8)?;
     let payload_end = payload_start.checked_add(usize::try_from(len).ok()?)?;
@@ -137,7 +147,7 @@ fn wal_record_at(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
     if record_end > data.len() {
         return None;
     }
-    if wal_digest(len, &data[payload_start..payload_end]) != data[payload_end..record_end] {
+    if wal_digest(key, len, &data[payload_start..payload_end]) != data[payload_end..record_end] {
         return None;
     }
     Some((payload_start, payload_end, record_end))
@@ -150,13 +160,13 @@ fn wal_record_at(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
 /// one does, whatever stopped the scan was not a crash, and the bytes behind it
 /// are data that must not be thrown away. Only run on the failure path; the cheap
 /// length test keeps it linear.
-fn wal_valid_record_follows(data: &[u8], from: usize) -> Option<usize> {
+fn wal_valid_record_follows(data: &[u8], key: &[u8], from: usize) -> Option<usize> {
     let mut pos = from;
     while pos.checked_add(8 + WAL_MIN_PAYLOAD + WAL_DIGEST_LEN)? <= data.len() {
         if let Some(len) = try_read_u64(data, pos)
             && len >= WAL_MIN_PAYLOAD as u64
             && len <= (data.len() - pos) as u64
-            && wal_record_at(data, pos).is_some()
+            && wal_record_at(data, key, pos).is_some()
         {
             return Some(pos);
         }
@@ -191,6 +201,15 @@ fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
     if data.is_empty() {
         return Ok(scan);
     }
+    // A file of nothing but zeros is an append that never happened: the
+    // filesystem made the file, or extended it, and no data landed. That window
+    // opens once per checkpoint fold, between removing the log and the next
+    // accept creating it. It is not an older build's log, and nothing in it is
+    // lost.
+    if data.iter().all(|byte| *byte == 0) {
+        scan.torn_tail = true;
+        return Ok(scan);
+    }
     if data.len() < WAL_MAGIC.len() {
         if WAL_MAGIC.starts_with(data) {
             scan.torn_tail = true; // a header cut short
@@ -205,16 +224,21 @@ fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
             "write-ahead log is not in the checksummed format (written by an earlier build?): stop that node cleanly with the build that wrote it, or resync".into(),
         ));
     }
-    let mut pos = WAL_MAGIC.len();
+    if data.len() < WAL_HEADER_LEN {
+        scan.torn_tail = true; // the key was cut short
+        return Ok(scan);
+    }
+    let key = &data[WAL_MAGIC.len()..WAL_HEADER_LEN];
+    let mut pos = WAL_HEADER_LEN;
     scan.valid_len = pos;
     while pos < data.len() {
-        let Some((payload_start, payload_end, record_end)) = wal_record_at(data, pos) else {
+        let Some((payload_start, payload_end, record_end)) = wal_record_at(data, key, pos) else {
             // The record at `pos` cannot be completed or does not verify. If an
             // intact record starts anywhere after it, this is damage in the
             // middle of the file, not a crash: refuse, and leave the file as it
             // is. If none does, what is left is the remains of a write that was
             // cut short (a partial record, zeros, anything), and goes.
-            if let Some(next) = wal_valid_record_follows(data, pos + 1) {
+            if let Some(next) = wal_valid_record_follows(data, key, pos + 1) {
                 return Err(DbError::Corrupted(format!(
                     "write-ahead log record at byte {pos} cannot be read and an intact record starts at byte {next}: the file was altered, not cut short, so nothing is discarded"
                 )));
@@ -241,18 +265,42 @@ pub struct WalReplay {
     pub torn_tail: bool,
 }
 
+/// The key in the header of the log at `path`.
+fn wal_key_of(path: &Path) -> Result<[u8; WAL_KEY_LEN], DbError> {
+    use std::io::Read;
+    let mut header = [0u8; WAL_HEADER_LEN];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| DbError::Io(format!("read the write-ahead log header: {e}")))?;
+    if &header[..WAL_MAGIC.len()] != WAL_MAGIC {
+        return Err(DbError::Corrupted(
+            "write-ahead log header is not the current format".into(),
+        ));
+    }
+    let mut key = [0u8; WAL_KEY_LEN];
+    key.copy_from_slice(&header[WAL_MAGIC.len()..]);
+    Ok(key)
+}
+
 fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
     use std::io::Write;
     let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     // One write per record, so a crash tears it at one point rather than leaving
     // a length with no payload behind it.
-    let mut record = Vec::with_capacity(WAL_MAGIC.len() + 8 + frame.len() + WAL_DIGEST_LEN);
-    if existing == 0 {
+    let mut record = Vec::with_capacity(WAL_HEADER_LEN + 8 + frame.len() + WAL_DIGEST_LEN);
+    let key = if existing == 0 {
+        let mut key = [0u8; WAL_KEY_LEN];
+        getrandom::fill(&mut key)
+            .map_err(|e| DbError::Io(format!("no randomness for the write-ahead log key: {e}")))?;
         record.extend_from_slice(WAL_MAGIC);
-    }
+        record.extend_from_slice(&key);
+        key
+    } else {
+        wal_key_of(path)?
+    };
     record.extend_from_slice(&(frame.len() as u64).to_le_bytes());
     record.extend_from_slice(frame);
-    record.extend_from_slice(&wal_digest(frame.len() as u64, frame));
+    record.extend_from_slice(&wal_digest(&key, frame.len() as u64, frame));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -283,7 +331,7 @@ trait AbstractTable: Send + Sync {
     fn type_id_num(&self) -> u16;
     fn type_name(&self) -> &'static str;
     fn pack_into(&self, out: &mut Vec<u8>);
-    fn pack_canonical_into(&self, out: &mut Vec<u8>);
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError>;
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn pack_delta(&self, out: &mut Vec<u8>);
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
@@ -330,7 +378,7 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     fn pack_into(&self, out: &mut Vec<u8>) {
         Table::pack_into(self, out)
     }
-    fn pack_canonical_into(&self, out: &mut Vec<u8>) {
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
         Table::pack_canonical_into(self, out)
     }
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
@@ -604,7 +652,7 @@ impl Db {
             out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
             let start = out.len();
             if canonical {
-                table.pack_canonical_into(&mut out);
+                table.pack_canonical_into(&mut out)?;
             } else {
                 table.pack_into(&mut out);
             }

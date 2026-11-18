@@ -397,8 +397,8 @@ impl RpcService {
         };
         // The pool is detached first, as ever, so ingress stays live whatever the
         // controller is busy with. The slot is then waited for with the batch in
-        // hand and the controller write lock not yet taken: the wait is up to a
-        // second, and the controller must not be held for it. The batch goes back
+        // hand and the controller write lock not yet taken: the wait is up to six
+        // slots (3 seconds), and the controller must not be held for it. The batch goes back
         // on every path, including a build that is refused for being too early.
         let result = async {
             self.wait_for_block_slot().await?;

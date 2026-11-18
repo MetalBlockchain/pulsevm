@@ -1219,16 +1219,27 @@ fn scan_entries(
             break;
         }
         let header = StateHistoryLogHeader::read_at(file, pos)?;
+        // A power cut can leave the file longer than the data that reached it:
+        // the filesystem extended it, the writes never landed, and the tail reads
+        // as zeros. That is a write that did not happen, and is trimmed like any
+        // torn tail. This is checked BEFORE the magic is compared and whatever
+        // magic is expected: the node opens its logs with magic 0, so a zero
+        // header matches it, and every 48 zero bytes would be read as an entry for
+        // block 0. No entry is all zeros (it carries a block id), so a remainder
+        // that is all zeros is never data.
+        if header.magic == 0 && rest_is_zero(file, pos, len_total)? {
+            file.set_len(pos)?;
+            break;
+        }
+        // An all-zero header with data after it is not a cut either: no entry has
+        // a zero block id, so it is a hole in the middle of the file. With magic 0
+        // it would otherwise pass the magic test and be read as an entry.
+        if header.magic == 0 && header.block_id.0.0 == [0u8; 32] && header.payload_size == 0 {
+            return Err(ShLogError::Corrupt(pos));
+        }
         if header.magic != expect_magic {
-            // A power cut can leave the file longer than the data that reached
-            // it: the filesystem extended it, the writes never landed, and the
-            // tail reads as zeros. That is a write that did not happen, and is
-            // trimmed like any torn tail. Anything else that is not a header is
-            // real corruption and stays a hard error.
-            if header.magic == 0 && rest_is_zero(file, pos, len_total)? {
-                file.set_len(pos)?;
-                break;
-            }
+            // Anything else that is not a header is real corruption and stays a
+            // hard error.
             return Err(ShLogError::BadMagic {
                 at: pos,
                 found: header.magic,
@@ -1527,6 +1538,109 @@ mod tests {
             );
             log.read_block(last_num).unwrap();
         }
+    }
+
+    // The node opens all three of its logs with magic 0 (controller.rs), which is
+    // what the zero-tail trim above never saw: a zero header matches a zero magic,
+    // so the tail was read as entries for block 0 ("recovery is not contiguous at
+    // block 0"). Every case here uses the magic the node really uses.
+    #[test]
+    fn zero_tails_are_trimmed_on_a_log_opened_with_magic_zero() {
+        for zeros in [1usize, 40, 47, 48, 49, 100, 581, 4096, 70_000] {
+            let dir = TestDir::new(&format!("zeromagic{zeros}"));
+            {
+                let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0).unwrap();
+                for n in 1..=FIXTURE_BLOCKS {
+                    log.append(make_id(n, n as u8), format!("payload-{n}").as_bytes())
+                        .unwrap();
+                }
+            }
+            let good_len = std::fs::metadata(dir.log_path()).unwrap().len();
+            {
+                use std::io::Write;
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(dir.log_path())
+                    .unwrap();
+                file.write_all(&vec![0u8; zeros]).unwrap();
+            }
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0)
+                .unwrap_or_else(|error| panic!("{zeros} zero bytes, magic 0: {error}"));
+            assert_eq!(log.range().unwrap().1, FIXTURE_BLOCKS, "{zeros}");
+            assert_eq!(
+                std::fs::metadata(dir.log_path()).unwrap().len(),
+                good_len,
+                "{zeros} zero bytes are cut off"
+            );
+            log.read_block(FIXTURE_BLOCKS).unwrap();
+            // And a block appended afterwards is contiguous, not behind phantoms.
+            log.append(make_id(FIXTURE_BLOCKS + 1, 9), b"next").unwrap();
+            assert_eq!(log.range().unwrap().1, FIXTURE_BLOCKS + 1);
+        }
+    }
+
+    // The last entry zeroed in place (its bytes replaced by zeros, the file the
+    // same length): the entry never reached the disk, so it is dropped and the
+    // log ends at the block before.
+    #[test]
+    fn a_last_entry_zeroed_in_place_is_dropped_with_magic_zero() {
+        let dir = TestDir::new("zeroinplace");
+        {
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0).unwrap();
+            for n in 1..=FIXTURE_BLOCKS {
+                log.append(make_id(n, n as u8), format!("payload-{n}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let raw = parse_raw(&dir.log_path(), 0);
+        let (_, last_pos, _) = raw.last().unwrap().clone();
+        let len = std::fs::metadata(dir.log_path()).unwrap().len();
+        {
+            use std::io::{
+                Seek,
+                SeekFrom,
+                Write,
+            };
+            let mut file = OpenOptions::new().write(true).open(dir.log_path()).unwrap();
+            file.seek(SeekFrom::Start(last_pos)).unwrap();
+            file.write_all(&vec![0u8; (len - last_pos) as usize])
+                .unwrap();
+        }
+        let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0).unwrap();
+        assert_eq!(log.range().unwrap().1, FIXTURE_BLOCKS - 1);
+        assert_eq!(std::fs::metadata(dir.log_path()).unwrap().len(), last_pos);
+    }
+
+    // Zeros are only a torn tail when nothing but zeros follows. Zeros with real
+    // data after them are damage, not a cut, and stay a hard error.
+    #[test]
+    fn zeros_followed_by_data_are_not_trimmed_with_magic_zero() {
+        let dir = TestDir::new("zerothendata");
+        {
+            let log = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0).unwrap();
+            for n in 1..=FIXTURE_BLOCKS {
+                log.append(make_id(n, n as u8), format!("payload-{n}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let good_len = std::fs::metadata(dir.log_path()).unwrap().len();
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(dir.log_path())
+                .unwrap();
+            file.write_all(&[0u8; 96]).unwrap();
+            file.write_all(&[0xAB; 7]).unwrap();
+        }
+        let before = std::fs::read(dir.log_path()).unwrap();
+        let outcome = StateHistoryLog::open_with_magic(dir.path(), "block_log", 0);
+        assert!(outcome.is_err(), "damage must not be silently cut");
+        assert_eq!(
+            std::fs::read(dir.log_path()).unwrap(),
+            before,
+            "the file is left as it was ({good_len} good bytes)"
+        );
     }
 
     // The same with the index ahead of nothing: only the log's tail is zeros and

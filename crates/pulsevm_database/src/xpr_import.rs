@@ -351,7 +351,11 @@ impl MigrationManifest {
             source_chain_id: None,
             checkpoint_sha256: hex::encode(Digest::hash(checkpoint).as_bytes()),
             checkpoint_revision,
-            deferred_policy: None,
+            // What the converter does unless told otherwise. A caller that built
+            // the checkpoint with `Expire` must say so (`with_deferred_policy`);
+            // forgetting makes the restore gate and the verifier refuse, because
+            // the rows then disagree with what the manifest claims.
+            deferred_policy: Some(DeferredPolicy::default().as_str().to_owned()),
             deferred_transaction_sidecar_sha256: None,
             halt_commitment: None,
             halt_declaration: None,
@@ -2088,41 +2092,38 @@ pub fn observed_deferred_policy(db: &Database) -> Result<Option<DeferredPolicy>,
 }
 
 /// Check what a manifest says about the deferred mode against what the restored
-/// checkpoint holds. Returns a line to print. A recorded mode that the rows do
-/// not show is an error: the manifest would be telling a validator something
-/// the checkpoint does not do.
+/// checkpoint holds. Returns a line to print. The mode is REQUIRED: a manifest
+/// that does not record one is refused, because a validator reads the mode from
+/// the manifest and an absent field is how an edited one would look. A recorded
+/// mode that the rows do not show is an error too: the manifest would be telling
+/// a validator something the checkpoint does not do. (The checkpoint hash, which
+/// the halt confirmation binds, already commits to the rows themselves.)
 pub fn check_deferred_policy(
     recorded: Option<&str>,
     observed: Option<DeferredPolicy>,
 ) -> Result<String, String> {
-    let recorded_policy = match recorded {
-        None => None,
-        Some(text) => Some(
-            DeferredPolicy::parse(text)
-                .ok_or_else(|| format!("the manifest records an unknown deferred mode {text:?}"))?,
-        ),
+    let Some(text) = recorded else {
+        return Err(
+            "the manifest does not record the deferred-transaction mode (deferred_policy): refusing a manifest that does not say which mode its checkpoint was built with"
+                .to_owned(),
+        );
     };
-    match (recorded_policy, observed) {
-        (Some(recorded), Some(observed)) if recorded != observed => Err(format!(
+    let recorded = DeferredPolicy::parse(text)
+        .ok_or_else(|| format!("the manifest records an unknown deferred mode {text:?}"))?;
+    match observed {
+        Some(observed) if observed != recorded => Err(format!(
             "the manifest records deferred mode {} but the checkpoint's deferred rows are {}",
             recorded.as_str(),
             observed.as_str()
         )),
-        (Some(recorded), Some(_)) => Ok(format!(
+        Some(_) => Ok(format!(
             "deferred mode {}: recorded in the manifest and shown by the checkpoint's rows",
             recorded.as_str()
         )),
-        (Some(recorded), None) => Ok(format!(
+        None => Ok(format!(
             "deferred mode {} is recorded; the checkpoint holds no deferred rows, so there is nothing to confirm it against",
             recorded.as_str()
         )),
-        (None, Some(observed)) => Ok(format!(
-            "deferred mode not recorded in the manifest (an older manifest); the checkpoint's rows are {}",
-            observed.as_str()
-        )),
-        (None, None) => {
-            Ok("deferred mode not recorded; the checkpoint holds no deferred rows".to_owned())
-        }
     }
 }
 
@@ -6870,9 +6871,13 @@ mod tests {
         assert!(json.contains("\"deferred_policy\":\"expire\""));
         let back: MigrationManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.deferred_policy.as_deref(), Some("expire"));
-        let legacy: MigrationManifest =
-            serde_json::from_str(&serde_json::to_string(&manifest(None)).unwrap()).unwrap();
+        // A manifest written before the field existed still PARSES (so the error
+        // can name the problem), and is then refused by the check.
+        let mut stripped = serde_json::to_value(manifest(None)).unwrap();
+        stripped.as_object_mut().unwrap().remove("deferred_policy");
+        let legacy: MigrationManifest = serde_json::from_value(stripped).unwrap();
         assert_eq!(legacy.deferred_policy, None);
+        assert!(check_deferred_policy(legacy.deferred_policy.as_deref(), None).is_err());
 
         let observed_expire = observed_deferred_policy(&expires).unwrap();
         let observed_execute = observed_deferred_policy(&executes).unwrap();
@@ -6883,12 +6888,11 @@ mod tests {
         assert!(error.contains("records deferred mode expire"), "{error}");
         assert!(check_deferred_policy(Some("execute"), observed_expire).is_err());
         assert!(check_deferred_policy(Some("nonsense"), observed_expire).is_err());
-        // Older manifest, and a checkpoint with nothing to check.
-        assert!(
-            check_deferred_policy(None, observed_expire)
-                .unwrap()
-                .contains("not recorded")
-        );
+        // A manifest that does not record the mode is refused, whatever the rows.
+        for observed in [observed_expire, observed_execute, None] {
+            let error = check_deferred_policy(None, observed).unwrap_err();
+            assert!(error.contains("does not record"), "{error}");
+        }
         assert!(check_deferred_policy(Some("expire"), None).is_ok());
     }
 

@@ -352,7 +352,7 @@ fn three_block_log() -> (
     accepted(&mut db, &wal, 4, 30);
     let data = std::fs::read(&wal).unwrap();
     let mut ends = Vec::new();
-    let mut at = 8; // past the header
+    let mut at = 40; // past the header: 8 bytes of format and a 32-byte key
     while at < data.len() {
         let len = u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
         at += 8 + len + 32;
@@ -668,4 +668,124 @@ fn garbage_after_the_last_good_record_is_trimmed_even_if_it_looks_like_a_length(
     let (_, outcome) = recover(&snap, &wal).unwrap();
     assert!(outcome.torn_tail);
     assert_eq!(outcome.valid_len, ends[2] as u64);
+}
+
+// Round 13. The checksum was a plain SHA-256 of the length and payload, and
+// payloads carry contract row bytes verbatim, so anyone could store bytes that
+// read as a valid record. Inside a torn final record that made the node refuse to
+// start as "altered", one such row per block being enough to keep it from
+// recovering without a manual fix. The checksum is now keyed with a random value
+// kept in the file's header.
+
+fn unkeyed_digest(len: u64, payload: &[u8]) -> [u8; 32] {
+    use sha2::{
+        Digest,
+        Sha256,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+#[test]
+fn a_record_forged_inside_a_torn_one_does_not_make_the_tail_look_altered() {
+    let (_dir, snap, wal, _db, ends) = three_block_log();
+    // What an attacker can store in a row: a well-formed record as the old
+    // checksum defined it (and as it would be if the key were guessed to be
+    // empty).
+    let inner_payload = [7u8; 16];
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&(inner_payload.len() as u64).to_le_bytes());
+    forged.extend_from_slice(&inner_payload);
+    forged.extend_from_slice(&unkeyed_digest(16, &inner_payload));
+    // A final record cut short: it claims far more than was written, and what was
+    // written holds the forged record.
+    let mut torn = Vec::new();
+    torn.extend_from_slice(&(1u64 << 20).to_le_bytes());
+    torn.extend_from_slice(&[0xCC; 33]);
+    torn.extend_from_slice(&forged);
+    torn.extend_from_slice(&[0xDD; 21]);
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        f.write_all(&torn).unwrap();
+    }
+    let (recovered, outcome) = recover(&snap, &wal)
+        .unwrap_or_else(|error| panic!("a forged record must not block recovery: {error:?}"));
+    assert!(outcome.torn_tail);
+    assert_eq!(outcome.valid_len, ends[2] as u64);
+    assert_eq!(recovered.revision(), 4);
+}
+
+#[test]
+fn every_log_has_its_own_key() {
+    let key_of = |wal: &std::path::Path| std::fs::read(wal).unwrap()[8..40].to_vec();
+    let (_d1, _s1, wal1, _db1, _) = three_block_log();
+    let (_d2, _s2, wal2, _db2, _) = three_block_log();
+    assert_ne!(key_of(&wal1), key_of(&wal2), "keys are random per file");
+    assert_ne!(key_of(&wal1), vec![0u8; 32]);
+}
+
+#[test]
+fn a_record_copied_from_another_log_does_not_verify() {
+    // The same blocks, written to two logs: the records differ because the keys do.
+    let (_d1, snap, wal1, _db1, ends1) = three_block_log();
+    let (_d2, _s2, wal2, _db2, ends2) = three_block_log();
+    let donor = std::fs::read(&wal2).unwrap();
+    let mut data = std::fs::read(&wal1).unwrap();
+    // Overwrite the middle record with the donor's.
+    data[ends1[0]..ends1[1]].copy_from_slice(&donor[ends2[0]..ends2[1]]);
+    std::fs::write(&wal1, &data).unwrap();
+    assert!(
+        recover(&snap, &wal1).is_err(),
+        "a record signed under a different key must not replay"
+    );
+}
+
+#[test]
+fn a_log_of_nothing_but_zeros_is_an_append_that_never_happened() {
+    // The window opens once per fold: the log is removed and the next accept
+    // creates it. A cut there left a file of zeros, refused as "written by an
+    // earlier build".
+    for zeros in [1usize, 7, 8, 39, 40, 41, 100, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("state");
+        let wal = dir.path().join("wal");
+        let mut db = new_db();
+        db.set_revision(1).unwrap();
+        db.checkpoint(&snap).unwrap();
+        std::fs::write(&wal, vec![0u8; zeros]).unwrap();
+        let (recovered, outcome) = recover(&snap, &wal)
+            .unwrap_or_else(|error| panic!("{zeros} zero bytes must be trimmed: {error:?}"));
+        assert!(outcome.torn_tail, "{zeros}");
+        assert_eq!(outcome.valid_len, 0, "{zeros}");
+        assert_eq!(recovered.revision(), 1, "{zeros}");
+
+        // What the node does: cut to the last good byte, then keep appending.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(outcome.valid_len)
+            .unwrap();
+        accepted(&mut db, &wal, 2, 10);
+        let (recovered, outcome) = recover(&snap, &wal).unwrap();
+        assert!(!outcome.torn_tail, "{zeros}");
+        assert_eq!(recovered.revision(), 2, "{zeros}");
+    }
+}
+
+#[test]
+fn a_zero_header_followed_by_data_is_still_not_an_empty_log() {
+    // Zeros are only "nothing happened" when nothing but zeros is there.
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("state");
+    let wal = dir.path().join("wal");
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.checkpoint(&snap).unwrap();
+    let mut data = vec![0u8; 48];
+    data.extend_from_slice(&[1, 2, 3]);
+    std::fs::write(&wal, data).unwrap();
+    assert!(recover(&snap, &wal).is_err());
 }

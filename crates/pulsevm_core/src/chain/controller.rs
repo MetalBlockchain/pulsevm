@@ -1451,6 +1451,15 @@ impl Controller {
         }
     }
 
+    /// How far behind a summary must put this node before it is state-synced
+    /// rather than caught up block by block (see the setting).
+    pub fn state_sync_min_blocks_behind(&self) -> u64 {
+        self.node_config
+            .as_ref()
+            .map(|config| config.state_sync_min_blocks_behind)
+            .unwrap_or(1024)
+    }
+
     fn restoring_migration(&self) -> bool {
         self.node_config
             .as_ref()
@@ -1481,6 +1490,7 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse node config JSON: {e}"))
         })?);
 
+        Self::quarantine_abandoned_state_sync(db_path)?;
         Self::ensure_no_incomplete_state_sync(db_path)?;
         self.db_path = Some(db_path.to_string());
         // Parse this before restoring a migration checkpoint: a migration
@@ -1746,6 +1756,16 @@ impl Controller {
                         )));
                     }
                 }
+                // The manifest must record how this checkpoint treats its
+                // pending deferred transactions, and the rows must show it: a
+                // validator reads the mode from the manifest.
+                let observed_mode = pulsevm_database::observed_deferred_policy(&self.db)
+                    .map_err(ChainError::GenesisError)?;
+                pulsevm_database::check_deferred_policy(
+                    manifest.deferred_policy.as_deref(),
+                    observed_mode,
+                )
+                .map_err(ChainError::GenesisError)?;
                 // Pause-window deferred inventory at restore, not just at
                 // export: the export-side check runs only when a sidecar is
                 // staged, but these are the rows actually promoted — a row
@@ -5284,6 +5304,83 @@ impl Controller {
         // The cache commits to the pre-sync tip; drop it.
         self.snapshot_cache = None;
         self.clear_state_sync_install_marker()?;
+        Ok(())
+    }
+
+    /// A node killed while installing a state-sync snapshot restarts with the
+    /// install marker still in its data directory. The install is a swap of the
+    /// arena, the block log and the history logs; a cut inside it can leave the
+    /// pieces from two different heights, so nothing here can be trusted to
+    /// continue. The node used to refuse to start until someone moved its data
+    /// aside by hand, and the host then logged `error creating chain`.
+    ///
+    /// Everything this node wrote is state it fetched from its peers, so the
+    /// recovery is the manual one done automatically: move the whole directory's
+    /// contents into `state_sync_abandoned/<time>/` (kept, not deleted, so the
+    /// damage can be examined; the two newest are kept) and start as a fresh node,
+    /// which the host then state-syncs again. The marker means an install began, so
+    /// this only happens for a node that was being synced from others, never for
+    /// one that was producing.
+    fn quarantine_abandoned_state_sync(db_path: &str) -> Result<(), ChainError> {
+        const QUARANTINE_DIR: &str = "state_sync_abandoned";
+        const KEEP: usize = 2;
+        let dir = Path::new(db_path);
+        let marker = dir.join(STATE_SYNC_INSTALL_MARKER_FILE);
+        match fs::metadata(&marker) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ChainError::fatal_consistency(format!(
+                    "cannot determine whether a state-sync publication is incomplete at {}: {error}",
+                    marker.display()
+                )));
+            }
+        }
+        let fail = |what: &str, error: &dyn std::fmt::Display| {
+            ChainError::fatal_consistency(format!(
+                "a state-sync install was interrupted at {}; moving this node's data aside to resync failed ({what}: {error}). Move the contents of the directory aside by hand and restart",
+                dir.display()
+            ))
+        };
+        let quarantine = dir.join(QUARANTINE_DIR);
+        fs::create_dir_all(&quarantine).map_err(|e| fail("create the quarantine", &e))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let target = quarantine.join(format!("{stamp:039}"));
+        fs::create_dir(&target).map_err(|e| fail("create the quarantine entry", &e))?;
+        let mut moved = 0usize;
+        for entry in fs::read_dir(dir).map_err(|e| fail("list the data directory", &e))? {
+            let entry = entry.map_err(|e| fail("list the data directory", &e))?;
+            if entry.file_name() == QUARANTINE_DIR {
+                continue;
+            }
+            fs::rename(entry.path(), target.join(entry.file_name()))
+                .map_err(|e| fail("move a file", &e))?;
+            moved += 1;
+        }
+        sync_directory(dir).map_err(|e| fail("sync the data directory", &e))?;
+        // Keep the newest few; the names sort by time.
+        let mut kept: Vec<_> = fs::read_dir(&quarantine)
+            .map_err(|e| fail("list the quarantine", &e))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        kept.sort();
+        while kept.len() > KEEP {
+            let oldest = kept.remove(0);
+            if let Err(error) = fs::remove_dir_all(&oldest) {
+                warn!(
+                    "could not remove the oldest abandoned state-sync data {}: {error}",
+                    oldest.display()
+                );
+            }
+        }
+        warn!(
+            "ALARM event=state_sync.install_abandoned outcome=recovered: a state-sync install was interrupted; moved {moved} item(s) of this node's data to {} and starting fresh to sync again",
+            target.display()
+        );
         Ok(())
     }
 
@@ -9210,8 +9307,9 @@ mod tests {
     fn wal_frame_ends(db_path: &str) -> Vec<usize> {
         let data = std::fs::read(std::path::Path::new(db_path).join("arena_wal.bin"))
             .expect("the log exists");
-        // An 8-byte header, then [length][payload][32-byte checksum] per record.
-        let (mut ends, mut at) = (Vec::new(), 8usize);
+        // A 40-byte header (8 of format, 32 of key), then [length][payload][32-byte
+        // checksum] per record.
+        let (mut ends, mut at) = (Vec::new(), 40usize);
         while at + 8 <= data.len() {
             let len = u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) as usize;
             at += 8 + len + 32;
@@ -9325,6 +9423,131 @@ mod tests {
         // The recovered node is a working node: it takes the next block.
         chain.accept(&mut reopened, "fourth").await?;
         assert_eq!(reopened.last_accepted_block().block_num(), 5);
+        Ok(())
+    }
+
+    // Paul's round-13 image: a power cut leaves zeros after the end of the trace,
+    // chain-state or block log (the file was extended, the data never landed). On
+    // a real node the logs are opened with magic 0, which a zero header matches, so
+    // the zeros used to be read as entries for block 0 and the node refused to
+    // start ("missed a block in trace_log.log recovery is not contiguous at block
+    // 0"). This uses the node's own open path, not a fixture magic.
+    #[tokio::test]
+    async fn zero_tails_on_the_three_history_logs_do_not_stop_a_node() -> Result<(), ChainError> {
+        for zeros in [40usize, 48, 581, 4096] {
+            for log_name in ["trace_log", "chain_state_log", "block_log"] {
+                let chain = CrashChain::new(json!({}))?;
+                let mut controller = chain.open()?;
+                for name in ["first", "second", "third"] {
+                    chain.accept(&mut controller, name).await?;
+                }
+                let root = controller.database().arena_state_root();
+                drop(controller);
+
+                let path = std::path::Path::new(chain.path()).join(format!("{log_name}.log"));
+                let good_len = std::fs::metadata(&path).unwrap().len();
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    file.write_all(&vec![0u8; zeros]).unwrap();
+                }
+
+                let mut reopened = chain.open().map_err(|error| {
+                    ChainError::InternalError(format!(
+                        "{zeros} zero bytes on {log_name} stopped the node: {error}"
+                    ))
+                })?;
+                assert_eq!(
+                    reopened.last_accepted_block().block_num(),
+                    4,
+                    "{log_name} {zeros}"
+                );
+                assert_eq!(
+                    reopened.database().arena_state_root(),
+                    root,
+                    "{log_name} {zeros}: same state"
+                );
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().len(),
+                    good_len,
+                    "{log_name} {zeros}: the zeros are cut off"
+                );
+                // The node carries on, and its history stays contiguous.
+                chain.accept(&mut reopened, "fourth").await?;
+                assert_eq!(
+                    reopened.last_accepted_block().block_num(),
+                    5,
+                    "{log_name} {zeros}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // A node cut during a state-sync install restarts with the marker in its
+    // directory. It used to refuse ("wipe and resync this node before restarting")
+    // and the host logged `error creating chain`. Now it moves its own data aside
+    // and starts fresh, keeping the old files, and is a working node.
+    #[tokio::test]
+    async fn a_node_cut_during_a_state_sync_install_starts_over_by_itself() -> Result<(), ChainError>
+    {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        for name in ["first", "second", "third"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        let tip = controller.last_accepted_block().id()?;
+        controller.begin_state_sync_install(4, &tip)?;
+        // No clean stop: the cut.
+        drop(controller);
+        let dir = std::path::Path::new(chain.path());
+        assert!(dir.join(STATE_SYNC_INSTALL_MARKER_FILE).exists());
+
+        let mut reopened = chain.open().map_err(|error| {
+            ChainError::InternalError(format!("the node did not recover by itself: {error}"))
+        })?;
+        assert_eq!(
+            reopened.last_accepted_block().block_num(),
+            1,
+            "a fresh node, to be synced again"
+        );
+        assert!(!dir.join(STATE_SYNC_INSTALL_MARKER_FILE).exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.join("state_sync_abandoned"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(kept.len(), 1, "the old data is kept, not deleted");
+        assert!(
+            kept[0].path().join(STATE_SYNC_INSTALL_MARKER_FILE).exists(),
+            "and it is the interrupted install's directory"
+        );
+        // It is a working node: it takes blocks.
+        chain.accept(&mut reopened, "fresh").await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    // Only the newest two abandoned installs are kept, so a node that keeps being
+    // cut cannot fill its disk with them.
+    #[tokio::test]
+    async fn abandoned_installs_are_kept_only_a_few_at_a_time() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        for name in ["one", "two", "three", "four"] {
+            let mut controller = chain.open()?;
+            let tip = controller.last_accepted_block().id()?;
+            chain.accept(&mut controller, name).await?;
+            controller.begin_state_sync_install(2, &tip)?;
+            drop(controller);
+        }
+        let _ = chain.open()?;
+        let kept =
+            std::fs::read_dir(std::path::Path::new(chain.path()).join("state_sync_abandoned"))
+                .unwrap()
+                .count();
+        assert_eq!(kept, 2);
         Ok(())
     }
 
@@ -14745,6 +14968,99 @@ mod tests {
             error.to_string().contains("migration manifest"),
             "an unsupported manifest version must fail closed, got: {error}"
         );
+        Ok(())
+    }
+
+    // A validator reads the deferred-transaction mode from the manifest, so the
+    // node refuses a manifest that does not record one (a deleted field is how an
+    // edited manifest would look) or records one it does not understand.
+    #[tokio::test]
+    async fn migration_restore_requires_the_manifest_to_record_the_deferred_mode()
+    -> Result<(), ChainError> {
+        for edit in ["remove", "bogus"] {
+            let schedule_key =
+                PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+            let temp = get_temp_dir();
+            let (
+                checkpoint,
+                manifest_path,
+                mut migration_genesis,
+                chain_id,
+                source_block_id,
+                source_block_num,
+                _source_revision,
+                source_chain_id,
+            ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+            // A complete, signed pair: the gate under test is the deferred-mode
+            // one, so everything before it must pass.
+            let pulse_k1 = pulsevm_crypto::K1PrivateKey::from_string(
+                "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+            )
+            .map_err(|e| ChainError::InternalError(format!("bad pulse fixture key: {e:?}")))?;
+            attach_halt_pair(
+                &manifest_path,
+                &mut migration_genesis,
+                &source_chain_id,
+                source_block_num,
+                &source_block_id,
+                &[pulse_k1],
+                &["pulse"],
+                &[0],
+                &chain_id.0.0,
+            )?;
+            attach_halt_commitment_v2(
+                &manifest_path,
+                source_block_num,
+                &source_block_id,
+                &[pulsevm_crypto::K1PrivateKey::from_string(
+                    "PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez",
+                )
+                .map_err(|e| ChainError::InternalError(format!("{e:?}")))?],
+                &["pulse"],
+                &[0],
+                false,
+            )?;
+            let manifest_bytes = fs::read(&manifest_path)
+                .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
+            let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                .map_err(|e| ChainError::InternalError(format!("failed to parse manifest: {e}")))?;
+            assert!(
+                manifest.get("deferred_policy").is_some(),
+                "the converter records the mode"
+            );
+            match edit {
+                "remove" => {
+                    manifest.as_object_mut().unwrap().remove("deferred_policy");
+                }
+                _ => manifest["deferred_policy"] = json!("bogus"),
+            }
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+                .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
+            let config_bytes = json!({
+                "producer_name": "pulse",
+                "producer_key": schedule_key.to_string(),
+                "migration_checkpoint": checkpoint,
+                "migration_local_checkpoint_sha256": local_checkpoint_sha256(&checkpoint),
+                "migration_manifest": manifest_path,
+            })
+            .to_string()
+            .into_bytes();
+            let target_path = temp.path().join("target");
+            let mut controller = Controller::new();
+            let error = controller
+                .initialize(
+                    &chain_id,
+                    &config_bytes,
+                    &migration_genesis,
+                    target_path.to_str().unwrap(),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("deferred"),
+                "{edit}: expected the deferred-mode refusal, got: {error}"
+            );
+        }
         Ok(())
     }
 

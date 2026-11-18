@@ -168,3 +168,39 @@ fn undo_after_realloc_restores_old_blob() {
         b"ORIGINAL"
     );
 }
+
+// A blob reference that points outside the arena is corruption. Exporting a
+// snapshot used to write it as an empty blob, so the damage became a snapshot
+// that looked valid and hashed differently from the state it was taken from.
+#[test]
+fn exporting_state_with_a_dangling_blob_reference_is_refused() {
+    let mut db = new_db();
+    create_account(&mut db, 1, b"fine");
+    db.create::<AccountObject>(|a| {
+        a.name = 2;
+        a.creation_date = 1;
+        a.abi = BlobRef {
+            off: 1_000_000,
+            len: 64,
+        };
+    })
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("export");
+    let error = db
+        .checkpoint_unmarked(&path)
+        .expect_err("a dangling reference must not export");
+    assert!(
+        format!("{error:?}").contains("outside its arena"),
+        "{error:?}"
+    );
+    assert!(!path.exists(), "nothing is written");
+}
+
+#[test]
+fn exporting_sound_state_still_works() {
+    let mut db = new_db();
+    create_account(&mut db, 1, b"fine");
+    let dir = tempfile::tempdir().unwrap();
+    db.checkpoint_unmarked(dir.path().join("export")).unwrap();
+}

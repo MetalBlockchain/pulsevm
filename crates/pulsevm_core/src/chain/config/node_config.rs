@@ -82,6 +82,14 @@ pub struct NodeConfig {
     /// it to bound crash-recovery replay, raise it to checkpoint less often.
     #[serde(default = "default_arena_wal_max_bytes")]
     pub arena_wal_max_bytes: u64,
+    /// A state summary no more than this many blocks ahead of this node's last
+    /// accepted block is skipped, and the node catches up by fetching those blocks
+    /// instead. A snapshot install rebases the block log onto the synced tip and
+    /// drops its history (a node 5 blocks behind lost 78 MB of it), and it is the
+    /// path on which a restart can stall, so it is kept for a node that is far
+    /// behind. Zero syncs whenever any summary is ahead.
+    #[serde(default = "default_state_sync_min_blocks_behind")]
+    pub state_sync_min_blocks_behind: u64,
     /// Log the arena state root at info level every this many blocks. Zero (the
     /// default) logs none. The root hashes all state, so it costs time in
     /// proportion to it; it exists so the nodes of a test network can be
@@ -95,6 +103,10 @@ pub struct NodeConfig {
     /// it. Set here for the same reason as above.
     #[serde(default)]
     pub log_level: Option<String>,
+}
+
+fn default_state_sync_min_blocks_behind() -> u64 {
+    1024
 }
 
 fn default_arena_wal_max_bytes() -> u64 {
@@ -142,6 +154,16 @@ mod tests {
         );
         assert_eq!(cfg.state_root_log_every, 0);
         assert_eq!(cfg.log_level, None);
+        assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
+    }
+
+    #[test]
+    fn the_state_sync_threshold_is_configurable() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_sync_min_blocks_behind":20}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.state_sync_min_blocks_behind, 20);
     }
 
     #[test]

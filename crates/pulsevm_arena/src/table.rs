@@ -815,7 +815,7 @@ impl<T: ArenaObject> Table<T> {
     ///
     /// Only for export. The live arena keeps its own layout, and the write-ahead
     /// log that follows a node's own checkpoint is written in terms of it.
-    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) {
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
         out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
         let offsets = T::blob_ref_offsets();
@@ -833,17 +833,33 @@ impl<T: ArenaObject> Table<T> {
             for &at in offsets {
                 let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
                 let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+                // A reference outside the arena is corruption. Exporting it as an
+                // empty blob would turn it into a snapshot that looks valid and
+                // hashes differently from the state it came from, so refuse.
                 let bytes = if len == 0 {
                     &[][..]
                 } else {
                     off.checked_add(len)
                         .and_then(|end| self.blobs.get(off..end))
-                        .unwrap_or(&[])
+                        .ok_or(TableError::Corrupted(
+                            "a blob reference points outside its arena: refusing to export",
+                        ))?
                 };
+                // The references are 32-bit: a table whose blobs, repacked, run
+                // past 4 GiB cannot be written in this format, and truncating the
+                // offset would make rows point at the wrong bytes.
+                let new_off = u32::try_from(blobs.len()).map_err(|_| {
+                    TableError::Corrupted("a table's blobs exceed 4 GiB: cannot export")
+                })?;
+                if u32::try_from(blobs.len().saturating_add(bytes.len())).is_err() {
+                    return Err(TableError::Corrupted(
+                        "a table's blobs exceed 4 GiB: cannot export",
+                    ));
+                }
                 let (new_off, new_len) = if bytes.is_empty() {
                     (0u32, 0u32)
                 } else {
-                    (blobs.len() as u32, bytes.len() as u32)
+                    (new_off, bytes.len() as u32)
                 };
                 blobs.extend_from_slice(bytes);
                 scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
@@ -853,6 +869,7 @@ impl<T: ArenaObject> Table<T> {
         }
         out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
         out.extend_from_slice(&blobs);
+        Ok(())
     }
 
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
