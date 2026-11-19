@@ -42,6 +42,21 @@ pub struct GenesisState {
     /// checkpoint committed by a migration manifest. Normal XPR-compatible
     /// genesis files omit it and retain their original packed chain-id layout.
     pub migration_checkpoint_sha256: Option<[u8; 32]>,
+    /// Migration extension: the hash of the source chain's published active
+    /// producer schedule (`pack_schedule_hash` over its version and
+    /// producers). The schedule can be read from any XPR node and published
+    /// weeks ahead, so it is a fact from outside the bundle: the converter,
+    /// the restore gate, the offline verifier and every voter compare the
+    /// committee they hold against it. Only valid together with
+    /// `migration_checkpoint_sha256`.
+    pub migration_schedule_sha256: Option<[u8; 32]>,
+    /// Optional operator-pinned chain id (U-1). When present, nodes use it
+    /// instead of the computed hash, so wallets and exchanges can ship the
+    /// successor id at T-14, before the checkpoint it names exists. The
+    /// confirmation still binds the checkpoint unconditionally, so a pinned
+    /// id never lets a wrong state through the gate. Absent by default:
+    /// derivation is bit-for-bit unchanged.
+    pub chain_id_override: Option<[u8; 32]>,
 }
 
 impl GenesisState {
@@ -70,7 +85,22 @@ impl GenesisState {
         let migration_checkpoint_sha256 = raw
             .migration_checkpoint_sha256
             .as_deref()
-            .map(decode_hex_32)
+            .map(|value| decode_hex_32("migration_checkpoint_sha256", value))
+            .transpose()?;
+        let migration_schedule_sha256 = raw
+            .migration_schedule_sha256
+            .as_deref()
+            .map(|value| decode_hex_32("migration_schedule_sha256", value))
+            .transpose()?;
+        if migration_schedule_sha256.is_some() && migration_checkpoint_sha256.is_none() {
+            return Err(ChainError::GenesisError(
+                "migration_schedule_sha256 is only valid with migration_checkpoint_sha256".into(),
+            ));
+        }
+        let chain_id_override = raw
+            .chain_id
+            .as_deref()
+            .map(|value| decode_hex_32("chain_id", value))
             .transpose()?;
 
         Ok(GenesisState {
@@ -80,6 +110,8 @@ impl GenesisState {
             max_action_return_value_size,
             chain_id_includes_max_action_return_value_size,
             migration_checkpoint_sha256,
+            migration_schedule_sha256,
+            chain_id_override,
         })
     }
 
@@ -88,7 +120,8 @@ impl GenesisState {
         self.initial_key.to_packed()
     }
 
-    /// The chain id: `sha256(fc::raw::pack(genesis_state))`, reproducing
+    /// The chain id: the operator-pinned `chain_id` override when present
+    /// (U-1), else `sha256(fc::raw::pack(genesis_state))`, reproducing
     /// `genesis_state::compute_chain_id`. fc packs the reflected members in
     /// declaration order — the timestamp as an i64 microsecond count, the key in
     /// its 34-byte form, then each `chain_config` field as its little-endian
@@ -96,6 +129,23 @@ impl GenesisState {
     /// `max_action_return_value_size`; EOSIO 2.0-era files use the historical
     /// 17-field layout and omit it.
     pub fn compute_chain_id(&self) -> [u8; 32] {
+        if let Some(pinned) = self.chain_id_override {
+            return pinned;
+        }
+        self.compute_ceremony_chain_id()
+    }
+
+    /// The chain id the cutover ceremony binds: the hash of the genesis fields
+    /// (initial key, timestamp, configuration, the migration checkpoint hash,
+    /// the published schedule hash) and, when present, the `chain_id`
+    /// override. `compute_chain_id` with an override is just a pinned number
+    /// that commits nothing about the genesis, so binding the ceremony to it
+    /// alone would let a bundle keep the pinned id and swap the initial key
+    /// (which seeds the new chain's producer schedule); binding the fields
+    /// without the override would let whoever creates the chain choose the id
+    /// wallets sign for after the quorum signed. This id covers both, and is
+    /// what the declaration, confirmation, voter and restore gate use.
+    pub fn compute_ceremony_chain_id(&self) -> [u8; 32] {
         let mut buf: Vec<u8> = Vec::with_capacity(34 + 8 + 19 * 4 + 32);
         let c = &self.initial_configuration;
 
@@ -129,6 +179,19 @@ impl GenesisState {
         if let Some(checkpoint_sha256) = self.migration_checkpoint_sha256 {
             buf.extend_from_slice(&checkpoint_sha256);
         }
+        // Later migration extensions carry a one-byte tag so no combination
+        // of present fields can produce another combination's preimage.
+        if let Some(schedule_sha256) = self.migration_schedule_sha256 {
+            buf.push(0x01);
+            buf.extend_from_slice(&schedule_sha256);
+        }
+        // The override is the id wallets sign for, so it is part of what the
+        // ceremony commits to whenever it is present: whoever creates the
+        // chain cannot choose it after the quorum signed.
+        if let Some(pinned) = self.chain_id_override {
+            buf.push(0x02);
+            buf.extend_from_slice(&pinned);
+        }
 
         pulsevm_crypto::Digest::hash(&buf).0
     }
@@ -141,13 +204,19 @@ struct RawGenesis {
     initial_configuration: RawConfig,
     #[serde(default)]
     migration_checkpoint_sha256: Option<String>,
+    #[serde(default)]
+    migration_schedule_sha256: Option<String>,
+    /// U-1 operator-pinned chain id. Independent of the checkpoint: the
+    /// pin names the chain early, the checkpoint still binds the state.
+    #[serde(default)]
+    chain_id: Option<String>,
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32], ChainError> {
+fn decode_hex_32(field: &str, value: &str) -> Result<[u8; 32], ChainError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ChainError::GenesisError(
-            "migration_checkpoint_sha256 must be 64 hexadecimal characters".into(),
-        ));
+        return Err(ChainError::GenesisError(format!(
+            "{field} must be 64 hexadecimal characters"
+        )));
     }
     let mut bytes = [0u8; 32];
     for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -403,6 +472,125 @@ mod tests {
     }
 
     #[test]
+    fn chain_id_override_pins_the_id_alongside_the_checkpoint() {
+        // The U-1 combination: a checkpoint (binds the state) plus a pinned
+        // id (names the chain early for wallets). The pin wins for the id;
+        // the checkpoint is still parsed and enforced downstream.
+        let mut pinned: serde_json::Value = serde_json::from_str(
+            r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#,
+        )
+        .unwrap();
+        pinned["migration_checkpoint_sha256"] = serde_json::Value::String(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        pinned["chain_id"] = serde_json::Value::String(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        let pinned = GenesisState::from_json(&pinned.to_string()).unwrap();
+        assert_eq!(pinned.compute_chain_id(), [0xbb; 32]);
+        assert_eq!(pinned.migration_checkpoint_sha256, Some([0xaa; 32]));
+        assert_eq!(pinned.chain_id_override, Some([0xbb; 32]));
+    }
+
+    #[test]
+    fn chain_id_override_absent_keeps_derivation_bit_for_bit() {
+        // The frozen oracle value must survive the new field: absent pin
+        // means the historical derivation, byte for byte.
+        let json = r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#;
+        let plain = GenesisState::from_json(json).unwrap();
+        assert_eq!(plain.chain_id_override, None);
+        let hex: String = plain
+            .compute_chain_id()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "0c880c391f7d695f3d64e57e1ee396c9b26b8e089f440d917493d83a2df9c306"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_chain_id_override() {
+        let mut bad: serde_json::Value = serde_json::from_str(
+            r#"{
+            "initial_timestamp": "2023-01-01T00:00:00",
+            "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+            "initial_configuration": {
+                "max_block_net_usage": 1048576,
+                "target_block_net_usage_pct": 1000,
+                "max_transaction_net_usage": 524288,
+                "base_per_transaction_net_usage": 12,
+                "net_usage_leeway": 500,
+                "context_free_discount_net_usage_num": 20,
+                "context_free_discount_net_usage_den": 100,
+                "max_block_cpu_usage": 3000000000,
+                "target_block_cpu_usage_pct": 2500,
+                "max_transaction_cpu_usage": 1000000000,
+                "min_transaction_cpu_usage": 100000,
+                "max_transaction_lifetime": 3600,
+                "deferred_trx_expiration_window": 600,
+                "max_transaction_delay": 3888000,
+                "max_inline_action_size": 4096,
+                "max_inline_action_depth": 6,
+                "max_authority_depth": 6,
+                "max_action_return_value_size": 256
+            }
+        }"#,
+        )
+        .unwrap();
+        bad["chain_id"] = serde_json::Value::String("not-hex".into());
+        let error = GenesisState::from_json(&bad.to_string()).unwrap_err();
+        assert!(format!("{error:?}").contains("chain_id"), "{error:?}");
+    }
+
+    #[test]
     fn defaults_omitted_delay_fields_to_zero() {
         let json = r#"{
             "initial_timestamp": "2023-01-01T00:00:00",
@@ -430,5 +618,58 @@ mod tests {
         assert_eq!(g.initial_configuration.max_transaction_delay, 0);
         assert_eq!(g.initial_configuration.deferred_trx_expiration_window, 0);
         assert_eq!(g.initial_configuration.max_block_cpu_usage, 3_000_000_000);
+    }
+
+    #[test]
+    fn ceremony_chain_id_commits_the_genesis_even_with_an_override() {
+        let genesis = |timestamp: &str, pinned: Option<&str>| {
+            let mut value: serde_json::Value = serde_json::from_str(
+                r#"{
+                "initial_timestamp": "2023-01-01T00:00:00",
+                "initial_key": "PUB_K1_8fsJkG5ka4o1G1wBhySUavHuGqstcjtXMrquxiRWVcYw8ZvZLX",
+                "initial_configuration": {
+                    "max_block_net_usage": 1048576, "target_block_net_usage_pct": 1000,
+                    "max_transaction_net_usage": 524288, "base_per_transaction_net_usage": 12,
+                    "net_usage_leeway": 500, "context_free_discount_net_usage_num": 20,
+                    "context_free_discount_net_usage_den": 100, "max_block_cpu_usage": 3000000000,
+                    "target_block_cpu_usage_pct": 2500, "max_transaction_cpu_usage": 1000000000,
+                    "min_transaction_cpu_usage": 100000, "max_transaction_lifetime": 3600,
+                    "deferred_trx_expiration_window": 600, "max_transaction_delay": 3888000,
+                    "max_inline_action_size": 4096, "max_inline_action_depth": 6,
+                    "max_authority_depth": 6, "max_action_return_value_size": 256
+                }
+            }"#,
+            )
+            .unwrap();
+            value["initial_timestamp"] = timestamp.into();
+            if let Some(pinned) = pinned {
+                value["chain_id"] = pinned.into();
+            }
+            GenesisState::from_json(&value.to_string()).unwrap()
+        };
+        let pinned = "bb".repeat(32);
+        let plain = genesis("2023-01-01T00:00:00", None);
+        let overridden = genesis("2023-01-01T00:00:00", Some(&pinned));
+        let altered = genesis("2023-01-02T00:00:00", Some(&pinned));
+        // The override still names the chain at runtime...
+        assert_eq!(overridden.compute_chain_id(), altered.compute_chain_id());
+        // ...but the ceremony id commits the genesis fields AND the override,
+        // so the quorum cannot sign one genesis and restore under another,
+        // and the override cannot be chosen after the signatures.
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            altered.compute_ceremony_chain_id()
+        );
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            plain.compute_ceremony_chain_id()
+        );
+        let other_override = genesis("2023-01-01T00:00:00", Some(&"cc".repeat(32)));
+        assert_ne!(
+            overridden.compute_ceremony_chain_id(),
+            other_override.compute_ceremony_chain_id()
+        );
+        // No override: unchanged from the plain derivation.
+        assert_eq!(plain.compute_ceremony_chain_id(), plain.compute_chain_id());
     }
 }

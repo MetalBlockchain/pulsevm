@@ -18,17 +18,18 @@ those build flags never activate chain behavior. Protocol features are not
 runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
-> **Current status:** the genesis, minimum-supported, and maximum-supported
-> protocol versions are all `1`. Both normal and `nightly` builds therefore
-> report maximum version `1`; `nightly` does not aggregate any unfinished
-> `protocol_feature_*` flag yet. `Baseline` is the only feature, and no
-> post-genesis behavior is gated. Schedule parsing, height selection,
-> fail-closed support checks, and RPC observability are wired, but the feature
-> helper has no production call site yet. A schedule that activates version `2`
-> or later makes the current binary refuse transaction admission, block
-> building, verification, replay, and state-sync application at that height.
-> Do not schedule version `2` until a
-> released binary reports support for it.
+> **Current status:** the genesis and minimum-supported protocol versions are
+> `1`. A normal (stable) build reports maximum version `1`, so `Baseline` is
+> the only feature it implements and no post-genesis behavior is active. A
+> build compiled with `--features nightly` reports maximum version `2` and
+> additionally implements `CpuUnitsInPoints` (see
+> [section 13](#13-cpuunitsinpoints-version-2)). Schedule parsing, height
+> selection, fail-closed support checks, and RPC observability are wired. A
+> schedule that activates a version the binary does not support makes it
+> refuse transaction admission, block building, verification, replay, and
+> state-sync application at that height. Do not schedule version `2` on a
+> chain whose validators run stable builds, and do not schedule it at all until
+> a released binary reports support for it.
 
 The code is authoritative. Start with
 [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
@@ -57,7 +58,7 @@ safe rollout into a chain halt.
 | `GENESIS_PROTOCOL_VERSION` | Protocol version used before the first scheduled upgrade. It is currently `1`. |
 | `MIN_SUPPORTED_PROTOCOL_VERSION` | Oldest chain protocol this binary can execute. It is currently `1`. |
 | `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `1`. |
-| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `1`. |
+| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `2`. |
 | `PROTOCOL_VERSION` | Newest version this particular binary can execute: stable maximum normally, nightly maximum in a `nightly` build. It is not the version active at the current head. |
 | `protocol_feature_*` Cargo feature | Temporary compile-time gate that includes one unfinished implementation. It does not activate the implementation. |
 | `nightly` Cargo feature | Aggregate compile-time gate for all unfinished protocol implementations. It is unrelated to the Rust nightly toolchain. |
@@ -298,8 +299,11 @@ arena, re-bases the block log, clears the trace and chain-state logs, and writes
 an atomically replaced, checksummed producer-schedule base for the re-based log.
 The marker is removed and its directory synced only after every companion file
 is installed. A failure after the arena swap is a fatal consistency error: the
-VM aborts, and the surviving marker makes every restart fail closed until the
-node's data is diagnosed and rebuilt or resynced. A re-based block log above
+VM aborts. On the next start the surviving marker means the pieces may come from
+two heights, so the node moves its own data into `state_sync_abandoned/` (kept, the
+two newest) and starts fresh to sync again, with an `ALARM` log line; see
+`docs/xpr-cutover-operations.md`, "State sync, damaged history logs and the
+write-ahead log". A re-based block log above
 genesis likewise cannot start without its valid producer-schedule sidecar.
 
 > **Operational invariant:** every validator, verifier, and state-sync node must
@@ -439,11 +443,10 @@ rollout normally means two rolling restarts: one to deploy supporting code, then
 one to load the canonical schedule. Leave enough time between those phases to
 verify every node before activation.
 
-With the code currently in this branch, no post-genesis upgrade can safely
-activate: a target must be greater than genesis version `1`, while this binary's
-maximum is still `1`. The parser accepts a future entry before activation, but
-the supporting binary must be deployed before that height. There is no released
-version-2 behavior yet.
+Version 2 exists only in a `nightly` build (section 13); a stable binary's
+maximum is still `1`, so a stable binary cannot activate it. The parser accepts a
+future entry before activation, but the supporting binary must be deployed
+before that height. There is no stable release of version 2 yet.
 
 ## 9. Adding a protocol feature
 
@@ -740,3 +743,107 @@ The feature-to-version pattern is inspired by
 [nearcore's protocol feature model](https://github.com/near/nearcore/blob/53f338792c7eeb0df43a6f37bb55578371bebcba/core/primitives-core/src/version.rs),
 but PulseVM's implementation and this repository's tests define PulseVM's
 behavior.
+
+## 13. `CpuUnitsInPoints` (version 2)
+
+Version 2 carries two changes. This section covers the CPU units; the start
+section rule is at the end of the section.
+
+Two CPU figures that a transaction or a governance call states are in the
+unit the chain bills and limits in, metering points (`POINTS_PER_US` = 38,000
+per microsecond of reference compute), not microseconds. Both rules were wrong
+in the same way before: they treated a microsecond-style number as a point
+count.
+
+| Rule | Before (version 1) | From the activation height (version 2) |
+|---|---|---|
+| A transaction header's `max_cpu_usage_ms` | The byte is a point count: at most 255 points, so the transaction can never pay the 100,000-point minimum bill. | `ms * 1000 * POINTS_PER_US` points, as Leap multiplies by 1000. The header can still only lower the limit, never raise it. |
+| `set_blockchain_parameters_packed` | Only relations between fields are checked, so XPR's microsecond values (a minimum bill of 100) are accepted and reset every cap to a few microseconds of reference compute. | A `min_transaction_cpu_usage` under `POINTS_PER_US` is refused, a `max_transaction_cpu_usage` under 100 times the minimum is refused, and so is a `max_block_cpu_usage` under 1000 times it ("CPU parameters are metering points, not microseconds"). |
+
+The second rule guards against one specific mistake (applying XPR's numbers after
+a migration), not a proof that a configuration is sensible. Both checks are
+needed: XPR's global row holds a 200,000 block cap and a 150,000 transaction cap
+(microseconds), and a proposal that copies the row and raises only the minimum to
+38,000 clears the first check while leaving caps of a few microseconds, so every
+ordinary transaction is dropped (Paul Grey measured `block_cpu_limit` 200,000 and
+`s1check` failing on every node). The multiple, 100, is far below any real ratio:
+the converted chain's figures (3,000,000,000 / 1,000,000,000 / 100,000) are
+10,000 times the minimum. A configuration that passes can still be wrong, for
+example every figure scaled by the same wrong factor. After any `setparams`,
+check `getInfo` (`block_cpu_limit`, `virtual_block_cpu_limit`).
+
+Imported XPR transactions that carry a header cap (for example multisig
+proposals) can only execute once the activation height is reached.
+
+**Availability.** Code is behind the Cargo flag
+`protocol_feature_cpu_units_in_points`, collected by `nightly`. A stable build
+does not contain it and reports maximum version 1. To use it on a chain:
+
+1. Run a binary built with `--features nightly` on every validator.
+2. Put `{"protocol_upgrades":[{"protocol_version":2,"activation_height":N}]}` in
+   the chain's upgrade bytes. Every validator must load the same bytes.
+3. Blocks before `N` run the version 1 rules unchanged, because they already
+   ran under them.
+
+**Choosing `N`.** An upgrade can only activate strictly after the height the
+chain started from, because the blocks up to that height ran somewhere else
+under other rules and no activation record for it can exist.
+
+| Chain | Started from | Smallest valid `N` |
+|---|---|---|
+| Fresh genesis | block 1 | 2 |
+| Restored from a migration checkpoint (the cutover chain) | `H`, the source block | `H + 1` |
+| State-synced node | the synced height, with the network's records | the network's schedule, unchanged |
+
+For the cutover chain that means `N = H + 1`, the first block the new chain
+produces, so no block ever runs the old rule. `N = 2` does not work there: it is
+at or below `H`, no record of it exists in the restored state, and every node
+refuses to boot with "configured protocol upgrade schedule does not match the 0
+activation record(s) persisted at chain height H". The message now also says
+which scheduled upgrades were never recorded and to use `H + 1`
+(`a_restored_chain_activates_version_two_at_h_plus_one_not_before`). Paul Grey
+ran this on five nodes: with `N = H+1`, `getInfo` showed `protocol_version` 1 and
+`next_protocol_upgrade {2, H+1}` before any transaction, and version 2 from
+`H+1` with the same schedule hash on all five.
+
+**The upgrade bytes are not bound to the genesis.** A validator started with
+empty or different bytes boots and runs the version 1 rules, which is a consensus
+split from the first block under version 2. The only thing an operator can
+compare is `getInfo.protocol_upgrade_schedule_hash`; check that it is identical
+on every node before the cut (the agent does, before LIVE). A node whose bytes
+disagree with the activation history already recorded in its state is refused at
+boot, so the split can only come from a node that has not yet passed activation.
+
+Promoting the feature to a stable release (raising `STABLE_PROTOCOL_VERSION`,
+section 9.3) is a separate release decision.
+
+Tests: `header_cpu_limit_tests` (`transaction_context.rs`) covers the unit
+conversion on both sides of the activation height;
+`webassembly/tests/privileged.rs` covers the floor, including exactly at
+`POINTS_PER_US`, and that a refused call changes nothing.
+
+### `WasmStartSections` (also version 2)
+
+Before version 2 `setcode` rejects a module that declares a WASM start section.
+XPR accepts them, so contracts compiled for XPR that use one (some toolchains
+emit it for global constructors) could not be redeployed here. From the
+activation height a new `setcode` may declare a start section.
+
+This is safe to allow because the runtime already handled the case: the start
+function is deferred until the module is instantiated for an action and runs
+under the same instruction metering as `apply`, so a start function cannot run
+for free or unbounded. Code installed before activation is unchanged, and
+blocks before the activation height keep refusing start sections, so replay
+agrees on both sides of the boundary.
+
+Code is behind the Cargo flag `protocol_feature_wasm_start_sections`, collected
+by `nightly`. A stable binary that reaches the activation height refuses the
+block ("WASM start sections were not compiled into this binary") rather than
+guessing, so version 2 must only be scheduled on chains whose validators all run
+a nightly build, exactly as for the CPU units.
+
+Tests: `pulsevm_wasm_validation` covers the validator entry point;
+`webassembly/tests/privileged.rs` covers the gate on both sides of the activation
+height; `setcode_with_a_start_section_*` in `controller.rs` deploys and executes
+a start-section contract on a real version 2 chain (nightly) and shows the
+refusal under version 1.

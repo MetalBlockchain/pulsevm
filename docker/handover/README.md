@@ -1,0 +1,126 @@
+# Handover rehearsal
+
+Rehearses the shadow-then-promote migration on one machine: a
+single-producer Leap chain ("normal XPR") produces blocks, a PulseVM shadow
+replays them in real time, the producer halts at `TERMINAL_HEIGHT`, and a
+five-node PulseVM network boots from the checkpointed shadow state and
+continues numbering at H+1.
+
+```bash
+# ~10 minutes at the default 1200 blocks (0.5s block time).
+docker/handover/run-handover.sh start
+docker/handover/run-handover.sh stop
+```
+
+## What it models
+
+| Step | Models |
+|---|---|
+| Leap produces, shadow follows | Live XPR replay (today's EC2 follower) |
+| `stop xpr-producer` at H | The producer halt commitment (all BPs stop) |
+| Snapshot, export, checkpoint | Canonical export plus independent validation |
+| Source-block anchor | Id-exact empty block H attached to the manifest so new nodes adopt H as tip |
+| Five-node boot from checkpoint | A-Chain validator boot from identical state |
+| Parent-linkage plus liveness asserts | Continuity gate: H+1 builds on H |
+
+`TERMINAL_HEIGHT` sets the cutover (default 1200; 100000 is ~14 hours).
+`HANDOVER_WORK_DIR` must stay below `/tmp` for the nodeos-docker adapter.
+
+## Prerequisites
+
+Host Rust with LLVM 22 (for the checkpoint importer), Docker with the
+`pulsevm-handover` compose project, and MetalGo plus the network runner
+for the five-node boot (`METALGO_EXEC_PATH`, default
+`../metalgo-tahoe/build/metalgo`: the plugin speaks rpcchainvm 45, so a
+pre-tahoe MetalGo fails the handshake and the boot never comes up). No
+XPR core checkout is needed: preflight and the
+deferred sidecar are mainnet provenance guards, and the fixture chain has
+no deferred activity, so the rehearsal skips them by design.
+
+## In CI, and the check after the cut
+
+`.github/workflows/cutover-e2e.yml` runs this whole rehearsal on every relevant
+change and nightly, in two scenarios (`clean`, and `chaos` with one validator
+dropped before H+1), on a hosted Linux runner: it builds the pinned Leap image,
+MetalGo, and the network runner, then runs `run-handover.sh start`. The evidence
+(logs, the manifest and boundary records, every node's chain log) is uploaded as
+an artifact.
+
+`run-handover.sh verify-restarts` runs on the clean scenario once `start` has
+passed. It kills validators with `kill -9` one at a time while the chain is being
+fed, lets the chain run on four of five, relaunches the node with its exact
+command line, and repeats (`RESTART_ROUNDS`, default 3). The feed is new accounts
+plus calls to a small contract (`fixtures/churn.wat`) that rewrites one table row
+at a varying size. The second half matters: account creation only appends rows,
+and a restart only changes a node's state layout if a contract row's slot has
+been freed and reused. Without those calls this check passed on a build with the
+original bug put back, so it proved nothing. It requires the five
+nodes to converge on one head each time, and at the end it compares the state
+root every node logged at every height they share. Same head is not enough: a
+node that had restarted once computed a different root from its first
+transaction on while heads and account reads agreed. Start the rehearsal with
+`PULSEVM_STATE_ROOT_LOG_EVERY=1` so the nodes log their roots (the variable is
+written into the chain config by `scripts/run-local.sh`; MetalGo does not pass
+its environment to the plugin, so it cannot be read from the environment there).
+
+The runner is the public `metal-network-runner` v1.9.0 plus one change, kept here
+as `patches/metal-network-runner-startup-timeout.patch`: a node restoring an
+imported checkpoint can take longer than the runner's three-second wait for the
+node to report itself, and the rehearsal needs that raised. Until it is upstream,
+a runner built without it reports a healthy node as failed. Build with
+`git apply` on the pinned commit, as the workflow does.
+
+Not covered by the CI job: the table compare against a real mainnet snapshot, the
+deferred-transaction sidecar and the mainnet provenance checks (the fixture chain
+has no deferred activity and no mainnet pins), and a power loss.
+
+## Known delta vs the real migration
+
+Promotion currently re-identifies the chain: the migration genesis commits
+to the checkpoint hash, so the five-node network reports a different chain
+ID than the Leap chain. The rehearsal asserts state continuity (parent link
+H to H+1, advancing head) across that re-identification. Same-ID
+in-process promotion — the shadow process itself starting to author at H —
+needs block production inside the replay binary and is not modeled here.
+
+Full run: `TERMINAL_HEIGHT=300 ./run-handover.sh start` runs everything
+unattended and ends with `handover: PASS`, leaving the new network
+running:
+
+1. Three-node Leap consensus (producer + two validating peers, equal head
+   and LIB), then pre-halt traffic: three accounts (one born under a
+   rotated key) plus a live key rotation, captured to
+   `pre-halt-accounts.json`.
+2. Shadow follow to N, snapshot at H, full network halt with a block-log
+   freeze proof.
+3. Checkpoint export, five-node boot, the network's own first transaction
+   (empty blocks are gated, so H+1 needs one).
+4. Continuity assert (H+1's parent is H), a state-equivalence gate
+   (every pre-halt account reads back with byte-identical authorities),
+   and a boundary audit: customer transactions submitted just before the
+   halt land at or below H, transactions submitted after boot land above
+   H, none lost, none duplicated — from the customer's seat the network
+   never stops, it swaps.
+
+The halt is a signed commitment, not just stopped containers: the attach
+step signs H over the old schedule's key into the manifest, and the new
+network verifies that commitment before promoting (tampered commitments
+fail the restore closed). The replay container is stopped explicitly once
+the shadow absorbs H — from there only the new network writes.
+
+`CHAOS_KILL_NODE=1` drops one validator before the first transaction, so
+H+1 must finalize on 4/5 quorum (slower Snowman convergence; longer wait
+budget). `stop` archives the workdir instead of deleting it, preserving
+the evidence trail.
+
+Rehearsal-only support: `XPR_REPLAY_GENESIS_FILE` lets the replay binary
+follow a non-mainnet fixture chain. It is default-off; without it every
+mainnet pin behaves exactly as before.
+
+Producer schedule: a migration restore starts a new schedule seeded from the
+migration genesis initial key (the source schedule is not carried over), so
+the boot wires `PULSEVM_GENESIS_INITIAL_KEY` from the fixture genesis the
+Leap producer uses. With a foreign key every build fails closed at the
+signing gate (`refusing to produce`, now logged by the VM) and the new
+network never passes H. The real migration ceremony must write the actual
+producers' keys into the migration genesis the same way.

@@ -1,5 +1,6 @@
 mod chain;
 pub use chain::*;
+pub mod migration_attach;
 
 // Re-export database and its process-local monitoring snapshots.
 pub use pulsevm_database::{

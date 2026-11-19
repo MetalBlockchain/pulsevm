@@ -806,6 +806,72 @@ impl<T: ArenaObject> Table<T> {
     /// raw bytes. No per-field encoding: the object is fixed-size POD, so its
     /// bytes go out with a single copy. The undo stack is deliberately not
     /// persisted — a snapshot is committed state.
+    /// As [`Table::pack_into`], but with the blob arena rewritten canonically:
+    /// each row's blobs repacked one after another in row order, and every
+    /// reference rewritten to match; an empty blob is always the default
+    /// reference. Two tables holding the same rows then pack to the same bytes
+    /// whatever their allocation history (dead spans, a lost free list), so a
+    /// hash of an exported snapshot agrees between nodes that agree on state.
+    ///
+    /// Only for export. The live arena keeps its own layout, and the write-ahead
+    /// log that follows a node's own checkpoint is written in terms of it.
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+        let offsets = T::blob_ref_offsets();
+        let mut blobs: Vec<u8> = Vec::new();
+        let mut scratch = Vec::new();
+        for (id, obj) in self.primary.iter_with_ids() {
+            out.extend_from_slice(&(id as u64).to_le_bytes());
+            let raw = obj.as_bytes();
+            if offsets.is_empty() {
+                out.extend_from_slice(raw);
+                continue;
+            }
+            scratch.clear();
+            scratch.extend_from_slice(raw);
+            for &at in offsets {
+                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+                // A reference outside the arena is corruption. Exporting it as an
+                // empty blob would turn it into a snapshot that looks valid and
+                // hashes differently from the state it came from, so refuse.
+                let bytes = if len == 0 {
+                    &[][..]
+                } else {
+                    off.checked_add(len)
+                        .and_then(|end| self.blobs.get(off..end))
+                        .ok_or(TableError::Corrupted(
+                            "a blob reference points outside its arena: refusing to export",
+                        ))?
+                };
+                // The references are 32-bit: a table whose blobs, repacked, run
+                // past 4 GiB cannot be written in this format, and truncating the
+                // offset would make rows point at the wrong bytes.
+                let new_off = u32::try_from(blobs.len()).map_err(|_| {
+                    TableError::Corrupted("a table's blobs exceed 4 GiB: cannot export")
+                })?;
+                if u32::try_from(blobs.len().saturating_add(bytes.len())).is_err() {
+                    return Err(TableError::Corrupted(
+                        "a table's blobs exceed 4 GiB: cannot export",
+                    ));
+                }
+                let (new_off, new_len) = if bytes.is_empty() {
+                    (0u32, 0u32)
+                } else {
+                    (new_off, bytes.len() as u32)
+                };
+                blobs.extend_from_slice(bytes);
+                scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
+                scratch[at + 4..at + 8].copy_from_slice(&new_len.to_le_bytes());
+            }
+            out.extend_from_slice(&scratch);
+        }
+        out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&blobs);
+        Ok(())
+    }
+
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
@@ -913,18 +979,20 @@ impl<T: ArenaObject> Table<T> {
             self.primary.set_len(next_id);
         }
         let count = read_u64(bytes, &mut pos)?;
+        // Read every changed row first, then remove all of the old versions from
+        // the indexes, then insert the new ones. A block can move a unique key
+        // from one row to another (or remove a row and give its key to a
+        // second); the live table did that in a safe order, but a replay that
+        // handles one row at a time in the order they were first touched can
+        // meet the new key while the old holder is still indexed, and would
+        // refuse a log that is perfectly good.
+        let mut changed: Vec<(usize, Option<T>)> = Vec::new();
         for _ in 0..count {
             let id = read_u64(bytes, &mut pos)? as usize;
             let tag = *bytes
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.take(id) {
-                for index in &mut self.secondaries {
-                    index.erase(&old);
-                }
-                self.row_count -= 1;
-            }
             if tag == 1 {
                 let end = pos
                     .checked_add(obj_size)
@@ -936,14 +1004,28 @@ impl<T: ArenaObject> Table<T> {
                 if id >= self.primary.len() {
                     return Err(TableError::Corrupted("delta row id out of range"));
                 }
-                for index in &mut self.secondaries {
-                    if !index.try_insert(&obj) {
-                        return Err(TableError::Corrupted("delta secondary key conflict"));
-                    }
-                }
-                self.primary.insert(id, obj);
-                self.row_count += 1;
+                changed.push((id, Some(obj)));
+            } else {
+                changed.push((id, None));
             }
+        }
+        for (id, _) in &changed {
+            if let Some(old) = self.primary.take(*id) {
+                for index in &mut self.secondaries {
+                    index.erase(&old);
+                }
+                self.row_count -= 1;
+            }
+        }
+        for (id, row) in changed {
+            let Some(obj) = row else { continue };
+            for index in &mut self.secondaries {
+                if !index.try_insert(&obj) {
+                    return Err(TableError::Corrupted("delta secondary key conflict"));
+                }
+            }
+            self.primary.insert(id, obj);
+            self.row_count += 1;
         }
         // In-place patches (into bytes appended by earlier frames), then the tail.
         let patch_count = read_u64(bytes, &mut pos)?;
@@ -988,13 +1070,43 @@ impl<T: ArenaObject> Table<T> {
     /// yields an equal digest.
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
         use sha2::Digest;
+        hasher.update(b"arena-table-v2");
         hasher.update((self.row_count as u64).to_le_bytes());
+        let offsets = T::blob_ref_offsets();
+        let mut scratch = Vec::new();
         for (id, obj) in self.primary.iter_with_ids() {
             hasher.update((id as u64).to_le_bytes());
-            hasher.update(obj.as_bytes());
+            let raw = obj.as_bytes();
+            if offsets.is_empty() {
+                hasher.update(raw);
+                continue;
+            }
+            // The row with each blob reference blanked, then each blob's bytes
+            // in field order behind a length. What the row says is its logical
+            // content; where it is stored is not part of the state.
+            scratch.clear();
+            scratch.extend_from_slice(raw);
+            for &at in offsets {
+                scratch[at..at + std::mem::size_of::<BlobRef>()].fill(0);
+            }
+            hasher.update(&scratch);
+            for &at in offsets {
+                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+                hasher.update((len as u64).to_le_bytes());
+                if len > 0 {
+                    // A ref past the arena cannot be a live state; hash a marker
+                    // rather than panic, so a corrupt row changes the root.
+                    match off
+                        .checked_add(len)
+                        .and_then(|end| self.blobs.get(off..end))
+                    {
+                        Some(bytes) => hasher.update(bytes),
+                        None => hasher.update(b"dangling-blob-ref"),
+                    }
+                }
+            }
         }
-        hasher.update((self.blobs.len() as u64).to_le_bytes());
-        hasher.update(&self.blobs);
     }
 }
 
@@ -1150,6 +1262,9 @@ mod tests {
 
     impl ArenaObject for TestRow {
         const TYPE_ID: u16 = 1;
+        fn blob_ref_offsets() -> &'static [usize] {
+            &[]
+        }
 
         fn id(&self) -> ObjectId<Self> {
             self.id

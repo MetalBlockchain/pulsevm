@@ -3779,6 +3779,7 @@ name = "pulsevm_arena"
 version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
+ "getrandom 0.3.4",
  "proptest",
  "pulsevm_arena_derive",
  "sha2 0.10.9",
@@ -3865,6 +3866,7 @@ dependencies = [
  "p256",
  "proptest",
  "pulsevm_billable_size",
+ "pulsevm_chain_types",
  "pulsevm_constants",
  "pulsevm_crypto",
  "pulsevm_database",
@@ -3938,6 +3940,7 @@ dependencies = [
  "pulsevm_proc_macros",
  "pulsevm_rpc",
  "pulsevm_serialization",
+ "pulsevm_snapshot",
  "pulsevm_softfloat",
  "secp256k1",
  "serde",

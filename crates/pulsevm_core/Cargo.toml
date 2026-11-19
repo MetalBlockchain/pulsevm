@@ -35,6 +35,7 @@ wasmer-middlewares = "7.4.0"
 wat = "1"
 
 pulsevm_billable_size = { path = "../pulsevm_billable_size" }
+pulsevm_chain_types = { path = "../pulsevm_chain_types" }
 pulsevm_constants = { path = "../pulsevm_constants" }
 pulsevm_crypto = { path = "../pulsevm_crypto" }
 pulsevm_error = { path = "../pulsevm_error" }
@@ -54,12 +55,21 @@ default = []
 # Aggregate every unfinished `protocol_feature_*` flag here. This controls
 # which implementations are compiled; the chain schedule still controls when
 # compiled behavior activates.
-nightly = []
+nightly = [
+    "protocol_feature_cpu_units_in_points",
+    "protocol_feature_wasm_start_sections",
+]
+# Protocol version 2: CPU figures a transaction header or a governance call
+# states are metering points, not microseconds. See docs/protocol-features.md.
+protocol_feature_cpu_units_in_points = []
+# Protocol version 2: new contract code may declare a WASM start section.
+protocol_feature_wasm_start_sections = []
 arena-shadow = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 wat = "1"
+pulsevm_crypto = { path = "../pulsevm_crypto" }
 # Signing the same digest twice with different nonce data, to build a
 # transaction whose signatures are distinct but recover the same key.
 secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }

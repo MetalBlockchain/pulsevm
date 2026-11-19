@@ -78,21 +78,242 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DbError> {
     let mut f = std::fs::File::create(&tmp).map_err(|e| DbError::Io(e.to_string()))?;
     f.write_all(bytes).map_err(|e| DbError::Io(e.to_string()))?;
     f.sync_all().map_err(|e| DbError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| DbError::Io(e.to_string()))
+    std::fs::rename(&tmp, path).map_err(|e| DbError::Io(e.to_string()))?;
+    // The rename is a directory change, and it is only durable once the directory
+    // is. A power loss before that can bring back the old file (or none) even
+    // though the data was fsynced, and the caller may be about to delete the log
+    // this checkpoint replaces.
+    sync_parent_dir(path)
+}
+
+/// Fsync the directory holding `path`, making a create, rename or unlink of an
+/// entry in it durable. A no-op where directories cannot be opened for sync.
+pub fn sync_parent_dir(path: &Path) -> Result<(), DbError> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|e| DbError::Io(format!("sync directory {}: {e}", dir.display())))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Start of every write-ahead log: the format version, then a random key chosen
+/// when the file is created. A log written before records carried a checksum, or
+/// before the key, has a different start and is refused by name, not misread.
+const WAL_MAGIC: &[u8; 8] = b"PVMWAL04";
+const WAL_KEY_LEN: usize = 32;
+const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + WAL_KEY_LEN;
+const WAL_DIGEST_LEN: usize = 32;
+
+/// The checksum of a record. It covers the length as well as the payload: with
+/// only the payload under it, a flipped bit in the length made a good record look
+/// cut short, and everything behind it was treated as a torn tail and deleted.
+///
+/// It is also keyed with the file's own random key. A plain hash can be computed
+/// by anyone, and the payload carries contract row bytes verbatim, so a
+/// transaction could store 56 bytes that read as a valid record. Found inside a
+/// torn final record, such a "record" proved the file was altered and the node
+/// refused to start. The key lives only in this file's header, which a contract
+/// cannot read, so no payload can contain a record that verifies.
+fn wal_digest(key: &[u8], len: u64, payload: &[u8]) -> [u8; WAL_DIGEST_LEN] {
+    use sha2::{
+        Digest,
+        Sha256,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(len.to_le_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+/// Smallest payload a record can carry: a revision and a table count.
+const WAL_MIN_PAYLOAD: usize = 16;
+
+/// The record that starts at `pos`, if one that verifies does:
+/// `(payload start, payload end, record end)`.
+fn wal_record_at(data: &[u8], key: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+    let len = try_read_u64(data, pos)?;
+    let payload_start = pos.checked_add(8)?;
+    let payload_end = payload_start.checked_add(usize::try_from(len).ok()?)?;
+    let record_end = payload_end.checked_add(WAL_DIGEST_LEN)?;
+    if record_end > data.len() {
+        return None;
+    }
+    if wal_digest(key, len, &data[payload_start..payload_end]) != data[payload_end..record_end] {
+        return None;
+    }
+    Some((payload_start, payload_end, record_end))
+}
+
+/// Where a record that verifies starts, anywhere in `data[from..]`.
+///
+/// This is how a cut-short log is told from a damaged one. A crash leaves a
+/// prefix of a record, then nothing or zeros: no intact record can follow it. If
+/// one does, whatever stopped the scan was not a crash, and the bytes behind it
+/// are data that must not be thrown away. Only run on the failure path; the cheap
+/// length test keeps it linear.
+fn wal_valid_record_follows(data: &[u8], key: &[u8], from: usize) -> Option<usize> {
+    let mut pos = from;
+    while pos.checked_add(8 + WAL_MIN_PAYLOAD + WAL_DIGEST_LEN)? <= data.len() {
+        if let Some(len) = try_read_u64(data, pos)
+            && len >= WAL_MIN_PAYLOAD as u64
+            && len <= (data.len() - pos) as u64
+            && wal_record_at(data, key, pos).is_some()
+        {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// The complete records of a log, and what is left over after them.
+struct WalScan {
+    /// `(start, end)` of each record's payload.
+    records: Vec<(usize, usize)>,
+    /// Where the last good record ends.
+    valid_len: usize,
+    /// Bytes follow that do not form a complete, intact record.
+    torn_tail: bool,
+}
+
+/// Split a log into records, checking each one's checksum.
+///
+/// A record cut short by a crash is the expected damage: it ends the log. A
+/// record whose checksum fails is the same thing if nothing follows it (a write
+/// that reached the file but not all of its pages), and is discarded as such. A
+/// failure with intact data after it cannot be a crash: something altered the
+/// file, and applying what follows would build state on a hole, so it is refused.
+fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
+    let mut scan = WalScan {
+        records: Vec::new(),
+        valid_len: 0,
+        torn_tail: false,
+    };
+    if data.is_empty() {
+        return Ok(scan);
+    }
+    // A file of nothing but zeros is an append that never happened: the
+    // filesystem made the file, or extended it, and no data landed. That window
+    // opens once per checkpoint fold, between removing the log and the next
+    // accept creating it. It is not an older build's log, and nothing in it is
+    // lost.
+    if data.iter().all(|byte| *byte == 0) {
+        scan.torn_tail = true;
+        return Ok(scan);
+    }
+    if data.len() < WAL_MAGIC.len() {
+        if WAL_MAGIC.starts_with(data) {
+            scan.torn_tail = true; // a header cut short
+            return Ok(scan);
+        }
+        return Err(DbError::Corrupted(
+            "write-ahead log has an unrecognised header".into(),
+        ));
+    }
+    if &data[..WAL_MAGIC.len()] != WAL_MAGIC {
+        return Err(DbError::Corrupted(
+            "write-ahead log is not in the checksummed format (written by an earlier build?): stop that node cleanly with the build that wrote it, or resync".into(),
+        ));
+    }
+    if data.len() < WAL_HEADER_LEN {
+        scan.torn_tail = true; // the key was cut short
+        return Ok(scan);
+    }
+    let key = &data[WAL_MAGIC.len()..WAL_HEADER_LEN];
+    let mut pos = WAL_HEADER_LEN;
+    scan.valid_len = pos;
+    while pos < data.len() {
+        let Some((payload_start, payload_end, record_end)) = wal_record_at(data, key, pos) else {
+            // The record at `pos` cannot be completed or does not verify. If an
+            // intact record starts anywhere after it, this is damage in the
+            // middle of the file, not a crash: refuse, and leave the file as it
+            // is. If none does, what is left is the remains of a write that was
+            // cut short (a partial record, zeros, anything), and goes.
+            if let Some(next) = wal_valid_record_follows(data, key, pos + 1) {
+                return Err(DbError::Corrupted(format!(
+                    "write-ahead log record at byte {pos} cannot be read and an intact record starts at byte {next}: the file was altered, not cut short, so nothing is discarded"
+                )));
+            }
+            scan.torn_tail = true;
+            break;
+        };
+        scan.records.push((payload_start, payload_end));
+        pos = record_end;
+        scan.valid_len = pos;
+    }
+    Ok(scan)
 }
 
 /// Appends `[len][frame]` to the log and fsyncs.
+/// What [`Db::replay_log_after`] did with a write-ahead log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalReplay {
+    pub frames_applied: usize,
+    /// Frames already covered by the checkpoint the log was replayed onto.
+    pub frames_skipped: usize,
+    /// End of the last complete frame; everything after it is a torn write.
+    pub valid_len: u64,
+    pub torn_tail: bool,
+}
+
+/// The key in the header of the log at `path`.
+fn wal_key_of(path: &Path) -> Result<[u8; WAL_KEY_LEN], DbError> {
+    use std::io::Read;
+    let mut header = [0u8; WAL_HEADER_LEN];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| DbError::Io(format!("read the write-ahead log header: {e}")))?;
+    if &header[..WAL_MAGIC.len()] != WAL_MAGIC {
+        return Err(DbError::Corrupted(
+            "write-ahead log header is not the current format".into(),
+        ));
+    }
+    let mut key = [0u8; WAL_KEY_LEN];
+    key.copy_from_slice(&header[WAL_MAGIC.len()..]);
+    Ok(key)
+}
+
 fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
     use std::io::Write;
+    let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // One write per record, so a crash tears it at one point rather than leaving
+    // a length with no payload behind it.
+    let mut record = Vec::with_capacity(WAL_HEADER_LEN + 8 + frame.len() + WAL_DIGEST_LEN);
+    let key = if existing == 0 {
+        let mut key = [0u8; WAL_KEY_LEN];
+        getrandom::fill(&mut key)
+            .map_err(|e| DbError::Io(format!("no randomness for the write-ahead log key: {e}")))?;
+        record.extend_from_slice(WAL_MAGIC);
+        record.extend_from_slice(&key);
+        key
+    } else {
+        wal_key_of(path)?
+    };
+    record.extend_from_slice(&(frame.len() as u64).to_le_bytes());
+    record.extend_from_slice(frame);
+    record.extend_from_slice(&wal_digest(&key, frame.len() as u64, frame));
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| DbError::Io(e.to_string()))?;
-    f.write_all(&(frame.len() as u64).to_le_bytes())
+    f.write_all(&record)
         .map_err(|e| DbError::Io(e.to_string()))?;
-    f.write_all(frame).map_err(|e| DbError::Io(e.to_string()))?;
-    f.sync_all().map_err(|e| DbError::Io(e.to_string()))
+    f.sync_all().map_err(|e| DbError::Io(e.to_string()))?;
+    if existing == 0 {
+        // A new file is a new directory entry.
+        sync_parent_dir(path)?;
+    }
+    Ok(())
 }
 
 /// Type-erased view of a `Table<T>` so the database can drive the shared
@@ -110,6 +331,7 @@ trait AbstractTable: Send + Sync {
     fn type_id_num(&self) -> u16;
     fn type_name(&self) -> &'static str;
     fn pack_into(&self, out: &mut Vec<u8>);
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError>;
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn pack_delta(&self, out: &mut Vec<u8>);
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
@@ -155,6 +377,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn pack_into(&self, out: &mut Vec<u8>) {
         Table::pack_into(self, out)
+    }
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        Table::pack_canonical_into(self, out)
     }
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         Table::load_from(self, bytes)
@@ -392,6 +617,28 @@ impl Db {
     /// leaves the previous checkpoint intact. Marks the tables flushed, so a
     /// following [`Db::flush_delta`] only records changes made after this.
     pub fn checkpoint(&mut self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        self.write_checkpoint(path.as_ref(), false)?;
+        for table in &mut self.tables {
+            table.mark_flushed();
+        }
+        Ok(())
+    }
+
+    /// Writes the same checkpoint as [`Db::checkpoint`] but leaves the flush
+    /// bookkeeping alone. Use it to export state (a snapshot for a peer, a hash)
+    /// from a database whose write-ahead log is live: marking the tables flushed
+    /// there would make the next [`Db::flush_delta`] skip every change made
+    /// before the export.
+    ///
+    /// The bytes are canonical: the same state gives the same file whatever the
+    /// history that built it (see `Table::pack_canonical_into`). A node's own
+    /// checkpoint ([`Db::checkpoint`]) is not, on purpose: the log that follows
+    /// it is written in terms of the live layout.
+    pub fn checkpoint_unmarked(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
+        self.write_checkpoint(path.as_ref(), true)
+    }
+
+    fn write_checkpoint(&self, path: &Path, canonical: bool) -> Result<(), DbError> {
         let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
         ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
 
@@ -404,15 +651,15 @@ impl Db {
             let len_at = out.len();
             out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
             let start = out.len();
-            table.pack_into(&mut out);
+            if canonical {
+                table.pack_canonical_into(&mut out)?;
+            } else {
+                table.pack_into(&mut out);
+            }
             let len = (out.len() - start) as u64;
             out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
         }
-        write_atomic(path.as_ref(), &out)?;
-        for table in &mut self.tables {
-            table.mark_flushed();
-        }
-        Ok(())
+        write_atomic(path, &out)
     }
 
     /// Back-compat alias for [`Db::checkpoint`].
@@ -486,22 +733,13 @@ impl Db {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(DbError::Io(e.to_string())),
         };
-        let mut pos = 0usize;
+        let scan = scan_wal(&data)?;
         let mut last_revision: Option<i64> = None;
-        while pos < data.len() {
-            let Some(frame_len) = try_read_u64(&data, pos) else {
-                break; // torn length prefix
-            };
-            let frame_start = pos + 8;
-            let frame_end = frame_start + frame_len as usize;
-            if frame_end > data.len() {
-                break; // torn frame; stop cleanly
-            }
-            let frame = &data[frame_start..frame_end];
+        for &(start, end) in &scan.records {
+            let frame = &data[start..end];
             self.apply_frame(frame)?;
             let mut fp = 0usize;
             last_revision = Some(read_i64(frame, &mut fp)?);
-            pos = frame_end;
         }
         if let Some(rev) = last_revision {
             for table in &mut self.tables {
@@ -510,6 +748,62 @@ impl Db {
             self.set_revision(rev)?;
         }
         Ok(())
+    }
+
+    /// Replays the write-ahead log at `path` on top of state already loaded
+    /// at `after_revision` (a checkpoint). Frames at or below that revision are
+    /// already in the state and are skipped, so a log that outlived a newer
+    /// checkpoint is harmless. The frames that remain must follow on without a
+    /// gap, one revision at a time: a missing frame means lost changes, and
+    /// applying the later ones over it would build state no node agrees on.
+    ///
+    /// A torn final frame (a crash during the last flush) is ignored. The
+    /// returned `valid_len` is where the last complete frame ends, so the caller
+    /// can cut the file there before appending again; appending after the torn
+    /// bytes would hide every later frame behind a bad length prefix.
+    pub fn replay_log_after(
+        &mut self,
+        path: impl AsRef<Path>,
+        after_revision: i64,
+    ) -> Result<WalReplay, DbError> {
+        let data = match std::fs::read(path.as_ref()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WalReplay::default());
+            }
+            Err(e) => return Err(DbError::Io(e.to_string())),
+        };
+        let scan = scan_wal(&data)?;
+        let mut outcome = WalReplay::default();
+        let mut last_revision = after_revision;
+        let mut applied_any = false;
+        for &(start, end) in &scan.records {
+            let frame = &data[start..end];
+            let mut fp = 0usize;
+            let revision = read_i64(frame, &mut fp)?;
+            if revision <= after_revision {
+                outcome.frames_skipped += 1;
+                continue;
+            }
+            if revision != last_revision + 1 {
+                return Err(DbError::Corrupted(format!(
+                    "write-ahead log jumps from revision {last_revision} to {revision}"
+                )));
+            }
+            self.apply_frame(frame)?;
+            last_revision = revision;
+            applied_any = true;
+            outcome.frames_applied += 1;
+        }
+        if applied_any {
+            for table in &mut self.tables {
+                table.mark_flushed();
+            }
+            self.set_revision(last_revision)?;
+        }
+        outcome.valid_len = scan.valid_len as u64;
+        outcome.torn_tail = scan.torn_tail;
+        Ok(outcome)
     }
 
     fn apply_frame(&mut self, frame: &[u8]) -> Result<(), DbError> {
@@ -558,6 +852,26 @@ impl Db {
             self.tables[pos].hash_state(&mut hasher);
         }
         hasher.finalize().into()
+    }
+
+    /// The state hash of each table on its own, as `(type name, root)`, in the
+    /// order [`Db::state_root`] combines them. When two nodes' roots differ this
+    /// says which table to look in.
+    pub fn table_roots(&self) -> Vec<(&'static str, [u8; 32])> {
+        use sha2::{
+            Digest,
+            Sha256,
+        };
+        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
+        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
+        ordered
+            .into_iter()
+            .map(|pos| {
+                let mut hasher = Sha256::new();
+                self.tables[pos].hash_state(&mut hasher);
+                (self.tables[pos].type_name(), hasher.finalize().into())
+            })
+            .collect()
     }
 
     /// Rows per table as `(count, type name)`, sorted like chainbase

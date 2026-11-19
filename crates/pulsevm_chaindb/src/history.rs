@@ -50,7 +50,7 @@ use super::{
 /// consensus constant the arena does not store because it never changes on this
 /// chain. Only `global_property` (block-2 full snapshot, or a `setparams`
 /// delta) serializes it. Verified against the golden's block-2 slice.
-const WASM_CONFIG: [u32; 11] = [
+pub const WASM_CONFIG: [u32; 11] = [
     1024,     // max_mutable_global_bytes
     1024,     // max_table_elements
     8192,     // max_section_elements
@@ -69,9 +69,18 @@ const WASM_CONFIG: [u32; 11] = [
 /// params intrinsic never sets it), so it is sourced as the fixed constant.
 const MAX_ACTION_RETURN_VALUE_SIZE: u32 = 256;
 
-/// The 16 chain-state tables, in the fixed order `create_deltas.cpp` emits them.
+/// The chain-state tables, in the fixed order `create_deltas.cpp` emits them.
 /// A table appears in the stream only when it has entries for the block.
-const TABLE_ORDER: [&str; 16] = [
+///
+/// Every table collected in `pack_deltas` must be listed here, in Leap's
+/// position. A table that is collected but not listed is silently dropped from
+/// the stream while the state still holds it, which is how
+/// `contract_index_double`, `contract_index_long_double` and
+/// `generated_transaction` each went missing from a restored checkpoint's
+/// export (reported as "no rows on the target"). The packer debug-asserts the
+/// two agree, so the next omission fails every test that exports instead of one
+/// comparison on a real snapshot.
+const TABLE_ORDER: [&str; 19] = [
     "account",
     "account_metadata",
     "code",
@@ -80,7 +89,10 @@ const TABLE_ORDER: [&str; 16] = [
     "contract_index64",
     "contract_index128",
     "contract_index256",
+    "contract_index_double",
+    "contract_index_long_double",
     "global_property",
+    "generated_transaction",
     "protocol_state",
     "permission",
     "permission_link",
@@ -885,6 +897,11 @@ pub(crate) fn pack_deltas(db: &Db, full_snapshot: bool, chain_id: &[u8; 32]) -> 
         }),
     );
 
+    debug_assert!(
+        per_table.len() == TABLE_ORDER.len()
+            && TABLE_ORDER.iter().all(|name| per_table.contains_key(name)),
+        "TABLE_ORDER and the collected tables disagree: a collected table would be dropped from the exported state"
+    );
     let num_tables = TABLE_ORDER
         .iter()
         .filter(|name| !per_table[**name].is_empty())

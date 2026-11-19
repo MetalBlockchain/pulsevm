@@ -434,20 +434,38 @@ pub fn record_block(block_num: u32, timing: BlockTiming) {
 mod tests {
     use super::*;
 
-    struct ProfilingGuard;
+    /// The profile is one process-wide global, and every test below resets and
+    /// reads it, so the tests that enable profiling must not run concurrently:
+    /// in parallel they zero or add to each other's counters (and one failed
+    /// assertion then poisons the lock for the other). The guard holds this
+    /// lock for the whole test.
+    static PROFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ProfilingGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl ProfilingGuard {
         fn enable() -> Self {
-            *PROFILE.lock().unwrap() = ReplayProfile::default();
+            // A previous test's failure poisons the serial lock; the state it
+            // guards is reset below, so recover instead of cascading.
+            let serial = PROFILE_TESTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *PROFILE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = ReplayProfile::default();
             TEST_ENABLED.set(true);
-            Self
+            Self { _serial: serial }
         }
     }
 
     impl Drop for ProfilingGuard {
         fn drop(&mut self) {
             TEST_ENABLED.set(false);
-            *PROFILE.lock().unwrap() = ReplayProfile::default();
+            *PROFILE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = ReplayProfile::default();
         }
     }
 

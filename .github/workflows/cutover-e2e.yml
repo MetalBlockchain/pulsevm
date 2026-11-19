@@ -1,0 +1,219 @@
+name: Cutover end to end
+
+# The whole cutover, on every relevant change and nightly: a three-node Leap
+# chain halts at H under a signed commitment, the state is exported and imported,
+# five PulseVM nodes under MetalGo boot from the checkpoint and build H+1 on H,
+# every pre-halt account reads back identically, and every boundary transaction
+# lands exactly once. Then, on the clean run, validators are killed with kill -9
+# while the chain is busy and brought back, and the five nodes must agree on
+# head AND on state root at every height they share (round 11: a restarted node
+# computed a different root and the chain did not notice).
+#
+# The faults scenario adds what a power cut or a hostile disk leaves behind (see
+# its step below). A real power cut, replayed at every write, is not reproducible
+# on a hosted runner (it needs a recording block device) and stays Paul's check.
+#
+# What it does not cover: the table compare against a real mainnet snapshot, the
+# deferred-transaction sidecar and the mainnet provenance checks (the fixture
+# chain has no deferred activity and no mainnet pins), and a power loss. Those
+# stay manual; see docs/xpr-handover-rehearsal.md.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'docker/handover/**'
+      - 'scripts/run-local.sh'
+      - 'contracts/cutover/**'
+      - 'tools/xpr-chainbase-export/localnet/**'
+      - 'crates/pulsevm/**'
+      - 'crates/pulsevm_core/**'
+      - 'crates/pulsevm_database/**'
+      - 'crates/pulsevm_chaindb/**'
+      - 'crates/pulsevm_arena/**'
+      - 'crates/pulsevm_chain_types/**'
+      - 'Cargo.lock'
+      - '.github/workflows/cutover-e2e.yml'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cutover-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  METALGO_VERSION: v1.14.2-tahoe
+  # metal-network-runner v1.9.0, pinned by commit. The rehearsal needs one change
+  # to it (a node restoring an imported checkpoint can take longer than three
+  # seconds to start); it is carried as a patch in this repository and applied
+  # on top, so nothing outside this repository has to change for CI to pass.
+  RUNNER_COMMIT: 869d8a0cd62dac3a0fd1c503a36bdd6dfabda025
+
+jobs:
+  cutover:
+    name: cutover-${{ matrix.scenario }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [ clean, chaos, faults ]
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      XPR_NODEOS_IMAGE: pulsevm-leap:5.0.3-amd64
+      XPR_PLATFORM: linux/amd64
+      TERMINAL_HEIGHT: '150'
+      HANDOVER_WORK_DIR: /tmp/pulsevm-handover
+      # The nodes log each block's state root, which the agreement check reads.
+      # It hashes all state, so it is opt-in for production nodes.
+      PULSEVM_LOG_LEVEL: debug
+      # The same roots at info level, which MetalGo passes through; the debug
+      # lines above do not reach the per-node logs the check reads.
+      PULSEVM_STATE_ROOT_LOG_EVERY: '1'
+      # One validator is dropped before H+1 in the chaos scenario, so H+1 must
+      # finalize on four of five.
+      CHAOS_KILL_NODE: ${{ matrix.scenario == 'chaos' && '1' || '0' }}
+      # The faults scenario makes a node a few blocks behind and another far
+      # behind within minutes, so the threshold at which a node state-syncs is
+      # lowered from its production default (1024 blocks). Empty elsewhere.
+      PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND: ${{ matrix.scenario == 'faults' && '10' || '' }}
+
+    steps:
+      # The rehearsal refuses to run below 12% free disk (Leap and MetalGo both
+      # misbehave below 10%), and release builds plus the Docker images are large
+      # for a hosted runner. These preinstalled toolchains are not used here.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev python3 jq lsof curl
+
+      - name: Checkout source code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Install Protobuf (protoc)
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-amd64-cutover-e2e-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.10'
+
+      - name: Build the pinned Leap image
+        run: docker build -t "$XPR_NODEOS_IMAGE" -f tools/xpr-chainbase-export/localnet/Dockerfile.leap-amd64 tools/xpr-chainbase-export/localnet
+
+      - name: Check out metalgo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: MetalBlockchain/metalgo
+          ref: ${{ env.METALGO_VERSION }}
+          path: metalgo
+
+      - name: Build metalgo
+        working-directory: metalgo
+        run: ./scripts/build.sh
+
+      - name: Check out metal-network-runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: MetalBlockchain/metal-network-runner
+          ref: ${{ env.RUNNER_COMMIT }}
+          path: metal-network-runner
+
+      - name: Patch and build metal-network-runner
+        working-directory: metal-network-runner
+        run: |
+          git apply "$GITHUB_WORKSPACE/docker/handover/patches/metal-network-runner-startup-timeout.patch"
+          ./scripts/build.sh
+
+      - name: Cutover, halt, import, boot and verify
+        env:
+          METALGO_EXEC_PATH: ${{ github.workspace }}/metalgo/build/metalgo
+          METAL_NETWORK_RUNNER_PATH: ${{ github.workspace }}/metal-network-runner/bin/metal-network-runner
+        run: |
+          set -o pipefail
+          ./docker/handover/run-handover.sh start 2>&1 | tee "$RUNNER_TEMP/handover.log"
+          grep -q '^handover: PASS' "$RUNNER_TEMP/handover.log"
+
+      # Only the clean scenario: the chaos scenario leaves one validator down on
+      # purpose, and this check needs all five.
+      - name: Kill validators under load and require agreement
+        if: ${{ matrix.scenario == 'clean' }}
+        env:
+          METALGO_EXEC_PATH: ${{ github.workspace }}/metalgo/build/metalgo
+          METAL_NETWORK_RUNNER_PATH: ${{ github.workspace }}/metal-network-runner/bin/metal-network-runner
+          RESTART_ROUNDS: '3'
+        run: |
+          set -o pipefail
+          ./docker/handover/run-handover.sh verify-restarts 2>&1 | tee "$RUNNER_TEMP/verify-restarts.log"
+          grep -q '^handover: verify-restarts: PASS' "$RUNNER_TEMP/verify-restarts.log"
+
+      # What a power cut or a hostile disk leaves behind, made on the live
+      # network: zero tails on the three history logs, a zero tail and then a
+      # damaged record in the write-ahead log, the marker of an interrupted
+      # state-sync install, a node state-syncing with transactions pending, and a
+      # node a few blocks behind. Each node has to come back, join, and agree with
+      # the nodes that never stopped (head and state root at every shared height).
+      - name: Damage files, interrupt state sync, sync under load
+        if: ${{ matrix.scenario == 'faults' }}
+        env:
+          METALGO_EXEC_PATH: ${{ github.workspace }}/metalgo/build/metalgo
+          METAL_NETWORK_RUNNER_PATH: ${{ github.workspace }}/metal-network-runner/bin/metal-network-runner
+          RESTART_ROUNDS: '0'
+          VERIFY_FAULTS: '1'
+        run: |
+          set -o pipefail
+          ./docker/handover/run-handover.sh verify-restarts 2>&1 | tee "$RUNNER_TEMP/verify-faults.log"
+          grep -q '^handover: faults: PASS' "$RUNNER_TEMP/verify-faults.log"
+          grep -q '^handover: verify-restarts: PASS' "$RUNNER_TEMP/verify-faults.log"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cp "$RUNNER_TEMP"/*.log "$RUNNER_TEMP/evidence/" 2>/dev/null || true
+          find "$HANDOVER_WORK_DIR" -maxdepth 2 -name '*.log' -exec cp {} "$RUNNER_TEMP/evidence/" \; 2>/dev/null || true
+          find /tmp -maxdepth 4 -path '*node[1-5]/logs/*.log' -exec sh -c 'cp "$1" "$2/$(echo "$1" | tr / _)"' _ {} "$RUNNER_TEMP/evidence" \; 2>/dev/null || true
+          cp "$HANDOVER_WORK_DIR"/*.json "$RUNNER_TEMP/evidence/" 2>/dev/null || true
+          docker ps -a > "$RUNNER_TEMP/evidence/docker-ps.txt" 2>&1 || true
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cutover-${{ matrix.scenario }}-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop the networks
+        if: always()
+        run: ./docker/handover/run-handover.sh stop || true

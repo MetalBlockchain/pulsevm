@@ -9,6 +9,7 @@ use crate::{
             PermissionLevel,
         },
         authorization_manager::AuthorizationManager,
+        protocol_features::ProtocolFeature,
         pulse_contract::pulse_contract_types::{
             DeleteAuth,
             LinkAuth,
@@ -150,6 +151,23 @@ pub fn newaccount(
     Ok(())
 }
 
+/// Whether `setcode` accepts a module with a WASM start section in this block.
+///
+/// Only under [`ProtocolFeature::WasmStartSections`] (protocol version 2). Before
+/// that version a start section is refused; blocks before the activation height
+/// keep that rule because they already ran under it.
+pub(crate) fn start_sections_allowed(context: &ApplyContext) -> Result<bool, ChainError> {
+    if context.protocol_feature_enabled(ProtocolFeature::WasmStartSections) {
+        #[cfg(feature = "protocol_feature_wasm_start_sections")]
+        return Ok(true);
+        #[cfg(not(feature = "protocol_feature_wasm_start_sections"))]
+        return Err(ChainError::BlockError(
+            "WASM start sections were not compiled into this binary".into(),
+        ));
+    }
+    Ok(false)
+}
+
 pub fn setcode(
     context: &mut ApplyContext,
     db: &mut Database,
@@ -185,6 +203,8 @@ pub fn setcode(
                 act.code.as_slice(),
                 maximum_section_elements,
             )
+        } else if start_sections_allowed(context)? {
+            pulsevm_wasm_validation::validate_wasm_allowing_start_section(act.code.as_slice())
         } else {
             pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
         };

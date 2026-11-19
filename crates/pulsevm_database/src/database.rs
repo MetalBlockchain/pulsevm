@@ -887,12 +887,24 @@ pub use speculation::{
     SpeculativeWave,
 };
 
+/// Result of replaying the write-ahead log when a database was opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalRecovery {
+    /// Accepted blocks reapplied on top of the checkpoint.
+    pub blocks_recovered: usize,
+    /// The log ended in a partial record, which was discarded.
+    pub torn_tail_discarded: bool,
+}
+
 #[derive(Clone)]
 pub struct Database {
     /// The directory the arena persists into, kept so snapshots can checkpoint
     /// and restore at the same path without threading the config back down from
     /// the controller.
     path: String,
+    /// What opening this directory had to repair after an unclean stop, for the
+    /// controller to report. Zero for a clean open.
+    wal_recovery: WalRecovery,
     /// The pure-Rust arena (pulsevm_chaindb). The sole state backend, shared
     /// across clones so every apply/transaction context reaches the same handle.
     backend: crate::backend::ChainDatabase,
@@ -1000,6 +1012,13 @@ const SHARED_MEMORY_FILE: &str = "arena_snapshot.bin";
 /// survives a restart (including a state-synced node, whose block log does not
 /// start at genesis).
 const ARENA_STATE_FILE: &str = "arena_state.bin";
+/// Changes since the last checkpoint, one framed record per accepted block. A
+/// clean shutdown folds them into the checkpoint; a crash is recovered by
+/// replaying them onto it.
+const ARENA_WAL_FILE: &str = "arena_wal.bin";
+/// Past this size the next flush writes a new checkpoint instead, so the log
+/// (and the replay after a crash) stays bounded.
+pub const DEFAULT_ARENA_WAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const ARENA_METADATA_FILE: &str = "arena_metadata.json";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1065,10 +1084,15 @@ impl Database {
         // restart, or a state-synced node). A fresh directory starts empty and the
         // controller authors genesis.
         let state_file = Path::new(path).join(ARENA_STATE_FILE);
+        let mut wal_recovery = WalRecovery::default();
         if state_file.exists() {
             backend
                 .reload_from(&state_file)
                 .map_err(|e| format!("arena reload {}: {e:?}", state_file.display()))?;
+            // A node that was killed has a log of the blocks accepted since
+            // the checkpoint. Without a checkpoint to apply it to, a log is
+            // meaningless, so it is only read next to one.
+            wal_recovery = Self::recover_wal(&backend, Path::new(path))?;
         }
         let protocol_records = match fs::read(Path::new(path).join(PROTOCOL_RECORDS_FILE)) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1078,6 +1102,7 @@ impl Database {
         };
         Ok(Database {
             path: path.to_string(),
+            wal_recovery,
             backend,
             system_accounts,
             native_system_contract: metadata
@@ -1095,6 +1120,97 @@ impl Database {
             xpr_native_sequences: Arc::new(Mutex::new(XprNativeSequenceCache::default())),
             ram_usage_monitor: Arc::new(RamUsageMonitor::default()),
         })
+    }
+
+    /// Replay the write-ahead log onto the checkpoint just loaded and cut off a
+    /// torn final frame so later appends land on a clean boundary.
+    fn recover_wal(
+        backend: &crate::backend::ChainDatabase,
+        dir: &Path,
+    ) -> Result<WalRecovery, String> {
+        let wal = dir.join(ARENA_WAL_FILE);
+        let replay = backend
+            .replay_log_after(&wal, backend.revision())
+            .map_err(|e| format!("arena write-ahead log {}: {e:?}", wal.display()))?;
+        if replay.torn_tail {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .map_err(|e| format!("open {} to trim: {e}", wal.display()))?;
+            file.set_len(replay.valid_len)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("trim {}: {e}", wal.display()))?;
+        }
+        Ok(WalRecovery {
+            blocks_recovered: replay.frames_applied,
+            torn_tail_discarded: replay.torn_tail,
+        })
+    }
+
+    pub fn wal_recovery(&self) -> WalRecovery {
+        self.wal_recovery
+    }
+
+    fn wal_file(&self) -> Option<std::path::PathBuf> {
+        (!self.path.is_empty()).then(|| Path::new(&self.path).join(ARENA_WAL_FILE))
+    }
+
+    /// Remove the log. Only valid right after the checkpoint file was replaced
+    /// by one that already contains everything the log held (or that replaces
+    /// it wholesale, as state sync does): a log left behind would be replayed
+    /// onto a state it does not follow.
+    fn discard_wal(&self) -> Result<(), ChainError> {
+        let Some(wal) = self.wal_file() else {
+            return Ok(());
+        };
+        match fs::remove_file(&wal) {
+            // The unlink is only durable once the directory is. Before that a
+            // power loss can bring the log back next to a checkpoint that
+            // already covers it, which replay tolerates, but it should not be
+            // left to chance.
+            Ok(()) => pulsevm_arena::sync_parent_dir(&wal).map_err(|e| {
+                ChainError::InternalError(format!("sync after removing the log: {e:?}"))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ChainError::InternalError(format!(
+                "remove {}: {e}",
+                wal.display()
+            ))),
+        }
+    }
+
+    /// Make the committed arena durable: the checkpoint file, then drop the
+    /// log it supersedes. A crash between the two leaves a log of frames the
+    /// checkpoint already covers, which recovery skips by revision.
+    pub fn checkpoint_to_disk(&self) -> Result<(), ChainError> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir)
+            .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
+        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
+            .map_err(ChainError::InternalError)?;
+        self.backend
+            .checkpoint(&dir.join(ARENA_STATE_FILE))
+            .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))?;
+        self.discard_wal()
+    }
+
+    /// Append what the last accepted block changed to the log and fsync it, so
+    /// a kill right after leaves the node able to restart at this block. Once
+    /// the log grows past `max_wal_bytes`, write a new checkpoint instead.
+    /// Call with no open undo session: the delta is cut from live state.
+    /// A database with no directory (unit tests) has nothing to make durable.
+    pub fn arena_flush_wal(&self, max_wal_bytes: u64) -> Result<(), ChainError> {
+        let Some(wal) = self.wal_file() else {
+            return Ok(());
+        };
+        let size = fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        if size >= max_wal_bytes {
+            return self.checkpoint_to_disk();
+        }
+        self.arena_flush_delta(&wal)
     }
 
     /// Clone this database handle with an isolated dependency recorder.
@@ -1343,8 +1459,13 @@ impl Database {
         .map_err(|e| format!("serialize database metadata: {e}"))?;
         let tmp = dir.join(format!("{ARENA_METADATA_FILE}.tmp"));
         fs::write(&tmp, metadata).map_err(|e| format!("write database metadata: {e}"))?;
-        fs::rename(&tmp, dir.join(ARENA_METADATA_FILE))
-            .map_err(|e| format!("install database metadata: {e}"))?;
+        fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| format!("sync database metadata: {e}"))?;
+        let installed = dir.join(ARENA_METADATA_FILE);
+        fs::rename(&tmp, &installed).map_err(|e| format!("install database metadata: {e}"))?;
+        pulsevm_arena::sync_parent_dir(&installed)
+            .map_err(|e| format!("sync database metadata directory: {e:?}"))?;
         Ok(())
     }
 
@@ -1366,10 +1487,16 @@ impl Database {
         fs::write(staged.path(), encoded)
             .map_err(|e| ChainError::InternalError(format!("protocol records: write: {e}")))?;
         staged
-            .persist(dir.join(PROTOCOL_RECORDS_FILE))
-            .map_err(|e| {
-                ChainError::InternalError(format!("protocol records: install: {}", e.error))
-            })?;
+            .as_file()
+            .sync_all()
+            .map_err(|e| ChainError::InternalError(format!("protocol records: sync: {e}")))?;
+        let installed = dir.join(PROTOCOL_RECORDS_FILE);
+        staged.persist(&installed).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: install: {}", e.error))
+        })?;
+        pulsevm_arena::sync_parent_dir(&installed).map_err(|e| {
+            ChainError::InternalError(format!("protocol records: sync directory: {e:?}"))
+        })?;
         Ok(())
     }
 
@@ -2347,6 +2474,17 @@ impl Database {
         Some(self.backend.state_root())
     }
 
+    /// The tables whose state differs between two databases, by name. Empty when
+    /// the roots agree. For a failing comparison to say where to look.
+    pub fn arena_tables_differing_from(&self, other: &Database) -> Vec<&'static str> {
+        let (ours, theirs) = (self.backend.table_roots(), other.backend.table_roots());
+        ours.iter()
+            .zip(theirs.iter())
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.0)
+            .collect()
+    }
+
     /// Canonical bytes used by the differential replay/fingerprint tools.
     /// The order and names are part of the report format; do not derive them
     /// from hash-map iteration.
@@ -2627,17 +2765,7 @@ impl Database {
         // Persist the committed arena to disk so the next open reloads it, matching
         // chainbase's mapped `shared_memory.bin`. The directory may not exist yet
         // for a never-opened default database, so create it first.
-        if self.path.is_empty() {
-            return Ok(());
-        }
-        let dir = Path::new(&self.path);
-        fs::create_dir_all(dir)
-            .map_err(|e| ChainError::InternalError(format!("close: create {}: {e}", self.path)))?;
-        self.persist_database_metadata(self.system_accounts().system, self.native_system_contract)
-            .map_err(ChainError::InternalError)?;
-        self.backend
-            .checkpoint(&dir.join(ARENA_STATE_FILE))
-            .map_err(|e| ChainError::InternalError(format!("close: checkpoint: {e:?}")))
+        self.checkpoint_to_disk()
     }
 
     /// Capture a snapshot of the committed arena state, wrapped in the transport
@@ -2654,12 +2782,82 @@ impl Database {
             ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
         })?;
         let file = dir.join(SHARED_MEMORY_FILE);
+        // Export only: the write-ahead log must still see every change made
+        // before this call, so the flush bookkeeping stays as it is.
         self.backend
-            .checkpoint(&file)
+            .checkpoint_unmarked(&file)
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
         let snapshot = Self::read_sparse_snapshot(&file, revision);
         let _ = fs::remove_file(&file);
         snapshot
+    }
+
+    /// The sha256 of the checkpoint file `snapshot_bytes` would produce,
+    /// computed as a stream: the arena is read twice in fixed chunks (once for
+    /// the payload hash the envelope header carries, once to hash header and
+    /// payload together) and the sparse payload is never held in memory. On
+    /// mainnet-size state the in-memory snapshot is many gigabytes, which a
+    /// restart check should not need.
+    pub fn snapshot_sha256(&self) -> Result<[u8; 32], ChainError> {
+        let revision = self.backend.revision();
+        let dir = Path::new(&self.path);
+        fs::create_dir_all(dir).map_err(|e| {
+            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
+        })?;
+        let file = dir.join(SHARED_MEMORY_FILE);
+        // Export only: the write-ahead log must still see every change made
+        // before this call, so the flush bookkeeping stays as it is.
+        self.backend
+            .checkpoint_unmarked(&file)
+            .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
+        let result = Self::stream_snapshot_sha256(&file, revision);
+        let _ = fs::remove_file(&file);
+        result
+    }
+
+    fn stream_snapshot_sha256(file: &Path, revision: i64) -> Result<[u8; 32], ChainError> {
+        // Feed the sparse payload of `file` to `sink`, chunk by chunk. Runs do
+        // not merge across chunks, so a fresh scratch buffer per chunk yields
+        // exactly the bytes `read_sparse_snapshot` would append.
+        fn stream_payload(file: &Path, mut sink: impl FnMut(&[u8])) -> Result<u64, ChainError> {
+            let mut f = fs::File::open(file).map_err(|e| {
+                ChainError::InternalError(format!("snapshot: open {}: {e}", file.display()))
+            })?;
+            let len = f
+                .metadata()
+                .map_err(|e| ChainError::InternalError(format!("snapshot: stat: {e}")))?
+                .len();
+            let begin = crate::snapshot::sparse_begin(len);
+            sink(&begin);
+            let mut total = begin.len() as u64;
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut scratch = Vec::new();
+            let mut offset = 0u64;
+            loop {
+                let n = fill(&mut f, &mut buf)
+                    .map_err(|e| ChainError::InternalError(format!("snapshot: read: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                scratch.clear();
+                crate::snapshot::sparse_append(&mut scratch, offset, &buf[..n]);
+                sink(&scratch);
+                total += scratch.len() as u64;
+                offset += n as u64;
+            }
+            Ok(total)
+        }
+        let mut payload_hasher = Sha256::new();
+        let payload_len = stream_payload(file, |bytes| payload_hasher.update(bytes))?;
+        let payload_sha: [u8; 32] = payload_hasher.finalize().into();
+        let mut whole = Sha256::new();
+        whole.update(crate::snapshot::encode_header(
+            revision,
+            payload_len,
+            &payload_sha,
+        ));
+        stream_payload(file, |bytes| whole.update(bytes))?;
+        Ok(whole.finalize().into())
     }
 
     /// Read `shared_memory.bin` into a sparse, envelope-wrapped snapshot without
@@ -2746,6 +2944,8 @@ impl Database {
         staged.persist(&dest).map_err(|e| {
             ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
         })?;
+        // The restored state replaces everything, including what the log held.
+        self.discard_wal()?;
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
@@ -2756,9 +2956,26 @@ impl Database {
     /// Replace the live arena from a snapshot envelope on disk. The envelope
     /// and sparse payload are streamed into a staged chainbase file, avoiding
     /// a second multi-gigabyte `Vec<u8>` during migration startup.
+    /// Where the durable arena state lives inside a database directory.
+    pub fn arena_state_file(dir: &Path) -> std::path::PathBuf {
+        dir.join(ARENA_STATE_FILE)
+    }
+
     pub fn restore_from_path(
         &self,
         snapshot_path: &Path,
+    ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
+        self.restore_from_path_checked(snapshot_path, None)
+    }
+
+    /// Restore a checkpoint and, when `expected_file_sha256` is given, require
+    /// the sha256 of the whole file to equal it. The hash is taken over the
+    /// very bytes this call reads and stages, so a file swapped between an
+    /// earlier hash of the path and this restore cannot be installed.
+    pub fn restore_from_path_checked(
+        &self,
+        snapshot_path: &Path,
+        expected_file_sha256: Option<&[u8; 32]>,
     ) -> Result<crate::snapshot::SnapshotHeader, ChainError> {
         let dir = Path::new(&self.path);
         fs::create_dir_all(dir).map_err(|e| {
@@ -2795,7 +3012,13 @@ impl Database {
             )));
         }
 
-        let staged = Self::stage_snapshot_stream(&mut input, header, dir)?;
+        let staged = Self::stage_snapshot_stream(
+            &mut input,
+            header,
+            &header_bytes,
+            expected_file_sha256,
+            dir,
+        )?;
         let candidate = crate::backend::ChainDatabase::new()
             .map_err(|e| ChainError::InternalError(format!("restore: arena init: {e:?}")))?;
         candidate
@@ -2812,6 +3035,8 @@ impl Database {
         staged.persist(&dest).map_err(|e| {
             ChainError::InternalError(format!("restore: install {}: {}", dest.display(), e.error))
         })?;
+        // The restored state replaces everything, including what the log held.
+        self.discard_wal()?;
         self.backend
             .reload_from(&dest)
             .map_err(|e| ChainError::InternalError(format!("restore: reload: {e:?}")))?;
@@ -2859,18 +3084,24 @@ impl Database {
     fn stage_snapshot_stream(
         input: &mut fs::File,
         header: crate::snapshot::SnapshotHeader,
+        header_bytes: &[u8],
+        expected_file_sha256: Option<&[u8; 32]>,
         dir: &Path,
     ) -> Result<tempfile::NamedTempFile, ChainError> {
         let staged = tempfile::NamedTempFile::new_in(dir)
             .map_err(|e| ChainError::InternalError(format!("restore: stage: {e}")))?;
         let mut output = staged.as_file();
         let mut hasher = Sha256::new();
+        // Whole-file hash: the envelope header followed by every payload byte.
+        let mut file_hasher = Sha256::new();
+        file_hasher.update(header_bytes);
         let mut payload_read = 0u64;
         let mut read_payload = |buf: &mut [u8], payload_read: &mut u64| -> Result<(), ChainError> {
             input.read_exact(buf).map_err(|e| {
                 ChainError::InternalError(format!("restore: read sparse payload: {e}"))
             })?;
             hasher.update(&*buf);
+            file_hasher.update(&*buf);
             *payload_read = (*payload_read)
                 .checked_add(buf.len() as u64)
                 .ok_or_else(|| {
@@ -2935,6 +3166,14 @@ impl Database {
         if hasher.finalize().as_slice() != header.payload_sha256 {
             return Err(ChainError::InternalError(
                 "restore: snapshot payload checksum mismatch".into(),
+            ));
+        }
+        if let Some(expected) = expected_file_sha256
+            && file_hasher.finalize().as_slice() != expected
+        {
+            return Err(ChainError::InternalError(
+                "restore: checkpoint file changed after it was verified (whole-file hash mismatch)"
+                    .into(),
             ));
         }
         output
@@ -7313,6 +7552,59 @@ mod tests {
     }
 
     #[test]
+    fn streamed_snapshot_hash_equals_the_hash_of_the_snapshot_bytes() {
+        let dir = TempDir::new().unwrap();
+        let mut database = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        database.add_indices().unwrap();
+        database.set_revision(11).unwrap();
+        for name in ["alice", "bob", "carol", "dave"] {
+            database.create_account(name_u64(name), 1).unwrap();
+        }
+        let bytes = database.snapshot_bytes().unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
+        // Stable across repeated calls on unchanged state.
+        assert_eq!(database.snapshot_sha256().unwrap(), expected);
+    }
+
+    #[test]
+    fn restore_checks_the_whole_file_hash_of_the_bytes_it_installs() {
+        let src = TempDir::new().unwrap();
+        let mut source = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        source.add_indices().unwrap();
+        source.set_revision(4).unwrap();
+        let alice = name_u64("alice");
+        source.create_account(alice, 1).unwrap();
+        let snapshot = source.snapshot_bytes().unwrap();
+        let checkpoint = src.path().join("migration.snapshot");
+        fs::write(&checkpoint, &snapshot).unwrap();
+        let file_sha: [u8; 32] = Sha256::digest(&snapshot).into();
+
+        // The right hash installs.
+        let ok_dir = TempDir::new().unwrap();
+        let mut ok = Database::new(ok_dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        ok.add_indices().unwrap();
+        ok.restore_from_path_checked(&checkpoint, Some(&file_sha))
+            .unwrap();
+        assert!(ok.arena_account_exists(alice));
+
+        // A different expected hash (the file was swapped after it was hashed
+        // on its path) installs nothing, and the live state is untouched.
+        let bad_dir = TempDir::new().unwrap();
+        let mut bad = Database::new(bad_dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        bad.add_indices().unwrap();
+        bad.set_revision(9).unwrap();
+        let wrong = [0xAB; 32];
+        let error = bad
+            .restore_from_path_checked(&checkpoint, Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("whole-file hash mismatch"), "{error}");
+        assert_eq!(bad.revision(), 9);
+        assert!(!bad.arena_account_exists(alice));
+    }
+
+    #[test]
     fn restore_from_bytes_rejects_corrupt_without_disturbing_db() {
         let src = TempDir::new().unwrap();
         let mut a = Database::new(src.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
@@ -8101,6 +8393,7 @@ impl Default for Database {
     fn default() -> Self {
         Self {
             path: String::new(),
+            wal_recovery: WalRecovery::default(),
             backend: crate::backend::ChainDatabase::new().expect("arena init"),
             system_accounts: Arc::new(OnceLock::from(SystemAccountNames::default())),
             native_system_contract: true,
