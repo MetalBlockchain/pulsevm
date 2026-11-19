@@ -777,7 +777,7 @@ heights and why the first was refused.
 verify-restarts`) runs on the live five-node network: zero tails on the three
 history logs, a zero tail and then a flipped record in the write-ahead log (refused by
 name, file left alone, then put back), the install marker, a node state-syncing with
-transactions pending, and a node a few blocks behind; each must rejoin and agree
+transactions pending (the stall only happens if MetalGo offers a summary ahead of the node, which a test cannot force: the stage says in its log whether a sync ran, and the unit tests of `next_engine_event` are what fail without the fix), and a node a few blocks behind; each must rejoin and agree
 with the nodes that never stopped, at all five nodes' roots. A real power cut
 replayed at every write needs a recording block device and is not reproducible on a
 hosted runner; Paul's box remains that check.
