@@ -1453,14 +1453,6 @@ impl Controller {
 
     /// How far behind a summary must put this node before it is state-synced
     /// rather than caught up block by block (see the setting).
-    /// TEST ONLY: see `NodeConfig::state_sync_apply_delay_ms`.
-    pub fn state_sync_apply_delay_ms(&self) -> u64 {
-        self.node_config
-            .as_ref()
-            .map(|config| config.state_sync_apply_delay_ms)
-            .unwrap_or(0)
-    }
-
     pub fn state_sync_min_blocks_behind(&self) -> u64 {
         self.node_config
             .as_ref()

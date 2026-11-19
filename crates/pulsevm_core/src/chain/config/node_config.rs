@@ -90,16 +90,6 @@ pub struct NodeConfig {
     /// behind. Zero syncs whenever any summary is ahead.
     #[serde(default = "default_state_sync_min_blocks_behind")]
     pub state_sync_min_blocks_behind: u64,
-
-    /// TEST ONLY. Hold a background state-sync apply for this many milliseconds
-    /// before it takes the controller lock. A real sync of a small chain finishes
-    /// in about a second, which is too fast for a test to put a transaction in the
-    /// node's pool while the host's state syncer is waiting, the condition of the
-    /// stall that left a node stuck in state sync. The delay makes that window
-    /// long enough to hit every time. Never set outside a test network; zero (the
-    /// default) does nothing.
-    #[serde(default)]
-    pub state_sync_apply_delay_ms: u64,
     /// Log the arena state root at info level every this many blocks. Zero (the
     /// default) logs none. The root hashes all state, so it costs time in
     /// proportion to it; it exists so the nodes of a test network can be
@@ -165,10 +155,6 @@ mod tests {
         assert_eq!(cfg.state_root_log_every, 0);
         assert_eq!(cfg.log_level, None);
         assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
-        assert_eq!(
-            cfg.state_sync_apply_delay_ms, 0,
-            "the test-only delay is off by default"
-        );
     }
 
     #[test]

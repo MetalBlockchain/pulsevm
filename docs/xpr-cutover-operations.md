@@ -772,12 +772,6 @@ level would hide a real failure among them. The first refusal in a ten-second wi
 is logged in full; the rest are counted into one summary with how many, over which
 heights and why the first was refused.
 
-**A test-only delay.** `state_sync_apply_delay_ms` (default 0, chain config) holds a
-background state-sync apply before it takes the controller lock. A real sync of a
-small chain takes about a second, too fast for a test to put a transaction in the
-node's pool while the host's state syncer waits, which is the condition of the
-stall. The `faults` scenario sets it to 20 s. It must not be set on a real network.
-
 **How this is checked end to end.** The `faults` scenario of
 `.github/workflows/cutover-e2e.yml` (`VERIFY_FAULTS=1 run-handover.sh
 verify-restarts`) runs on the live five-node network: zero tails on the three

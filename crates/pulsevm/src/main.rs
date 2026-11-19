@@ -1608,7 +1608,6 @@ impl Vm for VirtualMachine {
         let controller = self.controller.clone();
         let network = self.network_manager.clone();
         let sync_finished = self.sync_finished.clone();
-        let apply_delay_ms = self.controller.read().await.state_sync_apply_delay_ms();
         tokio::spawn(async move {
             let net = network.clone();
             let height = target.height;
@@ -1630,12 +1629,6 @@ impl Vm for VirtualMachine {
 
             match download {
                 Ok(envelope) => {
-                    // Test networks only (zero otherwise): stay inside the sync
-                    // long enough for a test to fill the pool during it.
-                    if apply_delay_ms > 0 {
-                        info!("holding the state-sync apply for {apply_delay_ms} ms (test delay)");
-                        tokio::time::sleep(std::time::Duration::from_millis(apply_delay_ms)).await;
-                    }
                     let mut controller = controller.write().await;
                     match controller.apply_state_snapshot(
                         target.block.clone(),

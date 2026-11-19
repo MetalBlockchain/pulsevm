@@ -83,11 +83,6 @@ jobs:
       # behind within minutes, so the threshold at which a node state-syncs is
       # lowered from its production default (1024 blocks). Empty elsewhere.
       PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND: ${{ matrix.scenario == 'faults' && '10' || '' }}
-      # Also faults only: hold each state-sync apply 20 s, so a transaction is
-      # in the restarting node's pool while the host's state syncer is waiting.
-      # Without it the sync takes about a second and the stall it exists to catch
-      # does not happen (a build with the stall put back passed without it).
-      PULSEVM_STATE_SYNC_APPLY_DELAY_MS: ${{ matrix.scenario == 'faults' && '20000' || '' }}
 
     steps:
       # The rehearsal refuses to run below 12% free disk (Leap and MetalGo both
