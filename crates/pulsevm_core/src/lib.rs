@@ -8,5 +8,7 @@ pub use pulsevm_database::{
     RamUsageMonitorSnapshot,
     RamUsageSeriesKey,
     RamUsageSeriesSnapshot,
+    STATE_HASH_FORMAT,
+    WAL_FORMAT,
 };
 pub use pulsevm_name::Name;

@@ -80,7 +80,9 @@ pub use crate::{
     snapshot::{
         SNAPSHOT_VERSION,
         SnapshotHeader,
+        decode as decode_snapshot,
         peek_header as peek_snapshot_header,
+        sparse_expand,
     },
     xpr_import::{
         DeferredPolicy,
@@ -127,6 +129,10 @@ pub use crate::{
         verify_migration_memo_names,
         verify_migration_post_chain,
     },
+};
+pub use pulsevm_arena::{
+    STATE_HASH_FORMAT,
+    WAL_FORMAT,
 };
 pub use pulsevm_chaindb::DeferredTransaction;
 // Re-export shared chain value types for the database facade's public API.

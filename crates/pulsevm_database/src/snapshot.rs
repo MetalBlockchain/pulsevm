@@ -150,6 +150,25 @@ pub fn sparse_logical_len(payload: &[u8]) -> Result<u64, ChainError> {
     Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
 }
 
+/// The most a sparse payload's logical length may exceed twice the bytes it
+/// carries. A dense file with a few all-zero blocks is the most a real snapshot
+/// is, so a claim far beyond what was sent is not one.
+const SPARSE_SLACK: u64 = 16 * 1024 * 1024;
+
+/// Whether a payload of `payload_len` bytes may declare a file of `logical_len`.
+/// Without it a header of eight bytes can ask the receiver to create a file of any
+/// size and then read the whole of it back into memory, before the state root is
+/// looked at.
+pub fn check_logical_len(logical_len: u64, payload_len: u64) -> Result<(), ChainError> {
+    let allowed = payload_len.saturating_mul(2).saturating_add(SPARSE_SLACK);
+    if logical_len > allowed {
+        return Err(bad(format!(
+            "sparse: declares a {logical_len}-byte file but carries only {payload_len} bytes (at most {allowed} accepted)"
+        )));
+    }
+    Ok(())
+}
+
 /// Append the non-zero runs of `chunk` — which begins at absolute offset `base`
 /// in the file — to `payload`. `base` must be block-aligned (callers feed
 /// block-aligned chunks except the final short one), so runs from consecutive
@@ -188,6 +207,7 @@ pub fn sparse_expand(
     mut write_run: impl FnMut(u64, &[u8]) -> std::io::Result<()>,
 ) -> Result<u64, ChainError> {
     let logical_len = sparse_logical_len(payload)?;
+    check_logical_len(logical_len, payload.len() as u64)?;
     let mut pos = 8usize;
     let mut previous_end = 0u64;
     while pos < payload.len() {
@@ -228,6 +248,26 @@ pub fn sparse_expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Eight header bytes must not be able to ask the receiver for a file of any
+    // size (which it then creates and reads back into memory).
+    #[test]
+    fn a_sparse_payload_cannot_declare_a_file_far_beyond_what_it_carries() {
+        let hostile = sparse_begin(1 << 40);
+        let error = sparse_expand(&hostile, |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declares a"), "{error}");
+        // A real snapshot: a dense file with a zero block or two is well inside it.
+        let mut payload = sparse_begin(64 * 1024);
+        sparse_append(&mut payload, 0, &[1u8; 4096]);
+        assert!(sparse_expand(&payload, |_, _| Ok(())).is_ok());
+        assert!(
+            check_logical_len(1 << 20, 0).is_ok(),
+            "small files need no data"
+        );
+        assert!(check_logical_len(SPARSE_SLACK + 1, 0).is_err());
+    }
 
     #[test]
     fn round_trips_header_and_payload() {

@@ -3118,6 +3118,7 @@ impl Database {
         let mut logical_len_bytes = [0u8; 8];
         read_payload(&mut logical_len_bytes, &mut payload_read)?;
         let logical_len = u64::from_le_bytes(logical_len_bytes);
+        crate::snapshot::check_logical_len(logical_len, header.payload_len)?;
         let mut previous_end = 0u64;
         while payload_read < header.payload_len {
             let remaining = header.payload_len - payload_read;

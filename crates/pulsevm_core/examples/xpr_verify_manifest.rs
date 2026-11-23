@@ -165,6 +165,13 @@ fn run(
         return fail(format!("checkpoint binding rejected: {error}"));
     }
     println!("checkpoint binding: ok ({})", manifest.checkpoint_sha256);
+    // The node decodes the attached source block and checks it against the
+    // manifest before it trusts anything built on it. This runs the same function:
+    // a verifier that skipped it printed PASS for a bundle the node refuses.
+    if let Err(error) = pulsevm_core::controller::verify_migration_source_block(&manifest) {
+        return fail(format!("source block rejected: {error}"));
+    }
+    println!("source block: id, height, extensions and transaction root agree with the manifest");
 
     let has_commitment = manifest.halt_commitment.is_some();
     let has_pair = manifest.halt_declaration.is_some();
@@ -500,6 +507,12 @@ fn verify_roster_against_checkpoint(
             header.revision, manifest.checkpoint_revision
         ));
     }
+    // The restore gate's own checks of the restored rows, by the same functions.
+    pulsevm_core::controller::verify_restored_deferred_rows(&database)?;
+    pulsevm_core::controller::verify_restored_input_transactions(&database, manifest)?;
+    println!(
+        "restored rows: every deferred transaction decodes to its id; input-transaction count matches"
+    );
     let observed = pulsevm_database::observed_deferred_policy(&database)?;
     println!(
         "{}",

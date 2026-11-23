@@ -20,6 +20,7 @@ mod table;
 pub use db::{
     Db,
     DbError,
+    WAL_FORMAT,
     WalReplay,
     sync_parent_dir,
 };
@@ -37,6 +38,7 @@ pub use object::{
 pub use table::{
     HashIndexView,
     IndexView,
+    STATE_HASH_FORMAT,
     Table,
     TableError,
     UndoSessionChanges,

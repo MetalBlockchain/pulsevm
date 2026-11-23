@@ -789,3 +789,12 @@ fn a_zero_header_followed_by_data_is_still_not_an_empty_log() {
     std::fs::write(&wal, data).unwrap();
     assert!(recover(&snap, &wal).is_err());
 }
+
+// The format name `getInfo` reports must be the one a log actually starts with,
+// or a fleet check on it would be checking nothing.
+#[test]
+fn the_reported_wal_format_is_what_a_log_starts_with() {
+    let (_dir, _snap, wal, _db, _ends) = three_block_log();
+    let data = std::fs::read(&wal).unwrap();
+    assert_eq!(&data[..8], pulsevm_arena::WAL_FORMAT.as_bytes());
+}

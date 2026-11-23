@@ -631,6 +631,7 @@ impl RpcServer for RpcService {
             total_net_weight: db.get_total_net_weight()?,
             earliest_available_block_num: 1,
             last_irreversible_block_time: head_block.timestamp().clone(),
+            pulsevm_build: crate::api::BuildInfo::current(),
         })
     }
 

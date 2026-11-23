@@ -32,10 +32,10 @@ use pulsevm_database::{
 
 fn usage() {
     eprintln!(
-        "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json [--contract ACCOUNT] --key WIF [--key WIF...] --out declaration.json"
+        "Usage: xpr_halt_ceremony declare --height H --source-chain HEX --roster roster.json [--contract ACCOUNT] (--key-file PATH | --key WIF)... --out declaration.json"
     );
     eprintln!(
-        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --pause-block-id HEX --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 --key WIF [--key WIF...] [--pause-height P...] --out confirmation.json"
+        "       xpr_halt_ceremony confirm --declaration declaration.json --height H --pause-height P --pause-block-id HEX --block-id HEX --checkpoint HEX --genesis migration-genesis.json --platform-chain-id HEX-or-base58 (--key-file PATH | --key WIF)... [--pause-height P...] --out confirmation.json"
     );
     eprintln!(
         "  --pause-height is each signer's observed frozen head (repeat once per --key, or pass once"
@@ -132,6 +132,34 @@ fn take_value(args: &mut env::ArgsOs, flag: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{flag} needs a value"))
 }
 
+/// Read one private key from a file only its owner can read. The file holds the
+/// key and a newline; anything readable by group or others is refused, as the
+/// voter refuses it, so a key is never exposed through the process list or a
+/// permissive file.
+fn read_key_file(path: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .map_err(|error| format!("read key file {path}: {error}"))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "key file {path} is readable by group or others (mode {:o}): chmod 600 it",
+                mode & 0o777
+            ));
+        }
+    }
+    let text =
+        fs::read_to_string(path).map_err(|error| format!("read key file {path}: {error}"))?;
+    let key = text.trim();
+    if key.is_empty() {
+        return Err(format!("key file {path} is empty"));
+    }
+    Ok(key.to_owned())
+}
+
 fn parse_height(value: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
@@ -156,7 +184,14 @@ impl DeclareRequest {
             } else if arg == "--contract" {
                 contract = Some(take_value(&mut args, "--contract")?);
             } else if arg == "--key" {
+                // A key on the command line is visible to every user of the host
+                // in the process list, and stays in shell history.
+                eprintln!(
+                    "WARNING: --key puts a private key on the command line (visible in `ps` and shell history); use --key-file with an owner-only file"
+                );
                 keys.push(take_value(&mut args, "--key")?);
+            } else if arg == "--key-file" {
+                keys.push(read_key_file(&take_value(&mut args, "--key-file")?)?);
             } else if arg == "--out" {
                 out = Some(take_value(&mut args, "--out")?);
             } else {
@@ -204,7 +239,14 @@ impl ConfirmRequest {
             } else if arg == "--platform-chain-id" {
                 platform_chain_id = Some(take_value(&mut args, "--platform-chain-id")?);
             } else if arg == "--key" {
+                // A key on the command line is visible to every user of the host
+                // in the process list, and stays in shell history.
+                eprintln!(
+                    "WARNING: --key puts a private key on the command line (visible in `ps` and shell history); use --key-file with an owner-only file"
+                );
                 keys.push(take_value(&mut args, "--key")?);
+            } else if arg == "--key-file" {
+                keys.push(read_key_file(&take_value(&mut args, "--key-file")?)?);
             } else if arg == "--out" {
                 out = Some(take_value(&mut args, "--out")?);
             } else {
@@ -330,6 +372,44 @@ fn declare(request: &DeclareRequest) -> Result<String, String> {
     ))
 }
 
+fn genesis_checkpoint_pin(genesis_path: &str) -> Result<String, String> {
+    let bytes = fs::read(genesis_path)
+        .map_err(|error| format!("read migration genesis {genesis_path}: {error}"))?;
+    let genesis = pulsevm_database::GenesisState::from_bytes(&bytes)
+        .map_err(|error| format!("parse migration genesis {genesis_path}: {error}"))?;
+    genesis
+        .migration_checkpoint_sha256
+        .map(hex::encode)
+        .ok_or_else(|| format!("migration genesis {genesis_path} carries no checkpoint pin"))
+}
+
+/// Strict two-thirds of the declared weight, counted once per member: the rule
+/// the restore gate applies, so a confirmation this tool writes is never one
+/// that cannot reach it.
+fn quorum_reached(members: &[HaltDeclarationMember], signers: &[HaltSignature]) -> bool {
+    let mut total: u128 = 0;
+    for member in members {
+        match total.checked_add(member.weight.0) {
+            Some(sum) => total = sum,
+            None => return false,
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut signed: u128 = 0;
+    for signature in signers {
+        if let Some(member) = members.iter().find(|m| m.producer == signature.producer)
+            && seen.insert(member.producer.clone())
+        {
+            // Bounded by `total`, which fit.
+            signed += member.weight.0;
+        }
+    }
+    match (signed.checked_mul(3), total.checked_mul(2)) {
+        (Some(left), Some(right)) => total > 0 && left > right,
+        _ => false,
+    }
+}
+
 fn successor_chain_id(genesis_path: &str) -> Result<String, String> {
     let bytes = fs::read(genesis_path)
         .map_err(|error| format!("read migration genesis {genesis_path}: {error}"))?;
@@ -397,6 +477,16 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
     // The successor id is derived from the migration genesis the new network
     // boots from, so the ceremony can never bind a hand-typed id.
     let new_chain_id = successor_chain_id(&request.genesis)?;
+    // The checkpoint being confirmed must be the one the genesis pins. A mismatch
+    // here is signed, written, and refused only at the restore gate, and the
+    // ceremony has no retry: it is burned. Check it before anyone signs.
+    let pinned = genesis_checkpoint_pin(&request.genesis)?;
+    if !pinned.eq_ignore_ascii_case(request.checkpoint.trim()) {
+        return Err(format!(
+            "--checkpoint {} is not the checkpoint the genesis pins ({pinned}): confirming it would burn the ceremony",
+            request.checkpoint
+        ));
+    }
     // The platform id is the one value the tool takes on trust: it must
     // come from the ceremony config (the MetalGo blockchain id, hex or the
     // base58 log rendering), and the restore gate fails closed if it does
@@ -426,6 +516,12 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
             signature: signing.sign(&digest).to_string(),
         });
     }
+    if !quorum_reached(&declaration.validator_set, &signatures) {
+        return Err(format!(
+            "{} signature(s) do not reach two thirds of the declared weight: refusing to write a confirmation the restore gate cannot accept",
+            signatures.len()
+        ));
+    }
     let confirmation = HaltConfirmation {
         signatures,
         ..template
@@ -439,4 +535,116 @@ fn confirm(request: &ConfirmRequest) -> Result<String, String> {
         confirmation.new_chain_id,
         confirmation.signatures.len()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HaltDeclarationMember,
+        HaltSignature,
+        quorum_reached,
+        read_key_file,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ceremony-key-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_key_file_only_its_owner_can_read_is_accepted() {
+        let dir = scratch("ok");
+        let path = dir.join("key");
+        std::fs::write(
+            &path,
+            "5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_key_file(path.to_str().unwrap()).unwrap(),
+            "5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_others_can_read_is_refused_without_reading_it() {
+        let dir = scratch("open");
+        let path = dir.join("key");
+        std::fs::write(&path, "secret\n").unwrap();
+        for mode in [0o644, 0o640, 0o604] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = read_key_file(path.to_str().unwrap()).unwrap_err();
+            assert!(error.contains("readable by group or others"), "{error}");
+            assert!(!error.contains("secret"), "the key must never be echoed");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_missing_key_file_is_an_error() {
+        let dir = scratch("empty");
+        let path = dir.join("key");
+        std::fs::write(&path, "  \n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            read_key_file(path.to_str().unwrap())
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(read_key_file(dir.join("absent").to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn member(producer: &str, weight: u128) -> HaltDeclarationMember {
+        HaltDeclarationMember {
+            producer: producer.to_owned(),
+            key: String::new(),
+            weight: pulsevm_database::HaltWeight(weight),
+        }
+    }
+
+    fn signed(producer: &str) -> HaltSignature {
+        HaltSignature {
+            producer: producer.to_owned(),
+            key: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    // The gate's rule is a STRICT two thirds, counted once per member.
+    #[test]
+    fn the_quorum_is_strictly_more_than_two_thirds_counted_once_per_member() {
+        let members = vec![member("a", 1), member("b", 1), member("c", 1)];
+        assert!(
+            !quorum_reached(&members, &[signed("a"), signed("b")]),
+            "exactly two thirds is not enough"
+        );
+        assert!(quorum_reached(
+            &members,
+            &[signed("a"), signed("b"), signed("c")]
+        ));
+        assert!(
+            !quorum_reached(&members, &[signed("a"), signed("a"), signed("a")]),
+            "one member three times is one member"
+        );
+        assert!(
+            !quorum_reached(&members, &[signed("x"), signed("y"), signed("z")]),
+            "strangers do not count"
+        );
+        let four = vec![
+            member("a", 1),
+            member("b", 1),
+            member("c", 1),
+            member("d", 1),
+        ];
+        assert!(quorum_reached(
+            &four,
+            &[signed("a"), signed("b"), signed("c")]
+        ));
+        assert!(!quorum_reached(&[], &[]));
+    }
 }

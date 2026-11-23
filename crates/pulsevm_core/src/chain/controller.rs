@@ -1150,6 +1150,64 @@ struct CachedSnapshot {
     envelope: Vec<u8>,
 }
 
+/// Every deferred row in the restored checkpoint must decode and must hash to its
+/// own id. The node runs this at restore; the offline verifier runs the same
+/// function, so a bundle it passes is not one the node refuses for this.
+pub fn verify_restored_deferred_rows(db: &Database) -> Result<(), String> {
+    for deferred in db.arena_deferred_transactions() {
+        let transaction =
+            PackedTransaction::from_deferred_transaction_bytes(Bytes::from(deferred.packed_trx))
+                .map_err(|error| {
+                    format!(
+                        "migration deferred transaction {} cannot be decoded: {error}",
+                        hex::encode(deferred.trx_id)
+                    )
+                })?;
+        if transaction.id().as_bytes() != deferred.trx_id {
+            return Err(format!(
+                "migration deferred transaction {} does not match its packed bytes",
+                hex::encode(deferred.trx_id)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The input-transaction dedupe rows the restored checkpoint holds must be the
+/// number the manifest commits to.
+pub fn verify_restored_input_transactions(
+    db: &Database,
+    manifest: &MigrationManifest,
+) -> Result<(), String> {
+    let imported = db.arena_transaction_count() as u64;
+    if imported != manifest.import_summary.input_transactions {
+        return Err(format!(
+            "migration checkpoint contains {imported} input-transaction dedupe rows but manifest commits to {}",
+            manifest.import_summary.input_transactions
+        ));
+    }
+    Ok(())
+}
+
+/// The attached source block must decode with nothing left over, hash to the
+/// manifest's source block id, sit at the checkpoint's height, carry no block
+/// extensions, and have the transaction root its header claims. The node and the
+/// offline verifier both call this.
+pub fn verify_migration_source_block(manifest: &MigrationManifest) -> Result<(), String> {
+    Controller::migration_source_block(manifest)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Whether the checks that read the migration checkpoint's own rows out of the
+/// arena (the source schedule binding, the memo accounts) apply on this start. They
+/// do while the arena is exactly the checkpoint; once the chain has advanced it is
+/// live state, and refusing to start because contract-owned rows changed would tie
+/// every restart to mutable data.
+fn checkpoint_state_checks_apply(arena_revision: i64, checkpoint_revision: i64) -> bool {
+    arena_revision == checkpoint_revision
+}
+
 /// The log size at which this node writes a checkpoint instead: the configured
 /// size plus up to as much again, chosen from the node's identity.
 ///
@@ -1739,23 +1797,7 @@ impl Controller {
                         "migration checkpoint must carry a positive revision".into(),
                     ));
                 }
-                for deferred in self.db.arena_deferred_transactions() {
-                    let transaction = PackedTransaction::from_deferred_transaction_bytes(
-                        Bytes::from(deferred.packed_trx),
-                    )
-                    .map_err(|error| {
-                        ChainError::GenesisError(format!(
-                            "migration deferred transaction {} cannot be decoded: {error}",
-                            hex::encode(deferred.trx_id)
-                        ))
-                    })?;
-                    if transaction.id().as_bytes() != deferred.trx_id {
-                        return Err(ChainError::GenesisError(format!(
-                            "migration deferred transaction {} does not match its packed bytes",
-                            hex::encode(deferred.trx_id)
-                        )));
-                    }
-                }
+                verify_restored_deferred_rows(&self.db).map_err(ChainError::GenesisError)?;
                 // The manifest must record how this checkpoint treats its
                 // pending deferred transactions, and the rows must show it: a
                 // validator reads the mode from the manifest.
@@ -1883,13 +1925,8 @@ impl Controller {
                 );
             }
             if self.db.revision() == manifest.checkpoint_revision {
-                let imported_transactions = self.db.arena_transaction_count() as u64;
-                if imported_transactions != manifest.import_summary.input_transactions {
-                    return Err(ChainError::GenesisError(format!(
-                        "migration checkpoint contains {imported_transactions} input-transaction dedupe rows but manifest commits to {}",
-                        manifest.import_summary.input_transactions
-                    )));
-                }
+                verify_restored_input_transactions(&self.db, &manifest)
+                    .map_err(ChainError::GenesisError)?;
             }
             // The producers table is NOT the schedule: on mainnet it carries
             // every active row (standbys included) while the schedule names
@@ -1904,7 +1941,15 @@ impl Controller {
             // exactly H with H's schedule version and no pending change.
             // An exporter-supplied schedule that the checkpoint does not
             // contain fails here.
-            if let Some(roster) = migration_roster.as_ref() {
+            // These two checks read the CHECKPOINT's rows out of the arena, so they
+            // apply while the arena is still the checkpoint. After the chain has
+            // moved on they would be reading live contract state, and a later edit
+            // of those rows by the migrated system account would refuse every
+            // restart. The binding was proven when the checkpoint was restored; a
+            // later restart is covered by the hash and block-log checks.
+            let at_checkpoint =
+                checkpoint_state_checks_apply(self.db.revision(), manifest.checkpoint_revision);
+            if let Some(roster) = migration_roster.as_ref().filter(|_| at_checkpoint) {
                 let source_block = migration_source_block.as_ref().ok_or_else(|| {
                     ChainError::GenesisError(
                         "migration schedule binding requires an attached source block".into(),
@@ -1935,17 +1980,19 @@ impl Controller {
             // and here every recorded name must exist in the restored
             // checkpoint state — names that decode but name no account fail
             // here, so a bare asserted inclusion height can never boot.
-            match pulsevm_database::verify_memo_names_exist(&self.db, &manifest).map_err(
-                |error| {
-                    ChainError::GenesisError(format!(
-                        "migration memo inclusion proof rejected: {error}"
-                    ))
-                },
-            )? {
-                0 => {}
-                proven => info!(
-                    "migration memo inclusion proven: {proven} declaration accounts in checkpoint state"
-                ),
+            if at_checkpoint {
+                match pulsevm_database::verify_memo_names_exist(&self.db, &manifest).map_err(
+                    |error| {
+                        ChainError::GenesisError(format!(
+                            "migration memo inclusion proof rejected: {error}"
+                        ))
+                    },
+                )? {
+                    0 => {}
+                    proven => info!(
+                        "migration memo inclusion proven: {proven} declaration accounts in checkpoint state"
+                    ),
+                }
             }
         } else if migration_checkpoint.is_some() || migration_manifest.is_some() {
             return Err(ChainError::GenesisError(
@@ -5168,7 +5215,17 @@ impl Controller {
                 "serve chunk: request does not match the cached snapshot".into(),
             ));
         }
-        let start = offset as usize;
+        // An honest peer asks for one chunk at a time. The length is a u32 the
+        // peer chose, and the copy below is made while the controller is read
+        // locked, so an unclamped request is up to the whole snapshot per request.
+        if len > crate::state_sync::SNAPSHOT_CHUNK_LEN {
+            return Err(ChainError::InternalError(format!(
+                "serve chunk: {len} bytes requested, at most {} are served per request",
+                crate::state_sync::SNAPSHOT_CHUNK_LEN
+            )));
+        }
+        let start = usize::try_from(offset)
+            .map_err(|_| ChainError::InternalError("serve chunk: out of range".into()))?;
         let end = start
             .checked_add(len as usize)
             .filter(|&e| e <= cache.envelope.len())
@@ -5322,6 +5379,15 @@ impl Controller {
     /// this only happens for a node that was being synced from others, never for
     /// one that was producing.
     fn quarantine_abandoned_state_sync(db_path: &str) -> Result<(), ChainError> {
+        Self::quarantine_abandoned_state_sync_inner(db_path, None)
+    }
+
+    /// `stop_after` is for tests only: stop (as a kill would) after that many files
+    /// have been moved.
+    fn quarantine_abandoned_state_sync_inner(
+        db_path: &str,
+        stop_after: Option<usize>,
+    ) -> Result<(), ChainError> {
         const QUARANTINE_DIR: &str = "state_sync_abandoned";
         const KEEP: usize = 2;
         let dir = Path::new(db_path);
@@ -5351,10 +5417,23 @@ impl Controller {
         let target = quarantine.join(format!("{stamp:039}"));
         fs::create_dir(&target).map_err(|e| fail("create the quarantine entry", &e))?;
         let mut moved = 0usize;
+        let mut entries = Vec::new();
         for entry in fs::read_dir(dir).map_err(|e| fail("list the data directory", &e))? {
             let entry = entry.map_err(|e| fail("list the data directory", &e))?;
             if entry.file_name() == QUARANTINE_DIR {
                 continue;
+            }
+            entries.push(entry);
+        }
+        // The marker goes LAST. While it is still in the directory the next start
+        // finds it and repeats this move, so a kill part-way leaves a directory the
+        // node can finish clearing. Moved first, a kill left a half-emptied
+        // directory with no marker: an arena without its block log, or the reverse,
+        // refused by a check with no automatic recovery.
+        entries.sort_by_key(|entry| entry.file_name() == STATE_SYNC_INSTALL_MARKER_FILE);
+        for entry in entries {
+            if stop_after == Some(moved) {
+                return Err(ChainError::InternalError("simulated kill".into()));
             }
             fs::rename(entry.path(), target.join(entry.file_name()))
                 .map_err(|e| fail("move a file", &e))?;
@@ -9530,6 +9609,53 @@ mod tests {
         Ok(())
     }
 
+    // The quarantine moves files one at a time. A kill part-way must leave the
+    // marker in place so the next start finishes the job: with the marker moved
+    // first, the directory was left half-emptied and refused with no recovery.
+    #[tokio::test]
+    async fn a_kill_in_the_middle_of_the_quarantine_is_finished_by_the_next_start()
+    -> Result<(), ChainError> {
+        for kill_after in 0..6 {
+            let chain = CrashChain::new(json!({}))?;
+            let mut controller = chain.open()?;
+            for name in ["one", "two"] {
+                chain.accept(&mut controller, name).await?;
+            }
+            let tip = controller.last_accepted_block().id()?;
+            controller.begin_state_sync_install(3, &tip)?;
+            drop(controller);
+            let dir = std::path::Path::new(chain.path());
+
+            let killed =
+                Controller::quarantine_abandoned_state_sync_inner(chain.path(), Some(kill_after));
+            assert!(
+                killed.is_err(),
+                "the simulated kill after {kill_after} files"
+            );
+            assert!(
+                dir.join(STATE_SYNC_INSTALL_MARKER_FILE).exists(),
+                "the marker is still there after {kill_after} files moved, so a restart knows"
+            );
+
+            let mut reopened = chain.open().map_err(|error| {
+                ChainError::InternalError(format!(
+                    "a kill after {kill_after} files left a directory the node refuses: {error}"
+                ))
+            })?;
+            assert_eq!(
+                reopened.last_accepted_block().block_num(),
+                1,
+                "{kill_after}"
+            );
+            assert!(
+                !dir.join(STATE_SYNC_INSTALL_MARKER_FILE).exists(),
+                "{kill_after}"
+            );
+            chain.accept(&mut reopened, "fresh").await?;
+        }
+        Ok(())
+    }
+
     // Only the newest two abandoned installs are kept, so a node that keeps being
     // cut cannot fill its disk with them.
     #[tokio::test]
@@ -9548,6 +9674,238 @@ mod tests {
                 .unwrap()
                 .count();
         assert_eq!(kept, 2);
+        Ok(())
+    }
+
+    // A chunk request carries a u32 length the peer chose, and the copy is made
+    // while the controller is read locked. A request for more than one chunk is
+    // refused, not served up to the whole snapshot.
+    #[test]
+    fn a_chunk_request_for_more_than_one_chunk_is_refused() {
+        let mut controller = Controller::new();
+        let hash = [7u8; 32];
+        controller.snapshot_cache = Some(CachedSnapshot {
+            height: 5,
+            state_root: [0; 32],
+            hash,
+            envelope: vec![1u8; 4 * crate::state_sync::SNAPSHOT_CHUNK_LEN as usize],
+        });
+        let chunk = crate::state_sync::SNAPSHOT_CHUNK_LEN;
+        assert_eq!(
+            controller
+                .serve_snapshot_chunk(5, &hash, 0, chunk)
+                .unwrap()
+                .len(),
+            chunk as usize,
+            "a whole chunk is served"
+        );
+        let error = controller
+            .serve_snapshot_chunk(5, &hash, 0, chunk + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most"), "{error}");
+        assert!(
+            controller
+                .serve_snapshot_chunk(5, &hash, 0, u32::MAX)
+                .is_err(),
+            "the request that asks for everything"
+        );
+    }
+
+    #[test]
+    fn checkpoint_row_checks_apply_only_while_the_arena_is_the_checkpoint() {
+        assert!(
+            checkpoint_state_checks_apply(413, 413),
+            "first boot, and a restart before a block"
+        );
+        assert!(
+            !checkpoint_state_checks_apply(414, 413),
+            "once a block is built the arena is live state, not the checkpoint"
+        );
+        assert!(!checkpoint_state_checks_apply(9_000_000, 413));
+    }
+
+    // ---- Crash-point enumeration -------------------------------------------------
+    //
+    // An accept writes four files in a fixed order, each synced before the next:
+    // the trace log, the chain-state log, the block log (the marker that the block
+    // was accepted) and the arena write-ahead log. Whatever the power does, the
+    // disk holds a PREFIX of that order, plus possibly a torn piece of the next
+    // file. The hand-written crash tests pick a few of these; this builds every
+    // one from a real run and requires each to recover to a height the
+    // never-stopped reference agrees with, then take another block.
+
+    fn history_record_ends(path: &std::path::Path) -> Vec<u64> {
+        // [magic u64][block id 32][payload size u64][payload], back to back.
+        let data = std::fs::read(path).unwrap();
+        let (mut ends, mut at) = (Vec::new(), 0usize);
+        while at + 48 <= data.len() {
+            let size = u64::from_le_bytes(data[at + 40..at + 48].try_into().unwrap()) as usize;
+            at += 48 + size;
+            ends.push(at as u64);
+        }
+        ends
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_crash_point_in_an_accept_recovers_to_a_height_the_reference_agrees_with()
+    -> Result<(), ChainError> {
+        // The reference: a node that never stops, its root recorded at every height.
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        let mut roots = std::collections::BTreeMap::new();
+        roots.insert(
+            controller.last_accepted_block().block_num(),
+            controller.database().arena_state_root(),
+        );
+        for name in ["one", "two", "three", "four"] {
+            chain.accept(&mut controller, name).await?;
+            roots.insert(
+                controller.last_accepted_block().block_num(),
+                controller.database().arena_state_root(),
+            );
+        }
+        let top = controller.last_accepted_block().block_num();
+        drop(controller);
+
+        let source = std::path::Path::new(chain.path());
+        // The order an accept writes in, and the file each step writes.
+        let steps = [
+            "trace_log.log",
+            "chain_state_log.log",
+            "block_log.log",
+            "arena_wal.bin",
+        ];
+        let last_record_start = |file: &str| -> u64 {
+            let path = source.join(file);
+            if file == "arena_wal.bin" {
+                let ends = wal_frame_ends(chain.path());
+                ends[ends.len() - 2] as u64
+            } else {
+                let ends = history_record_ends(&path);
+                ends[ends.len() - 2]
+            }
+        };
+        let full_len = |file: &str| std::fs::metadata(source.join(file)).unwrap().len();
+
+        enum Torn {
+            Nothing,
+            HalfTheRecord,
+            OneByteShort,
+            ZerosForTheRecord,
+        }
+        let mut scenarios = 0usize;
+        for done in 0..=steps.len() {
+            let torn_variants: &[Torn] = if done == steps.len() {
+                &[Torn::Nothing]
+            } else {
+                &[
+                    Torn::Nothing,
+                    Torn::HalfTheRecord,
+                    Torn::OneByteShort,
+                    Torn::ZerosForTheRecord,
+                ]
+            };
+            for torn in torn_variants {
+                let scratch = get_temp_dir();
+                let crashed = scratch.path().join("node");
+                copy_dir(source, &crashed);
+                // The index files are not fsynced; the node rebuilds them.
+                for index in [
+                    "trace_log.index",
+                    "chain_state_log.index",
+                    "block_log.index",
+                ] {
+                    let _ = std::fs::remove_file(crashed.join(index));
+                }
+                for (position, file) in steps.iter().enumerate() {
+                    let start = last_record_start(file);
+                    let target = crashed.join(file);
+                    let handle = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&target)
+                        .unwrap();
+                    if position < done {
+                        continue; // this step finished: the file holds the block
+                    }
+                    let record = full_len(file) - start;
+                    if position == done {
+                        match torn {
+                            Torn::Nothing => handle.set_len(start).unwrap(),
+                            Torn::HalfTheRecord => handle.set_len(start + record / 2).unwrap(),
+                            Torn::OneByteShort => handle.set_len(start + record - 1).unwrap(),
+                            Torn::ZerosForTheRecord => {
+                                // The file was extended; the data never landed.
+                                handle.set_len(start).unwrap();
+                                use std::io::Write;
+                                let mut tail = std::fs::OpenOptions::new()
+                                    .append(true)
+                                    .open(&target)
+                                    .unwrap();
+                                tail.write_all(&vec![0u8; record as usize]).unwrap();
+                            }
+                        }
+                    } else {
+                        handle.set_len(start).unwrap(); // not reached yet
+                    }
+                }
+
+                let node = CrashChain::at(crashed.to_str().unwrap())?;
+                let label = format!(
+                    "crash after {done} of {} steps, {}",
+                    steps.len(),
+                    match torn {
+                        Torn::Nothing => "nothing of the next file",
+                        Torn::HalfTheRecord => "half of the next record",
+                        Torn::OneByteShort => "the next record one byte short",
+                        Torn::ZerosForTheRecord => "the next file extended with zeros",
+                    }
+                );
+                let mut reopened = node.open().map_err(|error| {
+                    ChainError::InternalError(format!(
+                        "{label}: the node refused to start: {error}"
+                    ))
+                })?;
+                // The block counts only once the write-ahead log has it: before
+                // that the block log is at most one ahead of the arena and is
+                // rewound, which the host replaces from peers.
+                let expected = if done == steps.len() { top } else { top - 1 };
+                assert_eq!(
+                    reopened.last_accepted_block().block_num(),
+                    expected,
+                    "{label}: recovered height"
+                );
+                assert_eq!(
+                    reopened.database().arena_state_root(),
+                    roots[&expected],
+                    "{label}: the state root at that height differs from the reference"
+                );
+                node.accept(&mut reopened, "after").await.map_err(|error| {
+                    ChainError::InternalError(format!("{label}: the next block failed: {error}"))
+                })?;
+                assert_eq!(
+                    reopened.last_accepted_block().block_num(),
+                    expected + 1,
+                    "{label}: the next block"
+                );
+                scenarios += 1;
+            }
+        }
+        // 4 steps x 4 torn variants, plus the finished case.
+        assert_eq!(scenarios, steps.len() * 4 + 1);
         Ok(())
     }
 
@@ -14968,6 +15326,63 @@ mod tests {
             error.to_string().contains("migration manifest"),
             "an unsupported manifest version must fail closed, got: {error}"
         );
+        Ok(())
+    }
+
+    // The offline verifier is the go/no-go gate's second pair of eyes. It printed
+    // PASS for a bundle whose attached source block was a different block from the
+    // one the manifest names, which the node then refused. It now runs the node's
+    // own check.
+    #[tokio::test]
+    async fn the_source_block_check_rejects_a_bundle_the_node_would_refuse()
+    -> Result<(), ChainError> {
+        let schedule_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (
+            checkpoint,
+            manifest_path,
+            _genesis,
+            _chain_id,
+            _source_block_id,
+            _source_block_num,
+            _source_revision,
+            _source_chain_id,
+        ) = migration_checkpoint_with_schedule_key(&temp, &schedule_key, &[]).await?;
+        let bytes = fs::read(&manifest_path)
+            .map_err(|e| ChainError::InternalError(format!("read manifest: {e}")))?;
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ChainError::InternalError(format!("parse manifest: {e}")))?;
+        let manifest = |json: &serde_json::Value| -> MigrationManifest {
+            serde_json::from_value(json.clone()).unwrap()
+        };
+        assert!(
+            verify_migration_source_block(&manifest(&json)).is_ok(),
+            "the real bundle passes: {checkpoint}"
+        );
+
+        // The manifest names a different block than the one attached.
+        let mut other = json.clone();
+        let mut id = hex::decode(other["source_block_id"].as_str().unwrap()).unwrap();
+        id[31] ^= 1;
+        other["source_block_id"] = json!(hex::encode(id));
+        let error = verify_migration_source_block(&manifest(&other)).unwrap_err();
+        assert!(error.contains("does not match manifest"), "{error}");
+
+        // A height that is not the checkpoint's revision.
+        let mut other = json.clone();
+        other["checkpoint_revision"] = json!(other["checkpoint_revision"].as_i64().unwrap() + 1);
+        let error = verify_migration_source_block(&manifest(&other)).unwrap_err();
+        assert!(
+            error.contains("does not match checkpoint revision"),
+            "{error}"
+        );
+
+        // Trailing bytes after the block.
+        let packed = json["source_block"].as_str().unwrap().to_owned();
+        json["source_block"] = json!(format!("{packed}00"));
+        let error = verify_migration_source_block(&manifest(&json)).unwrap_err();
+        assert!(error.contains("trailing"), "{error}");
         Ok(())
     }
 

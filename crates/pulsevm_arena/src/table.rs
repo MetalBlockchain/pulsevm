@@ -17,6 +17,17 @@ use crate::object::{
     SecondaryIndex,
 };
 
+/// The format of the state hash and of the canonical export, as a name. The hash
+/// is domain-separated by it, so a change of what is hashed must change this, and
+/// `getInfo` reports it so a fleet can be checked for one build.
+pub const STATE_HASH_FORMAT: &str = "arena-table-v3";
+
+/// The most ids one table can have minted. A snapshot's `next_id` and a row's id
+/// size the primary index (one pointer per 1024 ids), so an id taken from a peer's
+/// file without a bound is an allocation the peer chooses. 2^36 ids is far past
+/// anything a chain mints (a table creating 100 rows a second needs two decades).
+pub const MAX_TABLE_IDS: usize = 1 << 36;
+
 /// Errors from table operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableError {
@@ -889,8 +900,25 @@ impl<T: ArenaObject> Table<T> {
         debug_assert!(self.primary.len() == 0 && self.undo_stack.is_empty());
         let obj_size = std::mem::size_of::<T>();
         let mut pos = 0usize;
-        let next_id = read_u64(bytes, &mut pos)? as usize;
-        let live = read_u64(bytes, &mut pos)? as usize;
+        let next_id = usize::try_from(read_u64(bytes, &mut pos)?)
+            .ok()
+            .filter(|next_id| *next_id <= MAX_TABLE_IDS)
+            .ok_or(TableError::Corrupted("next_id is beyond any real table"))?;
+        let live = usize::try_from(read_u64(bytes, &mut pos)?)
+            .map_err(|_| TableError::Corrupted("live row count does not fit"))?;
+        // Each live row takes its id and its bytes, so the count is bounded by what
+        // is left of the section before anything is sized from it, and a table
+        // cannot hold more live rows than it has minted ids.
+        let per_row = 8usize.saturating_add(obj_size);
+        if live > next_id
+            || live
+                .checked_mul(per_row)
+                .is_none_or(|need| need > bytes.len() - pos)
+        {
+            return Err(TableError::Corrupted(
+                "live row count exceeds the ids minted or the bytes present",
+            ));
+        }
 
         self.primary.set_len(next_id);
         let mut live_rows = Vec::with_capacity(live);
@@ -974,7 +1002,12 @@ impl<T: ArenaObject> Table<T> {
     pub(crate) fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         let obj_size = std::mem::size_of::<T>();
         let mut pos = 0usize;
-        let next_id = read_u64(bytes, &mut pos)? as usize;
+        let next_id = usize::try_from(read_u64(bytes, &mut pos)?)
+            .ok()
+            .filter(|next_id| *next_id <= MAX_TABLE_IDS)
+            .ok_or(TableError::Corrupted(
+                "delta next_id is beyond any real table",
+            ))?;
         if self.primary.len() < next_id {
             self.primary.set_len(next_id);
         }
@@ -1036,10 +1069,11 @@ impl<T: ArenaObject> Table<T> {
                 .checked_add(len)
                 .filter(|end| *end <= bytes.len())
                 .ok_or(TableError::Corrupted("delta patch extends past record"))?;
-            if off + len > self.blobs.len() {
-                return Err(TableError::Corrupted("delta patch out of range"));
-            }
-            self.blobs[off..off + len].copy_from_slice(&bytes[pos..end]);
+            let patch_end = off
+                .checked_add(len)
+                .filter(|patch_end| *patch_end <= self.blobs.len())
+                .ok_or(TableError::Corrupted("delta patch out of range"))?;
+            self.blobs[off..patch_end].copy_from_slice(&bytes[pos..end]);
             pos = end;
         }
         let blob_len = read_u64(bytes, &mut pos)? as usize;
@@ -1070,7 +1104,12 @@ impl<T: ArenaObject> Table<T> {
     /// yields an equal digest.
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
         use sha2::Digest;
-        hasher.update(b"arena-table-v2");
+        hasher.update(STATE_HASH_FORMAT.as_bytes());
+        // The id the next row will get is state: two nodes with the same rows but
+        // different counters mint different ids from the next block on. It was not
+        // hashed, so a snapshot carrying a forged counter installed under a root
+        // that matched, and the node diverged one block later.
+        hasher.update((self.primary.len() as u64).to_le_bytes());
         hasher.update((self.row_count as u64).to_le_bytes());
         let offsets = T::blob_ref_offsets();
         let mut scratch = Vec::new();

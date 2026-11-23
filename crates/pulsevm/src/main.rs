@@ -329,6 +329,16 @@ async fn main() {
         std::env::var("PULSEVM_LOG_LEVEL").ok().as_deref(),
     ));
 
+    {
+        let build = crate::api::BuildInfo::current();
+        spdlog::info!(
+            "pulsevm build {} (write-ahead log {}, state hash {})",
+            build.build_id,
+            build.wal_format,
+            build.state_hash_format
+        );
+    }
+
     let cancel = CancellationToken::new();
     let cancel_ws = cancel.clone();
     let cancel_runtime = cancel.clone();

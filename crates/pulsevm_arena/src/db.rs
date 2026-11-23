@@ -108,6 +108,11 @@ pub fn sync_parent_dir(path: &Path) -> Result<(), DbError> {
 /// when the file is created. A log written before records carried a checksum, or
 /// before the key, has a different start and is refused by name, not misread.
 const WAL_MAGIC: &[u8; 8] = b"PVMWAL04";
+/// The write-ahead log format a node writes, as a name. A node refuses a log in
+/// any other format, so two nodes of different formats cannot exchange data
+/// directories; `getInfo` reports it so a fleet can be checked for one build.
+/// A test pins it to the bytes at the start of a real log.
+pub const WAL_FORMAT: &str = "PVMWAL04";
 const WAL_KEY_LEN: usize = 32;
 const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + WAL_KEY_LEN;
 const WAL_DIGEST_LEN: usize = 32;
@@ -160,19 +165,53 @@ fn wal_record_at(data: &[u8], key: &[u8], pos: usize) -> Option<(usize, usize, u
 /// one does, whatever stopped the scan was not a crash, and the bytes behind it
 /// are data that must not be thrown away. Only run on the failure path; the cheap
 /// length test keeps it linear.
-fn wal_valid_record_follows(data: &[u8], key: &[u8], from: usize) -> Option<usize> {
+fn wal_valid_record_follows(data: &[u8], key: &[u8], from: usize) -> Follows {
+    wal_valid_record_follows_within(data, key, from, WAL_DAMAGE_SCAN_BUDGET)
+}
+
+fn wal_valid_record_follows_within(data: &[u8], key: &[u8], from: usize, budget: u64) -> Follows {
     let mut pos = from;
-    while pos.checked_add(8 + WAL_MIN_PAYLOAD + WAL_DIGEST_LEN)? <= data.len() {
+    let mut hashed = 0u64;
+    while pos
+        .checked_add(8 + WAL_MIN_PAYLOAD + WAL_DIGEST_LEN)
+        .is_some_and(|end| end <= data.len())
+    {
         if let Some(len) = try_read_u64(data, pos)
             && len >= WAL_MIN_PAYLOAD as u64
             && len <= (data.len() - pos) as u64
-            && wal_record_at(data, key, pos).is_some()
         {
-            return Some(pos);
+            // Checking a candidate costs a hash of its claimed length. In honest
+            // data a plausible length is rare, but a transaction can put chosen
+            // bytes into the log, so the work is bounded: past the budget the
+            // answer is "cannot rule out damage", which refuses the log instead of
+            // spending quadratic time on a hostile tail.
+            hashed = hashed.saturating_add(len);
+            if hashed > budget {
+                return Follows::BudgetExhausted;
+            }
+            if wal_record_at(data, key, pos).is_some() {
+                return Follows::At(pos);
+            }
         }
         pos += 1;
     }
-    None
+    Follows::No
+}
+
+/// The most bytes the damage scan will hash. A torn record is one block's change,
+/// and honest data has almost no offsets that look like a record, so this is far
+/// above any real need.
+const WAL_DAMAGE_SCAN_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// What the damage scan found after a record that failed to verify.
+#[derive(Debug, PartialEq, Eq)]
+enum Follows {
+    /// An intact record starts here: the failure was damage, not a cut.
+    At(usize),
+    /// Nothing intact follows: what is left is a write that was cut short.
+    No,
+    /// The scan was stopped by its budget. Treated as damage, never as a tear.
+    BudgetExhausted,
 }
 
 /// The complete records of a log, and what is left over after them.
@@ -238,10 +277,18 @@ fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
             // middle of the file, not a crash: refuse, and leave the file as it
             // is. If none does, what is left is the remains of a write that was
             // cut short (a partial record, zeros, anything), and goes.
-            if let Some(next) = wal_valid_record_follows(data, key, pos + 1) {
-                return Err(DbError::Corrupted(format!(
-                    "write-ahead log record at byte {pos} cannot be read and an intact record starts at byte {next}: the file was altered, not cut short, so nothing is discarded"
-                )));
+            match wal_valid_record_follows(data, key, pos + 1) {
+                Follows::At(next) => {
+                    return Err(DbError::Corrupted(format!(
+                        "write-ahead log record at byte {pos} cannot be read and an intact record starts at byte {next}: the file was altered, not cut short, so nothing is discarded"
+                    )));
+                }
+                Follows::BudgetExhausted => {
+                    return Err(DbError::Corrupted(format!(
+                        "write-ahead log record at byte {pos} cannot be read and the file after it is too large to rule out damage within the scan budget: it is refused rather than discarded"
+                    )));
+                }
+                Follows::No => {}
             }
             scan.torn_tail = true;
             break;
@@ -678,8 +725,17 @@ impl Db {
         let mut pos = 0usize;
         let revision = read_i64(&data, &mut pos)?;
         let count = read_u64(&data, &mut pos)? as usize;
+        let mut seen_types = std::collections::HashSet::new();
         for _ in 0..count {
             let type_id = read_u16(&data, &mut pos)?;
+            // A table split across two sections with one type id would load the
+            // second over the first and leave the secondary indexes covering only
+            // its rows, under a state root that still matches.
+            if !seen_types.insert(type_id) {
+                return Err(DbError::Corrupted(format!(
+                    "checkpoint has two sections for type_id {type_id}"
+                )));
+            }
             let len = read_u64(&data, &mut pos)? as usize;
             let end = pos
                 .checked_add(len)
@@ -695,6 +751,11 @@ impl Db {
                 })?;
             self.tables[table_pos].load_from(&data[pos..end])?;
             pos = end;
+        }
+        if pos != data.len() {
+            return Err(DbError::Corrupted(
+                "trailing bytes after the last section of the checkpoint".into(),
+            ));
         }
         self.set_revision(revision)?;
         Ok(())
@@ -884,5 +945,45 @@ impl Db {
             .collect();
         rows.sort();
         rows
+    }
+}
+
+#[cfg(test)]
+mod damage_scan_tests {
+    use super::*;
+
+    // Contract row bytes land verbatim in the log, so a transaction can plant a
+    // plausible length at every aligned offset of a torn tail. Each would be
+    // hashed over its claimed length: quadratic work at start-up. The scan has a
+    // budget and answers "cannot rule out damage" when it runs out.
+    #[test]
+    fn a_hostile_tail_exhausts_the_budget_instead_of_being_hashed_in_full() {
+        let key = [3u8; WAL_KEY_LEN];
+        let len: u64 = 1 << 20;
+        // 4 MiB of 8-byte words, each claiming 1 MiB: a candidate at every 8th byte.
+        let mut data = Vec::new();
+        for _ in 0..(4 << 20) / 8 {
+            data.extend_from_slice(&len.to_le_bytes());
+        }
+        assert_eq!(
+            wal_valid_record_follows_within(&data, &key, 0, 4 << 20),
+            Follows::BudgetExhausted
+        );
+        // With a budget for all of it the same data is searched and found empty.
+        let mut small = Vec::new();
+        for _ in 0..8 {
+            small.extend_from_slice(&16u64.to_le_bytes());
+        }
+        assert_eq!(
+            wal_valid_record_follows_within(&small, &key, 0, 1 << 30),
+            Follows::No
+        );
+    }
+
+    #[test]
+    fn an_ordinary_torn_tail_is_a_tear_within_the_default_budget() {
+        let key = [3u8; WAL_KEY_LEN];
+        let tail = vec![0xA5u8; 300];
+        assert_eq!(wal_valid_record_follows(&tail, &key, 0), Follows::No);
     }
 }
