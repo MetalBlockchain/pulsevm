@@ -1,0 +1,44 @@
+[package]
+name = "pulsevm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+zerocopy = { version = "0.8", features = ["derive"] }
+pulsevm_arena = { path = "../crates/pulsevm_arena" }
+pulsevm_database = { path = "../crates/pulsevm_database" }
+pulsevm_core = { path = "../crates/pulsevm_core" }
+
+# Its own workspace: the fuzz crate is built by cargo-fuzz with sanitizers and
+# must not change the main workspace's lockfile.
+[workspace]
+
+[[bin]]
+name = "wal_replay"
+path = "fuzz_targets/wal_replay.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "checkpoint_load"
+path = "fuzz_targets/checkpoint_load.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sparse_payload"
+path = "fuzz_targets/sparse_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "history_log"
+path = "fuzz_targets/history_log.rs"
+test = false
+doc = false

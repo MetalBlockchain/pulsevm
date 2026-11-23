@@ -16,3 +16,8 @@ plugins/build/
 # Local Docker cluster settings may contain a custom producer key.
 .env.localnet
 .env
+
+# cargo-fuzz output
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/

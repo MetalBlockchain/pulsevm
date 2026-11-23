@@ -1,0 +1,88 @@
+name: Fuzz
+
+# The byte parsers that read files and peer data: the write-ahead log, the
+# checkpoint a state-sync peer sends, the snapshot envelope and its sparse
+# payload, and the history logs. Each is fed arbitrary bytes and must refuse or
+# accept without a panic, an allocation the bytes do not justify, or super-linear
+# time. A short run on every change to them, a longer one weekly. The targets are
+# in fuzz/fuzz_targets; they check that nothing breaks, not that the parser is
+# right (that is the unit tests), and random bytes mostly fail a checksum early,
+# so coverage past the header is shallow without a seed corpus.
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'fuzz/**'
+      - 'crates/pulsevm_arena/**'
+      - 'crates/pulsevm_database/src/snapshot.rs'
+      - 'crates/pulsevm_core/src/chain/state_history/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '23 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz-${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ wal_replay, checkpoint_load, sparse_payload, history_log ]
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      # 60 s on a pull request, 10 minutes on the weekly run.
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+
+    steps:
+      - name: Configure LLVM APT repository
+        run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add - && sudo echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-13 cmake zlib1g-dev pkg-config llvm-22-dev libpolly-22-dev
+
+      - name: Checkout source code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The pinned nightly the repository formats with; sanitizers need nightly.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly-2026-07-27
+
+      - name: Install Protobuf (protoc)
+        uses: ./.github/actions/setup-protoc
+        with:
+          version: '27.1'
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-amd64-fuzz-cargo-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        run: |
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=20
+
+      - name: Keep what it found
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-${{ matrix.target }}-crash
+          path: fuzz/artifacts
+          retention-days: 30
+          if-no-files-found: ignore

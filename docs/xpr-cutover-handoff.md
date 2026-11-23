@@ -206,7 +206,7 @@ against independently replayed XPR state:
 - Restore gate: `crates/pulsevm_core/src/chain/controller.rs` (migration
   section of `initialize`)
 - Manifest + verifier: `crates/pulsevm_database/src/xpr_import.rs`,
-  `crates/pulsevm_database/examples/xpr_verify_manifest.rs`
+  `crates/pulsevm_core/examples/xpr_verify_manifest.rs`
 - Attach-side schedule/post-H recording (lib + tool):
   `crates/pulsevm_core/src/migration_attach.rs`,
   `crates/pulsevm_core/examples/xpr_attach_source_block.rs`

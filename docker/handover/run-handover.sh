@@ -2027,7 +2027,7 @@ cmd_checkpoint() {
         # Cargo no-ops in seconds when nothing changed.
         (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_halt_ceremony) || fail "ceremony tool build failed"
         (cd "$REPO_ROOT" && cargo build --locked --release --example xpr_attach_source_block) || fail "attach tool build failed"
-        (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_database --example xpr_verify_manifest) || fail "verifier build failed"
+        (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example xpr_verify_manifest) || fail "verifier build failed"
         H="$(cat "$WORK_DIR/H")"
         H_ID="$(cat "$WORK_DIR/H_ID")"
         GENESIS_BASE="${PULSEVM_GENESIS_PATH:-$REPO_ROOT/genesis.json}"
@@ -2874,9 +2874,29 @@ PY
         echo "handover: faults: PASS"
     }
 
+    # Every node must run the same build. The write-ahead log and the canonical
+    # export changed format with no gate between builds, so two producers on
+    # different builds cannot be expected to agree. getInfo reports the build.
+    check_one_build() {
+        local url info builds distinct
+        builds=""
+        for url in $(node_rpc_urls); do
+            info="$(rpc_call "$url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
+                | python3 -c 'import json,sys; b=json.load(sys.stdin)["result"]["pulsevm_build"]; print(b["build_id"], b["wal_format"], b["state_hash_format"])' 2>/dev/null)" \
+                || fail "check_one_build: a node did not report its build (pulsevm_build is missing from getInfo)"
+            builds="$builds$info"$'\n'
+        done
+        distinct="$(printf '%s' "$builds" | grep -v '^$' | sort -u)"
+        [[ -n "$distinct" ]] || fail "check_one_build: no node reported a build"
+        [[ "$(wc -l <<<"$distinct" | tr -d ' ')" == "1" ]] \
+            || fail "check_one_build: the nodes run different builds: $(tr '\n' ';' <<<"$distinct")"
+        echo "handover: verify-restarts: every node runs one build: $distinct"
+    }
+
     echo "handover: verify-restarts: network dir $NETBASE, $rounds round(s)"
     send_txs rs 4
     wait_converged "before any restart"
+    check_one_build
     for round in $(seq 1 "$rounds"); do
         victim=$((6 - round)); [[ "$victim" -lt 2 ]] && victim=2
         cmdline=""

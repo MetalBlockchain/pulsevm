@@ -77,7 +77,8 @@ jobs:
             a_partial_log damage_to_the_log exporting_a_snapshot the_log_is_folded \
             history_log_tails state_history_ a_node_with_state_history_off \
             nodes_that_restart_stay pacing_ checkpoint_folds_are_spread \
-            opted_in_replay replay_recovery
+            opted_in_replay replay_recovery every_crash_point \
+            a_kill_in_the_middle a_node_cut_during abandoned_installs zero_tails
 
       # The same on the nightly protocol profile, where version 2 can activate.
       - name: Crash recovery on the nightly protocol profile

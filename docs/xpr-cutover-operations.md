@@ -782,6 +782,102 @@ with the nodes that never stopped, at all five nodes' roots. A real power cut
 replayed at every write needs a recording block device and is not reproducible on a
 hosted runner; Paul's box remains that check.
 
+## Independent review of the cutover (round 14)
+
+Four reviewers who had not seen the earlier work read the restore gate, the voter,
+crash recovery and state sync, and the untrusted-input parsers, by reading only.
+Each finding below was checked against the code before it was acted on.
+
+**Fixed, each with a test that fails without the fix:**
+
+- **A wrong config disarmed a live pause (voter).** Restarting an armed voter with a
+  config whose digest matched nothing (a typo in the roster, contract or chain id)
+  moved the record aside without asking the chain, so the voter never paused and a
+  later nodeos restart resumed production past P. It now supersedes a record only
+  when the chain says that round was replaced, and otherwise holds the recorded pause.
+  The same check applies when a restart finds a record for the current config: if the
+  chain no longer shows the round, it is not restored.
+- **The degraded voter gave up on one read.** It stopped enforcing on a single read
+  that did not show the recorded round (a node restarting from a snapshot, a
+  microfork). It now needs three in a row and enforces meanwhile. The state file is
+  fsynced, with its directory.
+- **A snapshot's id counter was not part of the state root.** A peer's snapshot could
+  carry a forged `next_id` and install under a root that matched; the node then minted
+  different ids than its peers from the next block. The counter is hashed
+  (`arena-table-v3`), bounded, and a table's live-row count is checked against the
+  bytes present before anything is sized from it. A checkpoint with two sections for
+  one table, or bytes after the last one, is refused.
+- **Peer-reachable allocation and amplification.** A chunk request is limited to one
+  chunk (it was a peer-chosen u32 copied under the controller read lock). A sparse
+  payload cannot declare a file far beyond what it carries (eight header bytes could
+  ask for a terabyte file that was then read into memory). The write-ahead log's
+  damage scan has a work budget and refuses when it runs out, instead of spending
+  quadratic time on bytes a transaction can plant.
+- **Boot-time checks tied restarts to mutable state.** The source-schedule binding and
+  memo-account checks read the checkpoint's rows on every start, including after the
+  chain had advanced, so a later edit of those contract rows by the migrated system
+  account would have refused every restart. They now apply only while the arena is
+  still the checkpoint.
+- **The offline verifier could pass a bundle the node refuses.** It never decoded the
+  attached source block or the restored rows. It now calls the node's own functions
+  (`verify_migration_source_block`, `verify_restored_deferred_rows`,
+  `verify_restored_input_transactions`), so there is one implementation.
+- **The ceremony tool.** `confirm` refuses a `--checkpoint` that is not the genesis
+  pin, and a confirmation below a strict two-thirds quorum. Keys can be given with
+  `--key-file` (owner-only); `--key` still works but warns that it puts the key in the
+  process list.
+- **The quarantine of an interrupted install** moves the marker last, so a kill
+  part-way is finished by the next start.
+- **A node reports its build.** `getInfo` carries `pulsevm_build` (git commit, write-ahead
+  log format, state-hash format) and the node logs it at start; the rehearsal fails if
+  its five nodes report different builds. This is the same-build requirement made
+  checkable.
+
+**Not fixed, and why (decisions for the owner):**
+
+- **A block durable in the block log but not in the write-ahead log is dropped, not
+  replayed.** One node refetches it from peers. If every validator loses power inside
+  the same few milliseconds, no node has it and the network is back one height. Rolling
+  forward by re-executing the logged block removes the window; it is a change to the
+  recovery path and was not made here.
+- **A voter that has finalized but sees the schedule pin change before H exits** (code
+  3) and does not pause at P. The code comment treats this as an alarm to page on.
+  Whether it should instead hold the pause is a policy choice.
+- **Not changed:** the freshness bounds in the manifest are asserted by the exporter,
+  not committed by the ceremony; the multi-gigabyte checkpoint hash runs before the
+  cheap pair verification; the declaration's source chain id is signed but not compared
+  to the restored state (the confirmation still binds this chain's block and
+  checkpoint, so this is defense in depth).
+- **Smaller crash-recovery items** (two non-fatal install error paths that leave a
+  split state until the next restart quarantines it; the write-ahead log is read into
+  memory whole at recovery; the history logs cannot tell a corrupt size from a torn
+  tail) are recorded, not changed.
+
+**What now checks this, beyond the unit tests:**
+
+- **Every crash point of an accept** (`every_crash_point_in_an_accept_recovers_to_a_height_the_reference_agrees_with`).
+  An accept writes the trace log, the chain-state log, the block log and the arena
+  write-ahead log in that order, each synced before the next, so a crash leaves a
+  prefix of that order plus possibly a torn piece of the next file. The test builds
+  every such state from a real run (four steps, each with nothing, half, one byte
+  short, or a zero-filled record of the next file) and requires each to recover to a
+  height whose state root matches a node that never stopped, then take another block.
+  With the history-tail trim removed it fails with the error found live in round 10
+  (`missed a block in trace_log.log`). It models what reaches disk in fsync order; it
+  is not a real power cut (that stays Paul's replay), and it does not cover a disk
+  that reorders synced writes.
+- **Exhaustive checks of the voter's two decisions** (`a_record_is_only_removed_when_the_chain_answered_that_its_round_is_gone`,
+  `the_degraded_voter_stops_exactly_on_three_replaced_reads_in_a_row`). The decisions
+  are small pure functions the voter calls (`recorded_action`, `pause_only_step`);
+  the tests run every (record, chain answer) pair and every sequence of answers up
+  to length 9. This is a model check in plain Rust, not TLA+ (no Java here); it covers
+  those two decisions, not the whole voter.
+- **Fuzzing** (`fuzz/`, workflow `fuzz.yml`): the write-ahead log, the checkpoint, the
+  snapshot envelope and sparse payload, and the history logs, each fed arbitrary
+  bytes. A 40-second local run of each (about 800,000 executions) found nothing. That
+  is a smoke result: random bytes mostly fail a checksum early, so there is no claim of
+  depth without a seed corpus of real files.
+
 ## The voter after a failure: restart, degraded mode, state file
 
 - **A config fix needs a restart.** The voter reads its config at start. Fixing
