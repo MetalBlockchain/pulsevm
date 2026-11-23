@@ -1325,9 +1325,12 @@ pub fn verify_memo_names_exist(
             .map_err(|e| format!("migration memo account {} invalid: {e}", memo.name))?;
         match database.arena_account_creation_date(owner.as_u64()) {
             Some(actual) if actual == memo.created_slot => {}
-            Some(actual) => {
+            // The checkpoint's own slot is not printed: the recorded one is enough
+            // to see the disagreement, and the number itself is what a reader
+            // would have to look up in the checkpoint to trust.
+            Some(_) => {
                 return Err(format!(
-                    "migration memo account {} was created at slot {actual} in checkpoint state, not the recorded {}: the declaration landing is unproven",
+                    "migration memo account {} was created at a different slot in checkpoint state than the recorded {}: the declaration landing is unproven",
                     memo.name, memo.created_slot
                 ));
             }
