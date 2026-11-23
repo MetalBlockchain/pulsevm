@@ -14074,7 +14074,27 @@ mod tests {
         name: &str,
         max_cpu_usage_ms: u8,
     ) -> Result<(), ChainError> {
-        let now = TimePointSec::now().sec_since_epoch();
+        seed_deferred_account_at(
+            controller,
+            chain,
+            name,
+            max_cpu_usage_ms,
+            TimePointSec::now().sec_since_epoch(),
+        )
+    }
+
+    /// The seeded transaction's expiration is part of its id. Two controllers that
+    /// must hold the same deferred row have to be seeded with the same `now`, or
+    /// seeds that straddle a second boundary give them different ids (a slow
+    /// runner makes that likely, and the validator then reports an unknown
+    /// generated transaction).
+    fn seed_deferred_account_at(
+        controller: &mut Controller,
+        chain: &RestoredChain,
+        name: &str,
+        max_cpu_usage_ms: u8,
+        now: u32,
+    ) -> Result<(), ChainError> {
         let scheduled = create_account_with_cpu_cap(
             &chain.schedule_key,
             Name::from_str(name)?,
@@ -14150,7 +14170,9 @@ mod tests {
         )
         .into_bytes();
         let mut controller = chain.open(&upgrades)?;
-        seed_deferred_account(&mut controller, &chain, "deferredcap", 30)?;
+        // One timestamp for both controllers: it is part of the transaction's id.
+        let stamp = TimePointSec::now().sec_since_epoch();
+        seed_deferred_account_at(&mut controller, &chain, "deferredcap", 30, stamp)?;
         let mut mempool = Mempool::new();
         let block = controller.build_block(&mut mempool).await?;
         assert_eq!(
@@ -14168,7 +14190,7 @@ mod tests {
         assert_eq!(controller.db.deferred_transaction_count(), 0);
         // And a validator that did not build it agrees: same block, same state.
         let mut validator = chain.open_in("validator", &upgrades)?;
-        seed_deferred_account(&mut validator, &chain, "deferredcap", 30)?;
+        seed_deferred_account_at(&mut validator, &chain, "deferredcap", 30, stamp)?;
         let mut validator_mempool = Mempool::new();
         validator
             .verify_block(&block, &mut validator_mempool)
