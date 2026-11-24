@@ -1067,6 +1067,38 @@ fn fill(f: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(total)
 }
 
+/// A snapshot waiting to be built (see [`Database::freeze_snapshot`]).
+pub struct SnapshotJob {
+    revision: i64,
+    frozen: pulsevm_arena::FrozenDb,
+}
+
+impl SnapshotJob {
+    /// The envelope a state-sync peer downloads. The bytes are what
+    /// `snapshot_bytes` always produced: the canonical checkpoint, sparse-encoded
+    /// in block-aligned 4 MiB steps, in the snapshot envelope. It is built in
+    /// memory (the canonical bytes are no longer written to a file and read back).
+    pub fn build(self) -> Result<Vec<u8>, ChainError> {
+        let SnapshotJob { revision, frozen } = self;
+        let canonical = frozen
+            .canonical_bytes()
+            .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
+        // The copy is not needed once the canonical bytes exist; at mainnet size it
+        // is gigabytes, and holding it through the encode below is peak memory for
+        // nothing.
+        drop(frozen);
+        let mut payload = crate::snapshot::sparse_begin(canonical.len() as u64);
+        // A multiple of SPARSE_BLOCK, so every full chunk starts block-aligned.
+        let mut offset = 0u64;
+        for chunk in canonical.chunks(4 * 1024 * 1024) {
+            crate::snapshot::sparse_append(&mut payload, offset, chunk);
+            offset += chunk.len() as u64;
+        }
+        drop(canonical);
+        Ok(crate::snapshot::encode(revision, &payload))
+    }
+}
+
 impl Database {
     pub fn new(path: &str, _size: u64) -> Result<Self, String> {
         let backend =
@@ -2776,20 +2808,19 @@ impl Database {
     /// Call this only at a quiescent point (no open undo session): the checkpoint
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        let revision = self.backend.revision();
-        let dir = Path::new(&self.path);
-        fs::create_dir_all(dir).map_err(|e| {
-            ChainError::InternalError(format!("snapshot: create {}: {e}", dir.display()))
-        })?;
-        let file = dir.join(SHARED_MEMORY_FILE);
-        // Export only: the write-ahead log must still see every change made
-        // before this call, so the flush bookkeeping stays as it is.
-        self.backend
-            .checkpoint_unmarked(&file)
-            .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
-        let snapshot = Self::read_sparse_snapshot(&file, revision);
-        let _ = fs::remove_file(&file);
-        snapshot
+        self.freeze_snapshot().build()
+    }
+
+    /// Copy out the state a snapshot is made of. This is the only part that needs
+    /// the database held: a memory copy of the rows and blob bytes. The returned
+    /// job repacks, hashes and encodes them ([`SnapshotJob::build`]) on any thread,
+    /// without the database, so a peer asking for a summary no longer stops this
+    /// node from handling blocks for as long as the whole export takes.
+    pub fn freeze_snapshot(&self) -> SnapshotJob {
+        SnapshotJob {
+            revision: self.backend.revision(),
+            frozen: self.backend.freeze_canonical(),
+        }
     }
 
     /// The sha256 of the checkpoint file `snapshot_bytes` would produce,
@@ -2864,6 +2895,8 @@ impl Database {
     /// ever holding the whole (mostly-zero) file in memory. Fixed-size,
     /// block-aligned chunks keep the run boundaries deterministic, so re-reading
     /// an unchanged file yields byte-identical output.
+    // Only the test that pins the in-memory snapshot to the old file route uses it.
+    #[cfg(test)]
     fn read_sparse_snapshot(file: &Path, revision: i64) -> Result<Vec<u8>, ChainError> {
         let mut f = fs::File::open(file).map_err(|e| {
             ChainError::InternalError(format!("snapshot: open {}: {e}", file.display()))
@@ -7495,6 +7528,61 @@ mod tests {
         assert!(restore_snapshot(dst_path, &snap).is_err());
         // The envelope is validated before anything touches disk.
         assert!(!Path::new(dst_path).join(SHARED_MEMORY_FILE).exists());
+    }
+
+    // The old way: write the canonical checkpoint to a file, read it back, encode.
+    // Kept only to prove the in-memory path produces the same bytes.
+    fn snapshot_bytes_via_a_file(db: &Database) -> Vec<u8> {
+        let file = Path::new(&db.path).join("oracle_snapshot.bin");
+        db.backend.checkpoint_unmarked(&file).unwrap();
+        let bytes = Database::read_sparse_snapshot(&file, db.backend.revision()).unwrap();
+        let _ = fs::remove_file(&file);
+        bytes
+    }
+
+    #[test]
+    fn the_snapshot_built_in_memory_is_the_one_the_file_route_built() {
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        db.set_revision(5).unwrap();
+        for (index, name) in ["alice", "bob", "carol", "dave"].iter().enumerate() {
+            db.create_account(name_u64(name), index as u32 + 1).unwrap();
+        }
+        let expected = snapshot_bytes_via_a_file(&db);
+        assert_eq!(db.snapshot_bytes().unwrap(), expected);
+        assert_eq!(db.freeze_snapshot().build().unwrap(), expected);
+    }
+
+    // The job is a copy: building it after the database has moved on gives the
+    // snapshot of the state it was taken at, so it can be built off the lock.
+    #[test]
+    fn a_snapshot_job_is_the_state_it_was_taken_at_not_the_state_it_is_built_at() {
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        db.set_revision(5).unwrap();
+        db.create_account(name_u64("alice"), 1).unwrap();
+        let root_then = db.arena_state_root().unwrap();
+        let expected = db.snapshot_bytes().unwrap();
+        let job = db.freeze_snapshot();
+
+        db.create_account(name_u64("bob"), 2).unwrap();
+        db.set_revision(6).unwrap();
+        assert_ne!(db.arena_state_root().unwrap(), root_then);
+
+        let built = std::thread::spawn(move || job.build().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(built, expected, "the job holds the earlier state");
+        // And it is a snapshot a node can restore to exactly that root.
+        let other = TempDir::new().unwrap();
+        let mut target = Database::new(other.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        target.add_indices().unwrap();
+        let header = target.restore_from_bytes(&built, &root_then).unwrap();
+        assert_eq!(header.revision, 5);
+        assert!(target.arena_account_exists(name_u64("alice")));
+        assert!(!target.arena_account_exists(name_u64("bob")));
     }
 
     #[test]

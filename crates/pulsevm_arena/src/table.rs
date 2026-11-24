@@ -140,6 +140,15 @@ struct PrimaryPage<T> {
     live: usize,
 }
 
+impl<T: Copy> Clone for PrimaryPage<T> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            live: self.live,
+        }
+    }
+}
+
 impl<T> PrimaryPage<T> {
     fn new() -> Self {
         Self {
@@ -160,6 +169,15 @@ impl<T> PrimaryPage<T> {
 struct PagedPrimary<T> {
     pages: Vec<Option<PrimaryPage<T>>>,
     len: usize,
+}
+
+impl<T: Copy> Clone for PagedPrimary<T> {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            len: self.len,
+        }
+    }
 }
 
 impl<T> PagedPrimary<T> {
@@ -301,6 +319,88 @@ pub struct Table<T: ArenaObject> {
     blob_patches: Vec<BlobRef>,
     /// Blob bytes already written to the log; the tail beyond this is new.
     flushed_blob_len: usize,
+}
+
+/// The canonical form of one table: rows in id order, each row's blob references
+/// resolved and repacked one after another, so two tables holding the same rows
+/// pack to the same bytes whatever their allocation history. One implementation
+/// for the live table and for a frozen copy of it, so they cannot disagree.
+fn pack_canonical_table<T: ArenaObject>(
+    primary: &PagedPrimary<T>,
+    row_count: usize,
+    blobs_src: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), TableError> {
+    out.extend_from_slice(&(primary.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(row_count as u64).to_le_bytes());
+    let offsets = T::blob_ref_offsets();
+    let mut blobs: Vec<u8> = Vec::new();
+    let mut scratch = Vec::new();
+    for (id, obj) in primary.iter_with_ids() {
+        out.extend_from_slice(&(id as u64).to_le_bytes());
+        let raw = obj.as_bytes();
+        if offsets.is_empty() {
+            out.extend_from_slice(raw);
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(raw);
+        for &at in offsets {
+            let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+            // A reference outside the arena is corruption. Exporting it as an
+            // empty blob would turn it into a snapshot that looks valid and
+            // hashes differently from the state it came from, so refuse.
+            let bytes = if len == 0 {
+                &[][..]
+            } else {
+                off.checked_add(len)
+                    .and_then(|end| blobs_src.get(off..end))
+                    .ok_or(TableError::Corrupted(
+                        "a blob reference points outside its arena: refusing to export",
+                    ))?
+            };
+            // The references are 32-bit: a table whose blobs, repacked, run
+            // past 4 GiB cannot be written in this format, and truncating the
+            // offset would make rows point at the wrong bytes.
+            let new_off = u32::try_from(blobs.len()).map_err(|_| {
+                TableError::Corrupted("a table's blobs exceed 4 GiB: cannot export")
+            })?;
+            if u32::try_from(blobs.len().saturating_add(bytes.len())).is_err() {
+                return Err(TableError::Corrupted(
+                    "a table's blobs exceed 4 GiB: cannot export",
+                ));
+            }
+            let (new_off, new_len) = if bytes.is_empty() {
+                (0u32, 0u32)
+            } else {
+                (new_off, bytes.len() as u32)
+            };
+            blobs.extend_from_slice(bytes);
+            scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
+            scratch[at + 4..at + 8].copy_from_slice(&new_len.to_le_bytes());
+        }
+        out.extend_from_slice(&scratch);
+    }
+    out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
+    out.extend_from_slice(&blobs);
+    Ok(())
+}
+
+/// What the canonical export of a table reads, copied out of it. The copy is made
+/// while the table is locked and is a plain memory copy of the rows and blob
+/// bytes (no secondary indexes, no undo state), so the export itself, which hashes
+/// and repacks every byte, can run afterwards without holding anything.
+pub(crate) struct FrozenTable<T: ArenaObject> {
+    primary: PagedPrimary<T>,
+    row_count: usize,
+    blobs: Vec<u8>,
+}
+
+impl<T: ArenaObject> FrozenTable<T> {
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        pack_canonical_table(&self.primary, self.row_count, &self.blobs, out)
+    }
 }
 
 impl<T: ArenaObject> Default for Table<T> {
@@ -827,60 +927,16 @@ impl<T: ArenaObject> Table<T> {
     /// Only for export. The live arena keeps its own layout, and the write-ahead
     /// log that follows a node's own checkpoint is written in terms of it.
     pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
-        out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
-        let offsets = T::blob_ref_offsets();
-        let mut blobs: Vec<u8> = Vec::new();
-        let mut scratch = Vec::new();
-        for (id, obj) in self.primary.iter_with_ids() {
-            out.extend_from_slice(&(id as u64).to_le_bytes());
-            let raw = obj.as_bytes();
-            if offsets.is_empty() {
-                out.extend_from_slice(raw);
-                continue;
-            }
-            scratch.clear();
-            scratch.extend_from_slice(raw);
-            for &at in offsets {
-                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
-                // A reference outside the arena is corruption. Exporting it as an
-                // empty blob would turn it into a snapshot that looks valid and
-                // hashes differently from the state it came from, so refuse.
-                let bytes = if len == 0 {
-                    &[][..]
-                } else {
-                    off.checked_add(len)
-                        .and_then(|end| self.blobs.get(off..end))
-                        .ok_or(TableError::Corrupted(
-                            "a blob reference points outside its arena: refusing to export",
-                        ))?
-                };
-                // The references are 32-bit: a table whose blobs, repacked, run
-                // past 4 GiB cannot be written in this format, and truncating the
-                // offset would make rows point at the wrong bytes.
-                let new_off = u32::try_from(blobs.len()).map_err(|_| {
-                    TableError::Corrupted("a table's blobs exceed 4 GiB: cannot export")
-                })?;
-                if u32::try_from(blobs.len().saturating_add(bytes.len())).is_err() {
-                    return Err(TableError::Corrupted(
-                        "a table's blobs exceed 4 GiB: cannot export",
-                    ));
-                }
-                let (new_off, new_len) = if bytes.is_empty() {
-                    (0u32, 0u32)
-                } else {
-                    (new_off, bytes.len() as u32)
-                };
-                blobs.extend_from_slice(bytes);
-                scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
-                scratch[at + 4..at + 8].copy_from_slice(&new_len.to_le_bytes());
-            }
-            out.extend_from_slice(&scratch);
+        pack_canonical_table(&self.primary, self.row_count, &self.blobs, out)
+    }
+
+    /// Copy out what the canonical export reads (see [`FrozenTable`]).
+    pub(crate) fn freeze(&self) -> FrozenTable<T> {
+        FrozenTable {
+            primary: self.primary.clone(),
+            row_count: self.row_count,
+            blobs: self.blobs.clone(),
         }
-        out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
-        out.extend_from_slice(&blobs);
-        Ok(())
     }
 
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {

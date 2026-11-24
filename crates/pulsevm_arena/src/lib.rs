@@ -20,6 +20,7 @@ mod table;
 pub use db::{
     Db,
     DbError,
+    FrozenDb,
     WAL_FORMAT,
     WalReplay,
     sync_parent_dir,

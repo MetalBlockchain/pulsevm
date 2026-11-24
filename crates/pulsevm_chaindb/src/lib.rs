@@ -5897,6 +5897,12 @@ impl ChainDatabase {
         self.lock().checkpoint_unmarked(path)
     }
 
+    /// Copy out what the canonical export reads, so the export can be built after
+    /// this database is released (see `pulsevm_arena::FrozenDb`).
+    pub fn freeze_canonical(&self) -> pulsevm_arena::FrozenDb {
+        self.lock().freeze()
+    }
+
     /// Load a checkpoint into this (freshly constructed, empty) database.
     pub fn load(&self, path: &std::path::Path) -> Result<(), DbError> {
         self.lock().load(path)

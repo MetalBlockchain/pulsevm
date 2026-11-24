@@ -363,6 +363,51 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
     Ok(())
 }
 
+/// One table's frozen copy, type-erased so a frozen database can hold them all.
+trait FrozenSection: Send {
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError>;
+}
+
+impl<T: ArenaObject> FrozenSection for crate::table::FrozenTable<T> {
+    fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        crate::table::FrozenTable::pack_canonical_into(self, out)
+    }
+}
+
+/// A copy of everything the canonical export reads, taken at one revision. Making
+/// it is a memory copy of the rows and blob bytes, done while the database is
+/// held; [`FrozenDb::canonical_bytes`], which repacks and hashes every byte, is
+/// done afterwards, on any thread, without holding the database. The bytes are
+/// exactly those [`Db::checkpoint_unmarked`] writes to a file (a test pins it).
+pub struct FrozenDb {
+    revision: i64,
+    /// `(type_id, table)` in type-id order, as the checkpoint file lists them.
+    sections: Vec<(u16, Box<dyn FrozenSection>)>,
+}
+
+impl FrozenDb {
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    /// The canonical checkpoint, in memory.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, DbError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.revision.to_le_bytes());
+        out.extend_from_slice(&(self.sections.len() as u64).to_le_bytes());
+        for (type_id, section) in &self.sections {
+            out.extend_from_slice(&type_id.to_le_bytes());
+            let len_at = out.len();
+            out.extend_from_slice(&0u64.to_le_bytes()); // section length placeholder
+            let start = out.len();
+            section.pack_canonical_into(&mut out)?;
+            let len = (out.len() - start) as u64;
+            out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+        }
+        Ok(out)
+    }
+}
+
 /// Type-erased view of a `Table<T>` so the database can drive the shared
 /// revision/undo lifecycle across a heterogeneous set of tables.
 trait AbstractTable: Send + Sync {
@@ -379,6 +424,8 @@ trait AbstractTable: Send + Sync {
     fn type_name(&self) -> &'static str;
     fn pack_into(&self, out: &mut Vec<u8>);
     fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError>;
+    /// A copy of what the canonical export reads, to export without the table.
+    fn freeze(&self) -> Box<dyn FrozenSection>;
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError>;
     fn pack_delta(&self, out: &mut Vec<u8>);
     fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError>;
@@ -427,6 +474,9 @@ impl<T: ArenaObject> AbstractTable for Table<T> {
     }
     fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
         Table::pack_canonical_into(self, out)
+    }
+    fn freeze(&self) -> Box<dyn FrozenSection> {
+        Box::new(Table::freeze(self))
     }
     fn load_from(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         Table::load_from(self, bytes)
@@ -683,6 +733,20 @@ impl Db {
     /// it is written in terms of the live layout.
     pub fn checkpoint_unmarked(&self, path: impl AsRef<Path>) -> Result<(), DbError> {
         self.write_checkpoint(path.as_ref(), true)
+    }
+
+    /// Copy out what the canonical export reads, so the export can run without
+    /// holding this database (see [`FrozenDb`]).
+    pub fn freeze(&self) -> FrozenDb {
+        let mut ordered: Vec<usize> = (0..self.tables.len()).collect();
+        ordered.sort_by_key(|&pos| self.tables[pos].type_id_num());
+        FrozenDb {
+            revision: self.revision(),
+            sections: ordered
+                .into_iter()
+                .map(|pos| (self.tables[pos].type_id_num(), self.tables[pos].freeze()))
+                .collect(),
+        }
     }
 
     fn write_checkpoint(&self, path: &Path, canonical: bool) -> Result<(), DbError> {

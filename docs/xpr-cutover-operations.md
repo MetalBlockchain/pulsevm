@@ -878,6 +878,46 @@ Each finding below was checked against the code before it was acted on.
   is a smoke result: random bytes mostly fail a checksum early, so there is no claim of
   depth without a seed corpus of real files.
 
+## The state summary no longer stops the node (round 15)
+
+Paul measured the export of a mainnet-size state for a state summary at about 9
+seconds and a 7 GB peak. `get_last_state_summary` took the controller exclusively and
+kept it for the whole export, so while a peer was being served a summary this node
+handled no block. A node that restarts or state-syncs asks its validators for their
+last summary, so by the code this could pause each of them in turn. That inference
+has not been measured on a network; the 9 seconds and 7 GB are Paul's measurement.
+
+What changed:
+
+- The controller is held only to **copy out** what the export reads: the rows and
+  blob bytes of each table, no indexes or undo state (`Db::freeze`). Repacking,
+  hashing and encoding the copy (`SnapshotJob::build`) runs on a worker thread
+  without the controller, and the controller is taken again only to cache the
+  result. The summary describes the block the state was copied at, not the tip by
+  the time it is built, so it stays consistent with its snapshot when blocks are
+  accepted meanwhile (a test accepts blocks during the build and then state-syncs a
+  fresh node from the summary).
+- Builds are serialized, so several peers asking at once cost one build instead of
+  one full snapshot in memory each.
+- The canonical bytes are no longer written to a file and read back, and the copy is
+  dropped as soon as they exist.
+
+Measured on a synthetic 624 MB state (release build, a laptop): the database is held
+for 188 ms now, against 862 ms for the old route. The rest of the work (about 750 ms
+there) happens off the lock. Run
+`cargo test -p pulsevm_arena --release --test freeze_cost -- --ignored --nocapture`
+(`FREEZE_ROWS` sets the size). Expect the hold to scale with state size at memory-copy
+speed (roughly 0.5 to 1 s at 2 GB); that is an extrapolation, to be replaced by Paul's
+measurement on the mainnet snapshot. Peak memory is lower than before but not small:
+the copy and the canonical bytes exist together while the copy is repacked.
+
+Not changed: a summary is still for the exact tip, so the cache is stale after almost
+every block and each request after a new block builds again (now off the lock). A
+download in progress against an older summary finds the cache replaced and fails; that
+was true before. Serving summaries at fixed heights would fix both, but all validators
+would then have to snapshot the same height at the same time, which needs a copy
+that is cheap enough to take at every such height; not attempted here.
+
 ## The voter after a failure: restart, degraded mode, state file
 
 - **A config fix needs a restart.** The voter reads its config at start. Fixing

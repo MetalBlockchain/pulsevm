@@ -480,6 +480,8 @@ pub struct VirtualMachine {
     // Refused blocks above the head, gathered into a summary per window.
     refused_blocks: Arc<std::sync::Mutex<chain::RefusedBlocks>>,
     started: std::time::Instant,
+    // Serializes state-summary builds (see `state_summary`).
+    summary_build: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What `wait_for_event` reports next.
@@ -520,6 +522,40 @@ where
 }
 
 impl VirtualMachine {
+    /// The summary for the tip, built without holding the controller while the
+    /// snapshot is built.
+    ///
+    /// A peer's request used to take the controller exclusively and keep it for the
+    /// whole export: seconds at mainnet size, with no block handled meanwhile, once
+    /// per request and on every validator a restarting node asked. Now the
+    /// controller is held only to copy the state out; the snapshot is built on a
+    /// worker thread; the controller is taken again to cache it. Builds are
+    /// serialized, so several peers asking at once cost one build (the later ones
+    /// find it cached) rather than one full snapshot in memory each.
+    async fn state_summary(
+        &self,
+    ) -> Result<pulsevm_core::controller::StateSummary, pulsevm_core::ChainError> {
+        let _one_build_at_a_time = self.summary_build.lock().await;
+        let prepared = self.controller.write().await.prepare_state_summary()?;
+        match prepared {
+            pulsevm_core::controller::SummaryPrep::Ready(summary) => Ok(summary),
+            pulsevm_core::controller::SummaryPrep::Build(build) => {
+                let pulsevm_core::controller::SummaryBuild { job, pending } = build;
+                let envelope = tokio::task::spawn_blocking(move || job.build())
+                    .await
+                    .map_err(|error| {
+                        pulsevm_core::ChainError::InternalError(format!(
+                            "state-summary build did not finish: {error}"
+                        ))
+                    })??;
+                self.controller
+                    .write()
+                    .await
+                    .finish_state_summary(pending, envelope)
+            }
+        }
+    }
+
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(RwLock::new(Mempool::new()));
@@ -540,6 +576,7 @@ impl VirtualMachine {
             engine_state_syncing: Arc::new(AtomicBool::new(false)),
             refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
             started: std::time::Instant::now(),
+            summary_build: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
@@ -1492,10 +1529,7 @@ impl Vm for VirtualMachine {
         request: Request<()>,
     ) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        // Exclusive: producing a summary snapshots the arena, which briefly drops
-        // and remaps the database.
-        let mut controller = self.controller.write().await;
-        let summary = match controller.produce_state_summary() {
+        let summary = match self.state_summary().await {
             Ok(summary) => summary,
             Err(error) if error.is_fatal_consistency() => {
                 abort_on_fatal_consistency("state-summary creation", &error)

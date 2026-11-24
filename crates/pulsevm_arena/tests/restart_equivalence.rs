@@ -447,3 +447,83 @@ fn a_nodes_own_checkpoint_still_matches_its_live_layout() {
     recovered.replay_log_after(&wal, 11).unwrap();
     assert_eq!(recovered.state_root(), db.state_root());
 }
+
+// The export used to hold the whole database for as long as it took to repack and
+// hash every byte (seconds at mainnet size). It now copies out what it reads, and
+// repacks the copy afterwards. The copy has to give exactly the bytes the file
+// export gives, and has to be unaffected by what the database does next.
+#[test]
+fn a_frozen_copy_exports_the_same_bytes_as_the_database_and_is_unaffected_by_later_writes() {
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    // Blob churn: rows rewritten at different sizes, a freed span, an empty blob.
+    let junk = db.alloc_blob::<Doc>(b"xxxxxxxxxxxxxxxxxxxx").unwrap();
+    db.free_blob::<Doc>(junk).unwrap();
+    for (key, wrong, payload) in [
+        (7u64, &b"first-attempt"[..], &b"final-payload"[..]),
+        (9, b"zzzzzz", b"nine"),
+        (11, b"qq", b""),
+        (13, b"a-longer-first-attempt-here", b"short"),
+    ] {
+        let first = db.alloc_blob::<Doc>(wrong).unwrap();
+        let id = db
+            .create::<Doc>(|d| {
+                d.key = key;
+                d.payload = first;
+            })
+            .unwrap()
+            .id;
+        let moved = db.realloc_blob::<Doc>(first, payload).unwrap();
+        db.modify::<Doc>(id, |d| d.payload = moved).unwrap();
+    }
+
+    let before = export_bytes(&db);
+    let frozen = db.freeze();
+    assert_eq!(frozen.revision(), db.revision());
+    assert_eq!(
+        frozen.canonical_bytes().unwrap(),
+        before,
+        "the frozen copy exports the bytes the file export writes"
+    );
+
+    // The database moves on after the copy was taken: new rows, a rewrite.
+    let blob = db.alloc_blob::<Doc>(b"written-after-the-freeze").unwrap();
+    db.create::<Doc>(|d| {
+        d.key = 99;
+        d.payload = blob;
+    })
+    .unwrap();
+    db.set_revision(2).unwrap();
+    assert_ne!(export_bytes(&db), before, "the live state did change");
+    assert_eq!(
+        frozen.canonical_bytes().unwrap(),
+        before,
+        "and the copy still exports the state it was taken at"
+    );
+
+    // A copy builds the same bytes whichever thread does it.
+    let from_a_thread = std::thread::spawn(move || frozen.canonical_bytes().unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(from_a_thread, before);
+}
+
+#[test]
+fn a_frozen_copy_of_a_corrupt_database_still_refuses_to_export() {
+    // Same refusal as the file export (dangling blob reference), now off the lock.
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    db.create::<Doc>(|d| {
+        d.key = 1;
+        d.payload = BlobRef {
+            off: 1_000_000,
+            len: 64,
+        };
+    })
+    .unwrap();
+    let error = db.freeze().canonical_bytes().expect_err("must refuse");
+    assert!(
+        format!("{error:?}").contains("outside its arena"),
+        "{error:?}"
+    );
+}

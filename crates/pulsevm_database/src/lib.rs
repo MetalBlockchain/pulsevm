@@ -38,6 +38,7 @@ pub use crate::{
         Database,
         DbRead,
         PermissionInfo,
+        SnapshotJob,
         SnapshotVersion,
         SpeculativeCommitOutcome,
         SpeculativeFallbackReason,

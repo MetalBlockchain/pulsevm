@@ -1208,6 +1208,30 @@ fn checkpoint_state_checks_apply(arena_revision: i64, checkpoint_revision: i64) 
     arena_revision == checkpoint_revision
 }
 
+/// The outcome of the first half of producing a state summary.
+pub enum SummaryPrep {
+    /// The cached snapshot commits to the tip: nothing to build.
+    Ready(StateSummary),
+    /// The state was copied out; build it without holding the controller.
+    Build(SummaryBuild),
+}
+
+/// A snapshot to build ([`SummaryBuild::job`], safe to build on any thread) and
+/// what to remember about the block it was taken at ([`SummaryBuild::pending`]).
+pub struct SummaryBuild {
+    pub job: pulsevm_database::SnapshotJob,
+    pub pending: PendingSummary,
+}
+
+/// What the summary for a snapshot says, captured when the state was copied.
+pub struct PendingSummary {
+    height: u32,
+    state_root: [u8; 32],
+    block: SignedBlock,
+    schedule: ProducerSchedule,
+    protocol_commitment: crate::chain::protocol_features::ProtocolScheduleCommitment,
+}
+
 /// The log size at which this node writes a checkpoint instead: the configured
 /// size plus up to as much again, chosen from the node's identity.
 ///
@@ -5059,10 +5083,31 @@ impl Controller {
     /// Produce a state summary for the last accepted block, caching the snapshot
     /// it commits to so `serve_snapshot_chunk` can answer download requests.
     ///
-    /// Snapshots the live arena when the cache is stale, so the caller must hold
-    /// the controller exclusively (no block being processed): `snapshot_bytes`
-    /// briefly drops and remaps the database.
+    /// Builds the snapshot inline, holding the controller for all of it. The node
+    /// itself uses [`Self::prepare_state_summary`] and
+    /// [`Self::finish_state_summary`] instead, which hold it only to copy the state
+    /// out (see [`SummaryPrep`]); this is the same thing in one call.
     pub fn produce_state_summary(&mut self) -> Result<StateSummary, ChainError> {
+        match self.prepare_state_summary()? {
+            SummaryPrep::Ready(summary) => Ok(summary),
+            SummaryPrep::Build(build) => {
+                let SummaryBuild { job, pending } = build;
+                let envelope = job.build()?;
+                self.finish_state_summary(pending, envelope)
+            }
+        }
+    }
+
+    /// The first half of producing a summary: everything that needs the controller.
+    /// When the cached snapshot already commits to the tip the summary is ready.
+    /// Otherwise the state is COPIED OUT (a memory copy of the rows and blob
+    /// bytes) and returned as a job; repacking, hashing and encoding it is the slow
+    /// part (seconds at mainnet size) and needs nothing from the controller, so the
+    /// caller releases the controller, builds the job elsewhere, and hands the
+    /// result to [`Self::finish_state_summary`]. Before this, every peer's request
+    /// for a summary held the controller for the whole export and the node handled
+    /// no block meanwhile.
+    pub fn prepare_state_summary(&mut self) -> Result<SummaryPrep, ChainError> {
         // A verified child may have a live undo session materialized above the
         // accepted revision. State summaries are labelled with last accepted,
         // so unwind speculation before taking the physical arena snapshot.
@@ -5070,51 +5115,86 @@ impl Controller {
         let height = self.last_accepted_block.block_num();
         self.validate_persisted_protocol_state(height, false)?;
 
-        // Reuse the cached snapshot while it still commits to the tip; otherwise
-        // take a fresh one. Re-snapshotting scans the whole arena, so caching
-        // matters when a peer pulls many chunks for the same summary.
-        if self.snapshot_cache.as_ref().map(|c| c.height) != Some(height) {
-            let state_root = self.db.arena_state_root().ok_or_else(|| {
-                ChainError::InternalError("summary: database has no state root".into())
-            })?;
-            let envelope = self.db.snapshot_bytes()?;
-            let hash = *Digest::hash(&envelope).as_bytes();
-            self.snapshot_cache = Some(CachedSnapshot {
+        let protocol_commitment = self.protocol_upgrade_schedule.commitment(height);
+        // Reuse the cached snapshot while it still commits to the tip.
+        if let Some(cache) = self.snapshot_cache.as_ref().filter(|c| c.height == height) {
+            return Ok(SummaryPrep::Ready(Self::summary_from(
+                &self.last_accepted_block,
+                &self.active_schedule,
+                protocol_commitment,
+                cache.state_root,
+                cache.envelope.len() as u64,
+                &cache.hash,
+            )?));
+        }
+        let state_root = self.db.arena_state_root().ok_or_else(|| {
+            ChainError::InternalError("summary: database has no state root".into())
+        })?;
+        Ok(SummaryPrep::Build(SummaryBuild {
+            job: self.db.freeze_snapshot(),
+            pending: PendingSummary {
                 height,
                 state_root,
-                hash,
-                envelope,
-            });
-        }
-        let cache = self.snapshot_cache.as_ref().unwrap();
+                block: self.last_accepted_block.clone(),
+                schedule: self.active_schedule.clone(),
+                protocol_commitment,
+            },
+        }))
+    }
 
-        let block_bytes = self
-            .last_accepted_block
+    /// The second half: cache the built snapshot and return the summary for the
+    /// height it was taken at. The summary describes THAT block and schedule, not
+    /// whatever the tip is by now, so it stays consistent with its snapshot even if
+    /// blocks were accepted while it was built.
+    pub fn finish_state_summary(
+        &mut self,
+        pending: PendingSummary,
+        envelope: Vec<u8>,
+    ) -> Result<StateSummary, ChainError> {
+        let hash = *Digest::hash(&envelope).as_bytes();
+        let summary = Self::summary_from(
+            &pending.block,
+            &pending.schedule,
+            pending.protocol_commitment,
+            pending.state_root,
+            envelope.len() as u64,
+            &hash,
+        )?;
+        self.snapshot_cache = Some(CachedSnapshot {
+            height: pending.height,
+            state_root: pending.state_root,
+            hash,
+            envelope,
+        });
+        Ok(summary)
+    }
+
+    fn summary_from(
+        block: &SignedBlock,
+        schedule: &ProducerSchedule,
+        protocol_commitment: crate::chain::protocol_features::ProtocolScheduleCommitment,
+        state_root: [u8; 32],
+        envelope_len: u64,
+        hash: &[u8; 32],
+    ) -> Result<StateSummary, ChainError> {
+        let block_bytes = block
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack block: {}", e)))?;
-        let schedule_bytes = self
-            .active_schedule
+        let schedule_bytes = schedule
             .pack()
             .map_err(|e| ChainError::InternalError(format!("summary: pack schedule: {}", e)))?;
-        let protocol_commitment = self.protocol_upgrade_schedule.commitment(height);
         let bytes = state_sync::encode_summary_bytes(
             &schedule_bytes,
             &block_bytes,
-            cache.envelope.len() as u64,
-            &cache.hash,
-            &cache.state_root,
+            envelope_len,
+            hash,
+            &state_root,
             protocol_commitment,
         );
-        let id = state_sync::summary_id(
-            &self.last_accepted_block,
-            &self.active_schedule,
-            &cache.state_root,
-            protocol_commitment,
-        )?;
-
+        let id = state_sync::summary_id(block, schedule, &state_root, protocol_commitment)?;
         Ok(StateSummary {
             id,
-            height: height as u64,
+            height: block.block_num() as u64,
             bytes,
         })
     }
@@ -9909,6 +9989,97 @@ mod tests {
         Ok(())
     }
 
+    // A summary used to be produced while holding the controller for the whole
+    // export. It is now prepared (state copied out) under the controller and built
+    // elsewhere. Same bytes either way.
+    #[tokio::test]
+    async fn preparing_and_finishing_a_summary_gives_the_summary_producing_it_in_one_call_gives()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        for name in ["one", "two"] {
+            chain.accept(&mut controller, name).await?;
+        }
+        let in_one_call = controller.produce_state_summary()?;
+        controller.snapshot_cache = None; // force a build again
+
+        let SummaryPrep::Build(build) = controller.prepare_state_summary()? else {
+            panic!("a build is needed when nothing is cached");
+        };
+        let SummaryBuild { job, pending } = build;
+        let envelope = job.build()?;
+        let in_two_steps = controller.finish_state_summary(pending, envelope)?;
+        assert_eq!(in_two_steps.id, in_one_call.id);
+        assert_eq!(in_two_steps.height, in_one_call.height);
+        assert_eq!(in_two_steps.bytes, in_one_call.bytes);
+
+        // And the cache now answers the next request without another build.
+        match controller.prepare_state_summary()? {
+            SummaryPrep::Ready(again) => assert_eq!(again.bytes, in_one_call.bytes),
+            SummaryPrep::Build(_) => panic!("the cache should serve the tip"),
+        }
+        Ok(())
+    }
+
+    // The point of the split: blocks keep being accepted while the snapshot is
+    // built. The summary must still describe the height the state was copied at
+    // (not the new tip), and a node that state-syncs from it must end up in exactly
+    // that state.
+    #[tokio::test]
+    async fn a_summary_built_while_blocks_are_accepted_describes_the_state_it_copied()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut producer = chain.open()?;
+        for name in ["one", "two"] {
+            chain.accept(&mut producer, name).await?;
+        }
+        let height_then = producer.last_accepted_block().block_num();
+        let root_then = producer.database().arena_state_root().unwrap();
+
+        let SummaryPrep::Build(build) = producer.prepare_state_summary()? else {
+            panic!("nothing cached, so a build is needed");
+        };
+        let SummaryBuild { job, pending } = build;
+        // The controller is free: more blocks are accepted while the snapshot is
+        // built on another thread.
+        let built = std::thread::spawn(move || job.build());
+        for name in ["three", "four"] {
+            chain.accept(&mut producer, name).await?;
+        }
+        let envelope = built.join().unwrap()?;
+        let summary = producer.finish_state_summary(pending, envelope)?;
+        assert_eq!(
+            summary.height, height_then as u64,
+            "the height it was copied at"
+        );
+        assert!(
+            producer.last_accepted_block().block_num() > height_then,
+            "and the tip has moved on"
+        );
+
+        // A fresh node syncs from it and lands exactly there.
+        let syncer_chain = CrashChain::new(json!({}))?;
+        let mut syncer = syncer_chain.open()?;
+        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        syncer.validate_state_sync_target(&target)?;
+        let (hash, height) = (target.hash, target.height);
+        let downloaded = crate::chain::state_sync::download_snapshot(&target, |off, len| {
+            let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
+            async move { chunk }
+        })
+        .await?;
+        syncer.apply_state_snapshot(
+            target.block.clone(),
+            target.schedule.clone(),
+            target.protocol_commitment,
+            target.state_root,
+            &downloaded,
+        )?;
+        assert_eq!(syncer.last_accepted_block().block_num(), height_then);
+        assert_eq!(syncer.database().arena_state_root(), Some(root_then));
+        Ok(())
+    }
+
     // Killed again and again: each recovery must leave a log the next one can
     // extend, and a clean shutdown must fold the log into the checkpoint.
     #[tokio::test]
@@ -13836,8 +14007,7 @@ mod tests {
             pulsevm_database::HaltCommitment::digest(source_block_num, &source_block_id.0.0);
         let mut signature = signing_key.sign(&digest).to_string();
         if tamper {
-            signature.pop();
-            signature.push('1');
+            signature = with_last_character_changed(&signature);
         }
         let manifest_bytes = fs::read(manifest_path)
             .map_err(|e| ChainError::InternalError(format!("failed to read manifest: {e}")))?;
@@ -14068,6 +14238,30 @@ mod tests {
 
     /// Seed a pending deferred transaction on a restored chain, the way the
     /// importer leaves an XPR one (multisig proposals carry a header cap).
+    /// A signature with its last character changed, so it no longer verifies.
+    /// Swapping the last character for a fixed one ('1') does nothing when the
+    /// signature already ends in it, and two tests that expected a refusal were
+    /// then handed a valid signature about one run in fifty (found as an
+    /// intermittent failure of `migration_restore_rejects_tampered_halt_commitment`).
+    fn with_last_character_changed(signature: &str) -> String {
+        let mut changed = signature.to_string();
+        let last = changed.pop().expect("a signature is not empty");
+        changed.push(if last == '1' { '2' } else { '1' });
+        assert_ne!(changed, signature, "the signature really changed");
+        changed
+    }
+
+    #[test]
+    fn changing_the_last_character_always_changes_it() {
+        for ending in ['1', '2', 'a', 'Z', '9'] {
+            let original = format!("SIG_K1_abcdef{ending}");
+            let changed = with_last_character_changed(&original);
+            assert_ne!(changed, original, "ending in {ending}");
+            assert_eq!(changed.len(), original.len());
+            assert_eq!(changed[..changed.len() - 1], original[..original.len() - 1]);
+        }
+    }
+
     fn seed_deferred_account(
         controller: &mut Controller,
         chain: &RestoredChain,
@@ -14496,9 +14690,7 @@ mod tests {
         let signature = manifest["halt_commitment"]["signatures"][0]["signature"]
             .as_str()
             .ok_or_else(|| ChainError::InternalError("commitment has no signature".into()))?;
-        let mut tampered = signature.to_string();
-        tampered.pop();
-        tampered.push('1');
+        let tampered = with_last_character_changed(signature);
         manifest["halt_commitment"]["signatures"][0]["signature"] = json!(tampered);
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
             .map_err(|e| ChainError::InternalError(format!("failed to write manifest: {e}")))?;
