@@ -2888,9 +2888,20 @@ PY
         done
         distinct="$(printf '%s' "$builds" | grep -v '^$' | sort -u)"
         [[ -n "$distinct" ]] || fail "check_one_build: no node reported a build"
+        # A node that does not answer is not "the same build", it is unknown. The
+        # check used to skip silent nodes and pass on the ones that answered.
+        reported="$(printf '%s' "$builds" | grep -vc '^$')"
+        [[ "$reported" -ge 5 ]] \
+            || fail "check_one_build: only $reported of 5 nodes reported a build"
         [[ "$(wc -l <<<"$distinct" | tr -d ' ')" == "1" ]] \
             || fail "check_one_build: the nodes run different builds: $(tr '\n' ';' <<<"$distinct")"
-        echo "handover: verify-restarts: every node runs one build: $distinct"
+        # A binary built outside a git checkout reports "unknown", and five of
+        # those cannot be told apart. The rehearsal builds from git, so this is
+        # an error there; set PULSEVM_ALLOW_UNKNOWN_BUILD=1 to rehearse from a tarball.
+        if [[ "$distinct" == unknown\ * && "${PULSEVM_ALLOW_UNKNOWN_BUILD:-0}" != "1" ]]; then
+            fail "check_one_build: every node reports build id 'unknown', so the check cannot tell builds apart (build from a git checkout, or set PULSEVM_BUILD_ID)"
+        fi
+        echo "handover: verify-restarts: all $reported nodes run one build: $distinct"
     }
 
     echo "handover: verify-restarts: network dir $NETBASE, $rounds round(s)"

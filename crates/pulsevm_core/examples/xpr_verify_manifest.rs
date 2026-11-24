@@ -873,11 +873,28 @@ mod tests {
             7,
             ImportSummary::default(),
         );
-        // Minimal packed source-block prefix: zeros with schedule version 1
-        // at the version offset. The verifier only reads the prefix (the
-        // restore decodes the full block); the offset itself is pinned by a
-        // golden test against a decoded block in the controller tests.
-        manifest.source_block = Some(format!("{}01000000", "00".repeat(110)));
+        // A real, decodable source block with the header the fixture's H entry
+        // describes. The verifier now decodes the whole block, as the restore gate
+        // does (it used to read an unauthenticated prefix, which is what let a
+        // fake one pass); its id must be the H id the pair signed.
+        {
+            use pulsevm_serialization::Write;
+            let mut source_block = pulsevm_core::block::SignedBlock::new(
+                pulsevm_core::id::Id::new(parent6),
+                pulsevm_core::block::BlockTimestamp::new(0x01020304),
+                Name::new(owner),
+                std::collections::VecDeque::new(),
+                pulsevm_crypto::Digest::default(),
+                pulsevm_crypto::Digest::default(),
+            );
+            source_block.signed_block_header.header.schedule_version = 1;
+            assert_eq!(
+                source_block.id().unwrap().as_bytes(),
+                &hid,
+                "the fixture's source block is the H the entry describes"
+            );
+            manifest.source_block = Some(hex::encode(source_block.pack().unwrap()));
+        }
         let roster_key = if tamper_roster {
             other.public_key()
         } else {
@@ -1188,6 +1205,55 @@ mod tests {
             std::process::ExitCode::SUCCESS
         );
         drop(fixture.dir);
+    }
+
+    // The verifier used to read an unauthenticated prefix of the attached source
+    // block and print PASS for a bundle whose block was not the one the manifest
+    // names, which the node then refused. It now decodes the whole block and checks
+    // it against the manifest, as the restore gate does.
+    #[test]
+    fn rejects_a_source_block_that_is_not_the_one_the_manifest_names() {
+        let fixture = fixture(false, true);
+        let outcome = |fixture: &Fixture| {
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(fixture)),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            )
+        };
+        assert_eq!(outcome(&fixture), std::process::ExitCode::SUCCESS);
+
+        // The manifest names a different block than the one attached.
+        rewrite_manifest(&fixture, |manifest| {
+            let mut id = hex::decode(manifest["source_block_id"].as_str().unwrap()).unwrap();
+            id[31] ^= 1;
+            manifest["source_block_id"] = serde_json::json!(hex::encode(id));
+        });
+        assert_ne!(outcome(&fixture), std::process::ExitCode::SUCCESS);
+    }
+
+    // A placeholder block (a prefix of zeros, which is what the fixtures used to
+    // attach) is not a block.
+    #[test]
+    fn rejects_a_source_block_that_does_not_decode() {
+        let fixture = fixture(false, true);
+        rewrite_manifest(&fixture, |manifest| {
+            manifest["source_block"] = serde_json::json!(format!("{}01000000", "00".repeat(110)));
+        });
+        assert_ne!(
+            run(
+                &fixture.manifest,
+                &fixture.checkpoint,
+                None,
+                Some(genesis_str(&fixture)),
+                Some(&FIXTURE_PLATFORM),
+                None,
+            ),
+            std::process::ExitCode::SUCCESS
+        );
     }
 
     #[test]
