@@ -981,6 +981,22 @@ mod tests {
         account: &str,
         chain_id: &Id,
     ) -> PackedTransaction {
+        newaccount_tx_from_creator(
+            auth_key,
+            signer,
+            Name::from_str("pulse").unwrap(),
+            account,
+            chain_id,
+        )
+    }
+
+    fn newaccount_tx_from_creator(
+        auth_key: &PrivateKey,
+        signer: &PrivateKey,
+        creator: Name,
+        account: &str,
+        chain_id: &Id,
+    ) -> PackedTransaction {
         let authority = Authority::new(
             1,
             vec![KeyWeight::new(auth_key.get_public_key().into_k1(), 1)],
@@ -991,7 +1007,7 @@ mod tests {
             Name::from_str("pulse").unwrap(),
             Name::from_str("newaccount").unwrap(),
             NewAccount {
-                creator: Name::from_str("pulse").unwrap(),
+                creator,
                 name: Name::from_str(account).unwrap(),
                 owner: authority.clone(),
                 active: authority,
@@ -999,7 +1015,7 @@ mod tests {
             .pack()
             .unwrap(),
             vec![PermissionLevel::new(
-                Name::from_str("pulse").unwrap().as_u64(),
+                creator.as_u64(),
                 Name::from_str("active").unwrap().as_u64(),
             )],
         );
@@ -1213,6 +1229,44 @@ mod tests {
             executable.id(),
             "the failed transaction must not block a later valid transaction"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_creator_can_create_a_twelve_character_account() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let creator = Name::from_str("test").unwrap();
+        let bootstrap = newaccount_tx(&genesis_key, &genesis_key, "test", &chain_id);
+        assert!(service.admit_transaction(bootstrap.clone()).await.unwrap());
+        let bootstrap_block = service.build_block().await.unwrap();
+        assert_eq!(bootstrap_block.transactions.len(), 1);
+        let bootstrap_id = bootstrap_block.id().unwrap();
+        {
+            let mut mempool = mempool.write().await;
+            let mut controller = service.controller.write().await;
+            controller.accept_block(&bootstrap_id, &mut mempool).unwrap();
+        }
+
+        let transaction = newaccount_tx_from_creator(
+            &genesis_key,
+            &genesis_key,
+            creator,
+            "testacct1234",
+            &chain_id,
+        );
+        assert!(service.admit_transaction(transaction.clone()).await.unwrap());
+        let block = service.build_block().await.unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(
+            block.transactions[0].transaction_id(),
+            transaction.id(),
+            "the ordinary-creator transaction must execute into a block receipt"
+        );
+        assert!(service
+            .controller
+            .read()
+            .await
+            .database()
+            .arena_account_exists(Name::from_str("testacct1234").unwrap().as_u64()));
     }
 
     // Admission uses the synchronized database handle installed at controller
