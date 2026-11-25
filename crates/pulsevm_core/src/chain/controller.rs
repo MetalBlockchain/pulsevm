@@ -586,6 +586,22 @@ pub enum BlockResourceMode {
     ReplayHistoricalReceipts,
 }
 
+/// A transaction rejected during local block construction. This is local
+/// execution feedback and is not part of the block or consensus state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionExecutionFailure {
+    pub id: Id,
+    pub error: String,
+}
+
+/// The block candidate and any transactions the local producer dropped while
+/// executing its detached mempool batch.
+#[derive(Debug, Clone)]
+pub struct BlockBuildOutcome {
+    pub block: SignedBlock,
+    pub failed_transactions: Vec<TransactionExecutionFailure>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransactionResourceMode {
     /// Locally produced/admitted transaction: measure resources and retain the
@@ -1899,9 +1915,22 @@ impl Controller {
     }
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
+        self.build_block_with_outcomes(mempool)
+            .await
+            .map(|outcome| outcome.block)
+    }
+
+    /// Build a block and return local execution failures for transactions
+    /// removed from the producer's mempool batch. Callers may expose these
+    /// failures through node-local diagnostics; they are not consensus data.
+    pub async fn build_block_with_outcomes(
+        &mut self,
+        mempool: &mut Mempool,
+    ) -> Result<BlockBuildOutcome, ChainError> {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
+        let mut failed_transactions = Vec::new();
         let block_height = BlockHeader::num_from_id(&self.preferred_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let block_status = BlockStatus::Building;
@@ -2237,6 +2266,10 @@ impl Controller {
                 }
                 Err(e) => {
                     rejected_input_transaction = true;
+                    failed_transactions.push(TransactionExecutionFailure {
+                        id: transaction.id().clone(),
+                        error: e.to_string(),
+                    });
                     warn!(
                         "transaction {} failed to execute, dropping: {}",
                         transaction.id(),
@@ -2321,7 +2354,10 @@ impl Controller {
             traces: transaction_traces,
         });
 
-        Ok(block)
+        Ok(BlockBuildOutcome {
+            block,
+            failed_transactions,
+        })
     }
 
     fn schedule_state_for_parent(

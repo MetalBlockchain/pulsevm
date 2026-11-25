@@ -46,6 +46,27 @@ pub struct ProtocolUpgradeInfo {
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID"))]
     pub tx_id: Id,
+    pub status: TransactionStatus,
+}
+
+/// The latest transaction outcome known to this node. This is local telemetry,
+/// not a consensus receipt or a promise that every node has observed the same
+/// pending transaction.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionStatus {
+    Unknown,
+    Admitted,
+    Included,
+    ExecutionFailed,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct GetTransactionStatusResponse {
+    pub tx_id: Id,
+    pub status: TransactionStatus,
+    pub block_num: Option<u32>,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Clone, Default)]

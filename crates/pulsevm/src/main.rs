@@ -776,6 +776,10 @@ impl Vm for VirtualMachine {
             }
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
+        let accepted_block = controller.last_accepted_block().clone();
+        drop(mempool);
+        drop(controller);
+        self.rpc_service.note_accepted_block(&accepted_block);
         debug!(
             "block accepted with id {}, returning from block_accept",
             block_id

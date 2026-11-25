@@ -1,6 +1,7 @@
 use pulsevm_core::{
     Name,
     crypto::Signature,
+    id::Id,
     transaction::TransactionCompression,
     utils::StringFlex,
 };
@@ -90,6 +91,7 @@ pub const CHAIN_HANDLER_METHODS: &[&str] = &[
     "get_currency_balance",
     "get_currency_stats",
     "get_code_hash",
+    "get_transaction_status",
     "get_required_keys",
     "push_transaction",
     "send_transaction",
@@ -114,6 +116,7 @@ pub async fn handle_nodeos_request(
         "get_currency_balance" => handle_get_currency_balance(rpc_service, body).await,
         "get_currency_stats" => handle_get_currency_stats(rpc_service, body).await,
         "get_code_hash" => handle_get_code_hash(rpc_service, body).await,
+        "get_transaction_status" => handle_get_transaction_status(rpc_service, body).await,
         "get_required_keys" => handle_get_required_keys(rpc_service, body).await,
         "push_transaction" | "send_transaction" => handle_push_transaction(rpc_service, body).await,
         _ => (404, error_body("Not found", "unknown_method")),
@@ -447,10 +450,25 @@ async fn handle_push_transaction(rpc_service: &RpcService, body: &str) -> (i32, 
     };
 
     let response = json!({
-        "transaction_id": result.tx_id.to_string()
+        "transaction_id": result.tx_id.to_string(),
+        "status": result.status,
     });
 
     (200, response.to_string())
+}
+
+async fn handle_get_transaction_status(rpc_service: &RpcService, body: &str) -> (i32, String) {
+    let req: TransactionStatusRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return (400, error_body("Invalid JSON", "parse_error")),
+    };
+    match rpc_service.get_transaction_status_compat(req.tx_id).await {
+        Ok(status) => (
+            200,
+            serde_json::to_string(&status).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(error) => (500, error_body(get_error_message(&error), "internal_error")),
+    }
 }
 
 // Request/Response types for nodeos compatibility
@@ -478,6 +496,11 @@ struct BlockRequest {
 struct BlockInfoRequest {
     #[serde(deserialize_with = "u32_flex")]
     block_num: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct TransactionStatusRequest {
+    tx_id: Id,
 }
 
 #[derive(serde::Deserialize)]
