@@ -10740,6 +10740,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_block_after_rejected_batch_is_validated_and_accepted_by_peer()
+    -> Result<(), ChainError> {
+        let (mut producer, producer_key, chain_id, _producer_temp) = init_test_controller()?;
+        let mut producer_mempool = Mempool::new();
+        producer_mempool.add_transaction(create_account(&producer_key, PULSE_NAME, chain_id)?);
+
+        let block = producer.build_block(&mut producer_mempool).await?;
+        assert!(block.transactions.is_empty());
+
+        // Validate on an independent controller so the fast path for blocks
+        // already built locally cannot hide a peer verification failure.
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+
+        assert_eq!(validator.last_accepted_block().id()?, block.id()?);
+        assert_eq!(validator.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unscheduled_node_refuses_before_executing_the_mempool() -> Result<(), ChainError> {
         // Every node wakes the block builder when a gossiped transaction lands in
         // its mempool, scheduled producer or not. A node whose key is not the
