@@ -2669,8 +2669,13 @@ print((n.to_bytes(2, 'big') + bytes([n % 251]) * length).hex())")"
         echo "$total"
     }
     expect_log_grew() { # node, text, count before, what it shows
-        local now; now="$(log_count "$1" "$2")"
-        [[ "$now" -gt "$3" ]] || fail "faults: node$1's log never shows '$2' ($4)"
+        local now
+        for _ in $(seq 1 100); do
+            now="$(log_count "$1" "$2")"
+            [[ "$now" -gt "$3" ]] && return 0
+            sleep 0.1
+        done
+        fail "faults: node$1's log never shows '$2' ($4)"
     }
     expect_log_unchanged() { # node, text, count before, what it would mean
         local now; now="$(log_count "$1" "$2")"
@@ -2808,7 +2813,7 @@ PY
     }
 
     run_remaining_fault_stages() {
-        local n dir before size_before flood_pid
+        local n dir before before_removed size_before flood_pid
         # 3. A cut during a state-sync install leaves the marker. The node used to
         # refuse to start until someone moved its data aside by hand.
         n=2
@@ -2816,11 +2821,16 @@ PY
         dir="$(node_data_dir "$n")"
         printf 'PVMSYN01\0\0\0\0' >"$dir/state_sync_installing"
         before="$(log_count "$n" 'state_sync.install_abandoned')"
+        before_removed="$(log_count "$n" 'removed abandoned pre-sync data after authenticated state sync')"
         start_node "$n"
-        timed_converge "node$n after an interrupted state-sync install"
         expect_log_grew "$n" 'state_sync.install_abandoned' "$before" "the node must report that it started over"
-        find "$netdir/node$n" -type d -name state_sync_abandoned -print -quit | grep -q . \
-            || fail "faults: node$n kept no copy of the abandoned data"
+        find "$dir/state_sync_abandoned" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q . \
+            || fail "faults: node$n did not retain abandoned data while resyncing"
+        timed_converge "node$n after an interrupted state-sync install"
+        expect_log_grew "$n" 'removed abandoned pre-sync data after authenticated state sync' "$before_removed" \
+            "successful authenticated resync should release the retained data"
+        [[ ! -e "$dir/state_sync_abandoned" ]] \
+            || fail "faults: node$n retained abandoned data after authenticated resync"
 
         # 4. A node that is far behind state-syncs while transactions are pending.
         # The plugin used to answer "build a block" during the sync; the host's
