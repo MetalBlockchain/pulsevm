@@ -11470,10 +11470,12 @@ mod tests {
         )
         .sign(&private_key, &chain_id)?;
         mempool.add_transaction(PackedTransaction::from_signed_transaction(failed)?);
+        let rejected_batch_block = controller.build_block(&mut mempool).await?;
         assert!(
-            controller.build_block(&mut mempool).await.is_err(),
-            "a block containing only a failed transaction must remain empty"
+            rejected_batch_block.transactions.is_empty(),
+            "a block containing only a failed transaction must have no receipts"
         );
+        controller.reject_block(&rejected_batch_block.id()?, &mut mempool)?;
 
         // Consensus state still rolls back completely.
         assert_eq!(
