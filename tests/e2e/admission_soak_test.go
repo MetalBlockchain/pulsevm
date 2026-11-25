@@ -44,6 +44,7 @@ func TestMempoolAdmissionSoak(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	soakStarted := time.Now()
 	output, err := exec.CommandContext(ctx, soak,
 		"--url", uri,
 		"--private-key", key,
@@ -65,7 +66,7 @@ func TestMempoolAdmissionSoak(t *testing.T) {
 	for _, id := range report.TransactionIDs {
 		expected[id] = struct{}{}
 	}
-	deadline := time.Now().Add(time.Minute)
+	deadline := soakStarted.Add(time.Minute)
 	for _, node := range network.Nodes {
 		baseURI := node.GetAccessibleURI() + "/ext/bc/" + chainID
 		infoURI := baseURI + "/rpc"
@@ -93,7 +94,8 @@ func TestMempoolAdmissionSoak(t *testing.T) {
 				node.NodeID, len(seen), len(expected))
 			time.Sleep(100 * time.Millisecond)
 		}
-		t.Logf("node %s accepted all %d submitted transaction hashes", node.NodeID, len(seen))
+		t.Logf("node %s accepted all %d submitted transaction hashes in %s",
+			node.NodeID, len(seen), time.Since(soakStarted).Round(time.Millisecond))
 	}
 
 	// This is intentionally a liveness guard rather than a machine-specific
