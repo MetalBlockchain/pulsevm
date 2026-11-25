@@ -863,10 +863,14 @@ Each finding below was checked against the code before it was acted on.
   under a mainnet-sized sync and fix the measured host bottleneck, then repeat the
   multi-node rehearsal. PulseVM's fixed-height summaries and disk-backed chunks do
   not remove that host-side throughput risk.
-- **A VM that refuses to start can still be counted by MetalGo.** The inactivity
-  watchdog can stop the plugin runtime after a configured interval, but it does not
-  prove that MetalGo stops advertising the chain. The supervisor/validator health
-  integration needs to take that node out of polling.
+- **A dead VM must take its MetalGo node out of polling.** PulseVM's
+  `dead_chain_shutdown_after_secs` watchdog and MetalGo's
+  `--shutdown-on-chain-creation-failure` shutdown-on-unhealthy option are both
+  opt-in. Configure the PulseVM timeout and enable the MetalGo option together:
+  the VM watchdog exits the plugin after the timeout, and MetalGo then shuts down
+  after three consecutive VM health-check failures. With either setting disabled,
+  the node can remain advertised after the chain stops making progress. The
+  rehearsal still needs to exercise this failure path on the pinned host.
 - **The live five-node environment is not configured in this checkout.** The
   handover script can verify Pebble and synced writes on every live node, but that
   check has not been run against the rehearsal hosts here. Do not treat the local
