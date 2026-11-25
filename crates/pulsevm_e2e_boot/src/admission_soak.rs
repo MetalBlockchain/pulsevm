@@ -90,6 +90,7 @@ fn parse_args() -> Result<Args> {
 fn new_account_transaction(
     key: &PrivateKey,
     chain_id: &Id,
+    creator: Name,
     account: Name,
 ) -> Result<PackedTransaction> {
     let public_key = key.get_public_key().into_k1();
@@ -98,7 +99,7 @@ fn new_account_transaction(
         PULSE_NAME,
         NEWACCOUNT_NAME,
         NewAccount {
-            creator: PULSE_NAME,
+            creator,
             name: account,
             owner: authority.clone(),
             active: authority,
@@ -106,7 +107,7 @@ fn new_account_transaction(
         .pack()
         .context("packing newaccount")?,
         vec![PermissionLevel::new(
-            PULSE_NAME.as_u64(),
+            creator.as_u64(),
             ACTIVE_NAME.as_u64(),
         )],
     );
@@ -143,18 +144,42 @@ async fn main() -> Result<()> {
     let client = Arc::new(PulseVmClient::new(&args.url));
     let info = client.get_info().await.context("getting chain info")?;
     let chain_id = Id::from_str(&info.chain_id).context("invalid chain id from endpoint")?;
-    let start_block_num = info.head_block_num;
+
+    // Exercise the reported ordinary-creator case: pulse creates `test` with
+    // the same key, then all soak transactions are authorized by test rather
+    // than by the privileged system account.
+    let creator = Name::from_str("test").context("encoding test creator account")?;
+    let creator_setup = new_account_transaction(&key, &chain_id, PULSE_NAME, creator)?;
+    client
+        .issue_tx(&creator_setup)
+        .await
+        .context("submitting the test creator account")?;
+    let creator_deadline = Instant::now() + INCLUSION_TIMEOUT;
+    loop {
+        if client.get_account(&creator, &None).await.is_ok() {
+            break;
+        }
+        if Instant::now() >= creator_deadline {
+            bail!("test creator account was not created within {INCLUSION_TIMEOUT:?}");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let start_block_num = client
+        .get_info()
+        .await
+        .context("getting chain head after creator setup")?
+        .head_block_num;
 
     // A fresh tmpnet is used for each run. The twelve-character names use the
     // chain's `a-z1-5` alphabet and avoid collisions with the boot test's named
-    // accounts.
+    // accounts. They are created by the ordinary `test` account above.
     let accounts: Vec<Name> = (0..args.transactions)
         .map(soak_account_name)
         .collect::<Result<_>>()?;
     let transactions: Vec<_> = accounts
         .iter()
         .copied()
-        .map(|account| new_account_transaction(&key, &chain_id, account))
+        .map(|account| new_account_transaction(&key, &chain_id, creator, account))
         .collect::<Result<_>>()?;
     let expected_transaction_ids: BTreeSet<_> = transactions
         .iter()
