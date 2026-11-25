@@ -1,9 +1,10 @@
 //! Sends a bounded burst of independently signed transactions to a running
-//! PulseVM endpoint, then proves every accepted transaction was applied.
+//! PulseVM endpoint, checks admission and status RPCs, then proves every
+//! accepted transaction was applied.
 //!
 //! It is an end-to-end fixture rather than a benchmark: the surrounding Go
 //! test runs it against a five-node tmpnet, so the requests traverse HTTP,
-//! mempool admission, gossip, production, verification, and acceptance.
+//! mempool admission/status, gossip, production, verification, and acceptance.
 
 use std::{
     collections::BTreeSet,
@@ -21,6 +22,7 @@ use anyhow::{
     bail,
 };
 use pulsevm_api_client::PulseVmClient;
+use pulsevm_api_types::TransactionStatus;
 use pulsevm_core::{
     ACTIVE_NAME,
     PULSE_NAME,
@@ -49,6 +51,7 @@ const DEFAULT_TRANSACTIONS: usize = 128;
 const DEFAULT_CONCURRENCY: usize = 32;
 const INCLUSION_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ADMISSION_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCOUNT_NAME_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz12345";
 
 struct Args {
@@ -134,6 +137,34 @@ fn percentile_ms(latencies: &mut [u128], percentile: f64) -> u128 {
     latencies[index]
 }
 
+async fn admitted_or_included_status(
+    client: &PulseVmClient,
+    tx_id: &Id,
+) -> Result<TransactionStatus> {
+    let deadline = Instant::now() + ADMISSION_STATUS_TIMEOUT;
+    loop {
+        let response = client
+            .get_transaction_status(tx_id)
+            .await
+            .context("querying transaction status after admission")?;
+        match response.status {
+            TransactionStatus::Admitted | TransactionStatus::Included => {
+                return Ok(response.status);
+            }
+            TransactionStatus::ExecutionFailed => bail!(
+                "transaction {tx_id} failed during block execution: {}",
+                response.error.unwrap_or_else(|| "no error detail".into())
+            ),
+            TransactionStatus::Unknown => {
+                if Instant::now() >= deadline {
+                    bail!("transaction {tx_id} remained unknown after successful admission");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = parse_args()?;
@@ -191,9 +222,14 @@ async fn main() -> Result<()> {
         pending.spawn(async move {
             let started = Instant::now();
             let response = client.issue_tx(&transaction).await?;
-            Ok::<_, pulsevm_api_client::ClientError>((
+            if response.status != TransactionStatus::Admitted {
+                bail!("issue_tx returned unexpected status {:?}", response.status);
+            }
+            let status = admitted_or_included_status(&client, &response.tx_id).await?;
+            Ok::<_, anyhow::Error>((
                 started.elapsed().as_millis(),
                 response.tx_id.to_string(),
+                status,
             ))
         });
     }
@@ -201,17 +237,28 @@ async fn main() -> Result<()> {
     let mut latencies = Vec::with_capacity(args.transactions);
     let mut admitted_transaction_ids = BTreeSet::new();
     while let Some(result) = pending.join_next().await {
-        let (latency, transaction_id) = result.context("admission task panicked")??;
+        let (latency, transaction_id, status) = result.context("admission task panicked")??;
         latencies.push(latency);
         admitted_transaction_ids.insert(transaction_id);
+        if !matches!(
+            status,
+            TransactionStatus::Admitted | TransactionStatus::Included
+        ) {
+            bail!("status query did not observe the transaction in the mempool or a block");
+        }
         if let Some(transaction) = remaining.next() {
             let client = client.clone();
             pending.spawn(async move {
                 let started = Instant::now();
                 let response = client.issue_tx(&transaction).await?;
-                Ok::<_, pulsevm_api_client::ClientError>((
+                if response.status != TransactionStatus::Admitted {
+                    bail!("issue_tx returned unexpected status {:?}", response.status);
+                }
+                let status = admitted_or_included_status(&client, &response.tx_id).await?;
+                Ok::<_, anyhow::Error>((
                     started.elapsed().as_millis(),
                     response.tx_id.to_string(),
+                    status,
                 ))
             });
         }
@@ -241,6 +288,19 @@ async fn main() -> Result<()> {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
+    // Account state proves the actions executed; require the RPC status API to
+    // report the corresponding accepted receipt and block height as well.
+    for transaction_id in &admitted_transaction_ids {
+        let transaction_id = Id::from_str(transaction_id).context("invalid transaction ID")?;
+        let status = client.get_transaction_status(&transaction_id).await?;
+        if status.status != TransactionStatus::Included || status.block_num.is_none() {
+            bail!(
+                "transaction {transaction_id} finished without included status and block number: {:?}",
+                status.status
+            );
+        }
+    }
+
     let mut p50_values = latencies.clone();
     let mut p95_values = latencies.clone();
     let p50_ms = percentile_ms(&mut p50_values, 0.50);
@@ -251,6 +311,7 @@ async fn main() -> Result<()> {
         serde_json::json!({
             "submitted": args.transactions,
             "included": accounts.len(),
+            "included_statuses": admitted_transaction_ids.len(),
             "start_block_num": start_block_num,
             "transaction_ids": admitted_transaction_ids,
             "p50_admission_ms": p50_ms,

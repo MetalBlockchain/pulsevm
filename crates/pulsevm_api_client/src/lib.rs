@@ -1,9 +1,11 @@
 use pulsevm_api_types::{
     AccountResponse,
     ChainInfoResponse,
+    GetTransactionStatusResponse,
     IssueTxResponse,
 };
 use pulsevm_core::{
+    id::Id,
     name::Name,
     transaction::{
         PackedTransaction,
@@ -264,6 +266,14 @@ impl PulseVmClient {
     ) -> Result<IssueTxResponse, ClientError> {
         let params = serde_json::to_value(packed_trx)?;
         self.rpc_call("pulsevm.issueTx", Some(params)).await
+    }
+
+    pub async fn get_transaction_status(
+        &self,
+        tx_id: &Id,
+    ) -> Result<GetTransactionStatusResponse, ClientError> {
+        self.rpc_call("pulsevm.getTransactionStatus", Some(json!([tx_id])))
+            .await
     }
 }
 

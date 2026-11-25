@@ -132,11 +132,35 @@ pub struct ProtocolUpgradeInfo {
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID", deserialize = "txID"))]
     pub tx_id: Id,
+    #[serde(default)]
+    pub status: TransactionStatus,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionStatus {
+    #[default]
+    Unknown,
+    Admitted,
+    Included,
+    ExecutionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetTransactionStatusResponse {
+    pub tx_id: Id,
+    pub status: TransactionStatus,
+    pub block_num: Option<u32>,
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ChainInfoResponse;
+    use super::{
+        ChainInfoResponse,
+        IssueTxResponse,
+        TransactionStatus,
+    };
     use serde_json::{
         Value,
         json,
@@ -204,5 +228,15 @@ mod tests {
                 activation_height: 123,
             })
         );
+    }
+
+    #[test]
+    fn issue_tx_response_defaults_status_for_older_servers() {
+        let response: IssueTxResponse = serde_json::from_value(json!({
+            "txID": "29729782766cdaaf7f08421c300d5538a486bffe8042d74b1765205896854fe7"
+        }))
+        .unwrap();
+
+        assert_eq!(response.status, TransactionStatus::Unknown);
     }
 }

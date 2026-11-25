@@ -14,13 +14,14 @@ import (
 // transactions have become accounts on-chain. The latency values describe the
 // HTTP admission calls themselves, rather than waiting for block inclusion.
 type admissionSoakReport struct {
-	Submitted      int      `json:"submitted"`
-	Included       int      `json:"included"`
-	StartBlockNum  uint32   `json:"start_block_num"`
-	TransactionIDs []string `json:"transaction_ids"`
-	P50AdmissionMS int      `json:"p50_admission_ms"`
-	P95AdmissionMS int      `json:"p95_admission_ms"`
-	MaxAdmissionMS int      `json:"max_admission_ms"`
+	Submitted        int      `json:"submitted"`
+	Included         int      `json:"included"`
+	IncludedStatuses int      `json:"included_statuses"`
+	StartBlockNum    uint32   `json:"start_block_num"`
+	TransactionIDs   []string `json:"transaction_ids"`
+	P50AdmissionMS   int      `json:"p50_admission_ms"`
+	P95AdmissionMS   int      `json:"p95_admission_ms"`
+	MaxAdmissionMS   int      `json:"max_admission_ms"`
 }
 
 // TestMempoolAdmissionSoak drives concurrent signed HTTP ingress at one node
@@ -57,6 +58,7 @@ func TestMempoolAdmissionSoak(t *testing.T) {
 	require.NoError(json.Unmarshal(output, &report), "unparseable admission soak report: %s", output)
 	require.Equal(128, report.Submitted)
 	require.Equal(report.Submitted, report.Included, "every admitted transaction must be applied")
+	require.Equal(report.Submitted, report.IncludedStatuses, "every admitted transaction must reach included RPC status")
 	require.Len(report.TransactionIDs, report.Submitted)
 
 	// Account state on the submitter alone cannot show that every validator
