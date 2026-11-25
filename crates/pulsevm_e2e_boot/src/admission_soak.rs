@@ -106,10 +106,7 @@ fn new_account_transaction(
         }
         .pack()
         .context("packing newaccount")?,
-        vec![PermissionLevel::new(
-            creator.as_u64(),
-            ACTIVE_NAME.as_u64(),
-        )],
+        vec![PermissionLevel::new(creator.as_u64(), ACTIVE_NAME.as_u64())],
     );
     let mut transaction = Transaction::default();
     transaction.header.expiration = TimePointSec::now() + DEFAULT_MEMPOOL_TRANSACTION_TTL_SECS;
