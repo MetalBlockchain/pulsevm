@@ -586,6 +586,22 @@ pub enum BlockResourceMode {
     ReplayHistoricalReceipts,
 }
 
+/// A transaction rejected during local block construction. This is local
+/// execution feedback and is not part of the block or consensus state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionExecutionFailure {
+    pub id: Id,
+    pub error: String,
+}
+
+/// The block candidate and any transactions the local producer dropped while
+/// executing its detached mempool batch.
+#[derive(Debug, Clone)]
+pub struct BlockBuildOutcome {
+    pub block: SignedBlock,
+    pub failed_transactions: Vec<TransactionExecutionFailure>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransactionResourceMode {
     /// Locally produced/admitted transaction: measure resources and retain the
@@ -1899,12 +1915,62 @@ impl Controller {
     }
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
+        self.build_block_with_outcomes(mempool)
+            .await
+            .map(|outcome| outcome.block)
+    }
+
+    /// Build a block and return local execution failures for transactions
+    /// removed from the producer's mempool batch. Callers may expose these
+    /// failures through node-local diagnostics; they are not consensus data.
+    pub async fn build_block_with_outcomes(
+        &mut self,
+        mempool: &mut Mempool,
+    ) -> Result<BlockBuildOutcome, ChainError> {
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
+        let mut failed_transactions = Vec::new();
         let block_height = BlockHeader::num_from_id(&self.preferred_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let block_status = BlockStatus::Building;
+
+        // The schedule active for this block is normally its parent's active
+        // schedule. Once a pending schedule has reached accepted state, the next
+        // block promotes it by naming its version in the header. Do not promote a
+        // schedule that exists only on the speculative pending chain: it has not
+        // become irreversible yet.
+        let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
+        let block_schedule = match &self.pending_schedule {
+            Some(accepted_pending)
+                if parent_schedule_state.active.version < accepted_pending.version =>
+            {
+                accepted_pending.clone()
+            }
+            _ => parent_schedule_state.active.clone(),
+        };
+
+        // Refuse to produce a block this node isn't authorized to sign: if our
+        // key isn't that schedule's key for our producer, the block would fail
+        // verification everywhere (including here), so fail closed instead of
+        // emitting an unverifiable block after a schedule change. This must come
+        // before any execution. Every node with a gossiped transaction wakes the
+        // builder, and executing the whole mempool under the controller write lock
+        // just to discard it delays the block_verify / block_accept of the real
+        // producer's block on this node.
+        {
+            let node = self.node_config.as_ref().unwrap();
+            let producer = node.producer_name;
+            match block_schedule.block_signing_key(&producer) {
+                Some(scheduled) if *scheduled == node.producer_key.get_public_key() => {}
+                _ => {
+                    return Err(ChainError::BlockError(format!(
+                        "node key is not the active schedule key for producer {}; refusing to produce",
+                        producer
+                    )));
+                }
+            }
+        }
 
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
@@ -1956,20 +2022,6 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // The schedule active for this block is normally its parent's active
-        // schedule. Once a pending schedule has reached accepted state, the next
-        // block promotes it by naming its version in the header. Do not promote a
-        // schedule that exists only on the speculative pending chain: it has not
-        // become irreversible yet.
-        let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
-        let block_schedule = match &self.pending_schedule {
-            Some(accepted_pending)
-                if parent_schedule_state.active.version < accepted_pending.version =>
-            {
-                accepted_pending.clone()
-            }
-            _ => parent_schedule_state.active.clone(),
-        };
         self.block_active_schedule = block_schedule.clone();
 
         // A queued protocol feature is activated by the next block header, just
@@ -2184,6 +2236,7 @@ impl Controller {
         }
 
         // Get transactions from the mempool
+        let mut rejected_input_transaction = false;
         while let Some(transaction) = mempool.pop_transaction() {
             if pending_tx_ids.contains(transaction.id()) {
                 deferred.push(transaction);
@@ -2212,6 +2265,11 @@ impl Controller {
                     action_receipt_digests.extend(result.action_receipt_digests);
                 }
                 Err(e) => {
+                    rejected_input_transaction = true;
+                    failed_transactions.push(TransactionExecutionFailure {
+                        id: transaction.id().clone(),
+                        error: e.to_string(),
+                    });
                     warn!(
                         "transaction {} failed to execute, dropping: {}",
                         transaction.id(),
@@ -2224,12 +2282,22 @@ impl Controller {
         }
 
         // Return deferred transactions to the mempool for a later block.
+        let had_deferred_transactions = !deferred.is_empty();
         for tx in deferred {
             mempool.add_transaction(tx);
         }
 
-        // Don't build a block if we have no transactions
-        if transaction_receipts.len() == 0 {
+        let rejected_batch_without_deferred =
+            rejected_input_transaction && !had_deferred_transactions;
+
+        // Keep ordinary empty-pool builds gated, but if this build was woken by
+        // transactions and every input transaction was rejected during
+        // execution, return an empty block instead of an RPC build error.
+        // Otherwise the VM reports a failed build after correctly dropping the
+        // bad transactions; the engine may stop its current production attempt
+        // even though the mempool is now clean. Empty blocks are valid on the
+        // verification path.
+        if transaction_receipts.is_empty() && !rejected_batch_without_deferred {
             db.arena_undo(); // discard the empty block's session
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
@@ -2252,24 +2320,7 @@ impl Controller {
             .header
             .set_protocol_feature_activations(&protocol_feature_activations)?;
 
-        // Refuse to produce a block this node isn't authorized to sign:
-        // if our key isn't that schedule's key for our producer, the block would
-        // fail verification everywhere (including here), so fail closed instead of
-        // emitting an unverifiable block after a schedule change.
         let node = self.node_config.as_ref().unwrap();
-        let producer = node.producer_name;
-        let signing_key = node.producer_key.get_public_key();
-        match block_schedule.block_signing_key(&producer) {
-            Some(scheduled) if *scheduled == signing_key => {}
-            _ => {
-                db.arena_undo(); // discard this block's session
-                return Err(ChainError::BlockError(format!(
-                    "node key is not the active schedule key for producer {}; refusing to produce",
-                    producer
-                )));
-            }
-        }
-
         block.signed_block_header.header.schedule_version = block_schedule.version;
         block.signed_block_header.header.new_producers = new_pending_schedule;
 
@@ -2303,7 +2354,10 @@ impl Controller {
             traces: transaction_traces,
         });
 
-        Ok(block)
+        Ok(BlockBuildOutcome {
+            block,
+            failed_transactions,
+        })
     }
 
     fn schedule_state_for_parent(
@@ -10722,6 +10776,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_block_after_rejected_batch_is_validated_and_accepted_by_peer()
+    -> Result<(), ChainError> {
+        let (mut producer, producer_key, chain_id, _producer_temp) = init_test_controller()?;
+        let mut producer_mempool = Mempool::new();
+        producer_mempool.add_transaction(create_account(&producer_key, PULSE_NAME, chain_id)?);
+
+        let block = producer.build_block(&mut producer_mempool).await?;
+        assert!(block.transactions.is_empty());
+
+        // Validate on an independent controller so the fast path for blocks
+        // already built locally cannot hide a peer verification failure.
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller()?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&block, &mut validator_mempool)
+            .await?;
+        validator.accept_block(&block.id()?, &mut validator_mempool)?;
+
+        assert_eq!(validator.last_accepted_block().id()?, block.id()?);
+        assert_eq!(validator.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unscheduled_node_refuses_before_executing_the_mempool() -> Result<(), ChainError> {
+        // Every node wakes the block builder when a gossiped transaction lands in
+        // its mempool, scheduled producer or not. A node whose key is not the
+        // active schedule key must refuse before it executes anything: running the
+        // whole mempool under the controller write lock only to discard the result
+        // stalls the block_verify / block_accept that the real producer's block is
+        // waiting on. Executing pops the transaction, so an untouched mempool is
+        // the proof that nothing ran.
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let other = PrivateKey::random();
+        controller.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: other.get_public_key(),
+        }])?;
+
+        let transaction = create_account(&private_key, Name::from_str("testapi")?, chain_id)?;
+        let transaction_id = *transaction.id();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(transaction);
+
+        let error = controller
+            .build_block(&mut mempool)
+            .await
+            .expect_err("an unscheduled node must not build");
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            mempool.contains(&transaction_id),
+            "the refusal must come before any mempool transaction is executed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn onblock_runs_at_head_of_every_block() -> Result<(), ChainError> {
         // onblock is an implicit action received by the system account. A block
         // carrying a single newaccount transaction (also received by pulse) must
@@ -11415,10 +11531,12 @@ mod tests {
         )
         .sign(&private_key, &chain_id)?;
         mempool.add_transaction(PackedTransaction::from_signed_transaction(failed)?);
+        let rejected_batch_block = controller.build_block(&mut mempool).await?;
         assert!(
-            controller.build_block(&mut mempool).await.is_err(),
-            "a block containing only a failed transaction must remain empty"
+            rejected_batch_block.transactions.is_empty(),
+            "a block containing only a failed transaction must have no receipts"
         );
+        controller.reject_block(&rejected_batch_block.id()?, &mut mempool)?;
 
         // Consensus state still rolls back completely.
         assert_eq!(

@@ -72,6 +72,55 @@ func RPCCall(ctx context.Context, uri, method string, params any, out any) error
 	return json.Unmarshal(decoded.Result, out)
 }
 
+// BlockTransactionIDs returns receipt IDs from a nodeos-compatible accepted
+// block. The endpoint is the chain's /v1/chain/get_block route.
+func BlockTransactionIDs(ctx context.Context, endpoint string, blockNum uint32) ([]string, error) {
+	body, err := json.Marshal(map[string]string{"block_num_or_id": fmt.Sprint(blockNum)})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var decoded struct {
+		Transactions []struct {
+			Trx struct {
+				ID string `json:"id"`
+			} `json:"trx"`
+		} `json:"transactions"`
+		Message string `json:"message"`
+		Error   *struct {
+			What string `json:"what"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decoding block %d: %w", blockNum, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if decoded.Error != nil {
+			return nil, fmt.Errorf("get_block %d: %s", blockNum, decoded.Error.What)
+		}
+		return nil, fmt.Errorf("get_block %d returned HTTP %s: %s", blockNum, resp.Status, decoded.Message)
+	}
+
+	ids := make([]string, 0, len(decoded.Transactions))
+	for _, transaction := range decoded.Transactions {
+		if transaction.Trx.ID == "" {
+			return nil, fmt.Errorf("block %d has a receipt without a transaction ID", blockNum)
+		}
+		ids = append(ids, transaction.Trx.ID)
+	}
+	return ids, nil
+}
+
 // ChainInfo is the protocol-version view returned by pulsevm.getInfo. The
 // endpoint has many additional fields; these are the ones needed to assert an
 // upgrade boundary end to end.

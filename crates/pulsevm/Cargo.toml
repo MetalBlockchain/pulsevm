@@ -7,6 +7,7 @@ edition = "2024"
 ignored = ["spdlog-rs"] # The package exports the `spdlog` crate name.
 
 [dependencies]
+pulsevm_api_types = { path = "../pulsevm_api_types" }
 anyhow = "1.0.98"
 hex = "0.4"
 futures-util = "0.3"

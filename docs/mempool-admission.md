@@ -73,6 +73,24 @@ The final insertion is intentionally the deduplication point. Several identical
 requests may complete preflight concurrently, but at most one becomes a pool
 entry.
 
+### Submission and execution status
+
+`pulsevm.issueTx` and the Nodeos-compatible `push_transaction` return an
+`admitted` status and transaction ID after local mempool admission. Admission is
+not execution: action handlers run later during block construction. Query
+`pulsevm.getTransactionStatus` with that ID, or POST the same `tx_id` to
+`/v1/chain/get_transaction_status`, to read the latest outcome known by this
+node: `admitted`, `included`, `execution_failed` (with the action error), or
+`unknown`.
+
+These outcomes are node-local and held in a bounded in-memory cache. `included`
+means the node accepted a block containing the transaction; use the block log
+for durable proof. A transaction may be unknown if this node did not see it,
+its status aged out of the cache, or it expired before execution. A failed
+transaction is reported by the producer that executed and dropped it; other
+nodes cannot infer its action error from the accepted chain because failed
+transactions have no block receipt.
+
 If a service has not installed admission state yet, it falls back to the
 controller read lock. That fallback is safe but has the original contention
 behavior and is measured separately.
@@ -108,6 +126,13 @@ subsequently changes.
 
 This behavior is safe because admission is advisory. It must not be treated as
 an inclusion guarantee or as a transactionally coherent state read.
+
+During block production, action-execution failures are dropped from the local
+batch and execution continues with later transactions. If every transaction in
+a non-empty batch fails, the producer completes that wake-up with a valid empty
+block instead of returning a block-build error. A direct build against an
+already-empty pool remains gated; the timer only wakes block production when
+the pool contains transactions.
 
 Obtaining both concurrency and coherent reads requires a larger design:
 versioned database snapshots/MVCC, or a separate producer execution pipeline
