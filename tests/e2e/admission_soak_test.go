@@ -14,11 +14,13 @@ import (
 // transactions have become accounts on-chain. The latency values describe the
 // HTTP admission calls themselves, rather than waiting for block inclusion.
 type admissionSoakReport struct {
-	Submitted      int `json:"submitted"`
-	Included       int `json:"included"`
-	P50AdmissionMS int `json:"p50_admission_ms"`
-	P95AdmissionMS int `json:"p95_admission_ms"`
-	MaxAdmissionMS int `json:"max_admission_ms"`
+	Submitted      int      `json:"submitted"`
+	Included       int      `json:"included"`
+	StartBlockNum  uint32   `json:"start_block_num"`
+	TransactionIDs []string `json:"transaction_ids"`
+	P50AdmissionMS int      `json:"p50_admission_ms"`
+	P95AdmissionMS int      `json:"p95_admission_ms"`
+	MaxAdmissionMS int      `json:"max_admission_ms"`
 }
 
 // TestMempoolAdmissionSoak drives concurrent signed HTTP ingress at one node
@@ -54,6 +56,46 @@ func TestMempoolAdmissionSoak(t *testing.T) {
 	require.NoError(json.Unmarshal(output, &report), "unparseable admission soak report: %s", output)
 	require.Equal(128, report.Submitted)
 	require.Equal(report.Submitted, report.Included, "every admitted transaction must be applied")
+	require.Len(report.TransactionIDs, report.Submitted)
+
+	// Account state on the submitter alone cannot show that every validator
+	// accepted the same receipts. Walk each node's accepted blocks from the
+	// pre-soak head and require every submitted transaction hash to appear.
+	expected := make(map[string]struct{}, len(report.TransactionIDs))
+	for _, id := range report.TransactionIDs {
+		expected[id] = struct{}{}
+	}
+	deadline := time.Now().Add(time.Minute)
+	for _, node := range network.Nodes {
+		baseURI := node.GetAccessibleURI() + "/ext/bc/" + chainID
+		infoURI := baseURI + "/rpc"
+		blockURI := baseURI + "/v1/chain/get_block"
+		nextBlock := report.StartBlockNum + 1
+		seen := make(map[string]struct{}, len(expected))
+		for len(seen) < len(expected) {
+			info, err := GetInfo(ctx, infoURI)
+			require.NoError(err, "getting chain info from node %s", node.NodeID)
+			for nextBlock <= info.HeadBlockNum {
+				ids, err := BlockTransactionIDs(ctx, blockURI, nextBlock)
+				require.NoError(err, "reading block %d from node %s", nextBlock, node.NodeID)
+				for _, id := range ids {
+					if _, wanted := expected[id]; wanted {
+						seen[id] = struct{}{}
+					}
+				}
+				nextBlock++
+			}
+			if len(seen) == len(expected) {
+				break
+			}
+			require.True(time.Now().Before(deadline),
+				"node %s accepted only %d of %d submitted transaction hashes",
+				node.NodeID, len(seen), len(expected))
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Logf("node %s accepted all %d submitted transaction hashes", node.NodeID, len(seen))
+	}
+
 	// This is intentionally a liveness guard rather than a machine-specific
 	// performance target. It catches a regression back to multi-second queuing
 	// behind production while avoiding flaky CI on slow runners. The exact p95

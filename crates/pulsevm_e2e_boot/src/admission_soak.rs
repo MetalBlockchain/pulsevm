@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
     let client = Arc::new(PulseVmClient::new(&args.url));
     let info = client.get_info().await.context("getting chain info")?;
     let chain_id = Id::from_str(&info.chain_id).context("invalid chain id from endpoint")?;
+    let start_block_num = info.head_block_num;
 
     // A fresh tmpnet is used for each run. The twelve-character names use the
     // chain's `a-z1-5` alphabet and avoid collisions with the boot test's named
@@ -154,6 +155,10 @@ async fn main() -> Result<()> {
         .copied()
         .map(|account| new_account_transaction(&key, &chain_id, account))
         .collect::<Result<_>>()?;
+    let transaction_ids: Vec<_> = transactions
+        .iter()
+        .map(|transaction| transaction.id().to_string())
+        .collect();
 
     let mut remaining = transactions.into_iter();
     let mut pending = JoinSet::new();
@@ -211,6 +216,8 @@ async fn main() -> Result<()> {
         serde_json::json!({
             "submitted": args.transactions,
             "included": accounts.len(),
+            "start_block_num": start_block_num,
+            "transaction_ids": transaction_ids,
             "p50_admission_ms": p50_ms,
             "p95_admission_ms": p95_ms,
             "max_admission_ms": max_ms,
