@@ -1193,6 +1193,24 @@ mod tests {
             !mempool.read().await.contains(invalid_at_execution.id()),
             "a transaction rejected during block production must not remain queued"
         );
+
+        // A failed one-transaction candidate must not leave the controller or
+        // producer loop wedged. A subsequent executable transaction should wake
+        // the next build and advance the head without waiting for the failed
+        // transaction's original expiry.
+        let executable = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(executable.clone()).await.unwrap());
+        let block = service
+            .build_block()
+            .await
+            .expect("a later executable transaction must build immediately");
+        assert_eq!(block.block_num(), 2);
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(
+            block.transactions[0].transaction_id(),
+            executable.id(),
+            "the failed transaction must not block a later valid transaction"
+        );
     }
 
     // Admission uses the synchronized database handle installed at controller

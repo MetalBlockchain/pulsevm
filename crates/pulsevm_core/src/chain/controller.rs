@@ -1906,6 +1906,43 @@ impl Controller {
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
         let block_status = BlockStatus::Building;
 
+        // The schedule active for this block is normally its parent's active
+        // schedule. Once a pending schedule has reached accepted state, the next
+        // block promotes it by naming its version in the header. Do not promote a
+        // schedule that exists only on the speculative pending chain: it has not
+        // become irreversible yet.
+        let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
+        let block_schedule = match &self.pending_schedule {
+            Some(accepted_pending)
+                if parent_schedule_state.active.version < accepted_pending.version =>
+            {
+                accepted_pending.clone()
+            }
+            _ => parent_schedule_state.active.clone(),
+        };
+
+        // Refuse to produce a block this node isn't authorized to sign: if our
+        // key isn't that schedule's key for our producer, the block would fail
+        // verification everywhere (including here), so fail closed instead of
+        // emitting an unverifiable block after a schedule change. This must come
+        // before any execution. Every node with a gossiped transaction wakes the
+        // builder, and executing the whole mempool under the controller write lock
+        // just to discard it delays the block_verify / block_accept of the real
+        // producer's block on this node.
+        {
+            let node = self.node_config.as_ref().unwrap();
+            let producer = node.producer_name;
+            match block_schedule.block_signing_key(&producer) {
+                Some(scheduled) if *scheduled == node.producer_key.get_public_key() => {}
+                _ => {
+                    return Err(ChainError::BlockError(format!(
+                        "node key is not the active schedule key for producer {}; refusing to produce",
+                        producer
+                    )));
+                }
+            }
+        }
+
         // Transactions already present in a verified-but-not-yet-accepted block
         // must not be included again. At build time the earlier block has not
         // committed its `transaction_object` dedup record yet, so a re-gossiped
@@ -1956,20 +1993,6 @@ impl Controller {
         // block's session rather than before it.
         db.clear_expired_input_transactions(&timestamp.into())?;
 
-        // The schedule active for this block is normally its parent's active
-        // schedule. Once a pending schedule has reached accepted state, the next
-        // block promotes it by naming its version in the header. Do not promote a
-        // schedule that exists only on the speculative pending chain: it has not
-        // become irreversible yet.
-        let parent_schedule_state = self.schedule_state_for_parent(&self.preferred_id)?;
-        let block_schedule = match &self.pending_schedule {
-            Some(accepted_pending)
-                if parent_schedule_state.active.version < accepted_pending.version =>
-            {
-                accepted_pending.clone()
-            }
-            _ => parent_schedule_state.active.clone(),
-        };
         self.block_active_schedule = block_schedule.clone();
 
         // A queued protocol feature is activated by the next block header, just
@@ -2252,24 +2275,7 @@ impl Controller {
             .header
             .set_protocol_feature_activations(&protocol_feature_activations)?;
 
-        // Refuse to produce a block this node isn't authorized to sign:
-        // if our key isn't that schedule's key for our producer, the block would
-        // fail verification everywhere (including here), so fail closed instead of
-        // emitting an unverifiable block after a schedule change.
         let node = self.node_config.as_ref().unwrap();
-        let producer = node.producer_name;
-        let signing_key = node.producer_key.get_public_key();
-        match block_schedule.block_signing_key(&producer) {
-            Some(scheduled) if *scheduled == signing_key => {}
-            _ => {
-                db.arena_undo(); // discard this block's session
-                return Err(ChainError::BlockError(format!(
-                    "node key is not the active schedule key for producer {}; refusing to produce",
-                    producer
-                )));
-            }
-        }
-
         block.signed_block_header.header.schedule_version = block_schedule.version;
         block.signed_block_header.header.new_producers = new_pending_schedule;
 
@@ -10716,6 +10722,43 @@ mod tests {
         assert!(
             controller.build_block(&mut mempool).await.is_err(),
             "node must refuse to produce a block it cannot validly sign"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unscheduled_node_refuses_before_executing_the_mempool() -> Result<(), ChainError> {
+        // Every node wakes the block builder when a gossiped transaction lands in
+        // its mempool, scheduled producer or not. A node whose key is not the
+        // active schedule key must refuse before it executes anything: running the
+        // whole mempool under the controller write lock only to discard the result
+        // stalls the block_verify / block_accept that the real producer's block is
+        // waiting on. Executing pops the transaction, so an untouched mempool is
+        // the proof that nothing ran.
+        let (mut controller, private_key, chain_id, _temp) = init_test_controller()?;
+        let other = PrivateKey::random();
+        controller.activate_producer_schedule(vec![ProducerKey {
+            producer_name: Name::from_str("pulse")?,
+            block_signing_key: other.get_public_key(),
+        }])?;
+
+        let transaction = create_account(&private_key, Name::from_str("testapi")?, chain_id)?;
+        let transaction_id = *transaction.id();
+        let mut mempool = Mempool::new();
+        mempool.add_transaction(transaction);
+
+        let error = controller
+            .build_block(&mut mempool)
+            .await
+            .expect_err("an unscheduled node must not build");
+        assert!(
+            error.to_string().contains("refusing to produce"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            mempool.contains(&transaction_id),
+            "the refusal must come before any mempool transaction is executed"
         );
 
         Ok(())
