@@ -1243,7 +1243,9 @@ mod tests {
         {
             let mut mempool = mempool.write().await;
             let mut controller = service.controller.write().await;
-            controller.accept_block(&bootstrap_id, &mut mempool).unwrap();
+            controller
+                .accept_block(&bootstrap_id, &mut mempool)
+                .unwrap();
         }
 
         let transaction = newaccount_tx_from_creator(
@@ -1253,7 +1255,12 @@ mod tests {
             "testacct1234",
             &chain_id,
         );
-        assert!(service.admit_transaction(transaction.clone()).await.unwrap());
+        assert!(
+            service
+                .admit_transaction(transaction.clone())
+                .await
+                .unwrap()
+        );
         let block = service.build_block().await.unwrap();
         assert_eq!(block.transactions.len(), 1);
         assert_eq!(
@@ -1261,12 +1268,14 @@ mod tests {
             transaction.id(),
             "the ordinary-creator transaction must execute into a block receipt"
         );
-        assert!(service
-            .controller
-            .read()
-            .await
-            .database()
-            .arena_account_exists(Name::from_str("testacct1234").unwrap().as_u64()));
+        assert!(
+            service
+                .controller
+                .read()
+                .await
+                .database()
+                .arena_account_exists(Name::from_str("testacct1234").unwrap().as_u64())
+        );
     }
 
     // Admission uses the synchronized database handle installed at controller
