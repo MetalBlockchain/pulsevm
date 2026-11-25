@@ -1188,7 +1188,7 @@ mod tests {
             .build_block()
             .await
             .expect("a batch of rejected transactions should still complete block production");
-        assert_eq!(rejected_batch_block.block_num(), 1);
+        assert_eq!(rejected_batch_block.block_num(), 2);
         assert!(
             rejected_batch_block.transactions.is_empty(),
             "rejected transactions must not be included in the block"
@@ -1206,7 +1206,7 @@ mod tests {
             .build_block()
             .await
             .expect("a later executable transaction must build immediately");
-        assert_eq!(block.block_num(), 2);
+        assert_eq!(block.block_num(), 3);
         assert_eq!(block.transactions.len(), 1);
         assert_eq!(
             block.transactions[0].transaction_id(),
