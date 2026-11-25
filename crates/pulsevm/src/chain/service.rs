@@ -1199,14 +1199,14 @@ mod tests {
         );
 
         // The rejected batch must not leave the controller or producer loop
-        // wedged. A subsequent executable transaction should advance the head.
+        // wedged. A subsequent executable transaction must build immediately.
         let executable = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
         assert!(service.admit_transaction(executable.clone()).await.unwrap());
         let block = service
             .build_block()
             .await
             .expect("a later executable transaction must build immediately");
-        assert_eq!(block.block_num(), 3);
+        assert_eq!(block.block_num(), 2);
         assert_eq!(block.transactions.len(), 1);
         assert_eq!(
             block.transactions[0].transaction_id(),
