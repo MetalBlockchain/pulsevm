@@ -326,9 +326,24 @@ fn classify_recorded_round(path: &std::path::Path, config: &LoadedConfig) -> Rec
 /// Move a record of an earlier round aside, keeping it for the audit trail: it
 /// is evidence that a pause was once armed, and must not be silently deleted.
 fn supersede_pause_state(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let aside = path.with_extension("finalized.superseded");
+    let base = path.with_extension("finalized.superseded");
+    let mut aside = base.clone();
+    let mut suffix = 1u32;
+    while aside.exists() {
+        aside = std::path::PathBuf::from(format!("{}.{}", base.display(), suffix));
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| "too many superseded pause records".to_string())?;
+    }
     std::fs::rename(path, &aside)
         .map_err(|error| format!("move {} aside: {error}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!("sync pause-record directory {}: {error}", parent.display())
+            })?;
+    }
     Ok(aside)
 }
 
@@ -380,6 +395,53 @@ fn write_pause_state(path: &std::path::Path, state: &PauseState) -> Result<(), S
             .map_err(|error| format!("sync {}: {error}", dir.display()))?;
     }
     Ok(())
+}
+
+/// Persist that this exact declaration was abandoned after its live schedule
+/// pin changed. The filename binds the record to the declaration digest, so a
+/// new ceremony can proceed while a restart of this ceremony cannot re-arm it.
+fn pin_abort_marker_path(config: &LoadedConfig) -> std::path::PathBuf {
+    let mut name = config
+        .finalized_marker
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    name.push(format!(
+        ".pin-abort-{}",
+        hex::encode(config.expected_digest)
+    ));
+    config.finalized_marker.with_file_name(name)
+}
+
+fn write_pin_abort_marker(config: &LoadedConfig) -> Result<std::path::PathBuf, String> {
+    let path = pin_abort_marker_path(config);
+    let tmp = path.with_extension("pin-abort.tmp");
+    let record = serde_json::json!({
+        "format": 1,
+        "producer": config.inner.producer,
+        "height": config.inner.height,
+        "digest": hex::encode(config.expected_digest),
+        "schedule_pin": hex::encode(config.schedule_pin),
+    });
+    let mut bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("serialize pin abort marker: {error}"))?;
+    bytes.push(b'\n');
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|error| format!("create {}: {error}", tmp.display()))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("rename {} to {}: {error}", tmp.display(), path.display()))?;
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::File::open(dir)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|error| format!("sync {}: {error}", dir.display()))?;
+    }
+    Ok(path)
 }
 
 fn load_config(path: &str) -> Result<Config, String> {
@@ -2183,7 +2245,7 @@ async fn preflight(config: &LoadedConfig) -> ExitCode {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N] [--print-digest] [--preflight]\n\
+        "Usage: xpr_cutover_voter --config voter.json [--dry-run] [--max-polls N] [--print-digest] [--preflight] [--release-old-pause --expected-old-digest HEX]\n\
          \n\
          The config carries the node URL, contract, producer, coordinated\n\
          height and source chain, the roster file, the vote/payer key files\n\
@@ -2195,6 +2257,10 @@ fn usage() -> ! {
          JSON and exits without signing: an external agent (or remote\n\
          signer) signs exactly those bytes and submits through its own\n\
          path, so key custody never moves.\n\
+         --release-old-pause is a one-shot, coordinated round-reset command.\n\
+         Stop the old voter on every validator first, then provide the exact\n\
+         old declaration digest. The command resumes this local producer,\n\
+         verifies the resume, and archives its pause record.\n\
          \n\
          --preflight runs the operator go/no-go checklist (config, keys,\
          node, freeze, schedule, producer API) and exits 0 on GO.\n\
@@ -2271,6 +2337,13 @@ fn confirmation_digest_json(
 /// disagree on what to sign).
 async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
     let client = build_client(config)?;
+    let abort_marker = pin_abort_marker_path(config);
+    if abort_marker.exists() {
+        return Err(format!(
+            "{PIN_ABORT_PREFIX}this declaration was durably aborted after its schedule pin changed; marker {} prevents a restart from re-arming it. Publish and configure a new ceremony digest before restarting",
+            abort_marker.display()
+        ));
+    }
     let view = read_view(&client, config).await?;
     let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
     // Before the ceremony finalizes there is only the declaration to sign.
@@ -2536,6 +2609,66 @@ async fn pause_producer(client: &reqwest::Client, api_url: &str) -> Result<(), S
     }
 }
 
+/// Explicit break-glass reset between rounds on one producer. The operator
+/// supplies the old declaration digest; this never runs from the normal voter
+/// loop or from observing a new config alone.
+async fn release_old_pause(config: &LoadedConfig, expected_old_digest: &str) -> Result<(), String> {
+    let marker = &config.finalized_marker;
+    let state = read_pause_state(marker)
+        .ok_or_else(|| format!("no readable finalized pause state at {}", marker.display()))?;
+    let expected_old_digest = expected_old_digest.to_ascii_lowercase();
+    if expected_old_digest.len() != 64
+        || !expected_old_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || state.digest.to_ascii_lowercase() != expected_old_digest
+    {
+        return Err(format!(
+            "pause state digest does not match --expected-old-digest ({})",
+            marker.display()
+        ));
+    }
+    if state
+        .digest
+        .eq_ignore_ascii_case(&hex::encode(config.expected_digest))
+    {
+        return Err("the recorded pause is for this config's current declaration".into());
+    }
+    if state.producer != config.inner.producer
+        || state.source_chain_id != config.inner.source_chain_id
+    {
+        return Err("the recorded pause belongs to another producer or source chain".into());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("build producer API client: {error}"))?;
+    post_json(
+        &client,
+        &format!("{}/v1/producer/resume", state.producer_api_url),
+        &serde_json::json!({}),
+    )
+    .await?;
+    let status = post_json(
+        &client,
+        &format!("{}/v1/producer/paused", state.producer_api_url),
+        &serde_json::json!({}),
+    )
+    .await?;
+    if paused_flag(&status) != Some(false) {
+        return Err(format!("producer resume was not verified: {status}"));
+    }
+    let aside = supersede_pause_state(marker)?;
+    log_line!(
+        "ALARM event=cutover.voter_round_reset outcome=operator_reset: resumed {} after verifying old digest {}; archived {}",
+        state.producer,
+        expected_old_digest,
+        aside.display()
+    );
+    Ok(())
+}
+
 /// Blocks of lookahead that switch the loop to 1s polling: discovering H
 /// a poll late is fine hours out, but near the halt every half-second
 /// block counts and the pause must land promptly.
@@ -2620,7 +2753,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
             // that no longer stands. Believe the chain only when it answers; an
             // unreadable chain keeps the record in force.
             let chain = match PauseState::from_config(config) {
-                Some(state) => recorded_round_status(&client, &state).await,
+                Some(state) => recorded_round_status_confirmed(&client, &state).await,
                 None => RoundStatus::Unverifiable("no producer API to pause".to_string()),
             };
             let replaced = match (recorded_action(kind, &chain), chain) {
@@ -2686,7 +2819,7 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                     old.pause_height
                 );
             } else {
-                let chain = recorded_round_status(&client, &old).await;
+                let chain = recorded_round_status_confirmed(&client, &old).await;
                 match (recorded_action(kind, &chain), chain) {
                     (RecordedAction::SupersedeOld, RoundStatus::Replaced(why)) => {
                         match supersede_pause_state(&config.finalized_marker) {
@@ -2824,6 +2957,19 @@ async fn run(config: &LoadedConfig, dry_run: bool, max_polls: u64) -> Result<(),
                 config.inner.height,
                 view.head_num
             );
+            if !dry_run {
+                match write_pin_abort_marker(config) {
+                    Ok(path) => log_line!(
+                        "ALARM event=cutover.schedule_pin_abort_recorded producer={} outcome=success: durable abort marker written to {}",
+                        config.inner.producer,
+                        path.display()
+                    ),
+                    Err(error) => log_line!(
+                        "ALARM event=cutover.schedule_pin_abort_recorded producer={} outcome=failure: the abort marker could not be made durable ({error}); keep this voter stopped and page the coordinator before restarting",
+                        config.inner.producer
+                    ),
+                }
+            }
             return Err(format!(
                 "{PIN_ABORT_PREFIX}the live active schedule no longer hashes to confirmation.schedule_sha256 (a schedule version bump?): abort this round before H, publish the new hash, rebuild the genesis and ceremony id, and re-run the declaration"
             ));
@@ -3220,8 +3366,12 @@ async fn recorded_round_status(client: &reqwest::Client, state: &PauseState) -> 
         Ok(rows) => rows,
         Err(error) => return RoundStatus::Unverifiable(error),
     };
+    recorded_round_status_from_rows(&rows, state)
+}
+
+fn recorded_round_status_from_rows(rows: &[serde_json::Value], state: &PauseState) -> RoundStatus {
     let Some(row) = rows.first() else {
-        return RoundStatus::Replaced("the chain holds no ceremony".to_string());
+        return RoundStatus::Unverifiable("the ceremony table returned no rows".to_string());
     };
     match parse_ceremony_row(row) {
         Err(error) => RoundStatus::Unverifiable(error),
@@ -3238,6 +3388,39 @@ async fn recorded_round_status(client: &reqwest::Client, state: &PauseState) -> 
             ceremony.digest, ceremony.h, ceremony.finalized, state.digest, state.height
         )),
     }
+}
+
+/// Startup may set an old pause record aside only after three independent reads
+/// agree that the recorded ceremony was replaced. A transient empty table read
+/// is unverifiable and therefore keeps the record in force.
+async fn recorded_round_status_confirmed(
+    client: &reqwest::Client,
+    state: &PauseState,
+) -> RoundStatus {
+    let mut last_replacement: Option<String> = None;
+    let mut consecutive = 0;
+    for attempt in 0..REPLACED_READS_BEFORE_STOP {
+        match recorded_round_status(client, state).await {
+            status @ (RoundStatus::Armed | RoundStatus::Unverifiable(_)) => return status,
+            RoundStatus::Replaced(reason) => {
+                if last_replacement.as_deref() == Some(reason.as_str()) {
+                    consecutive += 1;
+                } else {
+                    last_replacement = Some(reason);
+                    consecutive = 1;
+                }
+                if consecutive >= REPLACED_READS_BEFORE_STOP {
+                    return RoundStatus::Replaced(last_replacement.unwrap_or_default());
+                }
+                if attempt + 1 < REPLACED_READS_BEFORE_STOP {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+    RoundStatus::Unverifiable(format!(
+        "the ceremony replacement was not returned consistently in {REPLACED_READS_BEFORE_STOP} reads"
+    ))
 }
 
 async fn run_pause_only(state: &PauseState, dry_run: bool, max_polls: u64) -> Result<(), String> {
@@ -3371,6 +3554,8 @@ async fn main() -> ExitCode {
     let mut print_digest_only = false;
     let mut preflight_only = false;
     let mut status_only = false;
+    let mut release_old_pause_only = false;
+    let mut expected_old_digest: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -3386,6 +3571,8 @@ async fn main() -> ExitCode {
             "--print-digest" => print_digest_only = true,
             "--preflight" => preflight_only = true,
             "--status" => status_only = true,
+            "--release-old-pause" => release_old_pause_only = true,
+            "--expected-old-digest" => expected_old_digest = args.next(),
             _ => usage(),
         }
     }
@@ -3398,7 +3585,7 @@ async fn main() -> ExitCode {
             eprintln!("xpr_cutover_voter: {error}");
             // The one-shot operator commands report the error and stop. The
             // long-running voter must not: see `degraded_plan`.
-            if print_digest_only || preflight_only || status_only {
+            if print_digest_only || preflight_only || status_only || release_old_pause_only {
                 return ExitCode::from(1);
             }
             return match degraded_plan(&config_path, &error) {
@@ -3438,6 +3625,22 @@ async fn main() -> ExitCode {
     }
     if status_only {
         return status(&config).await;
+    }
+    if release_old_pause_only {
+        let Some(digest) = expected_old_digest else {
+            eprintln!("xpr_cutover_voter: --release-old-pause requires --expected-old-digest");
+            return ExitCode::from(1);
+        };
+        return match release_old_pause(&config, &digest).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("xpr_cutover_voter: {error}");
+                ExitCode::from(1)
+            }
+        };
+    } else if expected_old_digest.is_some() {
+        eprintln!("xpr_cutover_voter: --expected-old-digest requires --release-old-pause");
+        return ExitCode::from(1);
     }
     if dry_run {
         log_line!("dry run: evaluating only, nothing will be signed or submitted");
@@ -4445,6 +4648,93 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_ceremony_read_is_unverifiable_and_keeps_the_pause_record() {
+        let config = armed_config();
+        let state = PauseState::from_config(&config).unwrap();
+        assert!(matches!(
+            recorded_round_status_from_rows(&[], &state),
+            RoundStatus::Unverifiable(_)
+        ));
+        assert_eq!(
+            recorded_action(
+                RecordKind::Other,
+                &recorded_round_status_from_rows(&[], &state)
+            ),
+            RecordedAction::HoldRecorded
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_requires_three_replacement_reads_and_keeps_an_empty_read() {
+        let state = PauseState::from_config(&armed_config()).unwrap();
+        let state_for_response = state.clone();
+        let (url, seen) = spawn_http_server(move |path: &str, _: &serde_json::Value| {
+            if path == "/v1/chain/get_table_rows" {
+                serde_json::json!({ "rows": [ceremony_row(&state_for_response, true, &"ab".repeat(32))] })
+            } else {
+                serde_json::json!({})
+            }
+        });
+        let mut live = state.clone();
+        live.nodeos_url = url;
+        assert!(matches!(
+            recorded_round_status_confirmed(&reqwest::Client::new(), &live).await,
+            RoundStatus::Replaced(_)
+        ));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/v1/chain/get_table_rows")
+                .count(),
+            REPLACED_READS_BEFORE_STOP as usize
+        );
+
+        let (url, seen) = spawn_http_server(|path: &str, _: &serde_json::Value| {
+            if path == "/v1/chain/get_table_rows" {
+                serde_json::json!({ "rows": [] })
+            } else {
+                serde_json::json!({})
+            }
+        });
+        let mut empty = state;
+        empty.nodeos_url = url;
+        assert!(matches!(
+            recorded_round_status_confirmed(&reqwest::Client::new(), &empty).await,
+            RoundStatus::Unverifiable(_)
+        ));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/v1/chain/get_table_rows")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_schedule_pin_abort_marker_survives_restart_and_is_round_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "pulsevm-voter-abort-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = armed_config();
+        config.finalized_marker = dir.join("voter.finalized");
+        let path = write_pin_abort_marker(&config).unwrap();
+        assert!(path.exists());
+        assert_eq!(path, pin_abort_marker_path(&config));
+        config.expected_digest[0] ^= 1;
+        assert_ne!(path, pin_abort_marker_path(&config));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn the_pause_state_describes_only_the_round_it_was_written_for() {
         let config = armed_config();
         let state = PauseState::from_config(&config).expect("an armed config has a state");
@@ -5291,17 +5581,19 @@ mod tests {
             "enforced while unconfirmed, and not once it is believed"
         );
 
-        // The same declaration but not finalized, and no ceremony at all, are
-        // both "not the finalized round".
+        // The same declaration but not finalized is confirmed replacement.
         let (url, seen) = spawn_http_server(serve(
             Some(ceremony_row(&state, false, &state.digest)),
             past_p,
         ));
         assert!(run_pause_only(&at(&url), false, 5).await.is_err());
         assert_eq!(pauses(&seen), (REPLACED_READS_BEFORE_STOP - 1) as usize);
+
+        // An empty table read can be a transient startup response, so it is
+        // unverifiable and must keep enforcing instead of clearing the record.
         let (url, seen) = spawn_http_server(serve(None, past_p));
-        assert!(run_pause_only(&at(&url), false, 5).await.is_err());
-        assert_eq!(pauses(&seen), (REPLACED_READS_BEFORE_STOP - 1) as usize);
+        run_pause_only(&at(&url), false, 5).await.unwrap();
+        assert_eq!(pauses(&seen), 5);
 
         // A record that cannot be checked (the table cannot be read) is enforced
         // rather than dropped: here the node answers with no `rows` at all.
@@ -5620,6 +5912,23 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_old_round_release_verifies_resume_and_preserves_the_record() {
+        let dir = scratch_dir("release-old-pause");
+        let config = offline_config(&dir);
+        let mut state = PauseState::from_config(&config).unwrap();
+        state.digest = "ab".repeat(32);
+        state.producer_api_url = stub_producer_api_shaped(false, true);
+        write_pause_state(&config.finalized_marker, &state).unwrap();
+
+        release_old_pause(&config, &state.digest).await.unwrap();
+        assert!(!config.finalized_marker.exists());
+        let archived = dir.join("voter.json.finalized.superseded");
+        let archived_state = read_pause_state(&archived).unwrap();
+        assert_eq!(archived_state, state);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -67,6 +67,9 @@ jobs:
       - name: Run example tests
         run: cargo test --workspace --examples --locked
 
+      - name: Test replay scanner model
+        run: python3 -m unittest scripts/plw-replay-tool/test_plw_replay.py
+
       - name: Compile every target
         run: cargo test --workspace --all-targets --locked --no-run
 

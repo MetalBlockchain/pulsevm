@@ -75,6 +75,7 @@ use crate::{
         },
         resource_limits::ResourceLimitsManager,
         state_history::{
+            ShLogError,
             StateHistoryLog,
             StateHistoryLogCheckpoint,
         },
@@ -622,6 +623,10 @@ pub struct Controller {
     block_log: Option<StateHistoryLog>,
     trace_log: Option<StateHistoryLog>,
     chain_state_log: Option<StateHistoryLog>,
+    /// An accepted block whose block-log append reached disk but whose Arena WAL
+    /// frame did not. After rebuilding the controller at the durable revision,
+    /// live initialization independently verifies and executes this block.
+    pending_accepted_recovery: Option<SignedBlock>,
     node_config: Option<NodeConfig>,
     // Set when a refused migration boot discarded the arena it was about to
     // run on. `shutdown` must then not close (and so re-persist) the database,
@@ -973,6 +978,7 @@ struct MigrationHeaderState {
 /// only after the arena, logs, producer schedule, and in-memory head agree.
 const STATE_SYNC_INSTALL_MARKER_FILE: &str = "state_sync_installing";
 const STATE_SYNC_INSTALL_MARKER_MAGIC: &[u8; 8] = b"PVMSYN01";
+const MISSING_CHECKPOINT_MARKER_FILE: &str = "checkpoint_missing_recovery";
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -1194,6 +1200,40 @@ fn checkpoint_state_checks_apply(arena_revision: i64, checkpoint_revision: i64) 
     arena_revision == checkpoint_revision
 }
 
+/// Why a block log entry is not the block the log says it is, or the block.
+fn decode_logged_block(bytes: &[u8], height: u32, recorded_id: &Id) -> Result<SignedBlock, String> {
+    let mut position = 0;
+    let block = SignedBlock::read(bytes, &mut position)
+        .map_err(|error| format!("it does not decode ({error})"))?;
+    if position != bytes.len() {
+        return Err(format!("{} bytes follow the block", bytes.len() - position));
+    }
+    if block.block_num() != height {
+        return Err(format!("it holds block {}", block.block_num()));
+    }
+    if !block.block_extensions.is_empty() {
+        return Err("it contains unsupported block extensions".to_string());
+    }
+    let id = block
+        .id()
+        .map_err(|error| format!("it has no id ({error})"))?;
+    if &id != recorded_id {
+        return Err("its id differs from the id the log recorded for it".to_string());
+    }
+    let mut digests = VecDeque::with_capacity(block.transactions.len());
+    for receipt in &block.transactions {
+        digests.push_back(
+            receipt
+                .digest()
+                .map_err(|error| format!("a transaction receipt cannot be hashed ({error})"))?,
+        );
+    }
+    if merkle(&mut digests) != block.signed_block_header.header.transaction_mroot {
+        return Err("its transactions do not match the root in its header".to_string());
+    }
+    Ok(block)
+}
+
 /// A state summary staged for building: the state of one accepted block, copied
 /// out of the database, and what the summary says about that block. Making it needs
 /// the controller (it copies the state); [`StagedSummary::build`] does not, so the
@@ -1350,6 +1390,7 @@ impl Controller {
             block_log: None,
             trace_log: None,
             chain_state_log: None,
+            pending_accepted_recovery: None,
             node_config: None,
             state_discarded: false,
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
@@ -1579,6 +1620,7 @@ impl Controller {
         db_path: &str,
     ) -> Result<(), ChainError> {
         self.subjective_billing.clear();
+        self.pending_accepted_recovery = None;
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
             .map_err(|e| {
@@ -2234,19 +2276,35 @@ impl Controller {
                     .as_ref()
                     .is_some_and(|config| config.allow_replay_recovery);
                 // The block log is appended before the arena commit is made
-                // durable, so a kill in that window leaves the log exactly one
-                // block ahead of a state that is otherwise intact. Dropping
-                // that one block is always safe (it is re-fetched from peers)
-                // and does not need the offline-replay opt-in.
+                // durable. Preserve that accepted block and replay it through
+                // first-time validation after restoring the durable state.
                 let one_block_ahead =
                     revision >= i64::from(start) && revision + 1 == i64::from(end);
                 if (replay_recovery || one_block_ahead)
                     && revision >= i64::from(start)
                     && revision <= i64::from(end)
                 {
+                    // MetalGo may have durably accepted a block before this
+                    // process made its matching Arena WAL frame durable. Keep
+                    // the block bytes, rewind the logs to the durable state, and
+                    // replay it through ordinary first-time validation below.
+                    // Offline replay remains explicitly allowed to rewind; only
+                    // the ordinary one-block crash window takes this path.
+                    if one_block_ahead && !replay_recovery {
+                        self.pending_accepted_recovery = Some(
+                            self.read_logged_block(end)?.ok_or_else(|| {
+                                ChainError::DatabaseError(format!(
+                                    "the block log lists accepted block {end} ahead of Arena revision {revision}, but the entry is missing"
+                                ))
+                            })?,
+                        );
+                        warn!(
+                            "Arena revision {revision} is one accepted block behind the block log; will revalidate and replay block {end}"
+                        );
+                    }
                     if revision != end as i64 {
                         warn!(
-                            "replay recovery is rewinding block log from {} to durable Arena revision {}",
+                            "recovery is rewinding accepted logs from {} to durable Arena revision {}",
                             end, revision
                         );
                     } else {
@@ -2356,11 +2414,16 @@ impl Controller {
                         // history and stops short of the block log is a gap.
                         if let Some(last) = last.filter(|last| *last < end) {
                             return Err(ChainError::DatabaseError(format!(
-                                "state history is enabled but the {name} log ends at block {last} while the block log ends at {end}: state history was off while those blocks were accepted. Its logs must be contiguous, so it cannot be switched back on over the gap. Either leave state_history_enabled=false for this data directory, or stop the node and move the trace and chain-state log files out of the data directory (the history logs then start again at the next block, without the missing history), or resync"
+                                "state history is enabled but the {name} log ends at block {last} while the block log ends at {end}. Either state history was off while those blocks were accepted, or the end of this log was lost (a power cut, a damaged file; the start-up check does not say which). Its logs must be contiguous, so it cannot carry on over the gap. Either leave state_history_enabled=false for this data directory, or stop the node and move the trace and chain-state log files out of the data directory (the history logs then start again at the next block, without the missing history), or resync"
                             )));
                         }
                     }
                 }
+
+                // The last entries are read back and checked, not only counted: an
+                // entry whose last bytes were zeroed in place still has an intact
+                // header, and used to be kept and served without a word.
+                self.verify_block_log_tail(start, end, 16)?;
 
                 info!("block log contains blocks from {} to {}", start, end);
 
@@ -2630,6 +2693,34 @@ impl Controller {
     ) -> Result<(), ChainError> {
         let block_height = context.block_height();
         self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
+    }
+
+    /// Finish the single accepted-block recovery staged by [`Self::initialize`].
+    /// The logs were rewound to match the durable Arena revision; this replays
+    /// the saved block through normal signature, authorization, receipt, and root
+    /// validation, then appends it again in the usual durability order.
+    pub async fn recover_pending_accepted_block(
+        &mut self,
+        mempool: &mut Mempool,
+    ) -> Result<bool, ChainError> {
+        let Some(block) = self.pending_accepted_recovery.clone() else {
+            return Ok(false);
+        };
+        let block_id = block.id()?;
+        self.verify_block(&block, mempool).await.map_err(|error| {
+            ChainError::DatabaseError(format!(
+                "could not revalidate block {} from the block log against durable Arena revision {}: {error}",
+                block.block_num(),
+                self.db.revision()
+            ))
+        })?;
+        self.accept_block(&block_id, mempool)?;
+        self.pending_accepted_recovery = None;
+        info!(
+            "revalidated and recovered accepted block {} from the block log",
+            block.block_num()
+        );
+        Ok(true)
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {
@@ -5084,13 +5175,53 @@ impl Controller {
             return Ok(Some(self.last_accepted_block.clone()));
         }
 
-        // Query DB
-        let res = match self.block_log()?.read_block(height) {
-            Ok(block) => Some(SignedBlock::read(block.as_slice(), &mut 0)?),
-            Err(_) => None,
-        };
+        self.read_logged_block(height)
+    }
 
-        return Ok(res);
+    /// A block out of the block log, checked. The log has no checksums, and a power
+    /// cut can leave the last bytes of an entry zeroed in place: the header and the
+    /// length still read fine, and the block decoded and was SERVED, a different
+    /// block from the one the network accepted. So an entry is accepted only if it
+    /// decodes with nothing left over, is the height asked for, hashes to the id the
+    /// log recorded for it, and its transactions hash to the root its header commits
+    /// to. `Ok(None)` is only "no such block"; a damaged entry is an error that says
+    /// so, never a missing block and never a wrong one.
+    pub fn read_logged_block(&self, height: u32) -> Result<Option<SignedBlock>, ChainError> {
+        let log = self.block_log()?;
+        let bytes = match log.read_block(height) {
+            Ok(bytes) => bytes,
+            Err(ShLogError::NotFound(_)) => return Ok(None),
+            Err(error) => {
+                return Err(ChainError::DatabaseError(format!(
+                    "the block log cannot read block {height}: {error}"
+                )));
+            }
+        };
+        let recorded_id = log.get_block_id(height).map_err(|error| {
+            ChainError::DatabaseError(format!(
+                "the block log has no readable id for block {height}: {error}"
+            ))
+        })?;
+        decode_logged_block(&bytes, height, &recorded_id)
+            .map(Some)
+            .map_err(|why| {
+                ChainError::DatabaseError(format!(
+                    "the block log's entry for block {height} is damaged: {why}. The block cannot be repaired from this node's files: stop the node, move its data directory aside and resync it from its peers"
+                ))
+            })
+    }
+
+    /// Check the last `count` entries of the block log (see [`Self::read_logged_block`]).
+    fn verify_block_log_tail(&self, start: u32, end: u32, count: u32) -> Result<(), ChainError> {
+        let first = start.max(end.saturating_sub(count.saturating_sub(1)));
+        for height in first..=end {
+            if self.read_logged_block(height)?.is_none() {
+                return Err(ChainError::DatabaseError(format!(
+                    "the block log lists block {height} between {start} and {end} but holds no entry for it"
+                )));
+            }
+        }
+        Ok(())
     }
 
     // ----- state sync (Avalanche StateSyncableVM) -------------------------
@@ -5149,6 +5280,14 @@ impl Controller {
             .as_ref()
             .map(|config| config.state_summary_interval)
             .unwrap_or(0)
+    }
+
+    /// Location of abandoned pre-sync data. Callers may remove it only after a
+    /// newly downloaded snapshot has passed the normal authenticated apply path.
+    pub fn state_sync_quarantine_path(&self) -> Option<std::path::PathBuf> {
+        self.db_path
+            .as_deref()
+            .map(|path| Path::new(path).join("state_sync_abandoned"))
     }
 
     /// How far below the tip a summary must be before it is offered.
@@ -5403,11 +5542,9 @@ impl Controller {
     ///
     /// Everything this node wrote is state it fetched from its peers, so the
     /// recovery is the manual one done automatically: move the whole directory's
-    /// contents into `state_sync_abandoned/<time>/` (kept, not deleted, so the
-    /// damage can be examined; the two newest are kept) and start as a fresh node,
-    /// which the host then state-syncs again. The marker means an install began, so
-    /// this only happens for a node that was being synced from others, never for
-    /// one that was producing.
+    /// contents into `state_sync_abandoned/<time>/` and start as a fresh node,
+    /// which the host then state-syncs again. Quarantined data may contain the
+    /// last usable checkpoint, so startup does not delete it before resync.
     fn quarantine_abandoned_state_sync(db_path: &str) -> Result<(), ChainError> {
         Self::quarantine_abandoned_state_sync_inner(db_path, None)
     }
@@ -5419,25 +5556,47 @@ impl Controller {
         stop_after: Option<usize>,
     ) -> Result<(), ChainError> {
         const QUARANTINE_DIR: &str = "state_sync_abandoned";
-        const KEEP: usize = 2;
         let dir = Path::new(db_path);
-        let marker = dir.join(STATE_SYNC_INSTALL_MARKER_FILE);
-        match fs::metadata(&marker) {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        let install_marker = dir.join(STATE_SYNC_INSTALL_MARKER_FILE);
+        let missing_marker = dir.join(MISSING_CHECKPOINT_MARKER_FILE);
+        let install_incomplete = match fs::metadata(&install_marker) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => {
                 return Err(ChainError::fatal_consistency(format!(
                     "cannot determine whether a state-sync publication is incomplete at {}: {error}",
-                    marker.display()
+                    install_marker.display()
                 )));
             }
+        };
+        let missing_recovery_incomplete = missing_marker.exists();
+        let checkpoint = Database::arena_state_file(dir);
+        let checkpoint_missing = !checkpoint.exists()
+            && [
+                "block_log.log",
+                "trace_log.log",
+                "chain_state_log.log",
+                "arena_wal.bin",
+                "protocol_records.json",
+                "accepted_protocol_schedule.bin",
+            ]
+            .iter()
+            .any(|name| dir.join(name).exists());
+        if !install_incomplete && !missing_recovery_incomplete && !checkpoint_missing {
+            return Ok(());
         }
         let fail = |what: &str, error: &dyn std::fmt::Display| {
             ChainError::fatal_consistency(format!(
-                "a state-sync install was interrupted at {}; moving this node's data aside to resync failed ({what}: {error}). Move the contents of the directory aside by hand and restart",
+                "chain recovery at {} could not quarantine old data ({what}: {error}); move the contents aside and restart",
                 dir.display()
             ))
         };
+        if checkpoint_missing && !missing_recovery_incomplete && !install_incomplete {
+            fs::write(&missing_marker, b"PVMMIS01")
+                .and_then(|()| fs::File::open(&missing_marker)?.sync_all())
+                .map_err(|e| fail("write the missing-checkpoint recovery marker", &e))?;
+            sync_directory(dir).map_err(|e| fail("sync the recovery marker", &e))?;
+        }
         let quarantine = dir.join(QUARANTINE_DIR);
         fs::create_dir_all(&quarantine).map_err(|e| fail("create the quarantine", &e))?;
         let stamp = std::time::SystemTime::now()
@@ -5460,7 +5619,10 @@ impl Controller {
         // node can finish clearing. Moved first, a kill left a half-emptied
         // directory with no marker: an arena without its block log, or the reverse,
         // refused by a check with no automatic recovery.
-        entries.sort_by_key(|entry| entry.file_name() == STATE_SYNC_INSTALL_MARKER_FILE);
+        entries.sort_by_key(|entry| {
+            let name = entry.file_name();
+            name == STATE_SYNC_INSTALL_MARKER_FILE || name == MISSING_CHECKPOINT_MARKER_FILE
+        });
         for entry in entries {
             if stop_after == Some(moved) {
                 return Err(ChainError::InternalError("simulated kill".into()));
@@ -5470,24 +5632,13 @@ impl Controller {
             moved += 1;
         }
         sync_directory(dir).map_err(|e| fail("sync the data directory", &e))?;
-        // Keep the newest few; the names sort by time.
-        let mut kept: Vec<_> = fs::read_dir(&quarantine)
-            .map_err(|e| fail("list the quarantine", &e))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
-        kept.sort();
-        while kept.len() > KEEP {
-            let oldest = kept.remove(0);
-            if let Err(error) = fs::remove_dir_all(&oldest) {
-                warn!(
-                    "could not remove the oldest abandoned state-sync data {}: {error}",
-                    oldest.display()
-                );
-            }
-        }
         warn!(
-            "ALARM event=state_sync.install_abandoned outcome=recovered: a state-sync install was interrupted; moved {moved} item(s) of this node's data to {} and starting fresh to sync again",
+            "ALARM event=state_sync.install_abandoned outcome=recovered: {} moved {moved} item(s) of this node's data to {} and starting fresh to sync again",
+            if checkpoint_missing || missing_recovery_incomplete {
+                "the Arena checkpoint is missing"
+            } else {
+                "a state-sync install was interrupted"
+            },
             target.display()
         );
         Ok(())
@@ -9639,6 +9790,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_missing_checkpoint_with_old_logs_is_quarantined_and_boots_fresh()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "oldstate").await?;
+        let expected_old_tip = controller.last_accepted_block().block_num();
+        drop(controller);
+
+        let dir = std::path::Path::new(chain.path());
+        std::fs::remove_file(Database::arena_state_file(dir))
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        let mut reopened = chain.open().map_err(|error| {
+            ChainError::InternalError(format!(
+                "a missing Arena checkpoint with a block log should quarantine and restart fresh: {error}"
+            ))
+        })?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 1);
+        assert_eq!(reopened.block_log()?.range().unwrap(), (1, 1));
+
+        let entries: Vec<_> = std::fs::read_dir(dir.join("state_sync_abandoned"))
+            .map_err(|error| ChainError::InternalError(error.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path().join("block_log.log").exists());
+        assert!(
+            entries[0]
+                .path()
+                .join(MISSING_CHECKPOINT_MARKER_FILE)
+                .exists()
+        );
+        assert!(expected_old_tip > 1);
+        chain.accept(&mut reopened, "fresh").await?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_missing_checkpoint_quarantine_finishes_on_restart()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "oldstate").await?;
+        drop(controller);
+        let dir = std::path::Path::new(chain.path());
+        std::fs::remove_file(Database::arena_state_file(dir))
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+
+        let interrupted = Controller::quarantine_abandoned_state_sync_inner(chain.path(), Some(2));
+        assert!(interrupted.is_err(), "simulate a cut during quarantine");
+        assert!(dir.join(MISSING_CHECKPOINT_MARKER_FILE).exists());
+
+        let reopened = chain.open().map_err(|error| {
+            ChainError::InternalError(format!(
+                "restart did not finish a missing-checkpoint quarantine: {error}"
+            ))
+        })?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 1);
+        assert!(!dir.join(MISSING_CHECKPOINT_MARKER_FILE).exists());
+        assert!(reopened.block_log()?.range().is_some());
+        Ok(())
+    }
+
     // The quarantine moves files one at a time. A kill part-way must leave the
     // marker in place so the next start finishes the job: with the marker moved
     // first, the directory was left half-emptied and refused with no recovery.
@@ -9686,10 +9901,10 @@ mod tests {
         Ok(())
     }
 
-    // Only the newest two abandoned installs are kept, so a node that keeps being
-    // cut cannot fill its disk with them.
+    // Abandoned installs are evidence and may contain usable checkpoint files;
+    // restart never removes one before a successful resync is verified.
     #[tokio::test]
-    async fn abandoned_installs_are_kept_only_a_few_at_a_time() -> Result<(), ChainError> {
+    async fn abandoned_installs_are_never_pruned_on_restart() -> Result<(), ChainError> {
         let chain = CrashChain::new(json!({}))?;
         for name in ["one", "two", "three", "four"] {
             let mut controller = chain.open()?;
@@ -9703,7 +9918,7 @@ mod tests {
             std::fs::read_dir(std::path::Path::new(chain.path()).join("state_sync_abandoned"))
                 .unwrap()
                 .count();
-        assert_eq!(kept, 2);
+        assert_eq!(kept, 4);
         Ok(())
     }
 
@@ -10050,11 +10265,10 @@ mod tests {
     }
 
     // The block log is appended before the arena commit is durable. A kill in
-    // that window leaves the log one block ahead of intact state; the node
-    // drops that block (peers have it) instead of refusing to start, and does
-    // not need the offline-replay opt-in to do so.
+    // that window leaves one accepted block ahead of intact state; restart
+    // revalidates and replays it without needing the offline-replay opt-in.
     #[tokio::test]
-    async fn a_kill_between_the_block_log_and_the_state_flush_drops_one_block()
+    async fn a_kill_between_the_block_log_and_the_state_flush_replays_the_accepted_block()
     -> Result<(), ChainError> {
         let chain = CrashChain::new(json!({}))?;
         let mut controller = chain.open()?;
@@ -10070,19 +10284,30 @@ mod tests {
         file.set_len(ends[0] as u64).unwrap();
         drop(file);
 
-        let reopened = chain.open()?;
+        let mut reopened = chain.open()?;
         assert_eq!(reopened.last_accepted_block().block_num(), 2);
         assert_eq!(reopened.database().revision(), 2);
         assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
         assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 2);
         assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
+        let mut mempool = Mempool::new();
+        assert!(
+            reopened
+                .recover_pending_accepted_block(&mut mempool)
+                .await?
+        );
+        assert_eq!(reopened.last_accepted_block().block_num(), 3);
+        assert_eq!(reopened.database().revision(), 3);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 3);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 3);
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 3);
         assert!(
             reopened
                 .database()
                 .arena_account_exists(Name::from_str("kept")?.as_u64())
         );
         assert!(
-            !reopened
+            reopened
                 .database()
                 .arena_account_exists(Name::from_str("lost")?.as_u64())
         );
@@ -10561,6 +10786,74 @@ mod tests {
             .expect("three blocks of gap is not a crash window")
             .to_string();
         assert!(error.contains("does not match block log end"), "{error}");
+        Ok(())
+    }
+
+    // A block-log header and index can survive a power cut while the record
+    // payload is zeroed in place. The log's range still looks healthy, but serving
+    // that block would hand peers a block with an id different from the accepted
+    // one. Startup checks the recent tail and refuses the damaged data directory.
+    #[tokio::test]
+    async fn a_zeroed_block_log_entry_is_refused_with_a_resync_diagnosis() -> Result<(), ChainError>
+    {
+        use std::io::{
+            Read,
+            Seek,
+            SeekFrom,
+            Write,
+        };
+
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        let mut mempool = Mempool::new();
+        for name in ["kept", "second", "third", "fourth"] {
+            mempool.add_transaction(create_account(
+                &chain.private_key,
+                Name::from_str(name)?,
+                chain.chain_id,
+            )?);
+        }
+        let accepted = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&accepted.id()?, &mut mempool)?;
+        let block = controller
+            .block_log()?
+            .read_block(2)
+            .expect("accepted block is in the block log");
+        drop(controller);
+
+        let path = std::path::Path::new(chain.path()).join("block_log.log");
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path)
+            .expect("block log can be opened")
+            .read_to_end(&mut bytes)
+            .expect("block log can be read");
+        let payload = bytes
+            .windows(block.len())
+            .position(|window| window == block)
+            .expect("serialized block is present in the block log");
+        // Match Paul's observed failure shape: the record header and length stay
+        // intact while the last 581 bytes of an accepted block are zeroed in place.
+        assert!(
+            block.len() > 581,
+            "the test block must cover the damaged tail"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("block log can be opened for mutation");
+        file.seek(SeekFrom::Start((payload + block.len() - 581) as u64))
+            .expect("block payload position is seekable");
+        file.write_all(&[0; 581])
+            .expect("block payload can be zeroed");
+        file.sync_all().expect("zeroed payload is flushed");
+
+        let error = chain
+            .open()
+            .err()
+            .expect("a damaged recent block must prevent startup")
+            .to_string();
+        assert!(error.contains("block 2 is damaged"), "{error}");
+        assert!(error.contains("resync"), "{error}");
         Ok(())
     }
 

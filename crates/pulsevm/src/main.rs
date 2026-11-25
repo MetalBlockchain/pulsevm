@@ -163,6 +163,24 @@ fn state_sync_is_worth_it(target_height: u64, last_accepted: u64, min_blocks_beh
     target_height > last_accepted.saturating_add(min_blocks_behind)
 }
 
+fn dead_chain_timeout_reached(now_ms: u64, last_accept_ms: u64, timeout_ms: u64) -> bool {
+    timeout_ms > 0 && now_ms.saturating_sub(last_accept_ms) >= timeout_ms
+}
+
+#[cfg(test)]
+mod dead_chain_watchdog_tests {
+    use super::dead_chain_timeout_reached;
+
+    #[test]
+    fn timeout_is_disabled_and_resets_on_each_accepted_block() {
+        assert!(!dead_chain_timeout_reached(10_000, 0, 0));
+        assert!(!dead_chain_timeout_reached(9_999, 0, 10_000));
+        assert!(dead_chain_timeout_reached(10_000, 0, 10_000));
+        assert!(!dead_chain_timeout_reached(10_000, 1, 10_000));
+        assert!(!dead_chain_timeout_reached(0, 1, 10_000));
+    }
+}
+
 #[cfg(test)]
 mod state_sync_threshold_tests {
     use super::state_sync_is_worth_it;
@@ -413,6 +431,12 @@ async fn main() {
     let _ = runtime_handle.await;
     let _ = ws_handle.await;
 
+    // The opt-in dead-chain watchdog shuts down the runtime server itself. Fold
+    // the accepted log into the database just as the host's Shutdown RPC does.
+    if let Err(error) = vm.shutdown_controller().await {
+        error!("could not shut down controller: {error}");
+    }
+
     // Gracefully shutdown
     info!("shutting down...");
 }
@@ -447,6 +471,9 @@ async fn shutdown_signal(vm: VirtualMachine) {
     tokio::select! {
         _ = terminate => {},
         _ = sigint => {},
+        _ = vm.shutdown_requested.notified() => {
+            info!("dead-chain watchdog requested a graceful shutdown");
+        },
     }
 }
 
@@ -471,6 +498,9 @@ pub struct VirtualMachine {
     rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<BlockTimer>>,
     ready_to_terminate: Arc<AtomicBool>,
+    shutdown_requested: Arc<tokio::sync::Notify>,
+    controller_shutdown: Arc<AtomicBool>,
+    last_block_accept_ms: Arc<std::sync::atomic::AtomicU64>,
     // Fired when a background state sync finishes applying, so `wait_for_event`
     // can report MESSAGE_STATE_SYNC_FINISHED to the engine.
     sync_finished: Arc<tokio::sync::Notify>,
@@ -538,12 +568,55 @@ impl VirtualMachine {
             rpc_service: rpc_service,
             block_timer,
             ready_to_terminate: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Arc::new(tokio::sync::Notify::new()),
+            controller_shutdown: Arc::new(AtomicBool::new(false)),
+            last_block_accept_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_finished: Arc::new(tokio::sync::Notify::new()),
             engine_state_syncing: Arc::new(AtomicBool::new(false)),
             refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
             started: std::time::Instant::now(),
             summaries: Arc::new(chain::SummaryService::new()),
         })
+    }
+
+    async fn shutdown_controller(&self) -> Result<(), ChainError> {
+        if self
+            .controller_shutdown
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let result = self.controller.write().await.shutdown();
+        if result.is_err() {
+            self.controller_shutdown
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn start_dead_chain_watchdog(&self, timeout_secs: u64) {
+        if timeout_secs == 0 {
+            return;
+        }
+        let timeout_ms = timeout_secs.saturating_mul(1000);
+        let last_accept = self.last_block_accept_ms.clone();
+        let requested = self.shutdown_requested.clone();
+        let started = self.started;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let last_ms = last_accept.load(std::sync::atomic::Ordering::Acquire);
+                if dead_chain_timeout_reached(now_ms, last_ms, timeout_ms) {
+                    warn!(
+                        "no block has been accepted for {timeout_secs} seconds; the opt-in dead-chain watchdog is shutting down"
+                    );
+                    requested.notify_one();
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -717,10 +790,15 @@ impl Vm for VirtualMachine {
             spdlog::default_logger().set_level_filter(log_level_filter(Some(&level)));
         }
         let summaries_dir = std::path::Path::new(&db_path).join("summaries");
+        let dead_chain_shutdown_after_secs =
+            serde_json::from_slice::<serde_json::Value>(&config_bytes)
+                .ok()
+                .and_then(|config| config.get("dead_chain_shutdown_after_secs")?.as_u64())
+                .unwrap_or(0);
         let controller = self.controller.clone();
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.
-        let admission_state = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut controller = controller.blocking_write();
             controller.set_node_identity(&node_identity);
             if let Err(error) = controller.initialize_with_protocol_upgrades(
@@ -741,10 +819,34 @@ impl Vm for VirtualMachine {
                     "could not initialize controller: {error}"
                 )));
             }
-            Ok::<_, Status>(controller.mempool_admission_state())
+            Ok::<_, Status>(())
         })
         .await
         .map_err(|e| Status::internal(format!("controller initialization task failed: {e}")))??;
+        let admission_state = {
+            let controller = self.controller.clone();
+            let mut controller = controller.write().await;
+            let mempool = self.mempool.clone();
+            let mut mempool = mempool.write().await;
+            if let Err(error) = controller
+                .recover_pending_accepted_block(&mut mempool)
+                .await
+            {
+                if error.is_fatal_consistency() {
+                    abort_on_fatal_consistency("accepted-block recovery", &error);
+                }
+                spdlog::error!("accepted-block recovery failed: {error}");
+                return Err(Status::internal(format!(
+                    "could not recover accepted block: {error}"
+                )));
+            }
+            controller.mempool_admission_state()
+        };
+        self.last_block_accept_ms.store(
+            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.start_dead_chain_watchdog(dead_chain_shutdown_after_secs);
         self.rpc_service.set_admission_state(admission_state);
         // A node that cannot keep summaries still runs; it just offers none.
         if let Err(error) = self.summaries.open(summaries_dir) {
@@ -851,9 +953,7 @@ impl Vm for VirtualMachine {
     async fn shutdown(&self, _request: Request<()>) -> Result<tonic::Response<()>, Status> {
         let ready_to_terminate = self.ready_to_terminate.clone();
         ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        if let Err(error) = controller.shutdown() {
+        if let Err(error) = self.shutdown_controller().await {
             if error.is_fatal_consistency() {
                 abort_on_fatal_consistency("controller shutdown", &error);
             }
@@ -1122,6 +1222,10 @@ impl Vm for VirtualMachine {
             }
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
+        self.last_block_accept_ms.store(
+            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            std::sync::atomic::Ordering::Release,
+        );
         debug!(
             "block accepted with id {}, returning from block_accept",
             block_id
@@ -1646,6 +1750,7 @@ impl Vm for VirtualMachine {
         // Fetch each chunk from peers, verify the payload against the summary
         // hash, then apply it.
         let controller = self.controller.clone();
+        let quarantine_path = self.controller.read().await.state_sync_quarantine_path();
         let network = self.network_manager.clone();
         let sync_finished = self.sync_finished.clone();
         tokio::spawn(async move {
@@ -1677,7 +1782,23 @@ impl Vm for VirtualMachine {
                         target.state_root,
                         &envelope,
                     ) {
-                        Ok(()) => info!("state sync applied at height {}", height),
+                        Ok(()) => {
+                            info!("state sync applied at height {}", height);
+                            drop(controller);
+                            if let Some(path) = quarantine_path {
+                                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(
+                                    &path,
+                                ) {
+                                    Ok(()) => info!(
+                                        "removed abandoned pre-sync data after authenticated state sync"
+                                    ),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(error) => warn!(
+                                        "state sync succeeded, but could not remove abandoned pre-sync data: {error}"
+                                    ),
+                                });
+                            }
+                        }
                         Err(e) if e.is_fatal_consistency() => {
                             // The arena or its companion metadata crossed a
                             // publication boundary. Never wake MetalGo to fall

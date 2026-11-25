@@ -211,8 +211,12 @@ genesis) includes the schedule
 version, and XPR's version moves. The voter checks the live active schedule
 against the pin at start and on every poll before H, and in `--preflight`, and
 exits with an explicit error if they differ (nothing has been paused before H).
-The exit code is 3 and the log carries an `ALARM event=cutover.schedule_pin_abort`
-line: page on either. There is no on-chain abort, so a bump between
+The voter durably records this declaration's abort before returning exit code 3.
+The log carries an `ALARM event=cutover.schedule_pin_abort` line and names the
+round-specific marker. A restart with the same declaration digest exits 3 again
+instead of re-arming it; a new declaration digest has a separate marker path.
+If writing the marker fails, keep the voter stopped and page the coordinator
+before any restart. There is no on-chain abort, so a bump between
 finalization and H splits the fleet (voters that polled in the gap exit; the
 rest pause at P and then cannot sign): tell the coordinator out of band the
 moment it fires, before P.
@@ -827,22 +831,69 @@ Each finding below was checked against the code before it was acted on.
   `--key-file` (owner-only); `--key` still works but warns that it puts the key in the
   process list.
 - **The quarantine of an interrupted install** moves the marker last, so a kill
-  part-way is finished by the next start.
+  part-way is finished by the next start. Quarantine entries are no longer pruned
+  automatically: an older entry may hold the node's last usable checkpoint.
+- **A zeroed block-log tail could be decoded and served as a different block.**
+  Startup checks the recent tail; every historical block read now checks exact
+  decoding, height, recorded id, and transaction Merkle root. Damaged entries fail
+  with a resync diagnosis.
+- **A node cut after the block-log append could forget a durably accepted block.**
+  The one-block-ahead case preserves the logged bytes, rewinds the logs to the
+  durable Arena revision, then revalidates and replays the block through ordinary
+  first-time validation.
+- **A schedule-pin abort was forgotten on restart.** The voter now fsyncs a
+  declaration-scoped abort marker before exit; restart of that same declaration
+  stays aborted.
+- **A blank startup ceremony read could discard an armed pause.** Empty reads now
+  count as unverifiable, and startup requires three matching replacement reads
+  before moving an older pause record aside.
 - **A node reports its build.** `getInfo` carries `pulsevm_build` (git commit, write-ahead
   log format, state-hash format) and the node logs it at start; the rehearsal fails if
   its five nodes report different builds. This is the same-build requirement made
   checkable.
 
-**Not fixed, and why (decisions for the owner):**
+**Remaining rehearsal blockers and operational limits:**
 
-- **A block durable in the block log but not in the write-ahead log is dropped, not
-  replayed.** One node refetches it from peers. If every validator loses power inside
-  the same few milliseconds, no node has it and the network is back one height. Rolling
-  forward by re-executing the logged block removes the window; it is a change to the
-  recovery path and was not made here.
-- **A voter that has finalized but sees the schedule pin change before H exits** (code
-  3) and does not pause at P. The code comment treats this as an alarm to page on.
-  Whether it should instead hold the pause is a policy choice.
+- **A syncing validator still stalls its peers while MetalGo serves snapshot chunks.**
+  The reported 97 MB rehearsal stalled block production during snapshot transfer.
+  In the pinned MetalGo checkout, summary-frontier messages run under the chain
+  context lock, while `AppRequest` chunk messages are dispatched through the async
+  queue without that lock. The measurements establish the stall; they do not by
+  themselves identify a lock held while chunks are served. Profile the pinned host
+  under a mainnet-sized sync and fix the measured host bottleneck, then repeat the
+  multi-node rehearsal. PulseVM's fixed-height summaries and disk-backed chunks do
+  not remove that host-side throughput risk.
+- **A VM that refuses to start can still be counted by MetalGo.** The inactivity
+  watchdog can stop the plugin runtime after a configured interval, but it does not
+  prove that MetalGo stops advertising the chain. The supervisor/validator health
+  integration needs to take that node out of polling.
+- **The live five-node environment is not configured in this checkout.** The
+  handover script can verify Pebble and synced writes on every live node, but that
+  check has not been run against the rehearsal hosts here. Do not treat the local
+  Compose stack as evidence of production database type.
+- **MetalGo memory growth and the two-of-five availability result remain measured
+  operational limits.** There is no MetalGo validator process or mainnet-sized
+  state-sync run available here to profile. Five equal-weight validators also stop
+  making progress when only three remain under the current polling threshold; change
+  the validator set or its consensus availability assumptions deliberately if that
+  fault tolerance is not acceptable.
+- **A second round on a producer paused at an older P needs a coordinated operator
+  reset.** Do not auto-release an old pause for an unfinalized declaration. Stop the
+  old voter on every validator, then run `xpr_cutover_voter --config voter.json
+  --release-old-pause --expected-old-digest <old declaration digest>` on each
+  producer host. It verifies the local pause record and producer/chain identity,
+  resumes that producer, verifies the API response, and archives the old record.
+  Only then create and finalize the new declaration, install the new voter config,
+  and start the voters together. This is an explicit operator break-glass path, not
+  automatic agreement that a new declaration may replace an old one.
+- **A missing Arena checkpoint with old logs now quarantines the whole data
+  directory and boots fresh.** It does not guess which quarantined files form a
+  usable checkpoint. The host must complete a new authenticated state sync. A cut
+  during quarantine leaves a durable marker so startup can finish moving the files.
+- **Quarantine data is kept until authenticated state sync succeeds.** On successful
+  snapshot apply, PulseVM removes the abandoned pre-sync directory off the controller
+  lock. If cleanup fails, sync remains successful and the error is logged for disk
+  monitoring.
 - **Not changed:** the freshness bounds in the manifest are asserted by the exporter,
   not committed by the ceremony; the multi-gigabyte checkpoint hash runs before the
   cheap pair verification; the declaration's source chain id is signed but not compared
@@ -877,6 +928,11 @@ Each finding below was checked against the code before it was acted on.
   bytes. A 40-second local run of each (about 800,000 executions) found nothing. That
   is a smoke result: random bytes mostly fail a checksum early, so there is no claim of
   depth without a seed corpus of real files.
+- **Replay scanner** (`scripts/plw-replay-tool/`): the Downloads harness is now kept
+  with the repo, its WAL damage scan mirrors the current `FramePrefix` revision and
+  table-count filter and budget, and scanner-model tests run in CI. Full
+  `dm-log-writes` image replay and live start-tests still require Linux, root, loop
+  devices and the target network.
 
 ## The state summary no longer stops the node (round 15)
 

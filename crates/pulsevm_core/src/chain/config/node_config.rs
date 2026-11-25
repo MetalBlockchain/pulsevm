@@ -115,6 +115,12 @@ pub struct NodeConfig {
     /// environment of its own.
     #[serde(default)]
     pub state_root_log_every: u64,
+    /// Shut this process down cleanly if it accepts no blocks for this many
+    /// seconds. Zero disables the watchdog. This is a node-local operational
+    /// safeguard for rehearsals and deliberately halted chains; it does not
+    /// affect block validity or consensus.
+    #[serde(default)]
+    pub dead_chain_shutdown_after_secs: u64,
     /// Log threshold: `trace`, `debug`, `info` (the default), `warn` or `error`.
     /// At debug the controller also hashes all state after every block to print
     /// it. Set here for the same reason as above.
@@ -178,10 +184,20 @@ mod tests {
             pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
         );
         assert_eq!(cfg.state_root_log_every, 0);
+        assert_eq!(cfg.dead_chain_shutdown_after_secs, 0);
         assert_eq!(cfg.log_level, None);
         assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
         assert_eq!(cfg.state_summary_interval, 4096);
         assert_eq!(cfg.state_summary_min_age, 8);
+    }
+
+    #[test]
+    fn dead_chain_shutdown_timeout_is_opt_in() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","dead_chain_shutdown_after_secs":3600}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.dead_chain_shutdown_after_secs, 3600);
     }
 
     #[test]

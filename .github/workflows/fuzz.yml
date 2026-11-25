@@ -76,7 +76,7 @@ jobs:
         working-directory: fuzz
         run: |
           cargo fuzz run ${{ matrix.target }} -- \
-            -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=20
+            -max_total_time="$FUZZ_SECONDS" -max_len=2000000 -rss_limit_mb=2048 -timeout=20
 
       - name: Keep what it found
         if: failure()
