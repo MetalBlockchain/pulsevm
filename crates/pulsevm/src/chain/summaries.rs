@@ -45,6 +45,18 @@ impl SummaryService {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn register_built_for_test(
+        &self,
+        built: pulsevm_core::controller::BuiltSummary,
+    ) -> Result<(), ChainError> {
+        self.store
+            .get()
+            .ok_or_else(|| ChainError::InternalError("test summary store is not open".into()))?
+            .register(built)
+            .map(|_| ())
+    }
+
     /// The newest summary that is at least `min_age` blocks below `tip`: a peer that
     /// picks it is not racing the head. `None` when none is old enough (the peer
     /// then catches up by fetching blocks).

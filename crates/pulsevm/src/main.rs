@@ -2092,6 +2092,10 @@ mod ram_usage_metric_tests {
 #[cfg(test)]
 mod state_summary_rpc_tests {
     use super::*;
+    use pulsevm_core::{
+        controller::BuiltSummary,
+        id::Id,
+    };
 
     #[tokio::test]
     async fn summary_rpc_methods_only_serve_persisted_summaries() {
@@ -2112,5 +2116,34 @@ mod state_summary_rpc_tests {
             .into_inner();
         assert_eq!(requested.err, vm::Error::NotFound as i32);
         assert!(requested.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requested_summary_rpc_serves_the_cached_height() {
+        let vm = VirtualMachine::new("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        vm.summaries.open(dir.path().join("summaries")).unwrap();
+        let expected_id_bytes = [0x42; 32];
+        let expected_id = Id::new(expected_id_bytes);
+        let expected_bytes = vec![0x24; 16];
+        vm.summaries
+            .register_built_for_test(BuiltSummary {
+                height: 4096,
+                id: expected_id,
+                bytes: expected_bytes.clone(),
+                hash: [0x55; 32],
+                state_root: [0x66; 32],
+                envelope: vec![0x77; 300],
+            })
+            .unwrap();
+
+        let response = vm
+            .get_state_summary(Request::new(vm::GetStateSummaryRequest { height: 4096 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.err, 0);
+        assert_eq!(response.id, expected_id_bytes.to_vec());
+        assert_eq!(response.bytes, expected_bytes);
     }
 }
