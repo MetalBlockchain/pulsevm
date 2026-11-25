@@ -109,10 +109,8 @@ mod auth_tests {
 
     #[tokio::test]
     async fn test_entry_behavior() -> Result<()> {
-        // A start section runs during instantiation, before apply is called and
-        // before the metering budget is seeded, so any host intrinsic it reaches
-        // (here `current_time`) would run unbilled. set_code must reject such a
-        // contract outright.
+        // Protocol version 1 rejects start sections, preserving the historical
+        // acceptance rule until the version-2 feature is scheduled.
         let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
         let result = chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST)?.into());
@@ -123,13 +121,46 @@ mod auth_tests {
 
     #[tokio::test]
     async fn test_entry_behavior_2() -> Result<()> {
-        // Same rule regardless of where the start section sits relative to the
-        // function bodies: a declared start section is rejected.
+        // The version-1 rejection is independent of where the start section
+        // appears relative to function bodies.
         let mut chain = Testing::new().await;
         chain.create_accounts(vec![name!("entrycheck").into()], false, true)?;
         let result = chain.set_code(name!("entrycheck").into(), wat2wasm(ENTRY_WAST_2)?.into());
         assert!(result.is_err());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_section_is_accepted_and_metered_after_protocol_activation() -> Result<()> {
+        let upgrades = br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#;
+        let mut chain = Testing::new_with_protocol_upgrades(upgrades).await;
+        let account: pulsevm_core::name::Name = name!("entrycheck").into();
+        chain.create_accounts(vec![account], false, true)?;
+        chain.set_code(account, wat2wasm(ENTRY_WAST)?.into())?;
+
+        let mut trx = Transaction::default();
+        chain.set_transaction_headers(&mut trx, DEFAULT_EXPIRATION_DELTA, 0);
+        trx.actions.push(Action::new(
+            account,
+            name!("test").into(),
+            Vec::new(),
+            vec![PermissionLevel::new(account.as_u64(), name!("active"))],
+        ));
+        let signed = trx.sign(
+            &get_private_key(account, "active"),
+            &chain.controller.chain_id(),
+        )?;
+        let trace = chain.push_transaction(signed)?;
+
+        assert!(
+            trace.except.is_none(),
+            "the deferred start and apply must execute successfully"
+        );
+        assert!(
+            trace.receipt.cpu_usage_us > 0,
+            "start execution must be metered"
+        );
         Ok(())
     }
 

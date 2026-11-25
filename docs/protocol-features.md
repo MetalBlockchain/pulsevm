@@ -18,17 +18,12 @@ those build flags never activate chain behavior. Protocol features are not
 runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
-> **Current status:** the genesis, minimum-supported, and maximum-supported
-> protocol versions are all `1`. Both normal and `nightly` builds therefore
-> report maximum version `1`; `nightly` does not aggregate any unfinished
-> `protocol_feature_*` flag yet. `Baseline` is the only feature, and no
-> post-genesis behavior is gated. Schedule parsing, height selection,
-> fail-closed support checks, and RPC observability are wired, but the feature
-> helper has no production call site yet. A schedule that activates version `2`
-> or later makes the current binary refuse transaction admission, block
-> building, verification, replay, and state-sync application at that height.
-> Do not schedule version `2` until a
-> released binary reports support for it.
+> **Current status:** genesis and minimum-supported protocol versions are `1`;
+> normal and `nightly` builds support through version `2`. Version `2` enables
+> the `WasmStartSection` feature, which accepts standard WASM start sections
+> during contract deployment. Version `1` retains the historical rejection.
+> Activation still requires a common `protocol_upgrades` schedule and all
+> validators running a binary that reports support for version `2`.
 
 The code is authoritative. Start with
 [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
@@ -211,9 +206,10 @@ JSON object with this shape:
 }
 ```
 
-This example explains the schema; it is **not deployable with the current
-version-1 binary**. The file may contain a future version before the binary can
-execute it, but at activation the unsupported-version behavior in
+This example explains the schema. The current binary supports versions `1` and
+`2`; version `3` in this example is therefore not executable at activation
+until a binary supporting it is deployed. The file may contain a future version
+before the binary can execute it, but at activation the unsupported-version behavior in
 [section 6](#6-failure-behavior) applies to startup, building, verification, and
 state sync.
 
@@ -439,11 +435,10 @@ rollout normally means two rolling restarts: one to deploy supporting code, then
 one to load the canonical schedule. Leave enough time between those phases to
 verify every node before activation.
 
-With the code currently in this branch, no post-genesis upgrade can safely
-activate: a target must be greater than genesis version `1`, while this binary's
-maximum is still `1`. The parser accepts a future entry before activation, but
-the supporting binary must be deployed before that height. There is no released
-version-2 behavior yet.
+This binary supports the first post-genesis feature version, `2`. Operators may
+schedule it only after every validator has the supporting binary installed and
+all nodes report the same schedule hash. Start sections remain rejected before
+the configured activation height.
 
 ## 9. Adding a protocol feature
 

@@ -9,6 +9,7 @@ use crate::{
             PermissionLevel,
         },
         authorization_manager::AuthorizationManager,
+        protocol_features::ProtocolFeature,
         pulse_contract::pulse_contract_types::{
             DeleteAuth,
             LinkAuth,
@@ -172,8 +173,9 @@ pub fn setcode(
     let code_size = act.code.len() as u64;
     let code_hash: [u8; 32] = if code_size > 0 {
         // XPR's source validator accepts standard start sections, and Mainnet
-        // contains historical AssemblyScript contracts that use one. Preserve
-        // PulseVM's stricter admission rule outside the opt-in migration path.
+        // contains historical AssemblyScript contracts that use one. Ordinary
+        // deployments adopt that rule only after the scheduled protocol
+        // feature activates; historical XPR replay retains its own validator.
         let validation = if db.xpr_native_replay_enabled() {
             let maximum_section_elements =
                 if db.protocol_feature_activated(CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST) {
@@ -185,6 +187,8 @@ pub fn setcode(
                 act.code.as_slice(),
                 maximum_section_elements,
             )
+        } else if context.protocol_feature_enabled(ProtocolFeature::WasmStartSection) {
+            pulsevm_wasm_validation::validate_wasm_with_start_section(act.code.as_slice())
         } else {
             pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
         };

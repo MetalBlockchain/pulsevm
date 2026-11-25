@@ -35,7 +35,7 @@ pub const GENESIS_PROTOCOL_VERSION: ProtocolVersion = 1;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = 1;
 
 /// Newest protocol version compiled into a normal production build.
-const STABLE_PROTOCOL_VERSION: ProtocolVersion = GENESIS_PROTOCOL_VERSION;
+const STABLE_PROTOCOL_VERSION: ProtocolVersion = 2;
 
 /// Newest protocol version compiled by the aggregate `nightly` Cargo feature.
 ///
@@ -70,6 +70,9 @@ pub enum ProtocolFeature {
     /// The protocol rules present at chain launch. This anchor keeps the first
     /// real breaking change on the same code path as every later feature.
     Baseline,
+    /// Accept standard WASM start sections in setcode and execute them through
+    /// the metered, per-action runtime path. See `docs/wasm-determinism.md`.
+    WasmStartSection,
 }
 
 /// A block height and protocol version that this binary has proved it can run.
@@ -109,6 +112,7 @@ impl ProtocolFeature {
     const fn protocol_version(self) -> ProtocolVersion {
         match self {
             Self::Baseline => GENESIS_PROTOCOL_VERSION,
+            Self::WasmStartSection => 2,
         }
     }
 
@@ -347,14 +351,15 @@ mod tests {
         // These are deliberate release declarations, not values derived from
         // the condition under test. Change them only with the corresponding
         // stable/nightly implementation and boundary-test updates.
-        assert_eq!(STABLE_PROTOCOL_VERSION, 1);
-        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 1);
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(STABLE_PROTOCOL_VERSION, 2);
+        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
     fn permanent_feature_version_mappings_are_stable() {
         assert_eq!(ProtocolFeature::Baseline.protocol_version(), 1);
+        assert_eq!(ProtocolFeature::WasmStartSection.protocol_version(), 2);
     }
 
     #[test]
@@ -376,6 +381,20 @@ mod tests {
 
         assert_eq!(schedule.protocol_version(99), GENESIS_PROTOCOL_VERSION);
         assert_eq!(schedule.protocol_version(100), 2);
+        assert!(
+            !schedule
+                .execution_context(99)
+                .unwrap()
+                .feature_enabled(ProtocolFeature::WasmStartSection)
+        );
+        for height in [100, 101] {
+            assert!(
+                schedule
+                    .execution_context(height)
+                    .unwrap()
+                    .feature_enabled(ProtocolFeature::WasmStartSection)
+            );
+        }
     }
 
     #[test]
