@@ -1184,20 +1184,22 @@ mod tests {
         );
         assert!(mempool.read().await.contains(invalid_at_execution.id()));
 
-        let build_result = service.build_block().await;
+        let rejected_batch_block = service
+            .build_block()
+            .await
+            .expect("a batch of rejected transactions should still complete block production");
+        assert_eq!(rejected_batch_block.block_num(), 1);
         assert!(
-            build_result.is_err(),
-            "the unexecutable transaction should be discarded while building"
+            rejected_batch_block.transactions.is_empty(),
+            "rejected transactions must not be included in the block"
         );
         assert!(
             !mempool.read().await.contains(invalid_at_execution.id()),
             "a transaction rejected during block production must not remain queued"
         );
 
-        // A failed one-transaction candidate must not leave the controller or
-        // producer loop wedged. A subsequent executable transaction should wake
-        // the next build and advance the head without waiting for the failed
-        // transaction's original expiry.
+        // The rejected batch must not leave the controller or producer loop
+        // wedged. A subsequent executable transaction should advance the head.
         let executable = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
         assert!(service.admit_transaction(executable.clone()).await.unwrap());
         let block = service

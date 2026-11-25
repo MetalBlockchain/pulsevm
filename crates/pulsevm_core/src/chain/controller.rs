@@ -2207,6 +2207,7 @@ impl Controller {
         }
 
         // Get transactions from the mempool
+        let mut rejected_input_transaction = false;
         while let Some(transaction) = mempool.pop_transaction() {
             if pending_tx_ids.contains(transaction.id()) {
                 deferred.push(transaction);
@@ -2235,6 +2236,7 @@ impl Controller {
                     action_receipt_digests.extend(result.action_receipt_digests);
                 }
                 Err(e) => {
+                    rejected_input_transaction = true;
                     warn!(
                         "transaction {} failed to execute, dropping: {}",
                         transaction.id(),
@@ -2247,12 +2249,22 @@ impl Controller {
         }
 
         // Return deferred transactions to the mempool for a later block.
+        let had_deferred_transactions = !deferred.is_empty();
         for tx in deferred {
             mempool.add_transaction(tx);
         }
 
-        // Don't build a block if we have no transactions
-        if transaction_receipts.len() == 0 {
+        let rejected_batch_without_deferred =
+            rejected_input_transaction && !had_deferred_transactions;
+
+        // Keep ordinary empty-pool builds gated, but if this build was woken by
+        // transactions and every input transaction was rejected during
+        // execution, return an empty block instead of an RPC build error.
+        // Otherwise the VM reports a failed build after correctly dropping the
+        // bad transactions; the engine may stop its current production attempt
+        // even though the mempool is now clean. Empty blocks are valid on the
+        // verification path.
+        if transaction_receipts.is_empty() && !rejected_batch_without_deferred {
             db.arena_undo(); // discard the empty block's session
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"

@@ -109,6 +109,13 @@ subsequently changes.
 This behavior is safe because admission is advisory. It must not be treated as
 an inclusion guarantee or as a transactionally coherent state read.
 
+During block production, action-execution failures are dropped from the local
+batch and execution continues with later transactions. If every transaction in
+a non-empty batch fails, the producer completes that wake-up with a valid empty
+block instead of returning a block-build error. A direct build against an
+already-empty pool remains gated; the timer only wakes block production when
+the pool contains transactions.
+
 Obtaining both concurrency and coherent reads requires a larger design:
 versioned database snapshots/MVCC, or a separate producer execution pipeline
 with an explicitly published state version.
