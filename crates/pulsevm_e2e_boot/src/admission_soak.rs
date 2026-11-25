@@ -6,6 +6,7 @@
 //! mempool admission, gossip, production, verification, and acceptance.
 
 use std::{
+    collections::BTreeSet,
     str::FromStr,
     sync::Arc,
     time::{
@@ -155,7 +156,7 @@ async fn main() -> Result<()> {
         .copied()
         .map(|account| new_account_transaction(&key, &chain_id, account))
         .collect::<Result<_>>()?;
-    let transaction_ids: Vec<_> = transactions
+    let expected_transaction_ids: BTreeSet<_> = transactions
         .iter()
         .map(|transaction| transaction.id().to_string())
         .collect();
@@ -167,22 +168,34 @@ async fn main() -> Result<()> {
         let client = client.clone();
         pending.spawn(async move {
             let started = Instant::now();
-            client.issue_tx(&transaction).await?;
-            Ok::<_, pulsevm_api_client::ClientError>(started.elapsed().as_millis())
+            let response = client.issue_tx(&transaction).await?;
+            Ok::<_, pulsevm_api_client::ClientError>((
+                started.elapsed().as_millis(),
+                response.tx_id.to_string(),
+            ))
         });
     }
 
     let mut latencies = Vec::with_capacity(args.transactions);
+    let mut admitted_transaction_ids = BTreeSet::new();
     while let Some(result) = pending.join_next().await {
-        latencies.push(result.context("admission task panicked")??);
+        let (latency, transaction_id) = result.context("admission task panicked")??;
+        latencies.push(latency);
+        admitted_transaction_ids.insert(transaction_id);
         if let Some(transaction) = remaining.next() {
             let client = client.clone();
             pending.spawn(async move {
                 let started = Instant::now();
-                client.issue_tx(&transaction).await?;
-                Ok::<_, pulsevm_api_client::ClientError>(started.elapsed().as_millis())
+                let response = client.issue_tx(&transaction).await?;
+                Ok::<_, pulsevm_api_client::ClientError>((
+                    started.elapsed().as_millis(),
+                    response.tx_id.to_string(),
+                ))
             });
         }
+    }
+    if admitted_transaction_ids != expected_transaction_ids {
+        bail!("issue_tx returned transaction IDs that differ from the signed transactions");
     }
 
     let deadline = Instant::now() + INCLUSION_TIMEOUT;
@@ -217,7 +230,7 @@ async fn main() -> Result<()> {
             "submitted": args.transactions,
             "included": accounts.len(),
             "start_block_num": start_block_num,
-            "transaction_ids": transaction_ids,
+            "transaction_ids": admitted_transaction_ids,
             "p50_admission_ms": p50_ms,
             "p95_admission_ms": p95_ms,
             "max_admission_ms": max_ms,
