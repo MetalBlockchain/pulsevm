@@ -1231,6 +1231,71 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_admitted_transaction_hash_is_in_an_accepted_block_under_load() {
+        use std::collections::BTreeSet;
+
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let rejected = newaccount_tx(&genesis_key, &genesis_key, "pulse", &chain_id);
+        assert!(service.admit_transaction(rejected.clone()).await.unwrap());
+
+        const BATCHES: usize = 5;
+        const TRANSACTIONS_PER_BATCH: usize = 8;
+        let mut all_admitted = BTreeSet::new();
+        let mut all_included = BTreeSet::new();
+
+        for batch in 0..BATCHES {
+            let transactions: Vec<_> = (0..TRANSACTIONS_PER_BATCH)
+                .map(|index| {
+                    let batch_suffix = char::from(b'a' + batch as u8);
+                    let tx_suffix = char::from(b'a' + index as u8);
+                    let account = format!("load{batch_suffix}{tx_suffix}");
+                    newaccount_tx(&genesis_key, &genesis_key, &account, &chain_id)
+                })
+                .collect();
+            let admissions: Vec<_> = transactions
+                .iter()
+                .cloned()
+                .map(|transaction| {
+                    let service = service.clone();
+                    tokio::spawn(async move { service.admit_transaction(transaction).await })
+                })
+                .collect();
+
+            let mut expected_this_block = BTreeSet::<[u8; 32]>::new();
+            for (transaction, admission) in transactions.iter().zip(admissions) {
+                assert!(admission.await.unwrap().unwrap());
+                expected_this_block.insert(transaction.id().0.0);
+                all_admitted.insert(transaction.id().0.0);
+            }
+
+            let block = service
+                .build_block()
+                .await
+                .expect("a valid batch must make progress past a rejected transaction");
+            let included_this_block: BTreeSet<_> = block
+                .transactions
+                .iter()
+                .map(|receipt| receipt.transaction_id().0.0)
+                .collect();
+            assert_eq!(included_this_block, expected_this_block);
+            all_included.extend(included_this_block);
+
+            let block_id = block.id().unwrap();
+            let mut mempool = mempool.write().await;
+            let mut controller = service.controller.write().await;
+            controller.accept_block(&block_id, &mut mempool).unwrap();
+            assert_eq!(
+                controller.last_accepted_block().block_num(),
+                (batch + 2) as u32
+            );
+        }
+
+        assert_eq!(all_included, all_admitted);
+        assert!(!all_included.contains(&rejected.id().0.0));
+        assert!(!mempool.read().await.contains(rejected.id()));
+    }
+
     #[tokio::test]
     async fn ordinary_creator_can_create_a_twelve_character_dotted_account() {
         let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
