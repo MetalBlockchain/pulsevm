@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_creator_can_create_a_twelve_character_account() {
+    async fn ordinary_creator_can_create_a_twelve_character_dotted_account() {
         let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
         let creator = Name::from_str("test").unwrap();
         let bootstrap = newaccount_tx(&genesis_key, &genesis_key, "test", &chain_id);
@@ -1252,7 +1252,7 @@ mod tests {
             &genesis_key,
             &genesis_key,
             creator,
-            "testacct1234",
+            "xmd.treasury",
             &chain_id,
         );
         assert!(
@@ -1274,7 +1274,7 @@ mod tests {
                 .read()
                 .await
                 .database()
-                .arena_account_exists(Name::from_str("testacct1234").unwrap().as_u64())
+                .arena_account_exists(Name::from_str("xmd.treasury").unwrap().as_u64())
         );
     }
 
