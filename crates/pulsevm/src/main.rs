@@ -2088,3 +2088,29 @@ mod ram_usage_metric_tests {
         assert_eq!(rpc_status.code(), tonic::Code::Internal);
     }
 }
+
+#[cfg(test)]
+mod state_summary_rpc_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn summary_rpc_methods_only_serve_persisted_summaries() {
+        let vm = VirtualMachine::new("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let latest = vm
+            .get_last_state_summary(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(latest.err, vm::Error::NotFound as i32);
+        assert!(latest.bytes.is_empty());
+
+        let requested = vm
+            .get_state_summary(Request::new(vm::GetStateSummaryRequest { height: 4096 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(requested.err, vm::Error::NotFound as i32);
+        assert!(requested.bytes.is_empty());
+    }
+}
