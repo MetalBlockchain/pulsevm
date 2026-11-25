@@ -1078,8 +1078,12 @@ impl SnapshotJob {
     /// `snapshot_bytes` always produced: the canonical checkpoint, sparse-encoded
     /// in block-aligned 4 MiB steps, in the snapshot envelope. It is built in
     /// memory (the canonical bytes are no longer written to a file and read back).
-    pub fn build(self) -> Result<Vec<u8>, ChainError> {
+    pub fn build(self) -> Result<BuiltSnapshot, ChainError> {
         let SnapshotJob { revision, frozen } = self;
+        // The state root and the envelope hash are each a full pass over the state
+        // (seconds at mainnet size). They are computed here, off the database, and
+        // not by whoever took the copy while it still held it.
+        let state_root = frozen.state_root();
         let canonical = frozen
             .canonical_bytes()
             .map_err(|e| ChainError::InternalError(format!("snapshot: checkpoint: {e:?}")))?;
@@ -1095,8 +1099,25 @@ impl SnapshotJob {
             offset += chunk.len() as u64;
         }
         drop(canonical);
-        Ok(crate::snapshot::encode(revision, &payload))
+        let envelope = crate::snapshot::encode(revision, &payload);
+        let hash = *pulsevm_crypto::Digest::hash(&envelope).as_bytes();
+        Ok(BuiltSnapshot {
+            revision,
+            state_root,
+            hash,
+            envelope,
+        })
     }
+}
+
+/// A snapshot built from a [`SnapshotJob`]: the envelope a state-sync peer
+/// downloads, with the state root of the state it was copied from and the hash of
+/// the envelope (what a summary commits to).
+pub struct BuiltSnapshot {
+    pub revision: i64,
+    pub state_root: [u8; 32],
+    pub hash: [u8; 32],
+    pub envelope: Vec<u8>,
 }
 
 impl Database {
@@ -2808,7 +2829,7 @@ impl Database {
     /// Call this only at a quiescent point (no open undo session): the checkpoint
     /// reflects whatever is committed to the arena at that instant.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ChainError> {
-        self.freeze_snapshot().build()
+        self.freeze_snapshot().build().map(|built| built.envelope)
     }
 
     /// Copy out the state a snapshot is made of. This is the only part that needs
@@ -7551,7 +7572,28 @@ mod tests {
         }
         let expected = snapshot_bytes_via_a_file(&db);
         assert_eq!(db.snapshot_bytes().unwrap(), expected);
-        assert_eq!(db.freeze_snapshot().build().unwrap(), expected);
+        assert_eq!(db.freeze_snapshot().build().unwrap().envelope, expected);
+    }
+
+    // The job returns the root of the state it copied and the hash of the envelope,
+    // computed off the database, and they are the ones a summary must commit to.
+    #[test]
+    fn a_built_snapshot_carries_the_state_root_and_the_hash_of_its_envelope() {
+        let dir = TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), TEST_DB_SIZE).unwrap();
+        db.add_indices().unwrap();
+        db.set_revision(5).unwrap();
+        db.create_account(name_u64("alice"), 1).unwrap();
+        db.create_account(name_u64("bob"), 2).unwrap();
+        let root = db.arena_state_root().unwrap();
+        let built = db.freeze_snapshot().build().unwrap();
+        assert_eq!(built.revision, 5);
+        assert_eq!(built.state_root, root, "the root of the copied state");
+        assert_eq!(
+            built.hash,
+            *pulsevm_crypto::Digest::hash(&built.envelope).as_bytes(),
+            "the hash a summary commits to"
+        );
     }
 
     // The job is a copy: building it after the database has moved on gives the
@@ -7571,7 +7613,7 @@ mod tests {
         db.set_revision(6).unwrap();
         assert_ne!(db.arena_state_root().unwrap(), root_then);
 
-        let built = std::thread::spawn(move || job.build().unwrap())
+        let built = std::thread::spawn(move || job.build().unwrap().envelope)
             .join()
             .unwrap();
         assert_eq!(built, expected, "the job holds the earlier state");

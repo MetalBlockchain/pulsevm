@@ -480,8 +480,8 @@ pub struct VirtualMachine {
     // Refused blocks above the head, gathered into a summary per window.
     refused_blocks: Arc<std::sync::Mutex<chain::RefusedBlocks>>,
     started: std::time::Instant,
-    // Serializes state-summary builds (see `state_summary`).
-    summary_build: Arc<tokio::sync::Mutex<()>>,
+    // The state summaries this node offers, kept on disk (see chain::SummaryService).
+    summaries: Arc<chain::SummaryService>,
 }
 
 /// What `wait_for_event` reports next.
@@ -522,40 +522,6 @@ where
 }
 
 impl VirtualMachine {
-    /// The summary for the tip, built without holding the controller while the
-    /// snapshot is built.
-    ///
-    /// A peer's request used to take the controller exclusively and keep it for the
-    /// whole export: seconds at mainnet size, with no block handled meanwhile, once
-    /// per request and on every validator a restarting node asked. Now the
-    /// controller is held only to copy the state out; the snapshot is built on a
-    /// worker thread; the controller is taken again to cache it. Builds are
-    /// serialized, so several peers asking at once cost one build (the later ones
-    /// find it cached) rather than one full snapshot in memory each.
-    async fn state_summary(
-        &self,
-    ) -> Result<pulsevm_core::controller::StateSummary, pulsevm_core::ChainError> {
-        let _one_build_at_a_time = self.summary_build.lock().await;
-        let prepared = self.controller.write().await.prepare_state_summary()?;
-        match prepared {
-            pulsevm_core::controller::SummaryPrep::Ready(summary) => Ok(summary),
-            pulsevm_core::controller::SummaryPrep::Build(build) => {
-                let pulsevm_core::controller::SummaryBuild { job, pending } = build;
-                let envelope = tokio::task::spawn_blocking(move || job.build())
-                    .await
-                    .map_err(|error| {
-                        pulsevm_core::ChainError::InternalError(format!(
-                            "state-summary build did not finish: {error}"
-                        ))
-                    })??;
-                self.controller
-                    .write()
-                    .await
-                    .finish_state_summary(pending, envelope)
-            }
-        }
-    }
-
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         let controller = Arc::new(RwLock::new(Controller::new()));
         let mempool = Arc::new(RwLock::new(Mempool::new()));
@@ -576,7 +542,7 @@ impl VirtualMachine {
             engine_state_syncing: Arc::new(AtomicBool::new(false)),
             refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
             started: std::time::Instant::now(),
-            summary_build: Arc::new(tokio::sync::Mutex::new(())),
+            summaries: Arc::new(chain::SummaryService::new()),
         })
     }
 }
@@ -750,6 +716,7 @@ impl Vm for VirtualMachine {
         {
             spdlog::default_logger().set_level_filter(log_level_filter(Some(&level)));
         }
+        let summaries_dir = std::path::Path::new(&db_path).join("summaries");
         let controller = self.controller.clone();
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.
@@ -779,6 +746,10 @@ impl Vm for VirtualMachine {
         .await
         .map_err(|e| Status::internal(format!("controller initialization task failed: {e}")))??;
         self.rpc_service.set_admission_state(admission_state);
+        // A node that cannot keep summaries still runs; it just offers none.
+        if let Err(error) = self.summaries.open(summaries_dir) {
+            spdlog::warn!("this node will offer no state summaries: {error}");
+        }
         let controller = self.controller.read().await;
 
         let network_manager = Arc::clone(&self.network_manager);
@@ -1155,6 +1126,33 @@ impl Vm for VirtualMachine {
             "block accepted with id {}, returning from block_accept",
             block_id
         );
+        // At a summary height, copy the state out now, under the lock already held
+        // (about a second at mainnet size, on every validator at the same block), and
+        // build the summary after both locks are released.
+        let staged = match controller.stage_summary_if_due() {
+            Ok(staged) => staged,
+            Err(error) => {
+                if error.is_fatal_consistency() {
+                    abort_on_fatal_consistency("state-summary staging", &error);
+                }
+                warn!("could not stage a state summary: {error}");
+                None
+            }
+        };
+        drop(mempool);
+        drop(controller);
+        if let Some(staged) = staged {
+            let summaries = self.summaries.clone();
+            tokio::spawn(async move {
+                let height = staged.height();
+                match summaries.build_and_keep(staged).await {
+                    Ok(height) => info!("kept the state summary for height {height}"),
+                    Err(error) => {
+                        warn!("could not build the state summary for height {height}: {error}")
+                    }
+                }
+            });
+        }
 
         Ok(Response::new(()))
     }
@@ -1247,10 +1245,11 @@ impl Vm for VirtualMachine {
             }
         };
 
-        let served = {
-            let controller = self.controller.read().await;
-            controller.serve_snapshot_chunk(req.height, &req.hash, req.offset, req.len)
-        };
+        // Read from the kept snapshot's file; the controller is not involved.
+        let served = self
+            .summaries
+            .read_chunk(req.height, req.hash, req.offset, req.len)
+            .await;
         let network = self.network_manager.clone();
         match served {
             Ok(chunk) => {
@@ -1529,23 +1528,31 @@ impl Vm for VirtualMachine {
         request: Request<()>,
     ) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        let summary = match self.state_summary().await {
-            Ok(summary) => summary,
-            Err(error) if error.is_fatal_consistency() => {
-                abort_on_fatal_consistency("state-summary creation", &error)
-            }
-            Err(error) => {
-                return Err(Status::internal(format!(
-                    "could not produce state summary: {error}"
-                )));
-            }
+        let (tip, min_age) = {
+            let controller = self.controller.read().await;
+            (
+                u64::from(controller.last_accepted_block().block_num()),
+                controller.state_summary_min_age(),
+            )
         };
-        Ok(Response::new(vm::GetLastStateSummaryResponse {
-            id: summary.id.into(),
-            height: summary.height,
-            bytes: summary.bytes,
-            err: 0,
-        }))
+        // Whatever is kept and old enough. Nothing is built here: a summary is built
+        // once, in the background, when a block at a summary height is accepted.
+        Ok(Response::new(
+            match self.summaries.offer_latest(tip, min_age) {
+                Some(summary) => vm::GetLastStateSummaryResponse {
+                    id: summary.id.into(),
+                    height: summary.height,
+                    bytes: summary.bytes,
+                    err: 0,
+                },
+                None => vm::GetLastStateSummaryResponse {
+                    id: vec![],
+                    height: 0,
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                },
+            },
+        ))
     }
 
     async fn parse_state_summary(
@@ -1566,33 +1573,22 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetStateSummaryRequest>,
     ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        let requested = request.get_ref().height;
-        let mut controller = self.controller.write().await;
-        // Only the last accepted height can be served: chainbase keeps a single
-        // live image, not per-height snapshots.
-        if requested != controller.last_accepted_block().block_num() as u64 {
-            return Ok(Response::new(vm::GetStateSummaryResponse {
-                id: vec![],
-                bytes: vec![],
-                err: vm::Error::NotFound as i32,
-            }));
-        }
-        let summary = match controller.produce_state_summary() {
-            Ok(summary) => summary,
-            Err(error) if error.is_fatal_consistency() => {
-                abort_on_fatal_consistency("state-summary creation", &error)
-            }
-            Err(error) => {
-                return Err(Status::internal(format!(
-                    "could not produce state summary: {error}"
-                )));
-            }
-        };
-        Ok(Response::new(vm::GetStateSummaryResponse {
-            id: summary.id.into(),
-            bytes: summary.bytes,
-            err: 0,
-        }))
+        // The host asks for the heights it chose when it voted; this node answers
+        // for the fixed heights it keeps a summary for, and for no other.
+        Ok(Response::new(
+            match self.summaries.offer_at(request.get_ref().height) {
+                Some(summary) => vm::GetStateSummaryResponse {
+                    id: summary.id.into(),
+                    bytes: summary.bytes,
+                    err: 0,
+                },
+                None => vm::GetStateSummaryResponse {
+                    id: vec![],
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                },
+            },
+        ))
     }
 
     async fn state_summary_accept(

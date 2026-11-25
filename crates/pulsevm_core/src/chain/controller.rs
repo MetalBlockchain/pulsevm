@@ -638,11 +638,6 @@ pub struct Controller {
     // accept can persist the synced producer schedule beside them.
     db_path: Option<String>,
 
-    // The snapshot last advertised via `produce_state_summary`, cached so this
-    // node can serve download chunks to a syncing peer. `None` until a summary
-    // is produced or after a sync is applied.
-    snapshot_cache: Option<CachedSnapshot>,
-
     // Active block producers and their signing keys. A block validates only if
     // signed by the key its producer holds here. Seeded from genesis, changed by
     // a block whose header carries `new_producers`, and reconstructed from the
@@ -1141,15 +1136,6 @@ fn decode_migration_header_state(bytes: &[u8]) -> Result<MigrationHeaderState, C
     })
 }
 
-/// The snapshot a node last advertised in a summary, kept so it can serve the
-/// download chunks without re-snapshotting the arena on every request.
-struct CachedSnapshot {
-    height: u32,
-    state_root: [u8; 32],
-    hash: [u8; 32],
-    envelope: Vec<u8>,
-}
-
 /// Every deferred row in the restored checkpoint must decode and must hash to its
 /// own id. The node runs this at restore; the offline verifier runs the same
 /// function, so a bundle it passes is not one the node refuses for this.
@@ -1208,28 +1194,65 @@ fn checkpoint_state_checks_apply(arena_revision: i64, checkpoint_revision: i64) 
     arena_revision == checkpoint_revision
 }
 
-/// The outcome of the first half of producing a state summary.
-pub enum SummaryPrep {
-    /// The cached snapshot commits to the tip: nothing to build.
-    Ready(StateSummary),
-    /// The state was copied out; build it without holding the controller.
-    Build(SummaryBuild),
+/// A state summary staged for building: the state of one accepted block, copied
+/// out of the database, and what the summary says about that block. Making it needs
+/// the controller (it copies the state); [`StagedSummary::build`] does not, so the
+/// caller releases the controller and builds it on a worker thread.
+pub struct StagedSummary {
+    job: pulsevm_database::SnapshotJob,
+    pending: PendingSummary,
 }
 
-/// A snapshot to build ([`SummaryBuild::job`], safe to build on any thread) and
-/// what to remember about the block it was taken at ([`SummaryBuild::pending`]).
-pub struct SummaryBuild {
-    pub job: pulsevm_database::SnapshotJob,
-    pub pending: PendingSummary,
-}
-
-/// What the summary for a snapshot says, captured when the state was copied.
-pub struct PendingSummary {
+/// What the summary for a snapshot says, captured when the state was copied: the
+/// block it was taken at, not whatever the tip is by the time it is built.
+struct PendingSummary {
     height: u32,
-    state_root: [u8; 32],
     block: SignedBlock,
     schedule: ProducerSchedule,
     protocol_commitment: crate::chain::protocol_features::ProtocolScheduleCommitment,
+}
+
+/// A built summary, ready to be kept on disk and offered (see
+/// [`crate::chain::summary_store::SummaryStore`]).
+pub struct BuiltSummary {
+    pub height: u64,
+    pub id: Id,
+    /// The summary as sent to a peer.
+    pub bytes: Vec<u8>,
+    /// The hash of `envelope`, which the summary commits to.
+    pub hash: [u8; 32],
+    pub state_root: [u8; 32],
+    /// The snapshot envelope a peer downloads in chunks.
+    pub envelope: Vec<u8>,
+}
+
+impl StagedSummary {
+    pub fn height(&self) -> u64 {
+        u64::from(self.pending.height)
+    }
+
+    /// Repack, hash and encode the copied state and describe it. Slow (seconds at
+    /// mainnet size) and independent of the controller.
+    pub fn build(self) -> Result<BuiltSummary, ChainError> {
+        let StagedSummary { job, pending } = self;
+        let built = job.build()?;
+        let summary = Controller::summary_from(
+            &pending.block,
+            &pending.schedule,
+            pending.protocol_commitment,
+            built.state_root,
+            built.envelope.len() as u64,
+            &built.hash,
+        )?;
+        Ok(BuiltSummary {
+            height: summary.height,
+            id: summary.id,
+            bytes: summary.bytes,
+            hash: built.hash,
+            state_root: built.state_root,
+            envelope: built.envelope,
+        })
+    }
 }
 
 /// The log size at which this node writes a checkpoint instead: the configured
@@ -1331,7 +1354,6 @@ impl Controller {
             state_discarded: false,
             protocol_upgrade_schedule: ProtocolUpgradeSchedule::default(),
             db_path: None,
-            snapshot_cache: None,
             active_schedule: ProducerSchedule::default(),
             pending_schedule: None,
             header_signing_state: HeaderSigningState::default(),
@@ -5080,93 +5102,61 @@ impl Controller {
     // producing side caches the snapshot it advertised so it can serve those
     // chunks without re-snapshotting per request.
 
-    /// Produce a state summary for the last accepted block, caching the snapshot
-    /// it commits to so `serve_snapshot_chunk` can answer download requests.
-    ///
-    /// Builds the snapshot inline, holding the controller for all of it. The node
-    /// itself uses [`Self::prepare_state_summary`] and
-    /// [`Self::finish_state_summary`] instead, which hold it only to copy the state
-    /// out (see [`SummaryPrep`]); this is the same thing in one call.
-    pub fn produce_state_summary(&mut self) -> Result<StateSummary, ChainError> {
-        match self.prepare_state_summary()? {
-            SummaryPrep::Ready(summary) => Ok(summary),
-            SummaryPrep::Build(build) => {
-                let SummaryBuild { job, pending } = build;
-                let envelope = job.build()?;
-                self.finish_state_summary(pending, envelope)
-            }
+    /// Stage a state summary if the block just accepted is at a summary height (a
+    /// multiple of `state_summary_interval`), copying its state out. Called under the
+    /// controller right after an accept; the caller then releases the controller and
+    /// builds the result (see [`StagedSummary`]). `None` when this height is not one,
+    /// summaries are off, or the node is in a bulk replay.
+    pub fn stage_summary_if_due(&mut self) -> Result<Option<StagedSummary>, ChainError> {
+        let interval = self.state_summary_interval();
+        let height = u64::from(self.last_accepted_block.block_num());
+        if interval == 0 || height % interval != 0 || self.bulk_replay_mode() {
+            return Ok(None);
         }
+        self.stage_summary_now().map(Some)
     }
 
-    /// The first half of producing a summary: everything that needs the controller.
-    /// When the cached snapshot already commits to the tip the summary is ready.
-    /// Otherwise the state is COPIED OUT (a memory copy of the rows and blob
-    /// bytes) and returned as a job; repacking, hashing and encoding it is the slow
-    /// part (seconds at mainnet size) and needs nothing from the controller, so the
-    /// caller releases the controller, builds the job elsewhere, and hands the
-    /// result to [`Self::finish_state_summary`]. Before this, every peer's request
-    /// for a summary held the controller for the whole export and the node handled
-    /// no block meanwhile.
-    pub fn prepare_state_summary(&mut self) -> Result<SummaryPrep, ChainError> {
+    /// Stage a summary of the last accepted block whatever its height. The copy
+    /// is the only part that needs the controller (a memory copy of the rows and
+    /// blob bytes: about a second at mainnet size).
+    pub fn stage_summary_now(&mut self) -> Result<StagedSummary, ChainError> {
         // A verified child may have a live undo session materialized above the
-        // accepted revision. State summaries are labelled with last accepted,
-        // so unwind speculation before taking the physical arena snapshot.
+        // accepted revision, and the copy must be the accepted state, so
+        // speculation is unwound first (it is re-materialized when needed).
         self.clear_pending()?;
         let height = self.last_accepted_block.block_num();
         self.validate_persisted_protocol_state(height, false)?;
-
-        let protocol_commitment = self.protocol_upgrade_schedule.commitment(height);
-        // Reuse the cached snapshot while it still commits to the tip.
-        if let Some(cache) = self.snapshot_cache.as_ref().filter(|c| c.height == height) {
-            return Ok(SummaryPrep::Ready(Self::summary_from(
-                &self.last_accepted_block,
-                &self.active_schedule,
-                protocol_commitment,
-                cache.state_root,
-                cache.envelope.len() as u64,
-                &cache.hash,
-            )?));
+        if self.db.revision() != i64::from(height) {
+            return Err(ChainError::InternalError(format!(
+                "summary: the database is at revision {} but the accepted block is {height}",
+                self.db.revision()
+            )));
         }
-        let state_root = self.db.arena_state_root().ok_or_else(|| {
-            ChainError::InternalError("summary: database has no state root".into())
-        })?;
-        Ok(SummaryPrep::Build(SummaryBuild {
+        Ok(StagedSummary {
             job: self.db.freeze_snapshot(),
             pending: PendingSummary {
                 height,
-                state_root,
                 block: self.last_accepted_block.clone(),
                 schedule: self.active_schedule.clone(),
-                protocol_commitment,
+                protocol_commitment: self.protocol_upgrade_schedule.commitment(height),
             },
-        }))
+        })
     }
 
-    /// The second half: cache the built snapshot and return the summary for the
-    /// height it was taken at. The summary describes THAT block and schedule, not
-    /// whatever the tip is by now, so it stays consistent with its snapshot even if
-    /// blocks were accepted while it was built.
-    pub fn finish_state_summary(
-        &mut self,
-        pending: PendingSummary,
-        envelope: Vec<u8>,
-    ) -> Result<StateSummary, ChainError> {
-        let hash = *Digest::hash(&envelope).as_bytes();
-        let summary = Self::summary_from(
-            &pending.block,
-            &pending.schedule,
-            pending.protocol_commitment,
-            pending.state_root,
-            envelope.len() as u64,
-            &hash,
-        )?;
-        self.snapshot_cache = Some(CachedSnapshot {
-            height: pending.height,
-            state_root: pending.state_root,
-            hash,
-            envelope,
-        });
-        Ok(summary)
+    /// How many blocks between state summaries (see the setting).
+    pub fn state_summary_interval(&self) -> u64 {
+        self.node_config
+            .as_ref()
+            .map(|config| config.state_summary_interval)
+            .unwrap_or(0)
+    }
+
+    /// How far below the tip a summary must be before it is offered.
+    pub fn state_summary_min_age(&self) -> u64 {
+        self.node_config
+            .as_ref()
+            .map(|config| config.state_summary_min_age)
+            .unwrap_or(0)
     }
 
     fn summary_from(
@@ -5273,44 +5263,6 @@ impl Controller {
                 "state-sync summary at height {block_height} has no protocol commitment"
             ))),
         }
-    }
-
-    /// Serve one slice of the snapshot a peer is downloading. Answered only when
-    /// the cached snapshot matches the requested `height` and `hash`; a stale or
-    /// absent cache is an error the caller turns into an AppRequest failure so the
-    /// peer retries elsewhere or re-fetches the summary.
-    pub fn serve_snapshot_chunk(
-        &self,
-        height: u64,
-        hash: &[u8; 32],
-        offset: u64,
-        len: u32,
-    ) -> Result<Vec<u8>, ChainError> {
-        let cache = self
-            .snapshot_cache
-            .as_ref()
-            .ok_or_else(|| ChainError::InternalError("serve chunk: no snapshot cached".into()))?;
-        if cache.height as u64 != height || &cache.hash != hash {
-            return Err(ChainError::InternalError(
-                "serve chunk: request does not match the cached snapshot".into(),
-            ));
-        }
-        // An honest peer asks for one chunk at a time. The length is a u32 the
-        // peer chose, and the copy below is made while the controller is read
-        // locked, so an unclamped request is up to the whole snapshot per request.
-        if len > crate::state_sync::SNAPSHOT_CHUNK_LEN {
-            return Err(ChainError::InternalError(format!(
-                "serve chunk: {len} bytes requested, at most {} are served per request",
-                crate::state_sync::SNAPSHOT_CHUNK_LEN
-            )));
-        }
-        let start = usize::try_from(offset)
-            .map_err(|_| ChainError::InternalError("serve chunk: out of range".into()))?;
-        let end = start
-            .checked_add(len as usize)
-            .filter(|&e| e <= cache.envelope.len())
-            .ok_or_else(|| ChainError::InternalError("serve chunk: out of range".into()))?;
-        Ok(cache.envelope[start..end].to_vec())
     }
 
     /// Apply a downloaded snapshot: swap the arena to it, re-base the block log to
@@ -5438,8 +5390,6 @@ impl Controller {
         self.last_accepted_block_id = block_id;
         self.preferred_id = block_id;
         self.verified_blocks.clear();
-        // The cache commits to the pre-sync tip; drop it.
-        self.snapshot_cache = None;
         self.clear_state_sync_install_marker()?;
         Ok(())
     }
@@ -9757,41 +9707,6 @@ mod tests {
         Ok(())
     }
 
-    // A chunk request carries a u32 length the peer chose, and the copy is made
-    // while the controller is read locked. A request for more than one chunk is
-    // refused, not served up to the whole snapshot.
-    #[test]
-    fn a_chunk_request_for_more_than_one_chunk_is_refused() {
-        let mut controller = Controller::new();
-        let hash = [7u8; 32];
-        controller.snapshot_cache = Some(CachedSnapshot {
-            height: 5,
-            state_root: [0; 32],
-            hash,
-            envelope: vec![1u8; 4 * crate::state_sync::SNAPSHOT_CHUNK_LEN as usize],
-        });
-        let chunk = crate::state_sync::SNAPSHOT_CHUNK_LEN;
-        assert_eq!(
-            controller
-                .serve_snapshot_chunk(5, &hash, 0, chunk)
-                .unwrap()
-                .len(),
-            chunk as usize,
-            "a whole chunk is served"
-        );
-        let error = controller
-            .serve_snapshot_chunk(5, &hash, 0, chunk + 1)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("at most"), "{error}");
-        assert!(
-            controller
-                .serve_snapshot_chunk(5, &hash, 0, u32::MAX)
-                .is_err(),
-            "the request that asks for everything"
-        );
-    }
-
     #[test]
     fn checkpoint_row_checks_apply_only_while_the_arena_is_the_checkpoint() {
         assert!(
@@ -9989,82 +9904,102 @@ mod tests {
         Ok(())
     }
 
-    // A summary used to be produced while holding the controller for the whole
-    // export. It is now prepared (state copied out) under the controller and built
-    // elsewhere. Same bytes either way.
+    // ---- State summaries at fixed heights ---------------------------------------
+
+    fn publish_summary(
+        controller: &mut Controller,
+        store: &crate::chain::summary_store::SummaryStore,
+    ) -> Result<crate::chain::summary_store::StoredSummary, ChainError> {
+        store.register(controller.stage_summary_now()?.build()?)
+    }
+
+    // The host accepts a summary only if over half the validator weight returns the
+    // same one for the same height, so every validator must stage one at the same
+    // heights: the multiples of the interval, whatever else is going on.
     #[tokio::test]
-    async fn preparing_and_finishing_a_summary_gives_the_summary_producing_it_in_one_call_gives()
-    -> Result<(), ChainError> {
-        let chain = CrashChain::new(json!({}))?;
+    async fn a_summary_is_staged_exactly_at_the_multiples_of_the_interval() -> Result<(), ChainError>
+    {
+        let chain = CrashChain::new(json!({"state_summary_interval": 3}))?;
         let mut controller = chain.open()?;
-        for name in ["one", "two"] {
+        let mut staged_at = Vec::new();
+        for name in ["one", "two", "three", "four", "five", "six", "seven"] {
             chain.accept(&mut controller, name).await?;
+            if let Some(staged) = controller.stage_summary_if_due()? {
+                assert_eq!(
+                    staged.height(),
+                    u64::from(controller.last_accepted_block().block_num())
+                );
+                staged_at.push(staged.height());
+            }
         }
-        let in_one_call = controller.produce_state_summary()?;
-        controller.snapshot_cache = None; // force a build again
+        assert_eq!(
+            staged_at,
+            vec![3, 6],
+            "heights 2 to 8 hold two multiples of 3"
+        );
+        Ok(())
+    }
 
-        let SummaryPrep::Build(build) = controller.prepare_state_summary()? else {
-            panic!("a build is needed when nothing is cached");
-        };
-        let SummaryBuild { job, pending } = build;
-        let envelope = job.build()?;
-        let in_two_steps = controller.finish_state_summary(pending, envelope)?;
-        assert_eq!(in_two_steps.id, in_one_call.id);
-        assert_eq!(in_two_steps.height, in_one_call.height);
-        assert_eq!(in_two_steps.bytes, in_one_call.bytes);
-
-        // And the cache now answers the next request without another build.
-        match controller.prepare_state_summary()? {
-            SummaryPrep::Ready(again) => assert_eq!(again.bytes, in_one_call.bytes),
-            SummaryPrep::Build(_) => panic!("the cache should serve the tip"),
+    #[tokio::test]
+    async fn an_interval_of_zero_stages_nothing() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({"state_summary_interval": 0}))?;
+        let mut controller = chain.open()?;
+        for name in ["one", "two", "three", "four"] {
+            chain.accept(&mut controller, name).await?;
+            assert!(controller.stage_summary_if_due()?.is_none());
         }
         Ok(())
     }
 
-    // The point of the split: blocks keep being accepted while the snapshot is
-    // built. The summary must still describe the height the state was copied at
-    // (not the new tip), and a node that state-syncs from it must end up in exactly
-    // that state.
+    // The point of fixed heights and of building off the controller: a summary for
+    // an aligned height is built while the chain keeps accepting blocks, is offered
+    // once it is old enough, is served from disk, and a fresh node that state-syncs
+    // from it lands exactly in the state at that height, not at the tip.
     #[tokio::test]
-    async fn a_summary_built_while_blocks_are_accepted_describes_the_state_it_copied()
+    async fn a_summary_built_while_blocks_are_accepted_is_offered_from_disk_and_syncs_a_fresh_node()
     -> Result<(), ChainError> {
-        let chain = CrashChain::new(json!({}))?;
+        use crate::chain::summary_store::SummaryStore;
+        let chain = CrashChain::new(json!({"state_summary_interval": 3}))?;
         let mut producer = chain.open()?;
+        let mut staged = None;
         for name in ["one", "two"] {
             chain.accept(&mut producer, name).await?;
+            staged = producer.stage_summary_if_due()?.or(staged);
         }
-        let height_then = producer.last_accepted_block().block_num();
-        let root_then = producer.database().arena_state_root().unwrap();
+        let staged = staged.expect("height 3 is a multiple of the interval");
+        let aligned = staged.height();
+        let root_at_aligned = producer.database().arena_state_root().unwrap();
+        assert_eq!(aligned, 3);
 
-        let SummaryPrep::Build(build) = producer.prepare_state_summary()? else {
-            panic!("nothing cached, so a build is needed");
-        };
-        let SummaryBuild { job, pending } = build;
-        // The controller is free: more blocks are accepted while the snapshot is
-        // built on another thread.
-        let built = std::thread::spawn(move || job.build());
-        for name in ["three", "four"] {
+        // The controller is free: blocks are accepted while the snapshot is built.
+        let built = std::thread::spawn(move || staged.build());
+        for name in ["three", "four", "five"] {
             chain.accept(&mut producer, name).await?;
         }
-        let envelope = built.join().unwrap()?;
-        let summary = producer.finish_state_summary(pending, envelope)?;
-        assert_eq!(
-            summary.height, height_then as u64,
-            "the height it was copied at"
-        );
-        assert!(
-            producer.last_accepted_block().block_num() > height_then,
-            "and the tip has moved on"
-        );
+        let built = built.join().unwrap()?;
+        assert_eq!(built.height, aligned, "the summary of the height it copied");
+        assert_eq!(built.state_root, root_at_aligned);
+        let summaries = get_temp_dir();
+        let store = SummaryStore::open(summaries.path().join("summaries"))?;
+        store.register(built)?;
+        let tip = u64::from(producer.last_accepted_block().block_num());
+        assert!(tip > aligned + 1, "the tip has moved well past the summary");
 
-        // A fresh node syncs from it and lands exactly there.
+        // Offered once old enough, never earlier.
+        assert!(store.newest_at_or_below(aligned - 1).is_none());
+        let offered = store
+            .newest_at_or_below(tip)
+            .expect("an old enough summary");
+        assert_eq!(offered.height, aligned);
+
+        // A fresh node downloads it from the files and lands exactly there.
         let syncer_chain = CrashChain::new(json!({}))?;
         let mut syncer = syncer_chain.open()?;
-        let target = Controller::sync_target_from_summary(&summary.bytes)?;
+        let target = Controller::sync_target_from_summary(&offered.bytes)?;
         syncer.validate_state_sync_target(&target)?;
         let (hash, height) = (target.hash, target.height);
         let downloaded = crate::chain::state_sync::download_snapshot(&target, |off, len| {
-            let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
+            let chunk = store.read_chunk(height, &hash, off, len);
             async move { chunk }
         })
         .await?;
@@ -10075,8 +10010,8 @@ mod tests {
             target.state_root,
             &downloaded,
         )?;
-        assert_eq!(syncer.last_accepted_block().block_num(), height_then);
-        assert_eq!(syncer.database().arena_state_root(), Some(root_then));
+        assert_eq!(syncer.last_accepted_block().block_num(), aligned as u32);
+        assert_eq!(syncer.database().arena_state_root(), Some(root_at_aligned));
         Ok(())
     }
 
@@ -12538,7 +12473,10 @@ mod tests {
         assert_eq!(producer_schedule.version, 1);
         assert!(producer.database().arena_account_metadata(name).is_some());
 
-        let summary = producer.produce_state_summary()?;
+        let summary_dir = get_temp_dir();
+        let store =
+            crate::chain::summary_store::SummaryStore::open(summary_dir.path().join("producer"))?;
+        let summary = publish_summary(&mut producer, &store)?;
         assert_eq!(summary.height, producer_height as u64);
         assert!(producer.pending_chain.is_empty());
         assert!(
@@ -12570,7 +12508,7 @@ mod tests {
         syncer.validate_state_sync_target(&target)?;
         let (hash, height) = (target.hash, target.height);
         let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
-            let chunk = producer.serve_snapshot_chunk(height, &hash, off, len);
+            let chunk = store.read_chunk(height, &hash, off, len);
             async move { chunk }
         })
         .await?;
@@ -12845,7 +12783,10 @@ mod tests {
         assert!(producer.database().arena_account_exists(pulse));
 
         // ---- Sync: a fresh node downloads and applies the snapshot. ----
-        let summary = producer.produce_state_summary()?;
+        let summary_dir = get_temp_dir();
+        let store =
+            crate::chain::summary_store::SummaryStore::open(summary_dir.path().join("producer"))?;
+        let summary = publish_summary(&mut producer, &store)?;
         let producer_tip_id = producer.last_accepted_block().id()?;
 
         let syncer_temp = get_temp_dir();
@@ -12861,7 +12802,7 @@ mod tests {
         assert_eq!(target.height, height as u64);
         let (hash, th) = (target.hash, target.height);
         let envelope = crate::chain::state_sync::download_snapshot(&target, |off, len| {
-            let chunk = producer.serve_snapshot_chunk(th, &hash, off, len);
+            let chunk = store.read_chunk(th, &hash, off, len);
             async move { chunk }
         })
         .await?;
@@ -12889,7 +12830,9 @@ mod tests {
         );
         // Faithfulness: re-snapshotting the synced arena reproduces the exact
         // payload hash the producer advertised — the transfer was lossless.
-        let re = syncer.produce_state_summary()?;
+        let resync_store =
+            crate::chain::summary_store::SummaryStore::open(summary_dir.path().join("syncer"))?;
+        let re = publish_summary(&mut syncer, &resync_store)?;
         let re_target = Controller::sync_target_from_summary(&re.bytes)?;
         assert_eq!(re.id, summary.id, "logical summary id changed after sync");
         assert_eq!(

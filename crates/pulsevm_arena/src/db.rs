@@ -438,11 +438,16 @@ fn append_frame(path: &Path, frame: &[u8]) -> Result<(), DbError> {
 /// One table's frozen copy, type-erased so a frozen database can hold them all.
 trait FrozenSection: Send {
     fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError>;
+    fn hash_state(&self, hasher: &mut sha2::Sha256);
 }
 
 impl<T: ArenaObject> FrozenSection for crate::table::FrozenTable<T> {
     fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
         crate::table::FrozenTable::pack_canonical_into(self, out)
+    }
+
+    fn hash_state(&self, hasher: &mut sha2::Sha256) {
+        crate::table::FrozenTable::hash_state(self, hasher)
     }
 }
 
@@ -460,6 +465,23 @@ pub struct FrozenDb {
 impl FrozenDb {
     pub fn revision(&self) -> i64 {
         self.revision
+    }
+
+    /// The state root of the copied state: what [`Db::state_root`] returned for the
+    /// database at the moment it was frozen. Hashing every byte takes seconds at
+    /// mainnet size, so it is computed here, off the database, not by the caller
+    /// before releasing it.
+    pub fn state_root(&self) -> [u8; 32] {
+        use sha2::{
+            Digest,
+            Sha256,
+        };
+        let mut hasher = Sha256::new();
+        for (type_id, section) in &self.sections {
+            hasher.update(type_id.to_le_bytes());
+            section.hash_state(&mut hasher);
+        }
+        hasher.finalize().into()
     }
 
     /// The canonical checkpoint, in memory.

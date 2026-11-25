@@ -83,6 +83,11 @@ jobs:
       # behind within minutes, so the threshold at which a node state-syncs is
       # lowered from its production default (1024 blocks). Empty elsewhere.
       PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND: ${{ matrix.scenario == 'faults' && '10' || '' }}
+      # And summaries every 10 blocks, offered once 2 blocks old: with the production
+      # interval (4096) a test network never builds one, and a node that falls behind
+      # catches up by fetching blocks instead of state-syncing.
+      PULSEVM_STATE_SUMMARY_INTERVAL: ${{ matrix.scenario == 'faults' && '10' || '' }}
+      PULSEVM_STATE_SUMMARY_MIN_AGE: ${{ matrix.scenario == 'faults' && '2' || '' }}
 
     steps:
       # The rehearsal refuses to run below 12% free disk (Leap and MetalGo both

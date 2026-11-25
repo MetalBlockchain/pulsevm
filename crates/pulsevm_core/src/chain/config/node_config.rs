@@ -90,6 +90,23 @@ pub struct NodeConfig {
     /// behind. Zero syncs whenever any summary is ahead.
     #[serde(default = "default_state_sync_min_blocks_behind")]
     pub state_sync_min_blocks_behind: u64,
+
+    /// A state summary is built for every block whose height is a multiple of this
+    /// (when that block is accepted), and offered to peers that need to state-sync.
+    /// The host takes a summary only if over half the validator weight returns the
+    /// same one for the same height in one vote, so every validator has to offer the
+    /// same heights; a summary of whatever the tip happens to be never agrees. Each
+    /// build stops the node for as long as it takes to copy the state (about a second
+    /// at mainnet size) on every validator at once, so this is large: 4096 blocks is
+    /// about half an hour at two blocks a second. Zero turns summaries off. A node
+    /// that joins when no summary is old enough catches up by fetching blocks.
+    #[serde(default = "default_state_summary_interval")]
+    pub state_summary_interval: u64,
+
+    /// A summary is offered only once it is this many blocks below the tip, so a
+    /// peer that picks it is not racing the head.
+    #[serde(default = "default_state_summary_min_age")]
+    pub state_summary_min_age: u64,
     /// Log the arena state root at info level every this many blocks. Zero (the
     /// default) logs none. The root hashes all state, so it costs time in
     /// proportion to it; it exists so the nodes of a test network can be
@@ -103,6 +120,14 @@ pub struct NodeConfig {
     /// it. Set here for the same reason as above.
     #[serde(default)]
     pub log_level: Option<String>,
+}
+
+fn default_state_summary_interval() -> u64 {
+    4096
+}
+
+fn default_state_summary_min_age() -> u64 {
+    8
 }
 
 fn default_state_sync_min_blocks_behind() -> u64 {
@@ -155,6 +180,8 @@ mod tests {
         assert_eq!(cfg.state_root_log_every, 0);
         assert_eq!(cfg.log_level, None);
         assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
+        assert_eq!(cfg.state_summary_interval, 4096);
+        assert_eq!(cfg.state_summary_min_age, 8);
     }
 
     #[test]

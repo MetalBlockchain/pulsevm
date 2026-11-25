@@ -398,6 +398,10 @@ pub(crate) struct FrozenTable<T: ArenaObject> {
 }
 
 impl<T: ArenaObject> FrozenTable<T> {
+    pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
+        hash_table_state(&self.primary, self.row_count, &self.blobs, hasher)
+    }
+
     pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
         pack_canonical_table(&self.primary, self.row_count, &self.blobs, out)
     }
@@ -1155,50 +1159,58 @@ impl<T: ArenaObject> Table<T> {
         self.flushed_blob_len = self.blobs.len();
     }
 
-    /// Feeds this table's committed content into the state hasher: the live rows
-    /// in id order, then the blob arena. Order is deterministic, so equal state
-    /// yields an equal digest.
+    /// The state hash of this table (see [`hash_table_state`]).
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
-        use sha2::Digest;
-        hasher.update(STATE_HASH_FORMAT.as_bytes());
-        // The id the next row will get is state: two nodes with the same rows but
-        // different counters mint different ids from the next block on. It was not
-        // hashed, so a snapshot carrying a forged counter installed under a root
-        // that matched, and the node diverged one block later.
-        hasher.update((self.primary.len() as u64).to_le_bytes());
-        hasher.update((self.row_count as u64).to_le_bytes());
-        let offsets = T::blob_ref_offsets();
-        let mut scratch = Vec::new();
-        for (id, obj) in self.primary.iter_with_ids() {
-            hasher.update((id as u64).to_le_bytes());
-            let raw = obj.as_bytes();
-            if offsets.is_empty() {
-                hasher.update(raw);
-                continue;
-            }
-            // The row with each blob reference blanked, then each blob's bytes
-            // in field order behind a length. What the row says is its logical
-            // content; where it is stored is not part of the state.
-            scratch.clear();
-            scratch.extend_from_slice(raw);
-            for &at in offsets {
-                scratch[at..at + std::mem::size_of::<BlobRef>()].fill(0);
-            }
-            hasher.update(&scratch);
-            for &at in offsets {
-                let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
-                hasher.update((len as u64).to_le_bytes());
-                if len > 0 {
-                    // A ref past the arena cannot be a live state; hash a marker
-                    // rather than panic, so a corrupt row changes the root.
-                    match off
-                        .checked_add(len)
-                        .and_then(|end| self.blobs.get(off..end))
-                    {
-                        Some(bytes) => hasher.update(bytes),
-                        None => hasher.update(b"dangling-blob-ref"),
-                    }
+        hash_table_state(&self.primary, self.row_count, &self.blobs, hasher)
+    }
+}
+
+/// Feeds one table's committed content into the state hasher: the live rows in id
+/// order, then each row's blobs. Order is deterministic, so equal state yields an
+/// equal digest. One implementation for the live table and for a frozen copy of
+/// it, so the two cannot disagree about the state root.
+fn hash_table_state<T: ArenaObject>(
+    primary: &PagedPrimary<T>,
+    row_count: usize,
+    blobs: &[u8],
+    hasher: &mut sha2::Sha256,
+) {
+    use sha2::Digest;
+    hasher.update(STATE_HASH_FORMAT.as_bytes());
+    // The id the next row will get is state: two nodes with the same rows but
+    // different counters mint different ids from the next block on. It was not
+    // hashed, so a snapshot carrying a forged counter installed under a root
+    // that matched, and the node diverged one block later.
+    hasher.update((primary.len() as u64).to_le_bytes());
+    hasher.update((row_count as u64).to_le_bytes());
+    let offsets = T::blob_ref_offsets();
+    let mut scratch = Vec::new();
+    for (id, obj) in primary.iter_with_ids() {
+        hasher.update((id as u64).to_le_bytes());
+        let raw = obj.as_bytes();
+        if offsets.is_empty() {
+            hasher.update(raw);
+            continue;
+        }
+        // The row with each blob reference blanked, then each blob's bytes
+        // in field order behind a length. What the row says is its logical
+        // content; where it is stored is not part of the state.
+        scratch.clear();
+        scratch.extend_from_slice(raw);
+        for &at in offsets {
+            scratch[at..at + std::mem::size_of::<BlobRef>()].fill(0);
+        }
+        hasher.update(&scratch);
+        for &at in offsets {
+            let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+            hasher.update((len as u64).to_le_bytes());
+            if len > 0 {
+                // A ref past the arena cannot be a live state; hash a marker
+                // rather than panic, so a corrupt row changes the root.
+                match off.checked_add(len).and_then(|end| blobs.get(off..end)) {
+                    Some(bytes) => hasher.update(bytes),
+                    None => hasher.update(b"dangling-blob-ref"),
                 }
             }
         }

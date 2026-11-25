@@ -61,6 +61,15 @@ add_vm_logging_config() { # $1=chain config json -> stdout
   if [[ -n "${PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND:-}" ]]; then
     config="$(jq -c --argjson n "$PULSEVM_STATE_SYNC_MIN_BLOCKS_BEHIND" '. + {state_sync_min_blocks_behind: $n}' <<<"$config")"
   fi
+  # How often a state summary is built (every N blocks, at heights every validator
+  # shares) and how old one must be to be offered. Production default is 4096; a
+  # test network lowers it so a node that falls behind can state-sync in minutes.
+  if [[ -n "${PULSEVM_STATE_SUMMARY_INTERVAL:-}" ]]; then
+    config="$(jq -c --argjson n "$PULSEVM_STATE_SUMMARY_INTERVAL" '. + {state_summary_interval: $n}' <<<"$config")"
+  fi
+  if [[ -n "${PULSEVM_STATE_SUMMARY_MIN_AGE:-}" ]]; then
+    config="$(jq -c --argjson n "$PULSEVM_STATE_SUMMARY_MIN_AGE" '. + {state_summary_min_age: $n}' <<<"$config")"
+  fi
   printf '%s' "$config"
 }
 

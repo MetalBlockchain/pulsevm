@@ -527,3 +527,50 @@ fn a_frozen_copy_of_a_corrupt_database_still_refuses_to_export() {
         "{error:?}"
     );
 }
+
+// The frozen copy hashes to the root the database had when it was copied. The
+// state root takes seconds at mainnet size, so it is computed from the copy rather
+// than by the caller while it still holds the database.
+#[test]
+fn a_frozen_copy_has_the_state_root_the_database_had_when_it_was_copied() {
+    let mut db = new_db();
+    db.set_revision(1).unwrap();
+    for (key, payload) in [
+        (7u64, &b"seven"[..]),
+        (9, b"nine-nine"),
+        (11, b""),
+        (13, b"x"),
+    ] {
+        let blob = db.alloc_blob::<Doc>(payload).unwrap();
+        db.create::<Doc>(|d| {
+            d.key = key;
+            d.payload = blob;
+        })
+        .unwrap();
+    }
+    // A blob rewritten at another size, so the layout has a dead span.
+    let first = db.alloc_blob::<Doc>(b"first").unwrap();
+    let id = db
+        .create::<Doc>(|d| {
+            d.key = 15;
+            d.payload = first;
+        })
+        .unwrap()
+        .id;
+    let moved = db.realloc_blob::<Doc>(first, b"second-and-longer").unwrap();
+    db.modify::<Doc>(id, |d| d.payload = moved).unwrap();
+
+    let root_then = db.state_root();
+    let frozen = db.freeze();
+    assert_eq!(frozen.state_root(), root_then);
+
+    // The database moves on; the copy keeps the root of the state it was taken at.
+    let blob = db.alloc_blob::<Doc>(b"later").unwrap();
+    db.create::<Doc>(|d| {
+        d.key = 99;
+        d.payload = blob;
+    })
+    .unwrap();
+    assert_ne!(db.state_root(), root_then);
+    assert_eq!(frozen.state_root(), root_then);
+}

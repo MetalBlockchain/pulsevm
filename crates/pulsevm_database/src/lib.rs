@@ -31,6 +31,7 @@ pub use crate::{
         AccountRamBillingBreakdown,
         AccountRamBillingProfile,
         BlockReadSnapshot,
+        BuiltSnapshot,
         ContractPrimaryKey,
         ContractPrimaryOverlay,
         ContractTableRamBilling,

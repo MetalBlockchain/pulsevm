@@ -880,6 +880,10 @@ Each finding below was checked against the code before it was acted on.
 
 ## The state summary no longer stops the node (round 15)
 
+*Superseded in part: the per-request build described first below (copy under the
+controller, build off it) was replaced by summaries at fixed heights, described at the end
+of this section. The measurements and the reasons stand.*
+
 Paul measured the export of a mainnet-size state for a state summary at about 9
 seconds and a 7 GB peak. `get_last_state_summary` took the controller exclusively and
 kept it for the whole export, so while a peer was being served a summary this node
@@ -911,12 +915,46 @@ speed (roughly 0.5 to 1 s at 2 GB); that is an extrapolation, to be replaced by 
 measurement on the mainnet snapshot. Peak memory is lower than before but not small:
 the copy and the canonical bytes exist together while the copy is repacked.
 
-Not changed: a summary is still for the exact tip, so the cache is stale after almost
-every block and each request after a new block builds again (now off the lock). A
-download in progress against an older summary finds the cache replaced and fails; that
-was true before. Serving summaries at fixed heights would fix both, but all validators
-would then have to snapshot the same height at the same time, which needs a copy
-that is cheap enough to take at every such height; not attempted here.
+**Summaries at fixed heights (round 16).** Paul's measurements on the mainnet
+snapshot (2.09 GB arena) showed the copy was only about 30% of the hold: the state
+root (1.6 to 1.8 s) and the hash of the envelope (1.2 s) were full-state passes made
+under the controller, and `get_state_summary`, which every validator answers when
+voting, still built inline. The host accepts a summary only if more than half the
+validator weight returns the same summary id for the same height in one vote, with
+no retry. A summary of "the tip" cannot agree across validators whose tips differ by
+a block, and 30 of 53 vote requests on a serving node asked for a height other than
+its head and got `NotFound`, which is why about one sync in four fell back to replay.
+
+Now:
+
+- A summary is built for every block whose height is a multiple of
+  `state_summary_interval` (default 4096, about half an hour at two blocks a second;
+  0 turns summaries off). Every validator therefore offers the same heights.
+- When the block at such a height is accepted, the controller copies the state out
+  (the only work under the lock, about 1.2 s on the mainnet arena, once per interval on
+  every validator at the same block). The state root, the repacking, the sparse encoding
+  and the hash all run afterwards on a worker thread, from the copy, and the result is
+  written to `<data dir>/summaries/<height>.snapshot` and `.summary`. The newest two
+  are kept.
+- `get_last_state_summary` returns the newest kept summary that is at least
+  `state_summary_min_age` blocks (default 8) below the tip, or `NotFound`.
+  `get_state_summary(height)` returns the kept summary for exactly that height, or
+  `NotFound`. Neither builds anything or waits for a build.
+- Chunks are read from the snapshot file and need neither the controller nor a
+  full-size copy in memory. A chunk request is limited to one chunk.
+- A node that joins when no summary is old enough catches up by fetching blocks, as
+  does one within `state_sync_min_blocks_behind` of the summary. On a chain restored
+  from a migration checkpoint the first summary is at the first multiple of the interval
+  above the restore height.
+
+What this does not fix, as Paul measured: serving a sync still stops block production on
+the validators that serve it, because MetalGo answers summary and chunk requests from its
+sync queue while holding the chain lock (about 37 s for 8 syncs at 97 MB, extrapolated to
+roughly 13 minutes at mainnet size). Cheap chunks help the controller, not that lock. A
+mainnet-size state sync is therefore something to plan and to keep rare. The copy under the
+lock at each summary height, the cost of every kept summary on disk (about the size of the
+state, two kept), and the memory of a build (the copy and the canonical bytes together)
+are the prices of this design.
 
 ## The voter after a failure: restart, degraded mode, state file
 
