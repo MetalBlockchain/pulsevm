@@ -1003,14 +1003,17 @@ Now:
   from a migration checkpoint the first summary is at the first multiple of the interval
   above the restore height.
 
-What this does not fix, as Paul measured: serving a sync still stops block production on
-the validators that serve it, because MetalGo answers summary and chunk requests from its
-sync queue while holding the chain lock (about 37 s for 8 syncs at 97 MB, extrapolated to
-roughly 13 minutes at mainnet size). Cheap chunks help the controller, not that lock. A
-mainnet-size state sync is therefore something to plan and to keep rare. The copy under the
-lock at each summary height, the cost of every kept summary on disk (about the size of the
-state, two kept), and the memory of a build (the copy and the canonical bytes together)
-are the prices of this design.
+What this does not yet establish: Paul measured near-zero block production on serving
+validators during state sync (about 37 s for 8 syncs at 97 MB, extrapolated to roughly 13
+minutes at mainnet size). The reported chain-lock explanation does not match the pinned
+MetalGo `v1.14.2-tahoe` source: `AppRequest` is routed through the asynchronous message
+queue and `executeAsyncMsg` calls the engine without taking the consensus context lock.
+The measurement remains a liveness concern, but the cause needs profiling before a code
+change can be chosen. The cutover faults stage now requires an actual snapshot sync to
+start and finish, and checks that a serving validator advances while it runs; block
+catch-up alone cannot pass the stage. The copy under the lock at each summary height, the cost of every
+kept summary on disk (about the size of the state, two kept), and the memory of a build
+(the copy and the canonical bytes together) remain costs of this design.
 
 ## The voter after a failure: restart, degraded mode, state file
 

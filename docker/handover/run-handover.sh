@@ -2840,7 +2840,8 @@ PY
         stop_node "$n"
         send_txs fb 30
         before="$(log_count "$n" 'unexpected message from the VM')"
-        size_before="$(log_count "$n" 'state sync finished')"
+        sync_started_before="$(log_count "$n" 'starting state sync')"
+        sync_finished_before="$(log_count "$n" 'state sync finished')"
         start_node "$n"
         # Transactions go to the restarting node's own pool while it syncs, and
         # to the network as well.
@@ -2851,19 +2852,40 @@ PY
         wait "$flood_pid"
         [[ "$(cat "$WORK_DIR/flood-accepted-$n" 2>/dev/null || echo 0)" -ge 1 ]] \
             || fail "faults: node$n accepted no transaction while it synced, so this stage cannot show the stall (it proves nothing)"
+
+        # Do not pass this stage on block catch-up. Require the node to enter and
+        # finish an actual snapshot sync, and sample a serving validator while
+        # that sync is in progress. This makes the reported server-side liveness
+        # property a real assertion instead of a note when no summary was offered.
+        sync_started=0
+        for _ in $(seq 1 300); do
+            if [[ "$(log_count "$n" 'starting state sync')" -gt "$sync_started_before" ]]; then
+                sync_started=1
+                break
+            fi
+            sleep 0.1
+        done
+        [[ "$sync_started" == 1 ]] || fail "faults: node$n did not start state sync; the server-side liveness check proved nothing"
+        serving_head_during="$(head_of "$rpc_url")"
+        serving_progress=0
+        sync_finished=0
+        for _ in $(seq 1 600); do
+            if [[ "$(log_count "$n" 'state sync finished')" -gt "$sync_finished_before" ]]; then
+                sync_finished=1
+                break
+            fi
+            serving_head_now="$(head_of "$rpc_url")"
+            if [[ "$serving_head_now" -gt "$serving_head_during" ]]; then
+                serving_progress=1
+            fi
+            sleep 0.1
+        done
+        [[ "$sync_finished" == 1 ]] || fail "faults: node$n did not finish its state sync within 60 seconds"
+        [[ "$serving_progress" == 1 ]] || fail "faults: serving validator made no block progress during node$n's state sync"
         timed_converge "node$n state-syncing with transactions pending"
         expect_log_unchanged "$n" 'unexpected message from the VM' "$before" \
             "the plugin sent a message the state syncer does not accept"
-        # Whether a node state-syncs at all is MetalGo's choice: it depends on which
-        # summary the other validators offer, which a test cannot force (two runs in
-        # a row offered none ahead of the node, and it caught up by fetching blocks).
-        # So this is not a failure. It is said, because without a sync the stall
-        # could not have happened and the stage showed only that the node caught up.
-        if [[ "$(log_count "$n" 'state sync finished')" -le "$size_before" ]]; then
-            echo "handover: faults: NOTE: no state sync ran on node$n this time (no summary was offered ahead of it), so the stall could not occur; the stage showed only that it caught up under load"
-        else
-            echo "handover: faults: node$n state-synced while its own pool held transactions, and finished"
-        fi
+        echo "handover: faults: node$n state-synced while transactions were pending; serving validator advanced from $serving_head_during during the sync"
 
         # 5. A node only a few blocks behind catches up by fetching them and keeps
         # its block-log history; a snapshot install drops it.
