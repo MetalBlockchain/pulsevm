@@ -73,11 +73,12 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
    observation window. Publish CONFIRMED after that hour only if the A-Chain
    remains healthy, the API and history continuity checks pass, and the
    coordinator records the decision. A rollback to XPR is an operator decision
-   available only before CONFIRMED. After CONFIRMED, every XPR producer removes
-   its XPR signing key from the live host and stores any required recovery copy
-   offline under key-custody policy. PulseVM has no protocol-level LIVE or
-   CONFIRMED flag; coordinator identity, publication channel, and sign-off
-   owners must be assigned before T-14.
+   available only before CONFIRMED. After CONFIRMED, participating XPR
+   producers should remove their XPR signing keys from live hosts under the
+   key-custody policy. This retires keys for those operators; it cannot prevent
+   another party from restarting XPR or producing a fork. PulseVM has no
+   protocol-level LIVE or CONFIRMED flag; coordinator identity, publication
+   channel, and sign-off owners must be assigned before T-14.
 
 **Superseded round.** If H+1 slips in before the pause (snapshot holds a
 head past H), the round is dead: the old declaration stays on-chain as
@@ -909,6 +910,12 @@ Each finding below was checked against the code before it was acted on.
   now fails initialization with an explicit explanation. Use a MetalGo-side
   health integration or host supervisor that stops/restarts the host; this remains
   external to this repo and is a rehearsal gate.
+- **Provider and history integration is not rehearsed here.** The local
+  cutover harness boots validators only; it does not boot an API-only provider,
+  connect Hyperion, validate the history router across H, or measure XPR archive
+  storage at mainnet volume. Run the provider gate in
+  `xpr-achain-migration.md` on the provider box and attach SHiP continuity,
+  Hyperion row-count, restart, and archive-size evidence before LIVE.
 - **The live five-node environment is not configured in this checkout.** The
   handover script can verify Pebble and synced writes on every live node, but that
   check has not been run against the rehearsal hosts here. Do not treat the local

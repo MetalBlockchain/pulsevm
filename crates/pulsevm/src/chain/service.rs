@@ -1396,6 +1396,27 @@ mod tests {
         let response = service.get_info().await.unwrap();
         assert_eq!(response.chain_id, signing_chain_id);
         assert_eq!(response.platform_chain_id, platform_chain_id);
+
+        // Admission must recover transaction signatures with the published
+        // Antelope signing id, not the distinct MetalGo subnet id.
+        assert!(service
+            .admit_transaction(newaccount_tx(
+                &genesis_key,
+                &genesis_key,
+                "alice",
+                &signing_chain_id,
+            ))
+            .await
+            .unwrap());
+        assert!(service
+            .admit_transaction(newaccount_tx(
+                &genesis_key,
+                &genesis_key,
+                "bob",
+                &platform_chain_id,
+            ))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

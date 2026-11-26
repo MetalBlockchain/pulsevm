@@ -1,10 +1,11 @@
 # U-1: genesis-settable successor chain id — assessment
 
-Status: implemented in genesis parsing and transaction signing. When the
+Status: implemented and covered through RPC admission. When the
 optional `chain_id` is present, it is the Antelope signing id reported by
-`get_info.chain_id` and SHiP; `get_info.platform_chain_id` reports the distinct
-MetalGo subnet id. Without the override, existing behavior is unchanged. Fixed
-chain registration in the MetalGo launcher remains external.
+`get_info.chain_id` and SHiP and used for signature recovery;
+`get_info.platform_chain_id` reports the distinct MetalGo subnet id. Without
+the override, existing behavior is unchanged. No MetalGo launcher change is
+required for the signing id.
 
 ## Problem
 
@@ -52,21 +53,18 @@ id) structurally possible. Analysis:
   not a retry: it needs a new H, because the old H already finalized
   under the first export's history.
 
-## MetalGo cooperation required
+## Platform chain id
 
-Platform-side chain registration assigns random ids today (observed in
-rehearsal: `createBlockchainTxs` yields non-deterministic ids). A
-pinned successor id requires launcher support to register the fixed id
-for the migration chain. This is a MetalGo-side change outside this
-repo; the rehearsal harness learns-then-binds as the interim path.
-Do not emulate a fixed id by patching the hash locally — every node
-must compute or accept the identical value from the identical genesis
-bytes.
+MetalGo assigns the platform subnet id during chain registration. It is not
+the transaction-signing id when the genesis override is present, and remains
+learned after registration and bound into every cutover confirmation. Each
+node reports both ids separately. Do not pass the platform id to wallets or
+transaction-signing APIs.
 
 ## Recommendation
 
 1. Publish the pinned id at T-14 with H, K, contract, and roster.
 2. Keep the confirmation's checkpoint binding unconditional: it is
    what makes a shared id safe.
-3. Coordinate the MetalGo launcher change before promising wallets a
-   stable pre-H id.
+3. Publish the platform id separately after registration; wallets need only
+   the pinned Antelope signing id.

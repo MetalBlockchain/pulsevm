@@ -22,9 +22,10 @@ State transfer is implemented and does not need reinventing:
   without them.
 - Import: `pulsevm_database::xpr_import` hydrates Arena from SHiP table deltas
   into `migration.snapshot` plus a manifest bound by `checkpoint_sha256`.
-- Genesis binding: `GenesisState::migration_checkpoint_sha256` changes the
-  chain ID, so the A-Chain is cryptographically distinct and XPR signatures
-  do not replay onto it (see
+- Genesis binding: migration genesis carries an operator-pinned Antelope
+  signing `chain_id` (published before H); the ceremony binding separately
+  commits to `migration_checkpoint_sha256`. XPR signatures do not replay onto
+  the A-Chain because the signing IDs differ (see
   [`genesis.rs`](../crates/pulsevm_chain_types/src/genesis.rs)).
 - Boot: MetalGo passes `genesis.json` through verbatim; `scripts/run-local.sh`
   already generates migration genesis committed to the checkpoint hash, and
@@ -35,11 +36,13 @@ State transfer is implemented and does not need reinventing:
 
 ## 2. What the cut is (and is not)
 
-- XPR keeps producing. The migration is a declared one-way fork: a cutoff
-  height H plus a new chain identity. Halting XPR would require two-thirds
-  producer coordination on a chain we do not control, with no rollback if the
-  A-Chain stalls. The new chain ID plus the declared cutoff gives the same
-  safety without XPR-side action beyond announcement.
+- XPR may keep producing or be restarted after the cut; PulseVM cannot prevent
+  that. The migration establishes A-Chain as the canonical destination through
+  governance, client configuration, and endpoint cutover. It does not guarantee
+  that XPR halts or that no XPR fork exists. If users, applications, and assets
+  have moved to A-Chain, continued XPR production is not itself a cutover
+  blocker. Operators must stop presenting XPR as canonical and exchanges must
+  not credit post-H XPR activity.
 - Post-H XPR activity is out of scope and is never honored on the A-Chain.
   The bounded history-window tooling (`xpr_apply_history_window`) exists only
   as a fallback; using it as the canonical path would reopen cross-chain
@@ -106,6 +109,10 @@ State transfer is implemented and does not need reinventing:
    numeric `compression` (0/1) and the A-Chain chain ID enforced at the
    boundary. Test it with a low-value transfer before announcing
    general availability.
+   In migration genesis, this is the pinned Antelope signing `chain_id`;
+   `get_info.platform_chain_id` is the separate MetalGo id and is not used for
+   transaction signing. The RPC `get_block` response includes structured
+   transactions and actions for exchange pollers (covered by the service test).
 3. Hyperion is hydrated from A-Chain state at H and starts consuming the
    H+1 SHiP stream. Keep the XPR full-replay index frozen at H as the
    permanent pre-cut archive. A history router serves pre-H transaction
@@ -134,6 +141,25 @@ would rebase the block and SHiP logs and discard the history they must serve.
 Expose the API only after the coordinator's LIVE announcement names the
 registered `platform_chain_id` and the successor validators agree on their
 head. LIVE is an operator/governance signal, not an on-chain protocol flag.
+
+**Provider rehearsal gate (not yet proven by the local handover harness).**
+Before LIVE, rehearse one API-only node and one history provider from the exact
+production migration bundle. The provider must start from checkpoint H with
+history enabled and state sync disabled, join by normal block replay, and
+expose the same pinned signing id and registered platform id as the
+validators. Verify that its first post-cut SHiP block is H+1, then stream
+through a moving head with no sequence gap or duplicate; compare sampled block
+ids and transaction roots with validator RPC. Verify that API traffic and
+Hyperion can use the provider while it remains a non-producer with no signing
+key. Hydrate Hyperion from the H state, ingest H+1 onward, and query known
+transactions on both sides of H through the history router: pre-H must resolve
+from the frozen XPR archive, H+1 onward from A-Chain Hyperion. Rehearse a
+provider restart and confirm its logs resume contiguously without state sync.
+Record node configs, SHiP sequence evidence, Hyperion version/schema, row-count
+reconciliation, and archive storage used. This repository does not include
+Hyperion or the production router, so those integration and volume gates must
+run on the provider box; the local ceremony rehearsal is not evidence for
+them.
 
 ## 6. Gateways
 
@@ -181,10 +207,15 @@ cutover keeps every hostname and only re-points backends:
 ## 9. Rollback
 
 - Before the gateway flip: fix forward on the A-Chain; XPR is unaffected.
-- After a partial flip: re-point the affected route backend to the XPR
-  follow stack, which is kept running for this purpose.
-- After full flip plus one week stable: rollback is a new migration, not
-  a revert; archived artifacts make it reproducible.
+- After a partial flip: only re-point routes to XPR if A-Chain has not accepted
+  user-visible writes that would be lost or need reconciliation. Once value or
+  application state has changed on A-Chain, a route flip alone is not a safe
+  rollback; freeze affected operations and make a governance recovery decision.
+- After CONFIRMED: returning to XPR is a new migration decision, not a revert.
+  Producer key retirement reduces accidental signing by those operators but
+  cannot prevent another party from restarting or extending XPR. A-Chain
+  changes after H are not copied back to XPR; clients and venues keep treating
+  A-Chain as canonical unless governance explicitly starts another migration.
 
 ## 10. Open questions
 
@@ -263,9 +294,9 @@ consent and blocks the announcement phase.
   the observed ~330-block head-minus-LIB lag, set `P - H >= 2 x 330 + 12 = 672`
   blocks and re-measure at T-14; snapshot balances at the H LIB for
   reconciliation. A fixed 180-confirmation delay may be shorter than finality.
-- Re-enable: deposits only carrying the A-Chain chain ID, under the
-  agreed ticker. Post-H XPR deposits are never credited — the XPR chain
-  keeps producing, so this rule must be explicit, not assumed.
+- Re-enable: deposits only carrying the pinned A-Chain signing ID, under the
+  agreed ticker. Post-H XPR deposits are never credited, even if XPR continues
+  producing or is restarted; this rule must be explicit, not assumed.
 - Memo/tag handling does not change: deposit memo schemes carry over
   unchanged since account names and memo conventions are part of the
   migrated state.

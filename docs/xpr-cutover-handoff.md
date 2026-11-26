@@ -186,14 +186,14 @@ against independently replayed XPR state:
 - **Gateways and RPC.** JSON-RPC/HTTPS endpoints, exchanges, and indexers
   cut over at H+1 to the A-Chain; XPR endpoints are abandoned at H with no
   coexistence period. Coordinate the switch per client, not per block.
-- **XPR is abandoned, not halted.** No protocol change stops XPR: upgraded
-  nodes pause their own block production after delivering the confirmation,
-  and everyone else follows the A-Chain. If a third or more of stake
-  upgrades, XPR stalls organically near H (the clean stop, for free). If
-  fewer upgrade, XPR keeps producing an unfollowed minority fork — visible
-  on explorers, meaningless for the cutover. Do not present this as a chain
-  halt to operators; present it as a coordinated move with a dead
-  origin chain.
+- **XPR may continue or fork; the cutover does not stop it.** A-Chain becomes
+  canonical because governance, applications, wallets, exchanges, and public
+  endpoints move there. Do not promise that XPR halts, stalls at H, or cannot
+  be restarted. Once apps and value have moved to A-Chain, continued XPR
+  production is not itself a cutover blocker. Make the canonical endpoint and
+  deposit policy explicit, and do not credit post-H XPR activity. Removing
+  XPR keys from participating producers is a custody/retirement measure; it
+  does not prevent other parties from running XPR.
 - **History.** Hyperion hydrates from A-Chain state at H and ingests H+1
   onward. The XPR full-replay index is frozen at H and retained permanently
   as the pre-cut archive; a history router sends pre-H transaction lookups
