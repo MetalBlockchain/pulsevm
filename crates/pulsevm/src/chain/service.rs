@@ -849,9 +849,25 @@ impl RpcServer for RpcService {
         // Validate and admit; only gossip a transaction we hadn't already seen.
         let newly_added = self.admit_transaction(packed_trx.clone()).await?;
         if newly_added {
-            let nm = self.network_manager.read().await;
-            let gossipable_msg = Gossipable::new(GossipType::Transaction, packed_trx.clone())?;
-            nm.gossip(gossipable_msg).await?;
+            let gossiped: Result<(), ChainError> = async {
+                let message = Gossipable::new(GossipType::Transaction, packed_trx.clone())?;
+                // Take the channel and release the lock before waiting on the
+                // network, so peer connect/disconnect handlers aren't held up.
+                let channel = self.network_manager.read().await.appsender_channel()?;
+                NetworkManager::send_gossip(channel, message).await
+            }
+            .await;
+            if let Err(error) = gossiped {
+                // Don't leave an admitted transaction that was never gossiped: a
+                // client retry would find it already in the mempool, count it as
+                // seen, and never send it to the producer. Dropping it makes the
+                // error true and lets the retry go through the whole path again.
+                self.mempool
+                    .write()
+                    .await
+                    .remove_transaction(packed_trx.id());
+                return Err(error.into());
+            }
         }
 
         // Return a simple response
