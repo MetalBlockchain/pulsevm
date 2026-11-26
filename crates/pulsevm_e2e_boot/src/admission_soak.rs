@@ -288,17 +288,40 @@ async fn main() -> Result<()> {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    // Account state proves the actions executed; require the RPC status API to
-    // report the corresponding accepted receipt and block height as well.
-    for transaction_id in &admitted_transaction_ids {
-        let transaction_id = Id::from_str(transaction_id).context("invalid transaction ID")?;
-        let status = client.get_transaction_status(&transaction_id).await?;
-        if status.status != TransactionStatus::Included || status.block_num.is_none() {
-            bail!(
-                "transaction {transaction_id} finished without included status and block number: {:?}",
-                status.status
-            );
-        }
+    // Account state proves the actions executed. Acceptance releases the
+    // controller lock just before recording local transaction-status entries,
+    // so poll rather than racing that short handoff with one status read.
+    let status_deadline = Instant::now() + INCLUSION_TIMEOUT;
+    let mut status_checks = JoinSet::new();
+    for transaction_id in admitted_transaction_ids.iter().cloned() {
+        let client = client.clone();
+        status_checks.spawn(async move {
+            let tx_id = Id::from_str(&transaction_id).context("invalid transaction ID")?;
+            loop {
+                let status = client.get_transaction_status(&tx_id).await?;
+                match status.status {
+                    TransactionStatus::Included if status.block_num.is_some() => return Ok(()),
+                    TransactionStatus::ExecutionFailed => bail!(
+                        "transaction {tx_id} finished with execution failure: {}",
+                        status.error.unwrap_or_else(|| "no error detail".into())
+                    ),
+                    TransactionStatus::Admitted
+                    | TransactionStatus::Included
+                    | TransactionStatus::Unknown => {
+                        if Instant::now() >= status_deadline {
+                            bail!(
+                                "transaction {tx_id} did not reach included status with a block number before {INCLUSION_TIMEOUT:?}: {:?}",
+                                status.status
+                            );
+                        }
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                }
+            }
+        });
+    }
+    while let Some(result) = status_checks.join_next().await {
+        result.context("transaction status task panicked")??;
     }
 
     let mut p50_values = latencies.clone();
