@@ -73,6 +73,7 @@ type stressWave struct {
 	InclusionMS         latencySummary            `json:"inclusion_ms"`
 	Kinds               map[string]map[string]int `json:"kinds"`
 	RejectionReasons    map[string]int            `json:"rejection_reasons"`
+	RetryReasons        map[string]int            `json:"retry_reasons"`
 	Failures            int                       `json:"failures"`
 }
 
@@ -554,6 +555,9 @@ func TestMixedWorkloadStress(t *testing.T) {
 			w.ResubmitAdmitted, w.ResubmitRejected)
 		if len(w.RejectionReasons) > 0 {
 			t.Logf("  rejection reasons: %v", w.RejectionReasons)
+		}
+		if len(w.RetryReasons) > 0 {
+			t.Logf("  admission retry reasons: %v", w.RetryReasons)
 		}
 		kinds := make([]string, 0, len(w.Kinds))
 		for k := range w.Kinds {

@@ -143,6 +143,8 @@ struct Record {
     admission: Admission,
     admit_ms: u128,
     retries: u32,
+    /// Why each failed attempt before the final outcome failed.
+    retry_errors: Vec<String>,
     submitted: Instant,
 }
 
@@ -160,6 +162,7 @@ async fn submit(ctx: &Ctx, job: Job, node: usize) -> Record {
     let id = job.tx.id().to_string();
     let started = Instant::now();
     let mut retries = 0;
+    let mut retry_errors: Vec<String> = Vec::new();
     let admission = loop {
         let result = timeout(RPC_TIMEOUT, ctx.clients[node].issue_tx(&job.tx))
             .await
@@ -181,6 +184,14 @@ async fn submit(ctx: &Ctx, job: Job, node: usize) -> Record {
                 if job.expect != Expect::Included {
                     break Admission::Rejected(message);
                 }
+                // A duplicate on a retry means an earlier attempt got through and
+                // only its response was lost: the node already holds this exact
+                // transaction (in its mempool, or already in a block). That is
+                // admitted; the settle step still has to see it included.
+                if retries >= 1 && message.contains("duplicate tx") {
+                    break Admission::Admitted;
+                }
+                retry_errors.push(message.chars().take(140).collect());
                 retries += 1;
                 if retries >= MAX_ADMISSION_ATTEMPTS {
                     break Admission::Failed(message);
@@ -199,6 +210,7 @@ async fn submit(ctx: &Ctx, job: Job, node: usize) -> Record {
         admission,
         admit_ms: started.elapsed().as_millis(),
         retries,
+        retry_errors,
         submitted: started,
     }
 }
@@ -366,11 +378,15 @@ pub async fn run_wave(
     let mut retries = 0u64;
     let mut per_block: BTreeMap<u32, u64> = BTreeMap::new();
     let mut sample_rejections: BTreeMap<String, u64> = BTreeMap::new();
+    let mut retry_reasons: BTreeMap<String, u64> = BTreeMap::new();
 
     for (index, record) in records.iter().enumerate() {
         let tally = by_kind.entry(record.kind).or_default();
         tally[0] += 1;
         retries += u64::from(record.retries);
+        for reason in &record.retry_errors {
+            *retry_reasons.entry(reason.clone()).or_default() += 1;
+        }
         admit_latencies.push(record.admit_ms);
         match record.expect {
             Expect::Included => good_ids.push(record.id.clone()),
@@ -474,6 +490,7 @@ pub async fn run_wave(
             })))
             .collect::<serde_json::Map<_, _>>(),
         "rejection_reasons": sample_rejections,
+        "retry_reasons": retry_reasons,
         "failures": failures.len(),
     });
     eprintln!(
