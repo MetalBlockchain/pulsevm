@@ -29,6 +29,11 @@ decision that fixes H, K, and the ceremony contract — never unilaterally.
 
 Pinning the id removes none of the existing bindings:
 
+- The pinned Antelope signing id must be different from the source XPR chain
+  id. Confirm that against the source id in the validated export before
+  publishing the T-14 value; otherwise cross-chain signature replay protection
+  would be lost.
+
 - The confirmation still binds `checkpoint_sha256`, the source block
   id, and the platform chain id. A node booting the right id with the
   wrong state fails closed at the restore gate.

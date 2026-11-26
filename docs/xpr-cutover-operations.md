@@ -17,7 +17,7 @@ named owner; nothing ships "when ready".
 | Ceremony contract account + code hash, voter release version | Chain ops | BPs verify the hash before deploying |
 | Roster snapshot method (producers table, frozen at H-K) | Chain ops | How the roster file is built, byte-exact |
 | Coordinator URLs (params + confirmations) | Chain ops | Or the manual file path; cross-checked against the node either way |
-| Successor Antelope signing id (`chain_id`, U-1) | Chain ops | Pin and publish at T-14; wallets and exchanges can preconfigure it |
+| Successor Antelope signing id (`chain_id`, U-1) | Chain ops | Pin, verify it differs from the validated source XPR id, and publish at T-14; wallets and exchanges can preconfigure it |
 | Platform chain id (MetalGo subnet id) | MetalGo team | Assigned after registration at H; bound into every confirmation and exposed separately as `platform_chain_id` |
 | Wallet/exchange test vectors (pre-H and post-H) | Wallet + exchange leads | Sign/verify fixtures on both chains before the window |
 | Stop window P (agreed stop height, P - H) | Chain ops | Measure the live head-minus-LIB gap at T-14 and set `P - H >= 2 x gap + 12`; a Leap snapshot of H only finalizes once H is irreversible, so a shorter window leaves no snapshot. `--preflight` refuses a short window |
