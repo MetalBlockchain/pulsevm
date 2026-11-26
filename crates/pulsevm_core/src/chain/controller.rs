@@ -1899,15 +1899,13 @@ impl Controller {
         Ok(())
     }
 
-    /// Confirm that a candidate executes against the activation history of its
-    /// accepted parent. The record itself is persisted only after the candidate
-    /// has been committed, so a rejected speculative block cannot activate it.
-    fn prepare_protocol_execution(
-        &mut self,
-        context: ProtocolExecutionContext,
-    ) -> Result<(), ChainError> {
-        let block_height = context.block_height();
-        self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
+    /// Confirm the durable activation history before executing a candidate.
+    /// Verified ancestors may include an activation block that has not yet been
+    /// accepted, so their records are not durable yet. Those ancestors are
+    /// independently verified on the pending chain; compare persisted records
+    /// only through the accepted tip here.
+    fn prepare_protocol_execution(&mut self) -> Result<(), ChainError> {
+        self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {
@@ -2021,7 +2019,7 @@ impl Controller {
 
         let mut db = self.db.clone();
         db.arena_start_undo_session(); // the block session; retained on the pending chain
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             db.arena_undo();
             return Err(error);
         }
@@ -3286,7 +3284,7 @@ impl Controller {
         let mut xpr_bot_oracle_cache = super::xpr_native_replay::DirectBotOracleCache::default();
         let mut dependency_reports = Vec::<TransactionDependencies>::new();
         let mut untracked_transactions = 0usize;
-        self.prepare_protocol_execution(protocol_context)?;
+        self.prepare_protocol_execution()?;
         self.blocks_executed += 1;
 
         let mut schedule_state = self.schedule_state_for_parent(block.previous_id())?;
@@ -3860,7 +3858,7 @@ impl Controller {
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             // Admission executes the same activation boundary as block
             // production, but its outer session is always discarded.
             db.arena_undo();
@@ -3905,7 +3903,7 @@ impl Controller {
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             db.arena_undo();
             return Err(error);
         }
@@ -7352,6 +7350,12 @@ mod tests {
     }
 
     fn init_test_controller() -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
+        init_test_controller_with_protocol_upgrades(&[])
+    }
+
+    fn init_test_controller_with_protocol_upgrades(
+        upgrade_bytes: &[u8],
+    ) -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -7366,10 +7370,11 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
+        controller.initialize_with_protocol_upgrades(
             &chain_id,
             &config_bytes,
             &genesis_bytes.to_vec(),
+            upgrade_bytes,
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
@@ -10519,6 +10524,78 @@ mod tests {
             "schedule must be reconstructed from the block log header, not a side file"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_upgrade_activation_does_not_reject_child_block() -> Result<(), ChainError> {
+        let upgrades = json!({
+            "protocol_upgrades": [{
+                "protocol_version": 2,
+                "activation_height": 2,
+            }],
+        })
+        .to_string();
+        let (mut producer, private_key, chain_id, _producer_temp) =
+            init_test_controller_with_protocol_upgrades(upgrades.as_bytes())?;
+        let mut producer_mempool = Mempool::new();
+
+        // The first produced block is the activation block at height 2. The
+        // producer accepts it before building its child, so its durable history
+        // already contains that activation when it builds height 3.
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradeone")?,
+            chain_id,
+        )?);
+        let activation = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(activation.block_num(), 2);
+        producer.accept_block(&activation.id()?, &mut producer_mempool)?;
+        producer.set_preferred_id(activation.id()?);
+
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradetwo")?,
+            chain_id,
+        )?);
+        let activation_child = producer.build_block(&mut producer_mempool).await?;
+        producer.accept_block(&activation_child.id()?, &mut producer_mempool)?;
+        producer.set_preferred_id(activation_child.id()?);
+        assert_eq!(producer.db.activated_protocol_features()?.len(), 1);
+
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradethree")?,
+            chain_id,
+        )?);
+        let child = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(child.block_num(), 4);
+
+        // A peer may receive and verify the activation block and its child
+        // before consensus accepts either. The child must still verify against
+        // the same configured schedule, even though the durable record is not
+        // written until the activation block is accepted.
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller_with_protocol_upgrades(upgrades.as_bytes())?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&activation, &mut validator_mempool)
+            .await?;
+        validator
+            .verify_block(&activation_child, &mut validator_mempool)
+            .await?;
+        assert!(validator.db.activated_protocol_features()?.is_empty());
+        validator
+            .verify_block(&child, &mut validator_mempool)
+            .await?;
+
+        // Once the common prefix is accepted, the durable record is appended at
+        // the activation height and descendants remain valid.
+        validator.accept_block(&activation.id()?, &mut validator_mempool)?;
+        validator.accept_block(&activation_child.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.activated_protocol_features()?.len(), 1);
+        validator.accept_block(&child.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.last_accepted_block().block_num(), 4);
         Ok(())
     }
 

@@ -271,6 +271,14 @@ fork rolls the record back; accepting the block commits it with the rest of
 state. The ordered records are included in physical snapshots and state-history
 deltas.
 
+Verification may run ahead of acceptance: a node can verify a child of an
+activation block while that activation block is still pending. In this case the
+child executes using the configured schedule, while the durable-history
+consistency check compares records only through the last accepted height. The
+pending activation ancestor is verified independently, and acceptance checks
+the newly committed record at its exact height. This avoids requiring a
+speculative activation record to exist durably before its block is accepted.
+
 At startup, the persisted records must exactly equal the configured schedule
 prefix through the accepted head. This makes an activated entry immutable:
 removing it, moving it, changing its version, or inserting a retroactive entry
