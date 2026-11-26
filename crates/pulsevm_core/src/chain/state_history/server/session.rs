@@ -221,7 +221,7 @@ impl Session {
                                     match make_block_response_for(ctrl.clone(), &request, next)
                                         .await
                                     {
-                                        Ok(resp) => {
+                                        Ok(Some(resp)) => {
                                             match resp.pack() {
                                                 Ok(bytes) => {
                                                     if tx_clone
@@ -250,22 +250,21 @@ impl Session {
                                                         .await;
                                                 }
                                             }
+                                            continue;
+                                        }
+                                        Ok(None) => {
+                                            debug!("[ship] block {next} not yet available");
                                         }
                                         Err(e) => {
-                                            // Likely "block not ready yet" — backoff and retry
-                                            // return slot because nothing was sent
                                             warn!(
                                                 "[ship] make_block_response_for failed for block {next}: {e}"
                                             );
-                                            budget.fetch_add(1, Ordering::SeqCst);
-                                            tokio::time::sleep(Duration::from_millis(500)).await;
                                         }
                                     }
 
-                                    // react quickly to cancellation
-                                    if stop_rx.has_changed().unwrap_or(false) {
-                                        break;
-                                    }
+                                    // Nothing was sent. Restore the slot and retry the same height.
+                                    budget.fetch_add(1, Ordering::SeqCst);
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
                                 }
                             }));
                         }
@@ -384,24 +383,22 @@ impl Session {
     }
 }
 
-// Builds a GetBlocksResponseV0 for a specific block number.
-// Replace internals with your real "get block by number" logic.
-// As-is, it waits until head >= block_num and then returns head as the block payload.
+/// Returns `None` while the requested height is ahead of the on-disk block log.
 async fn make_block_response_for(
     controller: Arc<RwLock<Controller>>,
     request: &GetBlocksRequestV0,
     block_num: u32,
-) -> Result<GetBlocksResponseV0> {
+) -> Result<Option<GetBlocksResponseV0>> {
     let controller = controller.read().await;
     let head = controller.last_accepted_block();
 
     // Serveability bound: only advertise/serve blocks actually appended to block_log.
     // last_accepted can run ~1 block ahead of what is on disk, and read_block would
     // then return NotFound, stalling the reader. Bound the head to the on-disk last block.
-    let serveable = controller.block_log().map(|l| l.last_block()).unwrap_or(0);
+    let serveable = controller.block_log()?.last_block();
 
     if serveable < block_num {
-        return Err(anyhow!("block {block_num} not yet available"));
+        return Ok(None);
     }
 
     let head_block_id = head.id()?;
@@ -475,7 +472,7 @@ async fn make_block_response_for(
         .await?
         .unwrap_or(head_block_id);
 
-    Ok(GetBlocksResponseV0 {
+    Ok(Some(GetBlocksResponseV0 {
         variant: 1,
         head: BlockPosition {
             block_num: serveable,
@@ -493,7 +490,7 @@ async fn make_block_response_for(
         block: block,
         traces: traces,
         deltas: deltas,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -508,8 +505,7 @@ mod tests {
         Id::new(bytes)
     }
 
-    #[tokio::test]
-    async fn status_reports_each_ship_logs_actual_exclusive_range() {
+    fn test_controller() -> (tempfile::TempDir, Controller) {
         let temp = tempfile::tempdir().unwrap();
         let config = br#"{
             "producer_name": "pulse",
@@ -524,7 +520,53 @@ mod tests {
         controller
             .initialize(&chain_id, &config, &genesis, temp.path().to_str().unwrap())
             .unwrap();
+        (temp, controller)
+    }
 
+    #[tokio::test]
+    async fn block_response_waits_only_for_heights_beyond_the_log() -> Result<()> {
+        let (_temp, controller) = test_controller();
+        controller.block_log()?.reset_to(block_id(400), b"")?;
+        let controller = Arc::new(RwLock::new(controller));
+        let mut request = GetBlocksRequestV0 {
+            start_block_num: 401,
+            end_block_num: 0,
+            max_messages_in_flight: 1,
+            have_positions: vec![],
+            irreversible_only: false,
+            fetch_block: false,
+            fetch_traces: false,
+            fetch_deltas: false,
+        };
+        assert!(
+            make_block_response_for(controller.clone(), &request, 401)
+                .await?
+                .is_none()
+        );
+
+        controller
+            .read()
+            .await
+            .block_log()?
+            .append(block_id(401), b"")?;
+        let response = make_block_response_for(controller.clone(), &request, 401)
+            .await?
+            .expect("the appended block is available");
+        assert_eq!(response.this_block.unwrap().block_id, block_id(401));
+
+        // The log contains an ID but its empty payload cannot decode as a block.
+        request.fetch_block = true;
+        assert!(
+            make_block_response_for(controller, &request, 401)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_reports_each_ship_logs_actual_exclusive_range() {
+        let (_temp, controller) = test_controller();
         let block_400 = block_id(400);
         let block_401 = block_id(401);
         controller
