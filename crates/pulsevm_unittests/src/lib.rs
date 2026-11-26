@@ -91,6 +91,10 @@ mod tests {
 
     impl Testing {
         pub async fn new() -> Self {
+            Self::new_with_protocol_upgrades(&[]).await
+        }
+
+        pub async fn new_with_protocol_upgrades(upgrade_bytes: &[u8]) -> Self {
             let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
             let chain_id =
                 Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
@@ -107,10 +111,11 @@ mod tests {
 
             // Initialize controller
             controller
-                .initialize(
+                .initialize_with_protocol_upgrades(
                     &chain_id,
                     &config_bytes,
                     &genesis,
+                    upgrade_bytes,
                     temp_dir.path().to_str().unwrap(),
                 )
                 .expect("Failed to initialize controller");

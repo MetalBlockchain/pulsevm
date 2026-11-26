@@ -107,6 +107,27 @@ those keys must be identical everywhere. Two subtleties here:
   `find_secondary`, `lowerbound`, `upperbound`, both widths). With NaN kept out,
   the two stores agree trivially and we match the reference's accept/reject.
 
+## 4. WebAssembly start sections
+
+Ordinary contract deployment rejects a WebAssembly start section under
+protocol version 1. Activating `ProtocolFeature::WasmStartSection` in version 2
+allows it. This is a consensus rule because it changes which `setcode`
+transactions execute successfully; validators must not enable it at different
+heights.
+
+Wasmer normally runs a module's start function during instantiation. That is
+too early for PulseVM because memory, the action context, and the metering
+budget are not attached yet. The runtime therefore removes the start section
+from the temporary compiled module, exposes the same function privately, then
+calls it immediately before `apply` for each action. Both calls share the same
+metering budget and host context. Stored contract bytes and their code hash are
+unchanged. This matches the XPR action lifecycle and avoids running start code
+for free during instantiation.
+
+Before version 2 activates, `setcode` continues to reject start sections,
+preserving historical block validity. The separate XPR migration replay path
+retains its existing source-chain validation rule.
+
 ## What changed on this branch
 
 `wasm_runtime.rs`:

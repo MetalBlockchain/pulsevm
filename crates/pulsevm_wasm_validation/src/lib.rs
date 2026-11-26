@@ -662,6 +662,14 @@ pub fn validate_wasm(wasm: &[u8]) -> Result<()> {
     validate_wasm_impl(wasm, false, constraints::MAXIMUM_SECTION_ELEMENTS)
 }
 
+/// Validate WASM using the protocol-version-2 rule that permits a standard
+/// start section. Callers must select this only when the candidate block's
+/// protocol context enables `WasmStartSection`; execution defers and meters the
+/// function instead of letting Wasmer run it during instantiation.
+pub fn validate_wasm_with_start_section(wasm: &[u8]) -> Result<()> {
+    validate_wasm_impl(wasm, true, constraints::MAXIMUM_SECTION_ELEMENTS)
+}
+
 /// Validate historical XPR code using the source chain's start-section rule.
 ///
 /// XPR's WAVM validator accepts a standard start function and its runtime
@@ -929,9 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_start_section_rejected() {
-        // Ordinary PulseVM deployments reject start sections. Historical XPR
-        // replay has a separate validation path because XPR accepted them.
+    fn start_section_validation_is_versioned() {
         let wasm = wat::parse_str(
             r#"
             (module
@@ -948,6 +954,7 @@ mod tests {
         .expect("valid WAT");
         let err = validate_wasm(&wasm).unwrap_err();
         assert!(matches!(err, ValidationError::StartSectionNotAllowed));
+        assert!(validate_wasm_with_start_section(&wasm).is_ok());
         assert!(validate_xpr_replay_wasm(&wasm, constraints::MAXIMUM_SECTION_ELEMENTS).is_ok());
     }
 
