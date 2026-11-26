@@ -5,6 +5,7 @@ use pulsevm_core::{
     ChainError,
     Name,
     config::{
+        NodeConfig,
         PLUGIN_VERSION,
         VERSION,
     },
@@ -121,9 +122,6 @@ pub(crate) fn abort_on_fatal_consistency(operation: &str, error: &ChainError) ->
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
-    // Initialize logging
-    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
-
     let cancel = CancellationToken::new();
     let cancel_ws = cancel.clone();
     let cancel_runtime = cancel.clone();
@@ -427,10 +425,13 @@ impl Vm for VirtualMachine {
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.
         let admission_state = tokio::task::spawn_blocking(move || {
+            let config = NodeConfig::from_bytes(&config_bytes)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
             let mut controller = controller.blocking_write();
-            if let Err(error) = controller.initialize_with_protocol_upgrades(
+            spdlog::default_logger().set_level_filter(config.log_level);
+            if let Err(error) = controller.initialize_with_node_config(
                 &chain_id,
-                &config_bytes,
+                config,
                 &genesis_bytes,
                 &upgrade_bytes,
                 db_path.as_str(),
@@ -1415,6 +1416,36 @@ impl Http for VirtualMachine {
             body: resp.into_bytes(),
         }))
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn initialize_applies_the_chain_config_log_level() -> Result<(), Box<dyn std::error::Error>> {
+    let base_config = serde_json::json!({
+        "producer_name": "pulse",
+        "producer_key": pulsevm_core::crypto::PrivateKey::random().to_string(),
+        "db_size": 64 * 1024 * 1024,
+    });
+    for level in [Some("debug"), None] {
+        let mut config = base_config.clone();
+        if let Some(value) = level {
+            config["log_level"] = value.into();
+        }
+        let dir = tempfile::tempdir()?;
+        let vm = VirtualMachine::new("127.0.0.1:1234".parse()?)?;
+        vm.initialize(Request::new(vm::InitializeRequest {
+            chain_id: vec![0; 32],
+            chain_data_dir: dir.path().display().to_string(),
+            config_bytes: serde_json::to_vec(&config)?,
+            genesis_bytes: include_bytes!("../../../genesis.json").to_vec(),
+            ..Default::default()
+        }))
+        .await?;
+        let logger = spdlog::default_logger();
+        assert_eq!(logger.should_log(spdlog::Level::Debug), level.is_some());
+        assert!(logger.should_log(spdlog::Level::Info));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

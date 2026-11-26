@@ -1,12 +1,28 @@
 use std::str::FromStr;
 
 use pulsevm_name::Name;
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Deserializer,
+};
+use spdlog::{
+    Level,
+    LevelFilter,
+};
 
-use crate::crypto::PrivateKey;
+use crate::{
+    ChainError,
+    crypto::PrivateKey,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
+    /// Minimum severity emitted by the PulseVM plugin.
+    #[serde(
+        default = "default_log_level",
+        deserialize_with = "deserialize_log_level"
+    )]
+    pub log_level: LevelFilter,
     // Root account used by the native system contract.  PulseVM defaults to
     // `pulse`; XPR/Antelope state imports set this to `eosio`.
     #[serde(default = "default_system_account")]
@@ -69,6 +85,34 @@ pub struct NodeConfig {
     pub ram_usage_monitor_max_series: usize,
 }
 
+impl NodeConfig {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ChainError> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| ChainError::ParseError(format!("failed to parse node config JSON: {e}")))
+    }
+}
+
+fn default_log_level() -> LevelFilter {
+    LevelFilter::MoreSevereEqual(Level::Info)
+}
+
+fn deserialize_log_level<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<LevelFilter, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(LevelFilter::Off);
+    }
+    value
+        .parse::<Level>()
+        .map(LevelFilter::MoreSevereEqual)
+        .map_err(|_| {
+            serde::de::Error::custom(
+                "invalid log_level: expected trace, debug, info, warn, error, critical, or off",
+            )
+        })
+}
+
 fn default_db_size() -> u64 {
     20 * 1024 * 1024 * 1024 // 20 GB
 }
@@ -100,10 +144,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.system_account, Name::from_str("pulse").unwrap());
+        assert_eq!(cfg.log_level, LevelFilter::MoreSevereEqual(Level::Info));
         assert!(cfg.native_system_contract);
         assert!(cfg.state_history_enabled);
         assert!(!cfg.allow_replay_recovery);
         assert_eq!(cfg.ram_usage_monitor_max_series, 0);
+    }
+
+    #[test]
+    fn log_level_accepts_severities_and_off_and_rejects_typos() {
+        let mut config = serde_json::json!({
+            "producer_name": "pulse",
+            "producer_key": PrivateKey::random().to_string(),
+        });
+        for (value, expected) in [
+            ("DEBUG", LevelFilter::MoreSevereEqual(Level::Debug)),
+            ("warn", LevelFilter::MoreSevereEqual(Level::Warn)),
+            ("off", LevelFilter::Off),
+        ] {
+            config["log_level"] = value.into();
+            let parsed = NodeConfig::from_bytes(&serde_json::to_vec(&config).unwrap()).unwrap();
+            assert_eq!(parsed.log_level, expected);
+        }
+        config["log_level"] = "verbose".into();
+        let error = NodeConfig::from_bytes(&serde_json::to_vec(&config).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("invalid log_level"));
+        assert!(!error.to_string().contains("producer_key"));
     }
 
     #[test]

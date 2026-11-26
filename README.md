@@ -57,6 +57,15 @@ The build produces:
 | `target/release/pulse` | Command-line client |
 | `target/release/pulse-keosd` | Wallet service |
 
+### Configure VM logging
+
+PulseVM logs at `info` by default. To see debug messages, including SHiP
+waiting for the next block, add `"log_level": "debug"` to the existing JSON
+object in `<chain-config-dir>/<blockchainID>/config.json` and restart the
+node. MetalGo's default chain config directory is `~/.metalgo/configs/chains`.
+Accepted values are `trace`, `debug`, `info`, `warn`, `error`, `critical`, and
+`off`. Each severity includes higher-severity messages.
+
 ## Run a local network
 
 For a containerized five-node cluster with Hyperion indexing and a Bloks

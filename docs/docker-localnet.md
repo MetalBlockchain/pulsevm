@@ -64,6 +64,12 @@ and defaults to 512 MiB for a small local chain. Increase it before creating a
 larger chain. All validators use one development producer identity, matching
 the existing local harness. These keys and settings are for local testing.
 
+PulseVM defaults to `info`. For a new localnet, the
+[bootstrap script](../docker/localnet/bootstrap.sh) builds the per-chain JSON
+passed to the runner as `chain_config`. Set `log_level` in that object to
+choose the VM's verbosity. Standalone MetalGo reads the same field from the
+[per-chain config file](../README.md#configure-vm-logging).
+
 The first build compiles PulseVM, Network Runner, Hyperion, and Bloks and can
 take several minutes. Build caches accelerate subsequent runs. BuildKit also
 needs network access to package registries and the pinned MetalGo release.

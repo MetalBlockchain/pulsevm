@@ -1305,22 +1305,30 @@ impl Controller {
         upgrade_bytes: &[u8],
         db_path: &str,
     ) -> Result<(), ChainError> {
+        self.initialize_with_node_config(
+            chain_id,
+            NodeConfig::from_bytes(config_bytes)?,
+            genesis_bytes,
+            upgrade_bytes,
+            db_path,
+        )
+    }
+
+    pub fn initialize_with_node_config(
+        &mut self,
+        chain_id: &Id,
+        config: NodeConfig,
+        genesis_bytes: &[u8],
+        upgrade_bytes: &[u8],
+        db_path: &str,
+    ) -> Result<(), ChainError> {
         self.subjective_billing.clear();
         info!("initializing controller with DB path: {}", db_path);
         self.protocol_upgrade_schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(upgrade_bytes)
             .map_err(|e| {
                 ChainError::ParseError(format!("failed to parse protocol upgrade schedule: {e}"))
             })?;
-        // Parse config bytes
-        let config_json = std::str::from_utf8(config_bytes).map_err(|e| {
-            ChainError::ParseError(format!("failed to parse config bytes as UTF-8: {}", e))
-        })?;
-        self.node_config = Some(serde_json::from_str(config_json).map_err(|e| {
-            ChainError::ParseError(format!(
-                "failed to parse node config JSON: {} - {}",
-                e, config_json
-            ))
-        })?);
+        self.node_config = Some(config);
 
         Self::ensure_no_incomplete_state_sync(db_path)?;
         self.db_path = Some(db_path.to_string());
