@@ -2181,7 +2181,7 @@ mod header_cpu_limit_tests {
     #[cfg(feature = "protocol_feature_cpu_units_in_points")]
     #[test]
     fn from_the_activation_the_header_byte_is_milliseconds_of_reference_compute() {
-        let schedule = br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":100}]}"#;
+        let schedule = br#"{"protocol_upgrades":[{"protocol_version":3,"activation_height":100}]}"#;
         let per_ms = 1_000 * crate::config::POINTS_PER_US as i64;
 
         // The last block under the old rule and the first under the new one.

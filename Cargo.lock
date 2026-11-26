@@ -3725,6 +3725,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "pulsevm_abi",
+ "pulsevm_api_types",
  "pulsevm_constants",
  "pulsevm_core",
  "pulsevm_crypto",
@@ -3956,6 +3957,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pulsevm_api_client",
+ "pulsevm_api_types",
  "pulsevm_core",
  "pulsevm_crypto",
  "pulsevm_name_macro",

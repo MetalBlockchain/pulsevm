@@ -151,21 +151,13 @@ pub fn newaccount(
     Ok(())
 }
 
-/// Whether `setcode` accepts a module with a WASM start section in this block.
+/// Whether `setcode` accepts a module with a WASM start section at this block.
 ///
-/// Only under [`ProtocolFeature::WasmStartSections`] (protocol version 2). Before
-/// that version a start section is refused; blocks before the activation height
-/// keep that rule because they already ran under it.
+/// The protocol schedule, rather than the node's replay mode, controls this
+/// rule for ordinary deployments. XPR native replay keeps its dedicated
+/// validator below.
 pub(crate) fn start_sections_allowed(context: &ApplyContext) -> Result<bool, ChainError> {
-    if context.protocol_feature_enabled(ProtocolFeature::WasmStartSections) {
-        #[cfg(feature = "protocol_feature_wasm_start_sections")]
-        return Ok(true);
-        #[cfg(not(feature = "protocol_feature_wasm_start_sections"))]
-        return Err(ChainError::BlockError(
-            "WASM start sections were not compiled into this binary".into(),
-        ));
-    }
-    Ok(false)
+    Ok(context.protocol_feature_enabled(ProtocolFeature::WasmStartSection))
 }
 
 pub fn setcode(
@@ -190,8 +182,9 @@ pub fn setcode(
     let code_size = act.code.len() as u64;
     let code_hash: [u8; 32] = if code_size > 0 {
         // XPR's source validator accepts standard start sections, and Mainnet
-        // contains historical AssemblyScript contracts that use one. Preserve
-        // PulseVM's stricter admission rule outside the opt-in migration path.
+        // contains historical AssemblyScript contracts that use one. Ordinary
+        // deployments adopt that rule only after the scheduled protocol
+        // feature activates; historical XPR replay retains its own validator.
         let validation = if db.xpr_native_replay_enabled() {
             let maximum_section_elements =
                 if db.protocol_feature_activated(CONFIGURABLE_WASM_LIMITS2_FEATURE_DIGEST) {
@@ -204,7 +197,7 @@ pub fn setcode(
                 maximum_section_elements,
             )
         } else if start_sections_allowed(context)? {
-            pulsevm_wasm_validation::validate_wasm_allowing_start_section(act.code.as_slice())
+            pulsevm_wasm_validation::validate_wasm_with_start_section(act.code.as_slice())
         } else {
             pulsevm_wasm_validation::validate_wasm(act.code.as_slice())
         };

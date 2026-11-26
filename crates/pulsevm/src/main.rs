@@ -1191,10 +1191,7 @@ impl Vm for VirtualMachine {
             }
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
-        debug!(
-            "block accepted with id {}, returning from block_accept",
-            block_id
-        );
+        let accepted_block = controller.last_accepted_block().clone();
         // At a summary height, copy the state out now, under the lock already held
         // (about a second at mainnet size, on every validator at the same block), and
         // build the summary after both locks are released.
@@ -1210,6 +1207,11 @@ impl Vm for VirtualMachine {
         };
         drop(mempool);
         drop(controller);
+        self.rpc_service.note_accepted_block(&accepted_block);
+        debug!(
+            "block accepted with id {}, returning from block_accept",
+            block_id
+        );
         if let Some(staged) = staged {
             let summaries = self.summaries.clone();
             tokio::spawn(async move {

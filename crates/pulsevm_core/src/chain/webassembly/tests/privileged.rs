@@ -297,9 +297,9 @@ fn xpr_microsecond_parameters(db: &pulsevm_database::Database) -> pulsevm_databa
 }
 
 #[test]
-fn before_protocol_v2_microsecond_parameters_are_still_accepted() {
+fn before_protocol_v3_microsecond_parameters_are_still_accepted() {
     // The legacy rule: only the relations between fields are checked. This is
-    // exactly the hazard the v2 guard closes, and what blocks before the
+    // exactly the hazard the v3 guard closes, and what blocks before the
     // activation height already ran under.
     let mut h = Host::new(false);
     let cfg = xpr_microsecond_parameters(&h.db);
@@ -310,13 +310,13 @@ fn before_protocol_v2_microsecond_parameters_are_still_accepted() {
 }
 
 #[cfg(feature = "protocol_feature_cpu_units_in_points")]
-mod protocol_v2 {
+mod protocol_v3 {
     use super::*;
     use crate::chain::protocol_features::ProtocolUpgradeSchedule;
 
-    fn v2_host() -> Host {
+    fn v3_host() -> Host {
         let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
-            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+            br#"{"protocol_upgrades":[{"protocol_version":3,"activation_height":2}]}"#,
         )
         .unwrap();
         Host::with_protocol(false, schedule.execution_context(2).unwrap())
@@ -324,12 +324,12 @@ mod protocol_v2 {
 
     #[test]
     fn microsecond_parameters_are_refused_and_leave_the_caps_alone() {
-        let mut h = v2_host();
+        let mut h = v3_host();
         let before = h.db.chain_config().unwrap();
         let packed = xpr_microsecond_parameters(&h.db).pack().unwrap();
         h.write(OUT, &packed);
         let error = set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32)
-            .expect_err("XPR's microsecond values must not be applied under v2");
+            .expect_err("XPR's microsecond values must not be applied under v3");
         assert!(
             error.to_string().contains("metering points"),
             "the refusal says why: {error}"
@@ -343,7 +343,7 @@ mod protocol_v2 {
 
     #[test]
     fn point_denominated_parameters_are_applied() {
-        let mut h = v2_host();
+        let mut h = v3_host();
         let mut cfg = h.db.chain_config().unwrap();
         cfg.min_transaction_cpu_usage = 100_000;
         cfg.max_transaction_cpu_usage = 1_000_000_000;
@@ -374,7 +374,7 @@ mod protocol_v2 {
     // ordinary transaction (s1check bills 362,028) is dropped.
     #[test]
     fn a_proposal_that_only_raises_the_minimum_is_refused_and_changes_nothing() {
-        let mut h = v2_host();
+        let mut h = v3_host();
         let before = h.db.chain_config().unwrap().pack().unwrap();
         let error = apply(&mut h, 38_000, 150_000, 200_000)
             .expect_err("microsecond caps under a point-denominated minimum must be refused");
@@ -397,7 +397,7 @@ mod protocol_v2 {
         let min = 38_000u32;
         let floor = 100 * min;
         for (tx, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
-            let mut h = v2_host();
+            let mut h = v3_host();
             // The block cap must clear the transaction cap plus the minimum bill
             // and 1000 minimum bills, so give it room and it is never the
             // binding one here.
@@ -420,7 +420,7 @@ mod protocol_v2 {
             (floor, true),
             (floor + 1, true),
         ] {
-            let mut h = v2_host();
+            let mut h = v3_host();
             let result = apply(&mut h, min, tx, block);
             assert_eq!(result.is_ok(), accepted, "max_block_cpu_usage = {block}");
             if !accepted {
@@ -437,7 +437,7 @@ mod protocol_v2 {
     fn the_converted_chains_own_figures_are_far_above_the_guard() {
         // 3e9 / 1e9 / 100,000 is what the migration converter writes: a ratio
         // of 10,000 against the minimum, a hundred times the guard.
-        let mut h = v2_host();
+        let mut h = v3_host();
         apply(&mut h, 100_000, 1_000_000_000, 3_000_000_000).unwrap();
     }
 
@@ -445,7 +445,7 @@ mod protocol_v2 {
     fn the_floor_is_exactly_one_microsecond_of_metering() {
         let floor = crate::config::POINTS_PER_US as u32;
         for (min, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
-            let mut h = v2_host();
+            let mut h = v3_host();
             let mut cfg = h.db.chain_config().unwrap();
             cfg.min_transaction_cpu_usage = min;
             cfg.max_transaction_cpu_usage = 1_000_000_000;

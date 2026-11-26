@@ -59,7 +59,7 @@ nightly = [
     "protocol_feature_cpu_units_in_points",
     "protocol_feature_wasm_start_sections",
 ]
-# Protocol version 2: CPU figures a transaction header or a governance call
+# Protocol version 3: CPU figures a transaction header or a governance call
 # states are metering points, not microseconds. See docs/protocol-features.md.
 protocol_feature_cpu_units_in_points = []
 # Protocol version 2: new contract code may declare a WASM start section.

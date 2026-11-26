@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeSet,
+    collections::{
+        BTreeSet,
+        HashMap,
+        VecDeque,
+    },
     str::FromStr,
     sync::{
         Arc,
@@ -61,7 +65,9 @@ use crate::{
         GetInfoResponse,
         GetProducersResponse,
         GetRawABIResponse,
+        GetTransactionStatusResponse,
         IssueTxResponse,
+        TransactionStatus,
     },
     chain::{
         GossipType,
@@ -72,6 +78,12 @@ use crate::{
 
 #[rpc(server)]
 pub trait Rpc {
+    #[method(name = "pulsevm.getTransactionStatus")]
+    async fn get_transaction_status(
+        &self,
+        tx_id: Id,
+    ) -> Result<GetTransactionStatusResponse, ErrorObjectOwned>;
+
     #[method(name = "pulsevm.issueTx")]
     async fn issue_tx(
         &self,
@@ -187,6 +199,84 @@ pub struct RpcService {
     admission_state: Arc<StdRwLock<Option<MempoolAdmissionState>>>,
     admission_metrics: Arc<AdmissionMetrics>,
     network_manager: Arc<RwLock<NetworkManager>>,
+    transaction_statuses: Arc<StdRwLock<TransactionStatusStore>>,
+}
+
+const MAX_TRACKED_TRANSACTION_STATUSES: usize = 10_000;
+const MAX_TRACKED_TRANSACTION_ERROR_BYTES: usize = 1_024;
+
+fn bounded_transaction_error(mut error: String) -> String {
+    if error.len() > MAX_TRACKED_TRANSACTION_ERROR_BYTES {
+        let mut boundary = MAX_TRACKED_TRANSACTION_ERROR_BYTES;
+        while !error.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        error.truncate(boundary);
+        error.push('…');
+    }
+    error
+}
+
+#[cfg(test)]
+mod transaction_status_store_tests {
+    use super::*;
+
+    #[test]
+    fn transaction_error_cache_is_bounded_on_utf8_boundaries() {
+        let error = "é".repeat(MAX_TRACKED_TRANSACTION_ERROR_BYTES);
+        let bounded = bounded_transaction_error(error);
+
+        assert!(bounded.len() <= MAX_TRACKED_TRANSACTION_ERROR_BYTES + '…'.len_utf8());
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
+}
+
+#[derive(Default)]
+struct TransactionStatusStore {
+    order: VecDeque<Id>,
+    entries: HashMap<Id, GetTransactionStatusResponse>,
+}
+
+impl TransactionStatusStore {
+    fn insert(&mut self, status: GetTransactionStatusResponse) {
+        let id = status.tx_id.clone();
+        if !self.entries.contains_key(&id) {
+            self.order.push_back(id.clone());
+        }
+        self.entries.insert(id, status);
+        self.evict_oldest();
+    }
+
+    fn admit(&mut self, tx_id: Id) {
+        let should_refresh = self
+            .entries
+            .get(&tx_id)
+            .is_none_or(|status| status.status != TransactionStatus::Admitted);
+        if should_refresh {
+            self.order.retain(|id| id != &tx_id);
+            self.order.push_back(tx_id.clone());
+            self.entries.insert(
+                tx_id.clone(),
+                GetTransactionStatusResponse {
+                    tx_id,
+                    status: TransactionStatus::Admitted,
+                    block_num: None,
+                    error: None,
+                },
+            );
+        }
+        self.evict_oldest();
+    }
+
+    fn evict_oldest(&mut self) {
+        while self.entries.len() > MAX_TRACKED_TRANSACTION_STATUSES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -246,6 +336,7 @@ impl RpcService {
             admission_state: Arc::new(StdRwLock::new(None)),
             admission_metrics: Arc::new(AdmissionMetrics::default()),
             network_manager,
+            transaction_statuses: Arc::new(StdRwLock::new(TransactionStatusStore::default())),
         }
     }
 
@@ -263,6 +354,33 @@ impl RpcService {
         self.admission_metrics.snapshot()
     }
 
+    fn remember_transaction_status(&self, status: GetTransactionStatusResponse) {
+        self.transaction_statuses
+            .write()
+            .expect("transaction status lock poisoned")
+            .insert(status);
+    }
+
+    /// Record transactions from a block accepted by this node. Status is
+    /// deliberately best-effort and local; the accepted block remains the
+    /// authoritative source of inclusion.
+    pub fn note_accepted_block(&self, block: &SignedBlock) {
+        let block_num = block.block_num();
+        let mut statuses = self
+            .transaction_statuses
+            .write()
+            .expect("transaction status lock poisoned");
+        for receipt in &block.transactions {
+            let tx_id = receipt.transaction_id().clone();
+            statuses.insert(GetTransactionStatusResponse {
+                tx_id,
+                status: TransactionStatus::Included,
+                block_num: Some(block_num),
+                error: None,
+            });
+        }
+    }
+
     pub async fn handle_api_request(
         &self,
         request_body: &str,
@@ -276,6 +394,13 @@ impl RpcService {
         // serde_json::from_str::<Response<u64>>(&resp).unwrap().try_into().unwrap();
 
         Ok(resp.get().to_owned())
+    }
+
+    pub async fn get_transaction_status_compat(
+        &self,
+        tx_id: Id,
+    ) -> Result<GetTransactionStatusResponse, ErrorObjectOwned> {
+        <Self as RpcServer>::get_transaction_status(self, tx_id).await
     }
 
     /// Validate a packed transaction and admit it to the mempool. Returns
@@ -381,9 +506,17 @@ impl RpcService {
         }
         // A full pool is an error to the sender, not a silent "accepted":
         // `issueTx` used to answer it with a tx id it would never build.
-        mempool
-            .try_add_transaction(packed_trx)
-            .map_err(|e| ChainError::TransactionError(format!("mempool refused transaction: {e}")))
+        let tx_id = packed_trx.id().clone();
+        let newly_added = mempool.try_add_transaction(packed_trx).map_err(|e| {
+            ChainError::TransactionError(format!("mempool refused transaction: {e}"))
+        })?;
+        if newly_added {
+            self.transaction_statuses
+                .write()
+                .expect("transaction status lock poisoned")
+                .admit(tx_id);
+        }
+        Ok(newly_added)
     }
 
     /// Build a candidate from a detached mempool batch. Keeping this orchestration
@@ -403,11 +536,26 @@ impl RpcService {
         let result = async {
             self.wait_for_block_slot().await?;
             let mut controller = self.controller.write().await;
-            controller.build_block(batch.transactions_mut()).await
+            controller
+                .build_block_with_outcomes(batch.transactions_mut())
+                .await
         }
         .await;
         self.mempool.write().await.finish_batch(batch);
-        result
+        match result {
+            Ok(outcome) => {
+                for failure in outcome.failed_transactions {
+                    self.remember_transaction_status(GetTransactionStatusResponse {
+                        tx_id: failure.id,
+                        status: TransactionStatus::ExecutionFailed,
+                        block_num: None,
+                        error: Some(bounded_transaction_error(failure.error)),
+                    });
+                }
+                Ok(outcome.block)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Hold off building until the clock reaches the next block's slot.
@@ -462,6 +610,38 @@ impl RpcService {
 
 #[async_trait]
 impl RpcServer for RpcService {
+    async fn get_transaction_status(
+        &self,
+        tx_id: Id,
+    ) -> Result<GetTransactionStatusResponse, ErrorObjectOwned> {
+        let status = self
+            .transaction_statuses
+            .read()
+            .expect("transaction status lock poisoned")
+            .entries
+            .get(&tx_id)
+            .cloned();
+        if let Some(status) = status {
+            if status.status != TransactionStatus::Admitted {
+                return Ok(status);
+            }
+        }
+        if self.mempool.read().await.contains(&tx_id) {
+            return Ok(GetTransactionStatusResponse {
+                tx_id,
+                status: TransactionStatus::Admitted,
+                block_num: None,
+                error: None,
+            });
+        }
+        Ok(GetTransactionStatusResponse {
+            tx_id,
+            status: TransactionStatus::Unknown,
+            block_num: None,
+            error: None,
+        })
+    }
+
     async fn get_abi(&self, account_name: Name) -> Result<AbiDefinition, ErrorObjectOwned> {
         let controller = self.controller.read().await;
         let db = controller.database();
@@ -738,6 +918,7 @@ impl RpcServer for RpcService {
         // Return a simple response
         Ok(IssueTxResponse {
             tx_id: packed_trx.id().clone(),
+            status: TransactionStatus::Admitted,
         })
     }
 
@@ -1042,6 +1223,22 @@ mod tests {
         account: &str,
         chain_id: &Id,
     ) -> PackedTransaction {
+        newaccount_tx_from_creator(
+            auth_key,
+            signer,
+            Name::from_str("pulse").unwrap(),
+            account,
+            chain_id,
+        )
+    }
+
+    fn newaccount_tx_from_creator(
+        auth_key: &PrivateKey,
+        signer: &PrivateKey,
+        creator: Name,
+        account: &str,
+        chain_id: &Id,
+    ) -> PackedTransaction {
         let authority = Authority::new(
             1,
             vec![KeyWeight::new(auth_key.get_public_key().into_k1(), 1)],
@@ -1052,7 +1249,7 @@ mod tests {
             Name::from_str("pulse").unwrap(),
             Name::from_str("newaccount").unwrap(),
             NewAccount {
-                creator: Name::from_str("pulse").unwrap(),
+                creator,
                 name: Name::from_str(account).unwrap(),
                 owner: authority.clone(),
                 active: authority,
@@ -1060,7 +1257,7 @@ mod tests {
             .pack()
             .unwrap(),
             vec![PermissionLevel::new(
-                Name::from_str("pulse").unwrap().as_u64(),
+                creator.as_u64(),
                 Name::from_str("active").unwrap().as_u64(),
             )],
         );
@@ -1296,15 +1493,201 @@ mod tests {
             "static preflight should admit a transaction without executing its action"
         );
         assert!(mempool.read().await.contains(invalid_at_execution.id()));
+        let admitted_status = service
+            .get_transaction_status_compat(invalid_at_execution.id().clone())
+            .await
+            .unwrap();
+        assert_eq!(admitted_status.status, TransactionStatus::Admitted);
 
-        let build_result = service.build_block().await;
+        let rejected_batch_block = service
+            .build_block()
+            .await
+            .expect("a batch of rejected transactions should still complete block production");
+        assert_eq!(rejected_batch_block.block_num(), 2);
         assert!(
-            build_result.is_err(),
-            "the unexecutable transaction should be discarded while building"
+            rejected_batch_block.transactions.is_empty(),
+            "rejected transactions must not be included in the block"
         );
         assert!(
             !mempool.read().await.contains(invalid_at_execution.id()),
             "a transaction rejected during block production must not remain queued"
+        );
+        let failed_status = service
+            .get_transaction_status_compat(invalid_at_execution.id().clone())
+            .await
+            .unwrap();
+        assert_eq!(failed_status.status, TransactionStatus::ExecutionFailed);
+        assert!(
+            failed_status.error.unwrap().contains("already taken"),
+            "the submitter can retrieve the execution assertion"
+        );
+        let (status_code, status_json) = nodeos_response(
+            &service,
+            "/v1/chain/get_transaction_status",
+            &serde_json::json!({"tx_id": invalid_at_execution.id().to_string()}).to_string(),
+        )
+        .await;
+        assert_eq!(status_code, 200);
+        assert_eq!(status_json["status"], "execution_failed");
+        assert!(
+            status_json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already taken")
+        );
+
+        assert!(
+            service
+                .admit_transaction(invalid_at_execution.clone())
+                .await
+                .unwrap(),
+            "a resubmitted transaction is a new admission attempt"
+        );
+        assert_eq!(
+            service
+                .get_transaction_status_compat(invalid_at_execution.id().clone())
+                .await
+                .unwrap()
+                .status,
+            TransactionStatus::Admitted
+        );
+
+        // The rejected batch must not leave the controller or producer loop
+        // wedged. A subsequent executable transaction must build immediately.
+        let executable = newaccount_tx(&genesis_key, &genesis_key, "alice", &chain_id);
+        assert!(service.admit_transaction(executable.clone()).await.unwrap());
+        let block = service
+            .build_block()
+            .await
+            .expect("a later executable transaction must build immediately");
+        assert_eq!(block.block_num(), 2);
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(
+            block.transactions[0].transaction_id(),
+            executable.id(),
+            "the failed transaction must not block a later valid transaction"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_admitted_transaction_hash_is_in_an_accepted_block_under_load() {
+        use std::collections::BTreeSet;
+
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let rejected = newaccount_tx(&genesis_key, &genesis_key, "pulse", &chain_id);
+        assert!(service.admit_transaction(rejected.clone()).await.unwrap());
+
+        const BATCHES: usize = 5;
+        const TRANSACTIONS_PER_BATCH: usize = 8;
+        let mut all_admitted = BTreeSet::new();
+        let mut all_included = BTreeSet::new();
+
+        for batch in 0..BATCHES {
+            let transactions: Vec<_> = (0..TRANSACTIONS_PER_BATCH)
+                .map(|index| {
+                    let batch_suffix = char::from(b'a' + batch as u8);
+                    let tx_suffix = char::from(b'a' + index as u8);
+                    let account = format!("load{batch_suffix}{tx_suffix}");
+                    newaccount_tx(&genesis_key, &genesis_key, &account, &chain_id)
+                })
+                .collect();
+            let admissions: Vec<_> = transactions
+                .iter()
+                .cloned()
+                .map(|transaction| {
+                    let service = service.clone();
+                    tokio::spawn(async move { service.admit_transaction(transaction).await })
+                })
+                .collect();
+
+            let mut expected_this_block = BTreeSet::<[u8; 32]>::new();
+            for (transaction, admission) in transactions.iter().zip(admissions) {
+                assert!(admission.await.unwrap().unwrap());
+                expected_this_block.insert(transaction.id().0.0);
+                all_admitted.insert(transaction.id().0.0);
+            }
+
+            let block = service
+                .build_block()
+                .await
+                .expect("a valid batch must make progress past a rejected transaction");
+            let included_this_block: BTreeSet<_> = block
+                .transactions
+                .iter()
+                .map(|receipt| receipt.transaction_id().0.0)
+                .collect();
+            assert_eq!(included_this_block, expected_this_block);
+            all_included.extend(included_this_block);
+
+            let block_id = block.id().unwrap();
+            let mut mempool = mempool.write().await;
+            let mut controller = service.controller.write().await;
+            controller.accept_block(&block_id, &mut mempool).unwrap();
+            let accepted_block = controller.last_accepted_block().clone();
+            assert_eq!(
+                controller.last_accepted_block().block_num(),
+                (batch + 2) as u32
+            );
+            drop(controller);
+            drop(mempool);
+            service.note_accepted_block(&accepted_block);
+            let included_status = service
+                .get_transaction_status_compat(transactions[0].id().clone())
+                .await
+                .unwrap();
+            assert_eq!(included_status.status, TransactionStatus::Included);
+            assert_eq!(included_status.block_num, Some((batch + 2) as u32));
+        }
+
+        assert_eq!(all_included, all_admitted);
+        assert!(!all_included.contains(&rejected.id().0.0));
+        assert!(!mempool.read().await.contains(rejected.id()));
+    }
+
+    #[tokio::test]
+    async fn ordinary_creator_can_create_a_twelve_character_dotted_account() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let creator = Name::from_str("test").unwrap();
+        let bootstrap = newaccount_tx(&genesis_key, &genesis_key, "test", &chain_id);
+        assert!(service.admit_transaction(bootstrap.clone()).await.unwrap());
+        let bootstrap_block = service.build_block().await.unwrap();
+        assert_eq!(bootstrap_block.transactions.len(), 1);
+        let bootstrap_id = bootstrap_block.id().unwrap();
+        {
+            let mut mempool = mempool.write().await;
+            let mut controller = service.controller.write().await;
+            controller
+                .accept_block(&bootstrap_id, &mut mempool)
+                .unwrap();
+        }
+
+        let transaction = newaccount_tx_from_creator(
+            &genesis_key,
+            &genesis_key,
+            creator,
+            "xmd.treasury",
+            &chain_id,
+        );
+        assert!(
+            service
+                .admit_transaction(transaction.clone())
+                .await
+                .unwrap()
+        );
+        let block = service.build_block().await.unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(
+            block.transactions[0].transaction_id(),
+            transaction.id(),
+            "the ordinary-creator transaction must execute into a block receipt"
+        );
+        assert!(
+            service
+                .controller
+                .read()
+                .await
+                .database()
+                .arena_account_exists(Name::from_str("xmd.treasury").unwrap().as_u64())
         );
     }
 
@@ -1632,11 +2015,24 @@ mod tests {
             nodeos_response(&service, "/v1/chain/push_transaction", &push_body).await;
         assert_eq!(code, 200, "push response: {pushed}");
         assert!(pushed["transaction_id"].is_string());
+        assert_eq!(pushed["status"], "admitted");
 
         let (code, duplicate) =
             nodeos_response(&service, "/v1/chain/send_transaction", &push_body).await;
         assert_eq!(code, 200);
         assert_eq!(duplicate["transaction_id"], pushed["transaction_id"]);
+
+        let block = service.build_block().await.unwrap();
+        service.note_accepted_block(&block);
+        let (code, status) = nodeos_response(
+            &service,
+            "/v1/chain/get_transaction_status",
+            &serde_json::json!({"tx_id": packed.id().to_string()}).to_string(),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(status["status"], "included");
+        assert_eq!(status["block_num"], 2);
     }
 
     #[tokio::test]

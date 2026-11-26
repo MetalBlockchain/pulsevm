@@ -1,3 +1,7 @@
+pub use pulsevm_api_types::{
+    GetTransactionStatusResponse,
+    TransactionStatus,
+};
 use pulsevm_core::{
     block::BlockTimestamp,
     id::Id,
@@ -78,6 +82,7 @@ pub struct ProtocolUpgradeInfo {
 pub struct IssueTxResponse {
     #[serde(rename(serialize = "txID"))]
     pub tx_id: Id,
+    pub status: TransactionStatus,
 }
 
 #[derive(Serialize, Clone, Default)]
