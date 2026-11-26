@@ -1,0 +1,15 @@
+[Unit]
+Description=Page the operator when the cutover voter exits abnormally
+# Triggered by cutover-voter.service (OnFailure=). The voter itself stays
+# alive enforcing the producer pause; this fires only when the voter
+# process dies: half-configured stop, lost node past retries, crash.
+
+[Service]
+Type=oneshot
+# Ship the webhook target here, owner-only like the key files:
+#   CUTOVER_WEBHOOK_URL=https://pager.example.com/cutover
+EnvironmentFile=-/etc/cutover/alert.env
+ExecStart=/usr/bin/curl --fail --max-time 15 -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"cutover voter exited abnormally, operator look required"}' \
+  "${CUTOVER_WEBHOOK_URL:?cutover webhook not configured}"

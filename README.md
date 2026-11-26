@@ -228,10 +228,27 @@ adds only relaxed atomic checks to contract-table writes.
 
 These metrics support continuous Grafana-style timelines and allocation/refund
 rates (for example `rate(pulsevm_contract_ram_allocated_bytes_total[5m])`).
+
 They measure logical billed chain RAM, not Rust heap allocations or process RSS.
 Current usage is reseeded after a restart or state sync; cumulative workload
 counters are process-local and reset on either event. If an exact state-sync
 reseed fails, the node disables the monitor instead of exposing stale metrics.
+
+For a rehearsal or a chain that is intentionally expected to stop, the node can
+shut itself down cleanly after it has accepted no blocks for a configured number
+of seconds:
+
+```json
+{
+  "dead_chain_shutdown_after_secs": 3600
+}
+```
+
+The default is `0` (disabled). The timer starts after initialization and resets
+whenever a block is accepted. When it expires, the plugin closes its runtime
+server and persists the accepted state before exiting. This is a node-local
+operational setting; it does not affect consensus. Avoid enabling it on a node
+that may spend longer than the timeout catching up or installing a state sync.
 
 The harness passes `migration_checkpoint` and its emitted manifest through the
 runner's per-chain VM configuration. Every node verifies the manifest hash and

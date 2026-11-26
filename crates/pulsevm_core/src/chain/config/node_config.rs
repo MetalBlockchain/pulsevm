@@ -37,8 +37,13 @@ pub struct NodeConfig {
     pub allow_replay_recovery: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
-    // Private key of the block producer, used for signing blocks and transactions
-    pub producer_key: PrivateKey,
+    /// Private block-signing key. Required only when `block_production_enabled`
+    /// is true; API and history nodes must not need producer secrets.
+    #[serde(default)]
+    pub producer_key: Option<PrivateKey>,
+    /// Whether this node is allowed to construct and sign blocks.
+    #[serde(default = "default_block_production_enabled")]
+    pub block_production_enabled: bool,
     // Size of the memory mapped database in bytes
     #[serde(default = "default_db_size")]
     pub db_size: u64,
@@ -51,6 +56,14 @@ pub struct NodeConfig {
     /// bytes and revision to the source state-history export.
     #[serde(default)]
     pub migration_manifest: Option<String>,
+    /// Checkpoint hash this operator derived itself, by converting its own
+    /// Leap snapshot at H (`xpr_import_check --leap-snapshot`). A migration
+    /// restore refuses to start unless it equals the genesis pin and the
+    /// manifest hash, so a checkpoint delivered by anyone else is only
+    /// trusted once it matches what this operator derived independently.
+    /// Required for a migration restore.
+    #[serde(default)]
+    pub migration_local_checkpoint_sha256: Option<String>,
     // Wall-clock ceiling on how long a single transaction may spend executing
     // before it is abandoned, in milliseconds. This is a SUBJECTIVE, node-local
     // guard (it depends on this machine's speed, not the transaction's result), so
@@ -67,6 +80,87 @@ pub struct NodeConfig {
     /// The database applies a hard upper bound to prevent unbounded labels.
     #[serde(default)]
     pub ram_usage_monitor_max_series: usize,
+    /// Size at which the arena's write-ahead log is folded into a new
+    /// checkpoint. The log is what lets a node killed between clean shutdowns
+    /// restart at its last accepted block; the checkpoint rewrites all state,
+    /// so this is the one place a long-running node pauses to write it. Lower
+    /// it to bound crash-recovery replay, raise it to checkpoint less often.
+    #[serde(default = "default_arena_wal_max_bytes")]
+    pub arena_wal_max_bytes: u64,
+    /// A state summary no more than this many blocks ahead of this node's last
+    /// accepted block is skipped, and the node catches up by fetching those blocks
+    /// instead. A snapshot install rebases the block log onto the synced tip and
+    /// drops its history (a node 5 blocks behind lost 78 MB of it), and it is the
+    /// path on which a restart can stall, so it is kept for a node that is far
+    /// behind. Zero syncs whenever any summary is ahead.
+    #[serde(default = "default_state_sync_min_blocks_behind")]
+    pub state_sync_min_blocks_behind: u64,
+
+    /// Whether this node may install remote state summaries. History providers
+    /// must disable this: snapshot installation rebases the block and SHiP logs,
+    /// discarding the block-by-block history they are expected to serve.
+    #[serde(default = "default_state_sync_enabled")]
+    pub state_sync_enabled: bool,
+
+    /// A state summary is built for every block whose height is a multiple of this
+    /// (when that block is accepted), and offered to peers that need to state-sync.
+    /// The host takes a summary only if over half the validator weight returns the
+    /// same one for the same height in one vote, so every validator has to offer the
+    /// same heights; a summary of whatever the tip happens to be never agrees. Each
+    /// build stops the node for as long as it takes to copy the state (about a second
+    /// at mainnet size) on every validator at once, so this is large: 4096 blocks is
+    /// about half an hour at two blocks a second. Zero turns summaries off. A node
+    /// that joins when no summary is old enough catches up by fetching blocks.
+    #[serde(default = "default_state_summary_interval")]
+    pub state_summary_interval: u64,
+
+    /// A summary is offered only once it is this many blocks below the tip, so a
+    /// peer that picks it is not racing the head.
+    #[serde(default = "default_state_summary_min_age")]
+    pub state_summary_min_age: u64,
+    /// Log the arena state root at info level every this many blocks. Zero (the
+    /// default) logs none. The root hashes all state, so it costs time in
+    /// proportion to it; it exists so the nodes of a test network can be
+    /// compared with each other. It is a setting here and not an environment
+    /// variable because a host such as MetalGo starts the plugin with a minimal
+    /// environment of its own.
+    #[serde(default)]
+    pub state_root_log_every: u64,
+    /// Legacy setting retained so the VM can return a targeted startup error.
+    /// Nonzero values are rejected: a plugin cannot stop or unadvertise its
+    /// MetalGo host, so an in-process shutdown leaves the validator lifecycle
+    /// in an unsafe state.
+    #[serde(default)]
+    pub dead_chain_shutdown_after_secs: u64,
+    /// Log threshold: `trace`, `debug`, `info` (the default), `warn` or `error`.
+    /// At debug the controller also hashes all state after every block to print
+    /// it. Set here for the same reason as above.
+    #[serde(default)]
+    pub log_level: Option<String>,
+}
+
+fn default_state_summary_interval() -> u64 {
+    4096
+}
+
+fn default_state_summary_min_age() -> u64 {
+    8
+}
+
+fn default_state_sync_min_blocks_behind() -> u64 {
+    1024
+}
+
+fn default_state_sync_enabled() -> bool {
+    true
+}
+
+fn default_block_production_enabled() -> bool {
+    true
+}
+
+fn default_arena_wal_max_bytes() -> u64 {
+    pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
 }
 
 fn default_db_size() -> u64 {
@@ -104,6 +198,76 @@ mod tests {
         assert!(cfg.state_history_enabled);
         assert!(!cfg.allow_replay_recovery);
         assert_eq!(cfg.ram_usage_monitor_max_series, 0);
+        assert_eq!(
+            cfg.arena_wal_max_bytes,
+            pulsevm_database::DEFAULT_ARENA_WAL_MAX_BYTES
+        );
+        assert_eq!(cfg.state_root_log_every, 0);
+        assert_eq!(cfg.dead_chain_shutdown_after_secs, 0);
+        assert_eq!(cfg.log_level, None);
+        assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
+        assert!(cfg.state_sync_enabled);
+        assert_eq!(cfg.state_summary_interval, 4096);
+        assert_eq!(cfg.state_summary_min_age, 8);
+        assert!(cfg.block_production_enabled);
+        assert!(cfg.producer_key.is_some());
+    }
+
+    #[test]
+    fn legacy_dead_chain_shutdown_timeout_is_still_deserialized() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","dead_chain_shutdown_after_secs":3600}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.dead_chain_shutdown_after_secs, 3600);
+    }
+
+    #[test]
+    fn the_state_sync_threshold_is_configurable() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_sync_min_blocks_behind":20}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.state_sync_min_blocks_behind, 20);
+    }
+
+    #[test]
+    fn state_sync_can_be_disabled_for_history_providers() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_sync_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!cfg.state_sync_enabled);
+    }
+
+    #[test]
+    fn observer_can_start_without_a_producer_key() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","block_production_enabled":false,"state_sync_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!cfg.block_production_enabled);
+        assert!(!cfg.state_sync_enabled);
+        assert!(cfg.producer_key.is_none());
+    }
+
+    #[test]
+    fn logging_is_set_in_the_chain_config() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_root_log_every":1,"log_level":"debug"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.state_root_log_every, 1);
+        assert_eq!(cfg.log_level.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn wal_checkpoint_threshold_is_configurable() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","arena_wal_max_bytes":1048576}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.arena_wal_max_bytes, 1_048_576);
     }
 
     #[test]

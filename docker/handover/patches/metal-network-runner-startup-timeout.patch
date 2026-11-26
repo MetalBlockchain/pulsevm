@@ -1,0 +1,17 @@
+diff --git a/local/network.go b/local/network.go
+index a70d9d0..6ac8532 100644
+--- a/local/network.go
++++ b/local/network.go
+@@ -56,7 +56,11 @@ const (
+ 	defaultDBSubdir             = "db"
+ 	defaultLogsSubdir           = "logs"
+ 	nodeStartupTime             = 1 * time.Second
+-	processContextWaitTimeout   = 3 * time.Second
++	// A VM may need to restore a large imported state checkpoint before
++	// metalgo writes process.json. Keep this separate from the normal health
++	// cadence so snapshot-backed nodes are not reported as failed merely because
++	// startup legitimately takes longer than a few seconds.
++	processContextWaitTimeout   = 2 * time.Minute
+ 	processContextCheckInterval = 100 * time.Millisecond
+ )
+ 

@@ -1,0 +1,25 @@
+file	bytes	sha256	what
+wal_replay/sys-90-torn.bin	206883	a53a5ec5fee67aa4150266c19848149539a8c01e97b68a51214c5c9672fdf047	honest torn record: setcode of eosio.system (220,929 B payload) cut at 90%; 2595 recovers (trim) [M live]
+wal_replay/multi-90-torn.bin	610974	6299e040ff6f1928ee8c08ce0846b7c3e0a7e67bd125d54e84e6926583149fc2	honest torn record: three setcodes in one block (668,975 B payload) cut at 90%; 2595 recovers [M live]
+wal_replay/burst-90-torn.bin	65419	2fa39cbafa8a7ba54c1f89576c80b3cba52c84e2f01d02b343df8a6e98e06dab	honest torn record of a transaction-burst block (4,570 B) cut at 90%; 2595 recovers [M live]
+wal_replay/tornreal-262144.bin	1246925	c62287d19bf0052af9e9f0db2af67d1c60873e8318a743c557c8bb028ef7f3f9	honest row-data torn record claiming 262,144 B (this log's own <20 KB payloads repeated), 90% present; 2595 REFUSES (scan budget), dbe5 recovers [M offline Database::new]
+wal_replay/F01-flipmid.bin	146768	5ccbaad957c7465666e9d998158aabfd18156b727fcafc011817892c76e7abbb	one payload byte flipped mid-file; refused, file left alone [M live]
+wal_replay/F02-fliplast.bin	82486	d730487bec49a0227e208e80ae090627adced5f8ad98c211051400f7099275e1	one payload byte flipped in the last record; trimmed [M live]
+wal_replay/F08-zeros4096.bin	139556	f884f7c1ea81161cf5565e70bc6ff3b34fa464590549bc31d2a85e10735d4cd2	4096 zero bytes appended; trimmed [M live]
+wal_replay/F-D6-quadtail65536.bin	94815	d0d9abdd753302944eebd7c4b5ceac09cbbaddfc2a562172269312752c3680a9	hostile torn tail, 64 KiB of one repeated plausible length; recovered [M live]
+wal_replay/F-D6-quadtail131072.bin	212546	eed1dae27bef9792650e2d665c34a41f603bf4d6b4a01e8728caae2d721a3477	hostile torn tail, 128 KiB; REFUSED by the scan budget [M live]
+history_log/block_log-6entries-clean.log	80674	b938c7a8a2e2e05bfc3b498911857dc5c99a6f603c86c88e944bee2dd2b113a2	block_log: 6 real entries, last 78193 B; opens clean
+history_log/block_log-zerotail581.log	81255	740941e09ce51b5130c117e890ff7b8dee21b62d81a2d6a6977e6def8f101a37	581 zero bytes appended: trimmed [M live, phase 13/14 D]
+history_log/block_log-zerolast581-inplace.log	80674	a9035397eb587c962e8eb19d2c8c725966113baf26864ef5920a8349f78fb691	last 581 B of the last entry zeroed in place: KEPT silently by 2595 (block log: the node serves the corrupt block) [M live]
+history_log/block_log-zeros581-then-data.log	81319	b2c1435fd72313e1d875f9be42aef443672656bd5b7ef3443579f4eb48b64386	581 zeros then 64 B of data: refused [M phase 13]
+history_log/block_log-zero-whole-last-entry.log	80674	2becd255a49d002284e978085bdef3187000ce82989b00de334250b847e24cf8	whole last entry + 100 B of the one before zeroed: entry dropped, node refuses to start (misleading message for trace/chain-state) [M live]
+history_log/trace_log-6entries-clean.log	82801	50fa6b0cb7882ffff03ba898f409e6f95bca9f8b8ce0f3ea10146364545f4aa3	trace_log: 6 real entries, last 1341 B; opens clean
+history_log/trace_log-zerotail581.log	83382	fb62a3431adad51372a2046afff26b848de1f516c1c281ea08370bf709791b7d	581 zero bytes appended: trimmed [M live, phase 13/14 D]
+history_log/trace_log-zerolast581-inplace.log	82801	8736cb007ce670a6f9f599108c5dfd09ac29c8be13c9b024c13a1de051b43fc3	last 581 B of the last entry zeroed in place: KEPT silently by 2595 (block log: the node serves the corrupt block) [M live]
+history_log/trace_log-zeros581-then-data.log	83446	f789fe8d424e8bbea4e15400a90c39c8ab75d8af2f28fe1b192f51b2120076cd	581 zeros then 64 B of data: refused [M phase 13]
+history_log/trace_log-zero-whole-last-entry.log	82801	ea7d2b604ed814037b21673aa363180377244bc46c870a8e8c56afe6aff71ae6	whole last entry + 100 B of the one before zeroed: entry dropped, node refuses to start (misleading message for trace/chain-state) [M live]
+history_log/chain_state_log-6entries-clean.log	3611	b0e1a56a3c3a8d65122a795c20f858027edc84852ce80c0aa1c24725e29c1136	chain_state_log: 6 real entries, last 805 B; opens clean
+history_log/chain_state_log-zerotail581.log	4192	50e111b5d43386c21842338554fddac32271599afc387b215141476200b29462	581 zero bytes appended: trimmed [M live, phase 13/14 D]
+history_log/chain_state_log-zerolast581-inplace.log	3611	40fc0545e8a9a080058e4c11e01d63d35ca5af0712bae856cb7a424bf515a96d	last 581 B of the last entry zeroed in place: KEPT silently by 2595 (block log: the node serves the corrupt block) [M live]
+history_log/chain_state_log-zeros581-then-data.log	4256	f8148722f3ad50f663511d81dfa8e5e41bef719648a0e7a6cf4bd4dc7a743d95	581 zeros then 64 B of data: refused [M phase 13]
+history_log/chain_state_log-zero-whole-last-entry.log	3611	7c72bd8addcd0090e4c310ec96dfcc35c5b6714d6382b200cf768ff738f51e80	whole last entry + 100 B of the one before zeroed: entry dropped, node refuses to start (misleading message for trace/chain-state) [M live]

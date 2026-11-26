@@ -151,6 +151,15 @@ pub fn newaccount(
     Ok(())
 }
 
+/// Whether `setcode` accepts a module with a WASM start section at this block.
+///
+/// The protocol schedule, rather than the node's replay mode, controls this
+/// rule for ordinary deployments. XPR native replay keeps its dedicated
+/// validator below.
+pub(crate) fn start_sections_allowed(context: &ApplyContext) -> Result<bool, ChainError> {
+    Ok(context.protocol_feature_enabled(ProtocolFeature::WasmStartSection))
+}
+
 pub fn setcode(
     context: &mut ApplyContext,
     db: &mut Database,
@@ -187,7 +196,7 @@ pub fn setcode(
                 act.code.as_slice(),
                 maximum_section_elements,
             )
-        } else if context.protocol_feature_enabled(ProtocolFeature::WasmStartSection) {
+        } else if start_sections_allowed(context)? {
             pulsevm_wasm_validation::validate_wasm_with_start_section(act.code.as_slice())
         } else {
             pulsevm_wasm_validation::validate_wasm(act.code.as_slice())

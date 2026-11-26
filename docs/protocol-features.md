@@ -19,11 +19,12 @@ runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
 > **Current status:** genesis and minimum-supported protocol versions are `1`;
-> normal and `nightly` builds support through version `2`. Version `2` enables
-> the `WasmStartSection` feature, which accepts standard WASM start sections
-> during contract deployment. Version `1` retains the historical rejection.
-> Activation still requires a common `protocol_upgrades` schedule and all
-> validators running a binary that reports support for version `2`.
+> stable builds support through version `2`, which enables metered WASM start
+> sections. The `nightly` profile supports through version `3`, which separately
+> enables CPU accounting in points. Keep version `3` unscheduled on production
+> chains until the CPU-units rule is promoted to stable. Each activation still
+> requires a common `protocol_upgrades` schedule and all validators running a
+> binary that reports support for the target version.
 
 The code is authoritative. Start with
 [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
@@ -51,8 +52,8 @@ safe rollout into a chain halt.
 | `PLUGIN_VERSION` | Compatibility version for the rpcchainvm connection between MetalGo and the PulseVM process. It does not select chain rules. |
 | `GENESIS_PROTOCOL_VERSION` | Protocol version used before the first scheduled upgrade. It is currently `1`. |
 | `MIN_SUPPORTED_PROTOCOL_VERSION` | Oldest chain protocol this binary can execute. It is currently `1`. |
-| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `1`. |
-| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `1`. |
+| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `2`. |
+| `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `3`. |
 | `PROTOCOL_VERSION` | Newest version this particular binary can execute: stable maximum normally, nightly maximum in a `nightly` build. It is not the version active at the current head. |
 | `protocol_feature_*` Cargo feature | Temporary compile-time gate that includes one unfinished implementation. It does not activate the implementation. |
 | `nightly` Cargo feature | Aggregate compile-time gate for all unfinished protocol implementations. It is unrelated to the Rust nightly toolchain. |
@@ -82,14 +83,15 @@ activation:
 | Cargo `#[cfg(feature = "protocol_feature_...")]` | At compilation | Whether unfinished implementation code exists in the binary | Which rules a block uses |
 | `ProtocolExecutionContext::feature_enabled(feature)` | While evaluating a block | Whether compiled legacy or new rules apply at that height | Whether the new code was compiled |
 
-The expected lifecycle for a future version `2` is:
+The expected lifecycle for a future feature version `N` is:
 
 1. A temporary `protocol_feature_*` flag hides the implementation from normal
    builds and is included by `nightly`.
-2. A nightly binary compiles the implementation and advertises nightly maximum
-   version `2`, but still executes version-1 rules before activation.
+2. A nightly binary compiles the implementation and advertises a maximum
+   version that includes `N`, but still executes the prior rules before
+   activation.
 3. After review and testing, the implementation is compiled into the normal
-   production build and the stable maximum becomes `2`.
+   production build and the stable maximum advances to `N`.
 4. Operators deploy that stable binary everywhere.
 5. Only then does the common height schedule activate version `2`.
 
@@ -694,7 +696,6 @@ activation ledger. Treat any such attempt as a chain incident, not a normal
 rollback.
 
 ## 12. Implementation map
-
 - Protocol constants, feature mappings, schedule parsing, selection, and unit
   tests: [`protocol_features.rs`](../crates/pulsevm_core/src/chain/protocol_features.rs)
 - Core stable/nightly Cargo profiles:
@@ -735,3 +736,26 @@ The feature-to-version pattern is inspired by
 [nearcore's protocol feature model](https://github.com/near/nearcore/blob/53f338792c7eeb0df43a6f37bb55578371bebcba/core/primitives-core/src/version.rs),
 but PulseVM's implementation and this repository's tests define PulseVM's
 behavior.
+
+## 13. CPU accounting in points (version 3)
+
+`CpuUnitsInPoints` changes two consensus rules together. Transaction header
+`max_cpu_usage_ms` is converted to metering points (`milliseconds * 1000 *
+POINTS_PER_US`), rather than being treated as a point count. The
+`set_blockchain_parameters_packed` path also rejects a minimum transaction CPU
+bill below `POINTS_PER_US`, a maximum transaction limit below 100 times that
+minimum, or a maximum block limit below 1,000 times it. These checks prevent
+microsecond-valued XPR settings from being applied as point values after a
+migration. A configuration that passes the checks can still be wrong; after a
+`setparams`, compare `block_cpu_limit` and `virtual_block_cpu_limit` in
+`getInfo`.
+
+The points rule is protocol version `3` and is compiled only by the
+`protocol_feature_cpu_units_in_points` flag, included in `nightly`. Stable
+builds support through version `2`; nightly builds support through version `3`.
+Do not schedule version `3` on a production chain until every validator has a
+release that supports it and the activation is coordinated. Version `2` is the
+separate metered WASM start-section rule, already compiled into stable builds.
+Tests covering the CPU conversion and parameter bounds are
+`header_cpu_limit_tests` in `transaction_context.rs` and the CPU parameter
+tests in `webassembly/tests/privileged.rs`.

@@ -1,0 +1,34 @@
+{
+  "_comment": "xpr_cutover_voter config. Copy, fill in, chmod 600. The voter refuses to start if either key file is readable by group or others. pause_height is the ceremony-agreed pause head P (a fixed H+k, strictly past height): every producer stops at P and every confirmation signs P.",
+
+  "nodeos_url": "http://127.0.0.1:8888",
+  "host_header": "0.0.0.0:8888",
+  "contract": "cutover",
+  "producer": "yourproducer",
+  "source_chain_id": "<64 hex chars of the XPR chain id, published with the ceremony>",
+  "height": 123456789,
+  "pause_height": 123456799,
+  "schedule_version": 1234,
+  "roster_file": "/etc/cutover/roster.json",
+  "vote_key_file": "/etc/cutover/vote.key",
+  "payer_account": "yourproducer",
+  "payer_key_file": "/etc/cutover/payer.key",
+  "poll_secs": 5,
+  "dry_run": false,
+  "enabled": true,
+  "confirmation": {
+    "_comment": "schedule_sha256 is the published hash of the source producer schedule (xpr_snapshot_schedule prints it). It is known before H and always required: the live schedule is checked against it on every poll before H, and the genesis you sign must pin the same value. checkpoint_sha256 (the hash of the checkpoint THIS operator derived from its own Leap snapshot at H, never taken from the coordinator), migration_genesis (pins that checkpoint and the same schedule hash; the successor chain id is derived from it, never adopted) and platform_chain_id (the MetalGo blockchain id wallets sign under, configured and never adopted) only exist after H, so a ceremony agent starts the voter with operator_fed set and restarts it as each lands. Without operator_fed, leaving any of the three out refuses to load. The pause never waits on them; signing needs all three. coordinator_url is optional: when set, its params are cross-checked against all of the above and the local node.",
+    "schedule_sha256": "<64 hex chars: the published source schedule hash>",
+    "operator_fed": false,
+    "coordinator_url": "https://cutover-coordinator.example.com",
+    "out_file": "/var/lib/cutover/confirmation.json",
+    "migration_genesis": "/etc/cutover/migration.genesis.json",
+    "checkpoint_sha256": "<64 hex chars: the checkpoint hash this operator derived itself>",
+    "platform_chain_id": "<64 hex chars of the MetalGo blockchain id, published with the ceremony>"
+  },
+  "stop_producer": {
+    "_comment": "Opt-in local halt. When at_pause is true, the voter pauses its own producer (Leap producer/pause) once the ceremony is finalized on-chain (this voter's own declaration, not any ceremony) and the local head has reached P, then proves it is paused (Leap answers /v1/producer/paused with a bare boolean). A contract cannot stop block production, only the producer can. Omit or set at_pause false and the voter signs without ever pausing. producer_api_url must be the LOCAL producer node, not a shared API endpoint. at_h was removed: configs still carrying it are refused.",
+    "at_pause": false,
+    "producer_api_url": "http://127.0.0.1:8888"
+  }
+}

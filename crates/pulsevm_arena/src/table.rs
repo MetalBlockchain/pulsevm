@@ -17,6 +17,17 @@ use crate::object::{
     SecondaryIndex,
 };
 
+/// The format of the state hash and of the canonical export, as a name. The hash
+/// is domain-separated by it, so a change of what is hashed must change this, and
+/// `getInfo` reports it so a fleet can be checked for one build.
+pub const STATE_HASH_FORMAT: &str = "arena-table-v3";
+
+/// The most ids one table can have minted. A snapshot's `next_id` and a row's id
+/// size the primary index (one pointer per 1024 ids), so an id taken from a peer's
+/// file without a bound is an allocation the peer chooses. 2^36 ids is far past
+/// anything a chain mints (a table creating 100 rows a second needs two decades).
+pub const MAX_TABLE_IDS: usize = 1 << 36;
+
 /// Errors from table operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableError {
@@ -129,6 +140,15 @@ struct PrimaryPage<T> {
     live: usize,
 }
 
+impl<T: Copy> Clone for PrimaryPage<T> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            live: self.live,
+        }
+    }
+}
+
 impl<T> PrimaryPage<T> {
     fn new() -> Self {
         Self {
@@ -149,6 +169,15 @@ impl<T> PrimaryPage<T> {
 struct PagedPrimary<T> {
     pages: Vec<Option<PrimaryPage<T>>>,
     len: usize,
+}
+
+impl<T: Copy> Clone for PagedPrimary<T> {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            len: self.len,
+        }
+    }
 }
 
 impl<T> PagedPrimary<T> {
@@ -290,6 +319,92 @@ pub struct Table<T: ArenaObject> {
     blob_patches: Vec<BlobRef>,
     /// Blob bytes already written to the log; the tail beyond this is new.
     flushed_blob_len: usize,
+}
+
+/// The canonical form of one table: rows in id order, each row's blob references
+/// resolved and repacked one after another, so two tables holding the same rows
+/// pack to the same bytes whatever their allocation history. One implementation
+/// for the live table and for a frozen copy of it, so they cannot disagree.
+fn pack_canonical_table<T: ArenaObject>(
+    primary: &PagedPrimary<T>,
+    row_count: usize,
+    blobs_src: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), TableError> {
+    out.extend_from_slice(&(primary.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(row_count as u64).to_le_bytes());
+    let offsets = T::blob_ref_offsets();
+    let mut blobs: Vec<u8> = Vec::new();
+    let mut scratch = Vec::new();
+    for (id, obj) in primary.iter_with_ids() {
+        out.extend_from_slice(&(id as u64).to_le_bytes());
+        let raw = obj.as_bytes();
+        if offsets.is_empty() {
+            out.extend_from_slice(raw);
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(raw);
+        for &at in offsets {
+            let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+            // A reference outside the arena is corruption. Exporting it as an
+            // empty blob would turn it into a snapshot that looks valid and
+            // hashes differently from the state it came from, so refuse.
+            let bytes = if len == 0 {
+                &[][..]
+            } else {
+                off.checked_add(len)
+                    .and_then(|end| blobs_src.get(off..end))
+                    .ok_or(TableError::Corrupted(
+                        "a blob reference points outside its arena: refusing to export",
+                    ))?
+            };
+            // The references are 32-bit: a table whose blobs, repacked, run
+            // past 4 GiB cannot be written in this format, and truncating the
+            // offset would make rows point at the wrong bytes.
+            let new_off = u32::try_from(blobs.len()).map_err(|_| {
+                TableError::Corrupted("a table's blobs exceed 4 GiB: cannot export")
+            })?;
+            if u32::try_from(blobs.len().saturating_add(bytes.len())).is_err() {
+                return Err(TableError::Corrupted(
+                    "a table's blobs exceed 4 GiB: cannot export",
+                ));
+            }
+            let (new_off, new_len) = if bytes.is_empty() {
+                (0u32, 0u32)
+            } else {
+                (new_off, bytes.len() as u32)
+            };
+            blobs.extend_from_slice(bytes);
+            scratch[at..at + 4].copy_from_slice(&new_off.to_le_bytes());
+            scratch[at + 4..at + 8].copy_from_slice(&new_len.to_le_bytes());
+        }
+        out.extend_from_slice(&scratch);
+    }
+    out.extend_from_slice(&(blobs.len() as u64).to_le_bytes());
+    out.extend_from_slice(&blobs);
+    Ok(())
+}
+
+/// What the canonical export of a table reads, copied out of it. The copy is made
+/// while the table is locked and is a plain memory copy of the rows and blob
+/// bytes (no secondary indexes, no undo state), so the export itself, which hashes
+/// and repacks every byte, can run afterwards without holding anything.
+pub(crate) struct FrozenTable<T: ArenaObject> {
+    primary: PagedPrimary<T>,
+    row_count: usize,
+    blobs: Vec<u8>,
+}
+
+impl<T: ArenaObject> FrozenTable<T> {
+    pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
+        hash_table_state(&self.primary, self.row_count, &self.blobs, hasher)
+    }
+
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        pack_canonical_table(&self.primary, self.row_count, &self.blobs, out)
+    }
 }
 
 impl<T: ArenaObject> Default for Table<T> {
@@ -806,6 +921,28 @@ impl<T: ArenaObject> Table<T> {
     /// raw bytes. No per-field encoding: the object is fixed-size POD, so its
     /// bytes go out with a single copy. The undo stack is deliberately not
     /// persisted — a snapshot is committed state.
+    /// As [`Table::pack_into`], but with the blob arena rewritten canonically:
+    /// each row's blobs repacked one after another in row order, and every
+    /// reference rewritten to match; an empty blob is always the default
+    /// reference. Two tables holding the same rows then pack to the same bytes
+    /// whatever their allocation history (dead spans, a lost free list), so a
+    /// hash of an exported snapshot agrees between nodes that agree on state.
+    ///
+    /// Only for export. The live arena keeps its own layout, and the write-ahead
+    /// log that follows a node's own checkpoint is written in terms of it.
+    pub(crate) fn pack_canonical_into(&self, out: &mut Vec<u8>) -> Result<(), TableError> {
+        pack_canonical_table(&self.primary, self.row_count, &self.blobs, out)
+    }
+
+    /// Copy out what the canonical export reads (see [`FrozenTable`]).
+    pub(crate) fn freeze(&self) -> FrozenTable<T> {
+        FrozenTable {
+            primary: self.primary.clone(),
+            row_count: self.row_count,
+            blobs: self.blobs.clone(),
+        }
+    }
+
     pub(crate) fn pack_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.primary.len() as u64).to_le_bytes());
         out.extend_from_slice(&(self.row_count as u64).to_le_bytes());
@@ -823,8 +960,25 @@ impl<T: ArenaObject> Table<T> {
         debug_assert!(self.primary.len() == 0 && self.undo_stack.is_empty());
         let obj_size = std::mem::size_of::<T>();
         let mut pos = 0usize;
-        let next_id = read_u64(bytes, &mut pos)? as usize;
-        let live = read_u64(bytes, &mut pos)? as usize;
+        let next_id = usize::try_from(read_u64(bytes, &mut pos)?)
+            .ok()
+            .filter(|next_id| *next_id <= MAX_TABLE_IDS)
+            .ok_or(TableError::Corrupted("next_id is beyond any real table"))?;
+        let live = usize::try_from(read_u64(bytes, &mut pos)?)
+            .map_err(|_| TableError::Corrupted("live row count does not fit"))?;
+        // Each live row takes its id and its bytes, so the count is bounded by what
+        // is left of the section before anything is sized from it, and a table
+        // cannot hold more live rows than it has minted ids.
+        let per_row = 8usize.saturating_add(obj_size);
+        if live > next_id
+            || live
+                .checked_mul(per_row)
+                .is_none_or(|need| need > bytes.len() - pos)
+        {
+            return Err(TableError::Corrupted(
+                "live row count exceeds the ids minted or the bytes present",
+            ));
+        }
 
         self.primary.set_len(next_id);
         let mut live_rows = Vec::with_capacity(live);
@@ -908,23 +1062,30 @@ impl<T: ArenaObject> Table<T> {
     pub(crate) fn apply_delta(&mut self, bytes: &[u8]) -> Result<(), TableError> {
         let obj_size = std::mem::size_of::<T>();
         let mut pos = 0usize;
-        let next_id = read_u64(bytes, &mut pos)? as usize;
+        let next_id = usize::try_from(read_u64(bytes, &mut pos)?)
+            .ok()
+            .filter(|next_id| *next_id <= MAX_TABLE_IDS)
+            .ok_or(TableError::Corrupted(
+                "delta next_id is beyond any real table",
+            ))?;
         if self.primary.len() < next_id {
             self.primary.set_len(next_id);
         }
         let count = read_u64(bytes, &mut pos)?;
+        // Read every changed row first, then remove all of the old versions from
+        // the indexes, then insert the new ones. A block can move a unique key
+        // from one row to another (or remove a row and give its key to a
+        // second); the live table did that in a safe order, but a replay that
+        // handles one row at a time in the order they were first touched can
+        // meet the new key while the old holder is still indexed, and would
+        // refuse a log that is perfectly good.
+        let mut changed: Vec<(usize, Option<T>)> = Vec::new();
         for _ in 0..count {
             let id = read_u64(bytes, &mut pos)? as usize;
             let tag = *bytes
                 .get(pos)
                 .ok_or(TableError::Corrupted("delta truncated"))?;
             pos += 1;
-            if let Some(old) = self.primary.take(id) {
-                for index in &mut self.secondaries {
-                    index.erase(&old);
-                }
-                self.row_count -= 1;
-            }
             if tag == 1 {
                 let end = pos
                     .checked_add(obj_size)
@@ -936,14 +1097,28 @@ impl<T: ArenaObject> Table<T> {
                 if id >= self.primary.len() {
                     return Err(TableError::Corrupted("delta row id out of range"));
                 }
-                for index in &mut self.secondaries {
-                    if !index.try_insert(&obj) {
-                        return Err(TableError::Corrupted("delta secondary key conflict"));
-                    }
-                }
-                self.primary.insert(id, obj);
-                self.row_count += 1;
+                changed.push((id, Some(obj)));
+            } else {
+                changed.push((id, None));
             }
+        }
+        for (id, _) in &changed {
+            if let Some(old) = self.primary.take(*id) {
+                for index in &mut self.secondaries {
+                    index.erase(&old);
+                }
+                self.row_count -= 1;
+            }
+        }
+        for (id, row) in changed {
+            let Some(obj) = row else { continue };
+            for index in &mut self.secondaries {
+                if !index.try_insert(&obj) {
+                    return Err(TableError::Corrupted("delta secondary key conflict"));
+                }
+            }
+            self.primary.insert(id, obj);
+            self.row_count += 1;
         }
         // In-place patches (into bytes appended by earlier frames), then the tail.
         let patch_count = read_u64(bytes, &mut pos)?;
@@ -954,10 +1129,11 @@ impl<T: ArenaObject> Table<T> {
                 .checked_add(len)
                 .filter(|end| *end <= bytes.len())
                 .ok_or(TableError::Corrupted("delta patch extends past record"))?;
-            if off + len > self.blobs.len() {
-                return Err(TableError::Corrupted("delta patch out of range"));
-            }
-            self.blobs[off..off + len].copy_from_slice(&bytes[pos..end]);
+            let patch_end = off
+                .checked_add(len)
+                .filter(|patch_end| *patch_end <= self.blobs.len())
+                .ok_or(TableError::Corrupted("delta patch out of range"))?;
+            self.blobs[off..patch_end].copy_from_slice(&bytes[pos..end]);
             pos = end;
         }
         let blob_len = read_u64(bytes, &mut pos)? as usize;
@@ -983,18 +1159,61 @@ impl<T: ArenaObject> Table<T> {
         self.flushed_blob_len = self.blobs.len();
     }
 
-    /// Feeds this table's committed content into the state hasher: the live rows
-    /// in id order, then the blob arena. Order is deterministic, so equal state
-    /// yields an equal digest.
+    /// The state hash of this table (see [`hash_table_state`]).
     pub(crate) fn hash_state(&self, hasher: &mut sha2::Sha256) {
-        use sha2::Digest;
-        hasher.update((self.row_count as u64).to_le_bytes());
-        for (id, obj) in self.primary.iter_with_ids() {
-            hasher.update((id as u64).to_le_bytes());
-            hasher.update(obj.as_bytes());
+        hash_table_state(&self.primary, self.row_count, &self.blobs, hasher)
+    }
+}
+
+/// Feeds one table's committed content into the state hasher: the live rows in id
+/// order, then each row's blobs. Order is deterministic, so equal state yields an
+/// equal digest. One implementation for the live table and for a frozen copy of
+/// it, so the two cannot disagree about the state root.
+fn hash_table_state<T: ArenaObject>(
+    primary: &PagedPrimary<T>,
+    row_count: usize,
+    blobs: &[u8],
+    hasher: &mut sha2::Sha256,
+) {
+    use sha2::Digest;
+    hasher.update(STATE_HASH_FORMAT.as_bytes());
+    // The id the next row will get is state: two nodes with the same rows but
+    // different counters mint different ids from the next block on. It was not
+    // hashed, so a snapshot carrying a forged counter installed under a root
+    // that matched, and the node diverged one block later.
+    hasher.update((primary.len() as u64).to_le_bytes());
+    hasher.update((row_count as u64).to_le_bytes());
+    let offsets = T::blob_ref_offsets();
+    let mut scratch = Vec::new();
+    for (id, obj) in primary.iter_with_ids() {
+        hasher.update((id as u64).to_le_bytes());
+        let raw = obj.as_bytes();
+        if offsets.is_empty() {
+            hasher.update(raw);
+            continue;
         }
-        hasher.update((self.blobs.len() as u64).to_le_bytes());
-        hasher.update(&self.blobs);
+        // The row with each blob reference blanked, then each blob's bytes
+        // in field order behind a length. What the row says is its logical
+        // content; where it is stored is not part of the state.
+        scratch.clear();
+        scratch.extend_from_slice(raw);
+        for &at in offsets {
+            scratch[at..at + std::mem::size_of::<BlobRef>()].fill(0);
+        }
+        hasher.update(&scratch);
+        for &at in offsets {
+            let off = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+            hasher.update((len as u64).to_le_bytes());
+            if len > 0 {
+                // A ref past the arena cannot be a live state; hash a marker
+                // rather than panic, so a corrupt row changes the root.
+                match off.checked_add(len).and_then(|end| blobs.get(off..end)) {
+                    Some(bytes) => hasher.update(bytes),
+                    None => hasher.update(b"dangling-blob-ref"),
+                }
+            }
+        }
     }
 }
 
@@ -1150,6 +1369,9 @@ mod tests {
 
     impl ArenaObject for TestRow {
         const TYPE_ID: u16 = 1;
+        fn blob_ref_offsets() -> &'static [usize] {
+            &[]
+        }
 
         fn id(&self) -> ObjectId<Self> {
             self.id

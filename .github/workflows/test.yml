@@ -60,6 +60,16 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
+      # Examples are not run by `cargo test --workspace`. The cutover tools (the
+      # voter, the halt ceremony, the manifest verifier) are examples and hold
+      # their own tests; without this step they were never run in CI, and a change
+      # to the verifier broke four of them unnoticed.
+      - name: Run example tests
+        run: cargo test --workspace --examples --locked
+
+      - name: Test replay scanner model
+        run: python3 -m unittest scripts/plw-replay-tool/test_plw_replay.py
+
       - name: Compile every target
         run: cargo test --workspace --all-targets --locked --no-run
 

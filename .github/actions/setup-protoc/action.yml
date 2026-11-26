@@ -11,6 +11,9 @@ runs:
   steps:
     - name: Download protoc
       shell: bash
+      env:
+        # Passed through the environment, never interpolated into the script.
+        PROTOC_VERSION_INPUT: ${{ inputs.version }}
       run: |
         set -euo pipefail
 
@@ -23,7 +26,7 @@ runs:
             ;;
         esac
 
-        protoc_version="${{ inputs.version }}"
+        protoc_version="$PROTOC_VERSION_INPUT"
         protoc_dir="$RUNNER_TEMP/protoc-${protoc_version}-${protoc_arch}"
         archive="$RUNNER_TEMP/protoc-${protoc_version}-${protoc_arch}.zip"
         url="https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-${protoc_arch}.zip"

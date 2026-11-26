@@ -286,3 +286,220 @@ fn privileged_calls_reject_unprivileged_and_context_free_callers() {
         );
     }
 }
+
+/// XPR states CPU parameters in microseconds (a minimum bill of 100).
+fn xpr_microsecond_parameters(db: &pulsevm_database::Database) -> pulsevm_database::ChainConfigV0 {
+    let mut cfg = db.chain_config().unwrap();
+    cfg.max_block_cpu_usage = 200_000;
+    cfg.max_transaction_cpu_usage = 150_000;
+    cfg.min_transaction_cpu_usage = 100;
+    cfg
+}
+
+#[test]
+fn before_protocol_v3_microsecond_parameters_are_still_accepted() {
+    // The legacy rule: only the relations between fields are checked. This is
+    // exactly the hazard the v3 guard closes, and what blocks before the
+    // activation height already ran under.
+    let mut h = Host::new(false);
+    let cfg = xpr_microsecond_parameters(&h.db);
+    let packed = cfg.pack().unwrap();
+    h.write(OUT, &packed);
+    set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32).unwrap();
+    assert_eq!(h.db.chain_config().unwrap().min_transaction_cpu_usage, 100);
+}
+
+#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+mod protocol_v3 {
+    use super::*;
+    use crate::chain::protocol_features::ProtocolUpgradeSchedule;
+
+    fn v3_host() -> Host {
+        let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":3,"activation_height":2}]}"#,
+        )
+        .unwrap();
+        Host::with_protocol(false, schedule.execution_context(2).unwrap())
+    }
+
+    #[test]
+    fn microsecond_parameters_are_refused_and_leave_the_caps_alone() {
+        let mut h = v3_host();
+        let before = h.db.chain_config().unwrap();
+        let packed = xpr_microsecond_parameters(&h.db).pack().unwrap();
+        h.write(OUT, &packed);
+        let error = set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32)
+            .expect_err("XPR's microsecond values must not be applied under v3");
+        assert!(
+            error.to_string().contains("metering points"),
+            "the refusal says why: {error}"
+        );
+        assert_eq!(
+            h.db.chain_config().unwrap().pack().unwrap(),
+            before.pack().unwrap(),
+            "a refused call changes nothing"
+        );
+    }
+
+    #[test]
+    fn point_denominated_parameters_are_applied() {
+        let mut h = v3_host();
+        let mut cfg = h.db.chain_config().unwrap();
+        cfg.min_transaction_cpu_usage = 100_000;
+        cfg.max_transaction_cpu_usage = 1_000_000_000;
+        cfg.max_block_cpu_usage = 3_000_000_000;
+        let packed = cfg.pack().unwrap();
+        h.write(OUT, &packed);
+        set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32).unwrap();
+        assert_eq!(
+            h.db.chain_config().unwrap().min_transaction_cpu_usage,
+            100_000
+        );
+    }
+
+    fn apply(h: &mut Host, min: u32, tx: u32, block: u32) -> Result<(), RuntimeError> {
+        let mut cfg = h.db.chain_config().unwrap();
+        cfg.min_transaction_cpu_usage = min;
+        cfg.max_transaction_cpu_usage = tx;
+        cfg.max_block_cpu_usage = block;
+        let packed = cfg.pack().unwrap();
+        h.write(OUT, &packed);
+        set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32)
+    }
+
+    // Paul's finding: mainnet's global row holds a 200,000 block cap and a
+    // 150,000 transaction cap (microseconds). A proposal that copies the row and
+    // only raises the minimum bill to 38,000 passes the floor and leaves every
+    // cap a few microseconds of compute: block_cpu_limit 200,000, and every
+    // ordinary transaction (s1check bills 362,028) is dropped.
+    #[test]
+    fn a_proposal_that_only_raises_the_minimum_is_refused_and_changes_nothing() {
+        let mut h = v3_host();
+        let before = h.db.chain_config().unwrap().pack().unwrap();
+        let error = apply(&mut h, 38_000, 150_000, 200_000)
+            .expect_err("microsecond caps under a point-denominated minimum must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("max_transaction_cpu_usage 150000")
+                && text.contains("min_transaction_cpu_usage 38000")
+                && text.contains("metering points"),
+            "the refusal names the cap, the minimum and the unit mistake: {text}"
+        );
+        assert_eq!(
+            h.db.chain_config().unwrap().pack().unwrap(),
+            before,
+            "a refused call changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_transaction_cap_must_be_at_least_a_hundred_minimum_bills() {
+        let min = 38_000u32;
+        let floor = 100 * min;
+        for (tx, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
+            let mut h = v3_host();
+            // The block cap must clear the transaction cap plus the minimum bill
+            // and 1000 minimum bills, so give it room and it is never the
+            // binding one here.
+            let result = apply(&mut h, min, tx, (tx + min + 1).max(1000 * min));
+            assert_eq!(result.is_ok(), accepted, "max_transaction_cpu_usage = {tx}");
+        }
+    }
+
+    // Paul: a block cap of 3,838,001 (a transaction cap just over the guard plus
+    // one minimum bill) was accepted, which fits about ten ordinary transactions
+    // in a block. The block cap has its own floor.
+    #[test]
+    fn the_block_cap_must_hold_a_thousand_minimum_bills() {
+        let min = 38_000u32;
+        let floor = 1000 * min;
+        let tx = 100 * min; // exactly at the transaction guard
+        for (block, accepted) in [
+            (tx + min + 1, false), // Paul's accepted value, now refused
+            (floor - 1, false),
+            (floor, true),
+            (floor + 1, true),
+        ] {
+            let mut h = v3_host();
+            let result = apply(&mut h, min, tx, block);
+            assert_eq!(result.is_ok(), accepted, "max_block_cpu_usage = {block}");
+            if !accepted {
+                let text = result.unwrap_err().to_string();
+                assert!(
+                    text.contains("max_block_cpu_usage") && text.contains("a block that small"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_converted_chains_own_figures_are_far_above_the_guard() {
+        // 3e9 / 1e9 / 100,000 is what the migration converter writes: a ratio
+        // of 10,000 against the minimum, a hundred times the guard.
+        let mut h = v3_host();
+        apply(&mut h, 100_000, 1_000_000_000, 3_000_000_000).unwrap();
+    }
+
+    #[test]
+    fn the_floor_is_exactly_one_microsecond_of_metering() {
+        let floor = crate::config::POINTS_PER_US as u32;
+        for (min, accepted) in [(floor - 1, false), (floor, true), (floor + 1, true)] {
+            let mut h = v3_host();
+            let mut cfg = h.db.chain_config().unwrap();
+            cfg.min_transaction_cpu_usage = min;
+            cfg.max_transaction_cpu_usage = 1_000_000_000;
+            cfg.max_block_cpu_usage = 3_000_000_000;
+            let packed = cfg.pack().unwrap();
+            h.write(OUT, &packed);
+            let result = set_blockchain_parameters_packed(h.env(), ptr(OUT), packed.len() as u32);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "min_transaction_cpu_usage = {min}"
+            );
+        }
+    }
+}
+
+#[test]
+fn before_protocol_v2_setcode_still_refuses_start_sections() {
+    // The legacy rule, which every block before an activation already ran under.
+    let mut h = Host::new(false);
+    let env = h.env();
+    assert!(
+        !crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context()).unwrap()
+    );
+}
+
+#[cfg(feature = "protocol_feature_wasm_start_sections")]
+mod start_sections_v2 {
+    use super::*;
+    use crate::chain::protocol_features::ProtocolUpgradeSchedule;
+
+    fn host_at(height: u32) -> Host {
+        let schedule = ProtocolUpgradeSchedule::from_upgrade_bytes(
+            br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#,
+        )
+        .unwrap();
+        Host::with_protocol(false, schedule.execution_context(height).unwrap())
+    }
+
+    #[test]
+    fn start_sections_are_allowed_from_the_activation_height_and_not_before() {
+        let mut before = host_at(1);
+        let env = before.env();
+        assert!(
+            !crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context())
+                .unwrap(),
+            "the last block under version 1 still refuses them"
+        );
+        let mut after = host_at(2);
+        let env = after.env();
+        assert!(
+            crate::chain::pulse_contract::start_sections_allowed(env.data().apply_context())
+                .unwrap(),
+            "the first block under version 2 allows them"
+        );
+    }
+}

@@ -7,6 +7,7 @@ edition = "2024"
 zerocopy = { version = "0.8", features = ["derive"] }
 pulsevm_arena_derive = { path = "../pulsevm_arena_derive" }
 sha2 = "0.10"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

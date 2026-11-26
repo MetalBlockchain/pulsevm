@@ -177,6 +177,21 @@ pub trait Rpc {
     ) -> Result<Value, ErrorObjectOwned>;
 }
 
+/// Show the node-local CPU bill in `getAccount`'s `subjective_cpu_bill_limit`.
+/// The database layer builds that field without the controller's ledger, so it
+/// is always zero there; without this overlay a payer refused for a bill it
+/// cannot see has no way to find out why.
+fn overlay_subjective_cpu_bill(account_info: &mut Value, bill: u64) {
+    let bill = i64::try_from(bill).unwrap_or(i64::MAX);
+    if let Some(limit) = account_info
+        .get_mut("subjective_cpu_bill_limit")
+        .and_then(Value::as_object_mut)
+    {
+        limit.insert("used".to_owned(), Value::from(bill));
+        limit.insert("current_used".to_owned(), Value::from(bill));
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcService {
     mempool: Arc<RwLock<Mempool>>,
@@ -513,12 +528,19 @@ impl RpcService {
             let mut mempool = self.mempool.write().await;
             mempool.take_all()
         };
-        let result = {
+        // The pool is detached first, as ever, so ingress stays live whatever the
+        // controller is busy with. The slot is then waited for with the batch in
+        // hand and the controller write lock not yet taken: the wait is up to six
+        // slots (3 seconds), and the controller must not be held for it. The batch goes back
+        // on every path, including a build that is refused for being too early.
+        let result = async {
+            self.wait_for_block_slot().await?;
             let mut controller = self.controller.write().await;
             controller
                 .build_block_with_outcomes(batch.transactions_mut())
                 .await
-        };
+        }
+        .await;
         self.mempool.write().await.finish_batch(batch);
         match result {
             Ok(outcome) => {
@@ -533,6 +555,37 @@ impl RpcService {
                 Ok(outcome.block)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Hold off building until the clock reaches the next block's slot.
+    ///
+    /// Blocks asked for faster than one per slot would each be stamped a slot
+    /// further ahead of the clock (a block takes the later of the clock and one
+    /// slot past its parent), and verifiers refuse blocks too far ahead of theirs,
+    /// which split a loaded network. A near slot is waited for, up to three seconds
+    /// (six slots): that also absorbs a clock that runs a second or two behind the
+    /// node that built the parent, well inside the twenty slots verifiers allow. A slot already
+    /// further ahead than that means the chain has drifted; it is answered with an
+    /// error rather than a long sleep, and the block timer asks again every
+    /// half second while there are transactions, so the clock catches up.
+    async fn wait_for_block_slot(&self) -> Result<(), ChainError> {
+        const MAX_WAIT_SLOTS: u32 = 6;
+        let next_slot = self.controller.read().await.next_block_slot()?;
+        let now = pulsevm_core::time::TimePoint::now()
+            .time_since_epoch()
+            .count();
+        match pulsevm_core::controller::pace_block_build(next_slot, now, MAX_WAIT_SLOTS) {
+            pulsevm_core::controller::SlotPacing::Ready => Ok(()),
+            pulsevm_core::controller::SlotPacing::Wait(wait) => {
+                tokio::time::sleep(wait).await;
+                Ok(())
+            }
+            pulsevm_core::controller::SlotPacing::TooFarAhead { slots_ahead } => {
+                Err(ChainError::BlockError(format!(
+                    "not building yet: the next block's slot is {slots_ahead} slots ahead of this node's clock; waiting for the clock instead of stamping blocks further into the future"
+                )))
+            }
         }
     }
 
@@ -616,6 +669,7 @@ impl RpcServer for RpcService {
         let db = controller.database();
         let head_block_time = controller.last_accepted_block().timestamp().to_time_point();
         let head_block_num = controller.last_accepted_block().block_num();
+        let subjective_cpu_bill = controller.subjective_cpu_bill(&name)?;
 
         match expected_core_symbol {
             Some(symbol) => {
@@ -625,10 +679,11 @@ impl RpcServer for RpcService {
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value =
+                let mut account_info: Value =
                     serde_json::from_str(&account_info_json).map_err(|e| {
                         ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
                     })?;
+                overlay_subjective_cpu_bill(&mut account_info, subjective_cpu_bill);
                 Ok(account_info)
             }
             None => {
@@ -637,10 +692,11 @@ impl RpcServer for RpcService {
                     head_block_num,
                     &head_block_time,
                 )?;
-                let account_info: Value =
+                let mut account_info: Value =
                     serde_json::from_str(&account_info_json).map_err(|e| {
                         ErrorObjectOwned::owned(500, "serialization_error", Some(format!("{}", e)))
                     })?;
+                overlay_subjective_cpu_bill(&mut account_info, subjective_cpu_bill);
                 Ok(account_info)
             }
         }
@@ -736,6 +792,10 @@ impl RpcServer for RpcService {
                 }),
             server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
+            platform_chain_id: controller.platform_chain_id().clone(),
+            state_summary_interval: controller.state_summary_interval(),
+            state_sync_enabled: controller.state_sync_enabled(),
+            block_production_enabled: controller.block_production_enabled(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block_id,
@@ -755,6 +815,7 @@ impl RpcServer for RpcService {
             total_net_weight: db.get_total_net_weight()?,
             earliest_available_block_num: 1,
             last_irreversible_block_time: head_block.timestamp().clone(),
+            pulsevm_build: crate::api::BuildInfo::current(),
         })
     }
 
@@ -1274,6 +1335,10 @@ mod tests {
         );
         assert!(response.next_protocol_upgrade.is_none());
         assert_eq!(response.head_block_num, 1);
+        assert_eq!(response.chain_id, response.platform_chain_id);
+        assert_eq!(response.state_summary_interval, 4096);
+        assert!(response.state_sync_enabled);
+        assert!(response.block_production_enabled);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["protocol_version"], json!(1));
@@ -1283,6 +1348,79 @@ mod tests {
             json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
         );
         assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
+        assert_eq!(json["state_summary_interval"], json!(4096));
+        assert_eq!(json["state_sync_enabled"], json!(true));
+        assert_eq!(json["block_production_enabled"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn migration_chain_id_override_is_reported_for_signing_and_ship() {
+        let genesis_key = PrivateKey::from_str(GENESIS_KEY).unwrap();
+        let platform_chain_id =
+            Id::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let mut genesis: serde_json::Value =
+            serde_json::from_slice(&genesis_bytes(&genesis_key)).unwrap();
+        genesis["chain_id"] =
+            serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let genesis_bytes = serde_json::to_vec(&genesis).unwrap();
+        let signing_chain_id =
+            Id::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let config_bytes = json!({
+            "system_account": "pulse",
+            "native_system_contract": true,
+            "producer_name": "pulse",
+            "producer_key": genesis_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new();
+        controller
+            .initialize(
+                &platform_chain_id,
+                &config_bytes,
+                &genesis_bytes,
+                temp.path().to_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(controller.chain_id(), &signing_chain_id);
+        assert_eq!(controller.platform_chain_id(), &platform_chain_id);
+
+        let service = RpcService::new(
+            Arc::new(RwLock::new(Mempool::new())),
+            Arc::new(RwLock::new(controller)),
+            Arc::new(RwLock::new(NetworkManager::new())),
+        );
+        let response = service.get_info().await.unwrap();
+        assert_eq!(response.chain_id, signing_chain_id);
+        assert_eq!(response.platform_chain_id, platform_chain_id);
+
+        // Admission must recover transaction signatures with the published
+        // Antelope signing id, not the distinct MetalGo subnet id.
+        assert!(
+            service
+                .admit_transaction(newaccount_tx(
+                    &genesis_key,
+                    &genesis_key,
+                    "alice",
+                    &signing_chain_id,
+                ))
+                .await
+                .unwrap()
+        );
+        assert!(
+            service
+                .admit_transaction(newaccount_tx(
+                    &genesis_key,
+                    &genesis_key,
+                    "bob",
+                    &platform_chain_id,
+                ))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1986,6 +2124,32 @@ mod tests {
         .await;
         assert_ne!(rows["error"]["name"], "parse_error", "{rows}");
         assert_ne!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn get_block_includes_structured_transactions_and_actions() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let packed = newaccount_tx(&genesis_key, &genesis_key, "blockreader", &chain_id);
+        service.admit_transaction(packed).await.unwrap();
+        let block = {
+            let mut controller = service.controller.write().await;
+            let mut mempool = mempool.write().await;
+            let block = controller.build_block(&mut mempool).await.unwrap();
+            controller
+                .accept_block(&block.id().unwrap(), &mut mempool)
+                .unwrap();
+            block
+        };
+
+        let returned = service
+            .get_block(block.block_num().to_string())
+            .await
+            .unwrap();
+        let json = serde_json::to_value(returned).unwrap();
+        let transaction = &json["transactions"][0]["trx"]["transaction"];
+        assert_eq!(transaction["actions"][0]["account"], "pulse");
+        assert_eq!(transaction["actions"][0]["name"], "newaccount");
+        assert!(transaction["actions"][0]["data"].is_string());
     }
 
     #[tokio::test]

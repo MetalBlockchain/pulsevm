@@ -42,7 +42,7 @@ const STABLE_PROTOCOL_VERSION: ProtocolVersion = 2;
 /// Advance this only after every unfinished implementation assigned to the new
 /// version is present and its `protocol_feature_*` Cargo flag is included by
 /// `nightly`. It may equal the stable version when no future feature exists.
-const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = STABLE_PROTOCOL_VERSION;
+const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = 3;
 
 /// Newest protocol version this particular binary can execute.
 ///
@@ -73,6 +73,10 @@ pub enum ProtocolFeature {
     /// Accept standard WASM start sections in setcode and execute them through
     /// the metered, per-action runtime path. See `docs/wasm-determinism.md`.
     WasmStartSection,
+    /// Interpret CPU usage limits in metering points, matching the transaction
+    /// receipt unit. This remains a separate protocol version from the v2 start
+    /// section rule so v2 activation cannot silently change CPU billing.
+    CpuUnitsInPoints,
 }
 
 /// A block height and protocol version that this binary has proved it can run.
@@ -113,6 +117,7 @@ impl ProtocolFeature {
         match self {
             Self::Baseline => GENESIS_PROTOCOL_VERSION,
             Self::WasmStartSection => 2,
+            Self::CpuUnitsInPoints => 3,
         }
     }
 
@@ -352,14 +357,18 @@ mod tests {
         // the condition under test. Change them only with the corresponding
         // stable/nightly implementation and boundary-test updates.
         assert_eq!(STABLE_PROTOCOL_VERSION, 2);
-        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 2);
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(NIGHTLY_PROTOCOL_VERSION, 3);
+        assert_eq!(
+            PROTOCOL_VERSION,
+            if cfg!(feature = "nightly") { 3 } else { 2 }
+        );
     }
 
     #[test]
     fn permanent_feature_version_mappings_are_stable() {
         assert_eq!(ProtocolFeature::Baseline.protocol_version(), 1);
         assert_eq!(ProtocolFeature::WasmStartSection.protocol_version(), 2);
+        assert_eq!(ProtocolFeature::CpuUnitsInPoints.protocol_version(), 3);
     }
 
     #[test]

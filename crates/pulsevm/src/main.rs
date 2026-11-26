@@ -119,10 +119,253 @@ pub(crate) fn abort_on_fatal_consistency(operation: &str, error: &ChainError) ->
     std::process::abort()
 }
 
+/// Whether a block is at or below the accepted head, so already decided.
+fn block_is_decided_history(block_height: u32, accepted_height: u32) -> bool {
+    block_height <= accepted_height
+}
+
+/// The log threshold for a `PULSEVM_LOG_LEVEL` value: info by default, and an
+/// unrecognised value also means info rather than silencing or flooding the log.
+fn log_level_filter(value: Option<&str>) -> spdlog::LevelFilter {
+    use spdlog::{
+        Level,
+        LevelFilter,
+    };
+    match value
+        .map(|text| text.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("trace") => LevelFilter::All,
+        Some("debug") => LevelFilter::MoreSevereEqual(Level::Debug),
+        Some("warn") | Some("warning") => LevelFilter::MoreSevereEqual(Level::Warn),
+        Some("error") => LevelFilter::MoreSevereEqual(Level::Error),
+        _ => LevelFilter::MoreSevereEqual(Level::Info),
+    }
+}
+
+#[cfg(test)]
+mod decided_history_tests {
+    use super::block_is_decided_history;
+
+    #[test]
+    fn only_blocks_above_the_head_are_news() {
+        assert!(block_is_decided_history(10, 10), "the head itself");
+        assert!(block_is_decided_history(3, 10), "history");
+        assert!(!block_is_decided_history(11, 10), "the next block");
+        assert!(!block_is_decided_history(500, 10), "far ahead");
+    }
+}
+
+/// Whether a state summary at `target_height` should be installed by a node at
+/// `last_accepted`. A summary at or below the node's own height gains nothing, and
+/// one within `min_blocks_behind` blocks is closer to a catch-up than a rebase.
+fn state_sync_is_worth_it(target_height: u64, last_accepted: u64, min_blocks_behind: u64) -> bool {
+    target_height > last_accepted.saturating_add(min_blocks_behind)
+}
+
+fn validate_dead_chain_shutdown_setting(config_bytes: &[u8]) -> Result<(), String> {
+    let timeout = serde_json::from_slice::<serde_json::Value>(config_bytes)
+        .ok()
+        .and_then(|config| config.get("dead_chain_shutdown_after_secs")?.as_u64())
+        .unwrap_or(0);
+    if timeout == 0 {
+        return Ok(());
+    }
+    Err("dead_chain_shutdown_after_secs is unsupported: the VM plugin cannot stop or unadvertise its MetalGo host; use a host-level health check and supervisor".into())
+}
+
+#[cfg(test)]
+mod dead_chain_setting_tests {
+    use super::validate_dead_chain_shutdown_setting;
+
+    #[test]
+    fn refuses_the_unsafe_in_plugin_shutdown_setting() {
+        assert!(
+            validate_dead_chain_shutdown_setting(br#"{"dead_chain_shutdown_after_secs":0}"#)
+                .is_ok()
+        );
+        let error =
+            validate_dead_chain_shutdown_setting(br#"{"dead_chain_shutdown_after_secs":3600}"#)
+                .unwrap_err();
+        assert!(error.contains("cannot stop or unadvertise its MetalGo host"));
+    }
+}
+
+#[cfg(test)]
+mod state_sync_threshold_tests {
+    use super::state_sync_is_worth_it;
+
+    #[test]
+    fn a_node_a_few_blocks_behind_catches_up_instead_of_syncing() {
+        assert!(!state_sync_is_worth_it(100, 100, 1024), "already there");
+        assert!(
+            !state_sync_is_worth_it(95, 100, 1024),
+            "ahead of the summary"
+        );
+        assert!(
+            !state_sync_is_worth_it(105, 100, 1024),
+            "five blocks behind"
+        );
+        assert!(
+            !state_sync_is_worth_it(1124, 100, 1024),
+            "exactly at the limit"
+        );
+        assert!(state_sync_is_worth_it(1125, 100, 1024), "one block past it");
+        assert!(state_sync_is_worth_it(1_000_000, 0, 1024), "a fresh node");
+    }
+
+    #[test]
+    fn a_zero_threshold_syncs_whenever_a_summary_is_ahead() {
+        assert!(state_sync_is_worth_it(101, 100, 0));
+        assert!(!state_sync_is_worth_it(100, 100, 0));
+    }
+
+    #[test]
+    fn a_huge_threshold_cannot_overflow() {
+        assert!(!state_sync_is_worth_it(u64::MAX, u64::MAX - 1, u64::MAX));
+        assert!(!state_sync_is_worth_it(5, u64::MAX, 1024));
+    }
+}
+
+#[cfg(test)]
+mod engine_event_tests {
+    use super::{
+        next_engine_event,
+        vm,
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{
+                AtomicBool,
+                Ordering,
+            },
+        },
+        time::Duration,
+    };
+    use tokio::sync::Notify;
+
+    async fn ready_now() {}
+
+    async fn never() {
+        std::future::pending::<()>().await
+    }
+
+    // Paul's hang: transactions pending while the node state-syncs. The pool is
+    // always ready, yet the engine must only ever be told the sync finished.
+    #[tokio::test]
+    async fn a_pending_transaction_does_not_end_a_state_sync_wait() {
+        let syncing = AtomicBool::new(true);
+        let done = Arc::new(Notify::new());
+        let wait = next_engine_event(&syncing, ready_now, &done);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut wait)
+                .await
+                .is_err(),
+            "reported an event while syncing without the sync having finished"
+        );
+        done.notify_one();
+        assert_eq!(wait.await, vm::Message::StateSyncFinished);
+    }
+
+    #[tokio::test]
+    async fn a_ready_pool_builds_when_the_engine_is_not_syncing() {
+        let syncing = AtomicBool::new(false);
+        let done = Notify::new();
+        assert_eq!(
+            next_engine_event(&syncing, ready_now, &done).await,
+            vm::Message::BuildBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_sync_is_reported_when_not_syncing_too() {
+        // A sync can finish after the host has already left the syncing state.
+        let syncing = AtomicBool::new(false);
+        let done = Notify::new();
+        done.notify_one();
+        assert_eq!(
+            next_engine_event(&syncing, never, &done).await,
+            vm::Message::StateSyncFinished
+        );
+    }
+
+    // The engine switches state while a wait is outstanding: a build signal that
+    // arrives after that must be held back, not reported.
+    #[tokio::test]
+    async fn a_build_signal_that_races_the_switch_to_syncing_is_held_back() {
+        let syncing = Arc::new(AtomicBool::new(false));
+        let flag = syncing.clone();
+        let done = Arc::new(Notify::new());
+        let build = move || {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, Ordering::Release);
+            }
+        };
+        let wait = next_engine_event(&syncing, build, &done);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut wait)
+                .await
+                .is_err()
+        );
+        done.notify_one();
+        assert_eq!(wait.await, vm::Message::StateSyncFinished);
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::log_level_filter;
+    use spdlog::{
+        Level,
+        LevelFilter,
+    };
+
+    #[test]
+    fn info_unless_asked_and_never_a_surprise() {
+        assert_eq!(
+            log_level_filter(None),
+            LevelFilter::MoreSevereEqual(Level::Info)
+        );
+        assert_eq!(
+            log_level_filter(Some("nonsense")),
+            LevelFilter::MoreSevereEqual(Level::Info)
+        );
+        assert_eq!(
+            log_level_filter(Some(" DEBUG ")),
+            LevelFilter::MoreSevereEqual(Level::Debug)
+        );
+        assert_eq!(log_level_filter(Some("trace")), LevelFilter::All);
+        assert_eq!(
+            log_level_filter(Some("warn")),
+            LevelFilter::MoreSevereEqual(Level::Warn)
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
-    // Initialize logging
-    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
+    // Initialize logging. Debug is opt-in (`PULSEVM_LOG_LEVEL=debug` when the
+    // binary is launched directly, `log_level` in the chain config under a host
+    // such as MetalGo, which does not pass its environment to the plugin): at debug
+    // the controller hashes the whole state after every block just to print it,
+    // which a production node should not pay for on every block.
+    spdlog::default_logger().set_level_filter(log_level_filter(
+        std::env::var("PULSEVM_LOG_LEVEL").ok().as_deref(),
+    ));
+
+    {
+        let build = crate::api::BuildInfo::current();
+        spdlog::info!(
+            "pulsevm build {} (write-ahead log {}, state hash {})",
+            build.build_id,
+            build.wal_format,
+            build.state_hash_format
+        );
+    }
 
     let cancel = CancellationToken::new();
     let cancel_ws = cancel.clone();
@@ -174,9 +417,35 @@ async fn main() {
         }
     });
 
+    // A window of refused blocks that ends with nothing more refused is still
+    // reported, so a count is never left unwritten.
+    {
+        let refused = vm.refused_blocks.clone();
+        let started = vm.started;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let summary = refused
+                    .lock()
+                    .ok()
+                    .and_then(|mut log| log.flush_if_due(started.elapsed()));
+                if let Some(summary) = summary {
+                    spdlog::warn!("{summary}");
+                }
+            }
+        });
+    }
+
     // Keep listening
     let _ = runtime_handle.await;
     let _ = ws_handle.await;
+
+    // The opt-in dead-chain watchdog shuts down the runtime server itself. Fold
+    // the accepted log into the database just as the host's Shutdown RPC does.
+    if let Err(error) = vm.shutdown_controller().await {
+        error!("could not shut down controller: {error}");
+    }
 
     // Gracefully shutdown
     info!("shutting down...");
@@ -236,9 +505,55 @@ pub struct VirtualMachine {
     rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<BlockTimer>>,
     ready_to_terminate: Arc<AtomicBool>,
+    controller_shutdown: Arc<AtomicBool>,
     // Fired when a background state sync finishes applying, so `wait_for_event`
     // can report MESSAGE_STATE_SYNC_FINISHED to the engine.
     sync_finished: Arc<tokio::sync::Notify>,
+    // True while the engine has put this VM in the state-syncing state. Read by
+    // `wait_for_event`, which must report nothing but the end of the sync then.
+    engine_state_syncing: Arc<AtomicBool>,
+    started: std::time::Instant,
+    // Refused blocks above the head, gathered into a summary per window.
+    refused_blocks: Arc<std::sync::Mutex<chain::RefusedBlocks>>,
+    // The state summaries this node offers, kept on disk (see chain::SummaryService).
+    summaries: Arc<chain::SummaryService>,
+}
+
+/// What `wait_for_event` reports next.
+///
+/// The host takes one notification per subscription and then waits for its own
+/// signal before subscribing again. A state syncer only accepts the end of the
+/// sync, so a "build a block" sent while it runs is ignored by it and the end of
+/// the sync is never subscribed to: the node stays in state sync until it is
+/// restarted by hand. While the engine has this VM state-syncing, the only event
+/// that may be reported is the sync finishing, whatever the mempool holds.
+async fn next_engine_event<Build, BuildFuture>(
+    syncing: &AtomicBool,
+    build_ready: Build,
+    sync_finished: &tokio::sync::Notify,
+) -> vm::Message
+where
+    Build: Fn() -> BuildFuture,
+    BuildFuture: std::future::Future<Output = ()>,
+{
+    loop {
+        if syncing.load(std::sync::atomic::Ordering::Acquire) {
+            sync_finished.notified().await;
+            return vm::Message::StateSyncFinished;
+        }
+        tokio::select! {
+            _ = build_ready() => {
+                // The state may have changed while waiting. The build signal is
+                // dropped if so; the block timer raises it again on its next tick
+                // once the sync is over and transactions are still pending.
+                if syncing.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
+                return vm::Message::BuildBlock;
+            }
+            _ = sync_finished.notified() => return vm::Message::StateSyncFinished,
+        }
+    }
 }
 
 impl VirtualMachine {
@@ -258,8 +573,28 @@ impl VirtualMachine {
             rpc_service: rpc_service,
             block_timer,
             ready_to_terminate: Arc::new(AtomicBool::new(false)),
+            controller_shutdown: Arc::new(AtomicBool::new(false)),
             sync_finished: Arc::new(tokio::sync::Notify::new()),
+            engine_state_syncing: Arc::new(AtomicBool::new(false)),
+            started: std::time::Instant::now(),
+            refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
+            summaries: Arc::new(chain::SummaryService::new()),
         })
+    }
+
+    async fn shutdown_controller(&self) -> Result<(), ChainError> {
+        if self
+            .controller_shutdown
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let result = self.controller.write().await.shutdown();
+        if result.is_err() {
+            self.controller_shutdown
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
     }
 }
 
@@ -416,6 +751,7 @@ impl Vm for VirtualMachine {
         let genesis_bytes = request.get_ref().genesis_bytes.clone();
         let upgrade_bytes = request.get_ref().upgrade_bytes.clone();
         let db_path = request.get_ref().chain_data_dir.clone();
+        let node_identity = request.get_ref().node_id.clone();
         let server_addr = request.get_ref().server_addr.clone();
         let chain_id: Id = request
             .get_ref()
@@ -423,11 +759,22 @@ impl Vm for VirtualMachine {
             .clone()
             .try_into()
             .map_err(|_| Status::invalid_argument("invalid chain id"))?;
+        // MetalGo starts the plugin with a minimal environment, so the log level
+        // an operator wants arrives in the chain config, not as a variable.
+        if let Some(level) = serde_json::from_slice::<serde_json::Value>(&config_bytes)
+            .ok()
+            .and_then(|config| config.get("log_level")?.as_str().map(str::to_owned))
+        {
+            spdlog::default_logger().set_level_filter(log_level_filter(Some(&level)));
+        }
+        let summaries_dir = std::path::Path::new(&db_path).join("summaries");
+        validate_dead_chain_shutdown_setting(&config_bytes).map_err(Status::invalid_argument)?;
         let controller = self.controller.clone();
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.
-        let admission_state = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut controller = controller.blocking_write();
+            controller.set_node_identity(&node_identity);
             if let Err(error) = controller.initialize_with_protocol_upgrades(
                 &chain_id,
                 &config_bytes,
@@ -438,15 +785,42 @@ impl Vm for VirtualMachine {
                 if error.is_fatal_consistency() {
                     abort_on_fatal_consistency("controller initialization", &error);
                 }
+                // MetalGo gets this as a gRPC status and the plugin used to say
+                // nothing of its own, so a node that could not start (a damaged
+                // log, say) looked like a hang with an empty log. Say why here.
+                spdlog::error!("controller initialization failed: {error}");
                 return Err(Status::internal(format!(
                     "could not initialize controller: {error}"
                 )));
             }
-            Ok::<_, Status>(controller.mempool_admission_state())
+            Ok::<_, Status>(())
         })
         .await
         .map_err(|e| Status::internal(format!("controller initialization task failed: {e}")))??;
+        let admission_state = {
+            let controller = self.controller.clone();
+            let mut controller = controller.write().await;
+            let mempool = self.mempool.clone();
+            let mut mempool = mempool.write().await;
+            if let Err(error) = controller
+                .recover_pending_accepted_block(&mut mempool)
+                .await
+            {
+                if error.is_fatal_consistency() {
+                    abort_on_fatal_consistency("accepted-block recovery", &error);
+                }
+                spdlog::error!("accepted-block recovery failed: {error}");
+                return Err(Status::internal(format!(
+                    "could not recover accepted block: {error}"
+                )));
+            }
+            controller.mempool_admission_state()
+        };
         self.rpc_service.set_admission_state(admission_state);
+        // A node that cannot keep summaries still runs; it just offers none.
+        if let Err(error) = self.summaries.open(summaries_dir) {
+            spdlog::warn!("this node will offer no state summaries: {error}");
+        }
         let controller = self.controller.read().await;
 
         let network_manager = Arc::clone(&self.network_manager);
@@ -488,10 +862,13 @@ impl Vm for VirtualMachine {
         })?;
 
         // Update state in controller
-        controller.set_state(
-            vm::State::try_from(request.get_ref().state)
-                .map_err(|_| Status::invalid_argument("invalid state"))?,
+        let new_state = vm::State::try_from(request.get_ref().state)
+            .map_err(|_| Status::invalid_argument("invalid state"))?;
+        self.engine_state_syncing.store(
+            new_state == vm::State::StateSyncing,
+            std::sync::atomic::Ordering::Release,
         );
+        controller.set_state(new_state);
 
         return Ok(Response::new(vm::SetStateResponse {
             last_accepted_id: last_accepted_block_id.into(),
@@ -525,14 +902,17 @@ impl Vm for VirtualMachine {
         let block_timer = block_timer.read().await;
 
         // Wake on whichever comes first: a block is ready to build, or a
-        // background state sync just finished.
-        let message = tokio::select! {
-            _ = block_timer.wait_for_block_build() => vm::Message::BuildBlock,
-            _ = self.sync_finished.notified() => {
-                info!("state sync finished, notifying engine");
-                vm::Message::StateSyncFinished
-            }
-        };
+        // background state sync just finished. While the engine has this VM
+        // state-syncing only the second may be reported (see next_engine_event).
+        let message = next_engine_event(
+            &self.engine_state_syncing,
+            || block_timer.wait_for_block_build(),
+            &self.sync_finished,
+        )
+        .await;
+        if message == vm::Message::StateSyncFinished {
+            info!("state sync finished, notifying engine");
+        }
 
         Ok(Response::new(vm::WaitForEventResponse {
             message: message.into(),
@@ -542,9 +922,7 @@ impl Vm for VirtualMachine {
     async fn shutdown(&self, _request: Request<()>) -> Result<tonic::Response<()>, Status> {
         let ready_to_terminate = self.ready_to_terminate.clone();
         ready_to_terminate.store(true, std::sync::atomic::Ordering::Relaxed);
-        let controller = self.controller.clone();
-        let mut controller = controller.write().await;
-        if let Err(error) = controller.shutdown() {
+        if let Err(error) = self.shutdown_controller().await {
             if error.is_fatal_consistency() {
                 abort_on_fatal_consistency("controller shutdown", &error);
             }
@@ -617,6 +995,9 @@ impl Vm for VirtualMachine {
                 abort_on_fatal_consistency("block building", &error)
             }
             Err(error) => {
+                // A failed build is otherwise silent: MetalGo only retries on
+                // new mempool activity, so log the cause where operators look.
+                error!("could not build block: {error}");
                 return Err(Status::internal(format!("could not build block: {error}")));
             }
         };
@@ -737,12 +1118,46 @@ impl Vm for VirtualMachine {
                 if e.is_fatal_consistency() {
                     abort_on_fatal_consistency("block verification", &e);
                 }
-                warn!(
-                    "could not verify block with id {} and height {}: {:?}",
-                    block.id().unwrap_or_default(),
-                    block.block_num(),
-                    e
-                );
+                // A block at or below the accepted head is decided history: a
+                // peer's copy of a block this node already has, or a fork that
+                // lost. Refusing it is right and is not news, and at about seven
+                // a block it buried the warnings that are. A block above the head
+                // whose parent is unknown is still a warning.
+                let accepted = self
+                    .controller
+                    .read()
+                    .await
+                    .last_accepted_block()
+                    .block_num();
+                if block_is_decided_history(block.block_num(), accepted) {
+                    debug!(
+                        "refused block {} at height {} (accepted head {accepted}): {:?}",
+                        block.id().unwrap_or_default(),
+                        block.block_num(),
+                        e
+                    );
+                } else {
+                    // Above the head: a block this node cannot place yet, usually
+                    // because it is behind. Logged in full once per window, counted
+                    // after that, never hidden (see chain::RefusedBlocks).
+                    let reason = format!("{e:?}");
+                    let (decision, summary) = self
+                        .refused_blocks
+                        .lock()
+                        .map(|mut log| log.note(self.started.elapsed(), block.block_num(), &reason))
+                        .unwrap_or((chain::Refusal::LogInFull, None));
+                    if let Some(summary) = summary {
+                        warn!("{summary}");
+                    }
+                    if decision == chain::Refusal::LogInFull {
+                        warn!(
+                            "could not verify block with id {} and height {}: {:?}",
+                            block.id().unwrap_or_default(),
+                            block.block_num(),
+                            e
+                        );
+                    }
+                }
 
                 return Err(Status::internal(format!(
                     "could not verify block with id {}: {}",
@@ -777,6 +1192,19 @@ impl Vm for VirtualMachine {
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
         let accepted_block = controller.last_accepted_block().clone();
+        // At a summary height, copy the state out now, under the lock already held
+        // (about a second at mainnet size, on every validator at the same block), and
+        // build the summary after both locks are released.
+        let staged = match controller.stage_summary_if_due() {
+            Ok(staged) => staged,
+            Err(error) => {
+                if error.is_fatal_consistency() {
+                    abort_on_fatal_consistency("state-summary staging", &error);
+                }
+                warn!("could not stage a state summary: {error}");
+                None
+            }
+        };
         drop(mempool);
         drop(controller);
         self.rpc_service.note_accepted_block(&accepted_block);
@@ -784,6 +1212,18 @@ impl Vm for VirtualMachine {
             "block accepted with id {}, returning from block_accept",
             block_id
         );
+        if let Some(staged) = staged {
+            let summaries = self.summaries.clone();
+            tokio::spawn(async move {
+                let height = staged.height();
+                match summaries.build_and_keep(staged).await {
+                    Ok(height) => info!("kept the state summary for height {height}"),
+                    Err(error) => {
+                        warn!("could not build the state summary for height {height}: {error}")
+                    }
+                }
+            });
+        }
 
         Ok(Response::new(()))
     }
@@ -876,10 +1316,11 @@ impl Vm for VirtualMachine {
             }
         };
 
-        let served = {
-            let controller = self.controller.read().await;
-            controller.serve_snapshot_chunk(req.height, &req.hash, req.offset, req.len)
-        };
+        // Read from the kept snapshot's file; the controller is not involved.
+        let served = self
+            .summaries
+            .read_chunk(req.height, req.hash, req.offset, req.len)
+            .await;
         let network = self.network_manager.clone();
         match served {
             Ok(chunk) => {
@@ -1132,8 +1573,9 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::StateSyncEnabledResponse>, Status> {
+        let enabled = self.controller.read().await.state_sync_enabled();
         Ok(Response::new(vm::StateSyncEnabledResponse {
-            enabled: true,
+            enabled,
             err: 0,
         }))
     }
@@ -1158,26 +1600,39 @@ impl Vm for VirtualMachine {
         request: Request<()>,
     ) -> Result<tonic::Response<vm::GetLastStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        // Exclusive: producing a summary snapshots the arena, which briefly drops
-        // and remaps the database.
-        let mut controller = self.controller.write().await;
-        let summary = match controller.produce_state_summary() {
-            Ok(summary) => summary,
-            Err(error) if error.is_fatal_consistency() => {
-                abort_on_fatal_consistency("state-summary creation", &error)
+        let (tip, min_age) = {
+            let controller = self.controller.read().await;
+            if !controller.state_sync_enabled() {
+                return Ok(Response::new(vm::GetLastStateSummaryResponse {
+                    id: vec![],
+                    height: 0,
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                }));
             }
-            Err(error) => {
-                return Err(Status::internal(format!(
-                    "could not produce state summary: {error}"
-                )));
-            }
+            (
+                u64::from(controller.last_accepted_block().block_num()),
+                controller.state_summary_min_age(),
+            )
         };
-        Ok(Response::new(vm::GetLastStateSummaryResponse {
-            id: summary.id.into(),
-            height: summary.height,
-            bytes: summary.bytes,
-            err: 0,
-        }))
+        // Whatever is kept and old enough. Nothing is built here: a summary is built
+        // once, in the background, when a block at a summary height is accepted.
+        Ok(Response::new(
+            match self.summaries.offer_latest(tip, min_age) {
+                Some(summary) => vm::GetLastStateSummaryResponse {
+                    id: summary.id.into(),
+                    height: summary.height,
+                    bytes: summary.bytes,
+                    err: 0,
+                },
+                None => vm::GetLastStateSummaryResponse {
+                    id: vec![],
+                    height: 0,
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                },
+            },
+        ))
     }
 
     async fn parse_state_summary(
@@ -1198,33 +1653,29 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetStateSummaryRequest>,
     ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
-        let requested = request.get_ref().height;
-        let mut controller = self.controller.write().await;
-        // Only the last accepted height can be served: chainbase keeps a single
-        // live image, not per-height snapshots.
-        if requested != controller.last_accepted_block().block_num() as u64 {
+        if !self.controller.read().await.state_sync_enabled() {
             return Ok(Response::new(vm::GetStateSummaryResponse {
                 id: vec![],
                 bytes: vec![],
                 err: vm::Error::NotFound as i32,
             }));
         }
-        let summary = match controller.produce_state_summary() {
-            Ok(summary) => summary,
-            Err(error) if error.is_fatal_consistency() => {
-                abort_on_fatal_consistency("state-summary creation", &error)
-            }
-            Err(error) => {
-                return Err(Status::internal(format!(
-                    "could not produce state summary: {error}"
-                )));
-            }
-        };
-        Ok(Response::new(vm::GetStateSummaryResponse {
-            id: summary.id.into(),
-            bytes: summary.bytes,
-            err: 0,
-        }))
+        // The host asks for the heights it chose when it voted; this node answers
+        // for the fixed heights it keeps a summary for, and for no other.
+        Ok(Response::new(
+            match self.summaries.offer_at(request.get_ref().height) {
+                Some(summary) => vm::GetStateSummaryResponse {
+                    id: summary.id.into(),
+                    bytes: summary.bytes,
+                    err: 0,
+                },
+                None => vm::GetStateSummaryResponse {
+                    id: vec![],
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                },
+            },
+        ))
     }
 
     async fn state_summary_accept(
@@ -1232,6 +1683,13 @@ impl Vm for VirtualMachine {
         request: Request<vm::StateSummaryAcceptRequest>,
     ) -> Result<tonic::Response<vm::StateSummaryAcceptResponse>, Status> {
         info!("received state summary accept request");
+
+        if !self.controller.read().await.state_sync_enabled() {
+            return Ok(Response::new(vm::StateSummaryAcceptResponse {
+                mode: vm::state_summary_accept_response::Mode::Skipped as i32,
+                err: 0,
+            }));
+        }
 
         // Parse the commitment up front so a malformed summary is rejected here,
         // before we commit to the asynchronous DYNAMIC mode.
@@ -1243,16 +1701,17 @@ impl Vm for VirtualMachine {
         // its own tip as a summary during bootstrap: accepting it would fire a
         // stray StateSyncFinished after consensus has already started, wedging
         // the wait_for_event stream so no block ever builds. Skip instead.
-        let last_accepted = self
-            .controller
-            .read()
-            .await
-            .last_accepted_block()
-            .block_num() as u64;
-        if target.height <= last_accepted {
+        let (last_accepted, min_blocks_behind) = {
+            let controller = self.controller.read().await;
+            (
+                controller.last_accepted_block().block_num() as u64,
+                controller.state_sync_min_blocks_behind(),
+            )
+        };
+        if !state_sync_is_worth_it(target.height, last_accepted, min_blocks_behind) {
             info!(
-                "skipping state summary at height {} (already at {})",
-                target.height, last_accepted
+                "skipping state summary at height {} (this node is at {}, which is within {} blocks of it: fetching them is cheaper than a snapshot install)",
+                target.height, last_accepted, min_blocks_behind
             );
             return Ok(Response::new(vm::StateSummaryAcceptResponse {
                 mode: vm::state_summary_accept_response::Mode::Skipped as i32,
@@ -1284,11 +1743,15 @@ impl Vm for VirtualMachine {
         let network = self.network_manager.clone();
         let sync_finished = self.sync_finished.clone();
         tokio::spawn(async move {
-            let net = network.clone();
             let height = target.height;
             let hash = target.hash;
-            let download =
-                pulsevm_core::state_sync::download_snapshot(&target, move |offset, len| {
+            let peers = network.read().await.connected_node_ids();
+            let mut download = Err(pulsevm_core::ChainError::NetworkError(
+                "state sync: no connected peers to fetch from".into(),
+            ));
+            for peer in peers {
+                let net = network.clone();
+                match pulsevm_core::state_sync::download_snapshot(&target, move |offset, len| {
                     let net = net.clone();
                     async move {
                         let req = pulsevm_core::state_sync::ChunkRequest {
@@ -1297,10 +1760,24 @@ impl Vm for VirtualMachine {
                             offset,
                             len,
                         };
-                        chain::NetworkManager::request_chunk(&net, &req).await
+                        chain::NetworkManager::request_chunk_from_peer(&net, peer, &req).await
                     }
                 })
-                .await;
+                .await
+                {
+                    Ok(envelope) => {
+                        download = Ok(envelope);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "state sync snapshot from peer {} failed integrity or transfer checks: {error}; trying another peer",
+                            hex::encode(peer.0)
+                        );
+                        download = Err(error);
+                    }
+                }
+            }
 
             match download {
                 Ok(envelope) => {
@@ -1312,7 +1789,13 @@ impl Vm for VirtualMachine {
                         target.state_root,
                         &envelope,
                     ) {
-                        Ok(()) => info!("state sync applied at height {}", height),
+                        Ok(()) => {
+                            info!("state sync applied at height {}", height);
+                            drop(controller);
+                            info!(
+                                "authenticated state sync succeeded; prior quarantined data is retained for operator recovery or cleanup"
+                            );
+                        }
                         Err(e) if e.is_fatal_consistency() => {
                             // The arena or its companion metadata crossed a
                             // publication boundary. Never wake MetalGo to fall
@@ -1600,5 +2083,64 @@ mod ram_usage_metric_tests {
             .await
             .expect_err("malformed JSON-RPC should be rejected");
         assert_eq!(rpc_status.code(), tonic::Code::Internal);
+    }
+}
+
+#[cfg(test)]
+mod state_summary_rpc_tests {
+    use super::*;
+    use pulsevm_core::{
+        controller::BuiltSummary,
+        id::Id,
+    };
+
+    #[tokio::test]
+    async fn summary_rpc_methods_only_serve_persisted_summaries() {
+        let vm = VirtualMachine::new("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let latest = vm
+            .get_last_state_summary(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(latest.err, vm::Error::NotFound as i32);
+        assert!(latest.bytes.is_empty());
+
+        let requested = vm
+            .get_state_summary(Request::new(vm::GetStateSummaryRequest { height: 4096 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(requested.err, vm::Error::NotFound as i32);
+        assert!(requested.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requested_summary_rpc_serves_the_cached_height() {
+        let vm = VirtualMachine::new("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        vm.summaries.open(dir.path().join("summaries")).unwrap();
+        let expected_id_bytes = [0x42; 32];
+        let expected_id = Id::new(expected_id_bytes);
+        let expected_bytes = vec![0x24; 16];
+        vm.summaries
+            .register_built_for_test(BuiltSummary {
+                height: 4096,
+                id: expected_id,
+                bytes: expected_bytes.clone(),
+                hash: [0x55; 32],
+                state_root: [0x66; 32],
+                envelope: vec![0x77; 300],
+            })
+            .unwrap();
+
+        let response = vm
+            .get_state_summary(Request::new(vm::GetStateSummaryRequest { height: 4096 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.err, 0);
+        assert_eq!(response.id, expected_id_bytes.to_vec());
+        assert_eq!(response.bytes, expected_bytes);
     }
 }

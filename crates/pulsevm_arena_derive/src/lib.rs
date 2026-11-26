@@ -81,6 +81,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
 
     let mut has_id = false;
+    // Offsets of every `BlobRef` field, so the state hash can resolve each one to
+    // the bytes it points at instead of hashing the offset.
+    let mut blob_offsets = Vec::new();
     let mut ordered_tags = Vec::new();
     let mut hashed_tags = Vec::new();
     let mut index_defs = Vec::new();
@@ -88,6 +91,15 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let ident = field.ident.as_ref().unwrap();
         if ident == "id" {
             has_id = true;
+        }
+        if let syn::Type::Path(path) = &field.ty
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "BlobRef")
+        {
+            blob_offsets.push(quote! { ::std::mem::offset_of!(#name, #ident) });
         }
         let is_index = field
             .attrs
@@ -147,6 +159,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
             fn secondary_indices() -> Vec<Box<dyn ::pulsevm_arena::SecondaryIndex<Self>>> {
                 #secondary
+            }
+            fn blob_ref_offsets() -> &'static [usize] {
+                &[ #( #blob_offsets ),* ]
             }
         }
     })

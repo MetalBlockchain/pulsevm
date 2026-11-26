@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Handover-local adapter for export.sh: run Leap's Linux nodeos under Docker
+# while retaining the host paths in the command line. Unlike
+# tools/xpr-chainbase-export/localnet/nodeos-docker, this does not prepend
+# `nodeos`: the prebuilt pulsevm-leap image already uses it as ENTRYPOINT.
+# The export work directory must be beneath /tmp so it can be mounted at the
+# same path in the container.
+set -euo pipefail
+
+readonly image="${XPR_NODEOS_IMAGE:-pulsevm-leap:5.0.3-amd64}"
+# XPR_PLATFORM is the rehearsal-wide knob (compose services); XPR_NODEOS_PLATFORM
+# overrides for the export container only when set explicitly.
+readonly platform="${XPR_NODEOS_PLATFORM:-${XPR_PLATFORM:-linux/amd64}}"
+# The export container attaches to the localnet network; the standalone
+# localnet runner creates it, so ensure it here for rehearsal-only flows
+# (no-op when it already exists).
+docker network inspect pulsevm-xpr-localnet >/dev/null 2>&1 \
+    || docker network create pulsevm-xpr-localnet >/dev/null
+# Images with the sidecar plugin baked in as a required option need exactly
+# one sidecar flag. Upstream images have no such option, so this stays
+# behind XPR_SIDECAR_PATH (unset keeps the command line identical).
+if [[ -n "${XPR_SIDECAR_PATH:-}" ]]; then
+    rm -f "$XPR_SIDECAR_PATH"
+    set -- "$@" --deferred-transaction-sidecar-path "$XPR_SIDECAR_PATH"
+fi
+docker_args=(
+    --rm
+    --platform "$platform"
+    --network pulsevm-xpr-localnet
+    --mount type=bind,src=/tmp,dst=/tmp
+)
+if [[ -n "${XPR_NODEOS_HTTP_PORT:-}" ]]; then
+    docker_args+=(--publish "127.0.0.1:${XPR_NODEOS_HTTP_PORT}:${XPR_NODEOS_HTTP_PORT}")
+fi
+exec docker run "${docker_args[@]}" \
+    "$image" "$@"

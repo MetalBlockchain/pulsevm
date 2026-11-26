@@ -26,6 +26,12 @@ accept the Antelope packed transaction fields and submit through PulseVM's
 transaction admission path. Unsupported methods return an Antelope-shaped
 404 response.
 
+`get_block` returns each packed transaction together with its structurally
+decoded transaction and action objects (account, action name, authorization,
+and raw action data bytes). It does not ABI-decode action data into contract
+fields; pollers use the chain's ABI for that step. Generated receipts that only
+carry a transaction ID cannot return the original packed transaction.
+
 ## Browser clients
 
 Successful `/rpc` and `/v1/chain/*` responses include CORS headers for public

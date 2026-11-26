@@ -43,7 +43,10 @@ use crate::{
     crypto::PrivateKey,
     id::Id,
     name::Name,
-    protocol_features::ProtocolUpgradeSchedule,
+    protocol_features::{
+        ProtocolExecutionContext,
+        ProtocolUpgradeSchedule,
+    },
     transaction::{
         Action,
         PackedTransaction,
@@ -79,7 +82,19 @@ struct Host {
 }
 
 impl Host {
+    /// A host under the genesis protocol rules.
     fn new(context_free: bool) -> Self {
+        Self::with_protocol(
+            context_free,
+            ProtocolUpgradeSchedule::default()
+                .execution_context(1)
+                .unwrap(),
+        )
+    }
+
+    /// A host executing under an explicit protocol context, for tests that
+    /// exercise a rule gated on a protocol version.
+    fn with_protocol(context_free: bool, protocol: ProtocolExecutionContext) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let key = PrivateKey::new_k1_from_string("host-function-test-only").unwrap();
         let mut genesis: serde_json::Value = serde_json::from_str(include_str!(concat!(
@@ -139,9 +154,7 @@ impl Host {
         let mut trx = TransactionContext::new(
             db.clone(),
             runtime.clone(),
-            ProtocolUpgradeSchedule::default()
-                .execution_context(1)
-                .unwrap(),
+            protocol,
             time.clone(),
             &Id::default(),
             BlockStatus::Verifying,
