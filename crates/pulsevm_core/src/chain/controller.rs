@@ -7143,6 +7143,99 @@ mod tests {
         Ok(())
     }
 
+    // The reference token contract keeps its supply rows in a table named `stats`
+    // (scope: symbol code), where the nodeos-standard `eosio.token` uses `stat`.
+    // getCurrencyStats must read whichever the token actually uses, or supply
+    // comes back as `{}` for a token that demonstrably has one.
+    #[tokio::test]
+    async fn get_currency_stats_reads_the_reference_token_supply() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let block_status = BlockStatus::Building;
+        let token = Name::from_str("glenn")?;
+        controller.execute_transaction(
+            &create_account(&private_key, token, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let token_wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, token, token_wasm, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        // Parsed rather than a raw `Symbol(..)` literal so the code is really "PLUS".
+        let max_supply = Asset::from_str("10000.0000 PLUS").unwrap();
+        let issued = Asset::from_str("100.0000 PLUS").unwrap();
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                token,
+                Name::from_str("create")?,
+                &Create {
+                    issuer: token,
+                    max_supply,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                token,
+                Name::from_str("issue")?,
+                &Issue {
+                    to: token,
+                    quantity: issued,
+                    memo: "supply".to_string(),
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        let stats: serde_json::Value = serde_json::from_str(
+            &controller
+                .database()
+                .get_currency_stats(token.as_u64(), "PLUS")?,
+        )
+        .unwrap();
+        // max_supply is deliberately not asserted: the reference contract stores
+        // 0 there regardless of what `create` was given.
+        assert_eq!(stats["PLUS"]["supply"], "100.0000 PLUS", "{stats}");
+        assert_eq!(stats["PLUS"]["issuer"], "glenn", "{stats}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError>
     {

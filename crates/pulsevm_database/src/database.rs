@@ -6392,16 +6392,25 @@ impl Database {
         Ok(serde_json::to_string(&value).unwrap())
     }
 
-    /// `get_currency_stats`: the `stat` row for `symbol` under token contract
+    /// `get_currency_stats`: the stats row for `symbol` under token contract
     /// `code` (supply, max_supply, issuer).
+    ///
+    /// nodeos-standard `eosio.token` names that table `stat`, but the reference
+    /// `pulse_token` contract names it `stats`. Look at `stat` first, then fall
+    /// back, so supply is reported for both rather than as `{}`.
     pub fn rpc_get_currency_stats(&self, code: u64, symbol: &str) -> Result<String, ChainError> {
-        let stat = name_u64("stat")?;
         let scope = symbol_code_from_str(symbol);
-        let rows: Vec<Vec<u8>> = self
-            .arena_table_range(code, scope, stat)
-            .into_iter()
-            .map(|(_pk, value)| value)
-            .collect();
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        for table in ["stat", "stats"] {
+            rows = self
+                .arena_table_range(code, scope, name_u64(table)?)
+                .into_iter()
+                .map(|(_pk, value)| value)
+                .collect();
+            if !rows.is_empty() {
+                break;
+            }
+        }
         let value = pulsevm_rpc::format_currency_stats(&rows)
             .map_err(|e| ChainError::InternalError(format!("format currency_stats: {e}")))?;
         Ok(serde_json::to_string(&value).unwrap())
