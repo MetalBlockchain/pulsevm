@@ -643,7 +643,7 @@ fn main() -> ExitCode {
         let right = right_rows.map(|rows| hash_rows(rows));
         // global_property is a different byte shape on the two sides by design
         // (PulseVM has no proposed schedule and no deferred-transaction fields,
-        // 14 bytes shorter), so a byte hash can never match. Compare it field
+        // 12 bytes shorter), so a byte hash can never match. Compare it field
         // by field instead, which still fails on any real difference.
         if name == "global_property" {
             match (left_rows.map(Vec::as_slice), right_rows.map(Vec::as_slice)) {

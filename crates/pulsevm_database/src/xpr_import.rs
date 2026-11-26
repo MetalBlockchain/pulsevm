@@ -4365,8 +4365,9 @@ pub struct IgnoredGlobalPropertyFields {
 /// config with an optional proposed-schedule block number and a proposed
 /// producer-authority schedule (6 bytes when empty) and carries two
 /// deferred-transaction fields (`deferred_trx_expiration_window`,
-/// `max_transaction_delay`, 8 bytes); PulseVM has no deferred transactions and
-/// keeps its schedule elsewhere, so its row is 14 bytes shorter. A byte compare
+/// `max_transaction_delay`, 8 bytes); PulseVM emits two absent optional schedule
+/// fields (2 bytes) and has no deferred transactions, so its row is 12 bytes
+/// shorter. A byte compare
 /// can therefore only ever fail on this table, which teaches an operator to
 /// wave a FAILED through. This decodes both with the importer's own decoder and
 /// compares the chain id and every other configuration field (CPU caps
@@ -4559,7 +4560,26 @@ fn decode_global_property_as_stored(
             }
         }
     }
-    Err(first_error.expect("three layouts were attempted"))
+    // PulseVM's SHiP ABI writes the two optional proposed-schedule fields as
+    // absent, then writes chain_config directly. Leap serializes the schedule
+    // value itself (six bytes when empty), so the XPR layouts above cannot read
+    // this row without mistaking configuration bytes for producer keys.
+    let mut row = RowCursor::new(bytes);
+    let version = row.varuint()?;
+    if version != 1 {
+        return Err(bad(format!(
+            "unsupported PulseVM global_property version {version}"
+        )));
+    }
+    if row.bool()? || row.bool()? {
+        return Err(bad(
+            "PulseVM global_property unexpectedly contains a proposed schedule",
+        ));
+    }
+    match decode_global_property_layout_at(row, false, true) {
+        Ok((config, chain_id, _, wasm)) => Ok((config, chain_id, wasm)),
+        Err(error) => Err(first_error.unwrap_or(error)),
+    }
 }
 
 fn skip_producer_authority_schedule(row: &mut RowCursor<'_>) -> Result<(), XprImportError> {
@@ -6324,7 +6344,7 @@ mod tests {
     }
 
     /// A real Leap 5 `global_property` row (157 bytes) and PulseVM's export of
-    /// the same configuration (143 bytes).
+    /// the same configuration (145 bytes).
     fn leap_and_pulse_global_property_rows() -> (Vec<u8>, Vec<u8>) {
         let leap = hex::decode("01000000000000010000100000000000e8030000000008000c000000f40100001400000064000000400d0300e8030000f049020064000000100e00005802000080533b000010000004000600000100009371fb05f023fcc78b23923d70bdfe6642cdf1956d120045bcd1371e05c961a90000040000000400000020000000000100002000000004000000200000000040010000400110020000fb000000").unwrap();
         let PortableRow::GlobalProperty {
@@ -6350,8 +6370,8 @@ mod tests {
         assert_eq!(leap.len(), 157);
         assert_eq!(
             pulse.len(),
-            143,
-            "PulseVM's row is the 14-byte-shorter shape"
+            145,
+            "PulseVM's row is the 12-byte-shorter shape"
         );
         assert_ne!(leap, pulse, "a byte compare cannot succeed on this table");
         let ignored = global_property_rows_equivalent(&leap, &pulse).expect("equivalent");
@@ -6427,15 +6447,16 @@ mod tests {
         assert!(error.contains("chain id"), "{error}");
 
         // A configuration field the two must agree on: the first byte of
-        // max_block_net_usage, right after the two version bytes.
+        // max_block_net_usage, after the row and chain-config versions and
+        // absent optionals.
         let mut other_config = pulse.clone();
-        other_config[2] ^= 0x01;
+        other_config[4] ^= 0x01;
         let error = global_property_rows_equivalent(&leap, &other_config).unwrap_err();
         assert!(error.contains("configuration differs"), "{error}");
 
         // The converted CPU caps are compared, not skipped.
         let mut other_cap = pulse.clone();
-        let cap_at = 2 + 8 + 4 * 6; // max_block_cpu_usage
+        let cap_at = 4 + 8 + 4 * 6; // max_block_cpu_usage
         other_cap[cap_at] ^= 0x01;
         let error = global_property_rows_equivalent(&leap, &other_cap).unwrap_err();
         assert!(error.contains("configuration differs"), "{error}");
