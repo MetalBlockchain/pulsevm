@@ -2034,11 +2034,19 @@ cmd_checkpoint() {
         GENESIS_KEY="${PULSEVM_GENESIS_INITIAL_KEY:-$(jq -er '.initial_key' "$REPO_ROOT/tools/xpr-chainbase-export/localnet/genesis.json")}"
         CHECKPOINT_SHA256="$(jq -er '.checkpoint_sha256' "$manifest")"
         SCHEDULE_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/schedule.sha256")"
+        signing_chain_id="${PULSEVM_SIGNING_CHAIN_ID:-}"
+        if [[ -n "$signing_chain_id" && ! "$signing_chain_id" =~ ^[[:xdigit:]]{64}$ ]]; then
+            fail "PULSEVM_SIGNING_CHAIN_ID must be 64 hexadecimal characters"
+        fi
         jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
             --arg schedule_sha256 "$SCHEDULE_SHA256" \
             --arg initial_key "$GENESIS_KEY" \
-            '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key}' \
+            --arg signing_chain_id "$signing_chain_id" \
+            '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key} | if $signing_chain_id == "" then . else . + {chain_id: $signing_chain_id} end' \
             "$GENESIS_BASE" >"$WORK_DIR/migration.genesis.json" || fail "migration genesis build failed"
+        if [[ -n "$signing_chain_id" ]]; then
+            echo "handover: migration signing chain id pinned to $signing_chain_id"
+        fi
         # Platform id the boot will run under: the confirmation binds
         # exactly this id (hex or the base58 log rendering), and the restore
         # gate fails closed on any other. Set PULSEVM_PLATFORM_CHAIN_ID from
@@ -2255,6 +2263,11 @@ EOF
     read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
         | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
     [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
+    if [[ -n "${PULSEVM_SIGNING_CHAIN_ID:-}" ]]; then
+        [[ "$(printf '%s' "$new_chain" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$PULSEVM_SIGNING_CHAIN_ID" | tr '[:upper:]' '[:lower:]')" ]] \
+            || fail "get_info.chain_id $new_chain does not match pinned signing id $PULSEVM_SIGNING_CHAIN_ID"
+        echo "handover: get_info signing id matches the published migration id"
+    fi
     # Optional chaos: drop one validator before the first transaction, so
     # H+1 must finalize on 4/5 quorum. Off by default; the dead node is left
     # down (a restart path is future work).

@@ -87,6 +87,17 @@ Full run: `TERMINAL_HEIGHT=300 ./run-handover.sh start` runs everything
 unattended and ends with `handover: PASS`, leaving the new network
 running:
 
+To rehearse a T-14 Antelope signing ID, set
+`PULSEVM_SIGNING_CHAIN_ID` to the published 64-character hex value. The
+harness puts it in migration genesis, keeps the runner-assigned platform id
+separate for the ceremony confirmation, checks `get_info.chain_id`, and uses
+that signing id for its first transactions:
+
+```bash
+PULSEVM_SIGNING_CHAIN_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  TERMINAL_HEIGHT=150 ./docker/handover/run-handover.sh start
+```
+
 1. Three-node Leap consensus (producer + two validating peers, equal head
    and LIB), then pre-halt traffic: three accounts (one born under a
    rotated key) plus a live key rotation, captured to

@@ -70,6 +70,10 @@ jobs:
       XPR_PLATFORM: linux/amd64
       TERMINAL_HEIGHT: '150'
       HANDOVER_WORK_DIR: /tmp/pulsevm-handover
+      # Exercise the pre-published Antelope signing ID through genesis,
+      # ceremony confirmation, get_info, and first transaction admission.
+      # MetalGo's platform chain id remains independently assigned.
+      PULSEVM_SIGNING_CHAIN_ID: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
       # The nodes log each block's state root, which the agreement check reads.
       # It hashes all state, so it is opt-in for production nodes.
       PULSEVM_LOG_LEVEL: debug
