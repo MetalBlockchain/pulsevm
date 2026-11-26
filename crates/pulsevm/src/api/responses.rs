@@ -20,6 +20,10 @@ pub struct GetInfoResponse {
     pub next_protocol_upgrade: Option<ProtocolUpgradeInfo>,
     pub server_time: BlockTimestamp,
     pub chain_id: Id,
+    /// MetalGo's platform blockchain id supplied during VM initialization.
+    /// This is commonly the same as `chain_id`; it is reported explicitly to
+    /// distinguish the host identity from Antelope's genesis-derived id.
+    pub platform_chain_id: Id,
     pub head_block_num: u32,
     pub last_irreversible_block_num: u32,
     pub last_irreversible_block_id: Id,

@@ -778,9 +778,12 @@ impl Vm for VirtualMachine {
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
         let accepted_block = controller.last_accepted_block().clone();
+        // Publish inclusion status before releasing the controller lock. This
+        // keeps RPC readers from observing accepted state while the transaction
+        // status cache still says the now-removed transactions are unknown.
+        self.rpc_service.note_accepted_block(&accepted_block);
         drop(mempool);
         drop(controller);
-        self.rpc_service.note_accepted_block(&accepted_block);
         debug!(
             "block accepted with id {}, returning from block_accept",
             block_id
