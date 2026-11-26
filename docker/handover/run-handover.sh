@@ -2813,7 +2813,7 @@ PY
     }
 
     run_remaining_fault_stages() {
-        local n dir before before_removed size_before flood_pid
+        local n dir before before_retained size_before flood_pid
         # 3. A cut during a state-sync install leaves the marker. The node used to
         # refuse to start until someone moved its data aside by hand.
         n=2
@@ -2821,16 +2821,16 @@ PY
         dir="$(node_data_dir "$n")"
         printf 'PVMSYN01\0\0\0\0' >"$dir/state_sync_installing"
         before="$(log_count "$n" 'state_sync.install_abandoned')"
-        before_removed="$(log_count "$n" 'removed abandoned pre-sync data after authenticated state sync')"
+        before_retained="$(log_count "$n" 'prior quarantined data is retained')"
         start_node "$n"
         expect_log_grew "$n" 'state_sync.install_abandoned' "$before" "the node must report that it started over"
         find "$dir/state_sync_abandoned" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q . \
             || fail "faults: node$n did not retain abandoned data while resyncing"
         timed_converge "node$n after an interrupted state-sync install"
-        expect_log_grew "$n" 'removed abandoned pre-sync data after authenticated state sync' "$before_removed" \
-            "successful authenticated resync should release the retained data"
-        [[ ! -e "$dir/state_sync_abandoned" ]] \
-            || fail "faults: node$n retained abandoned data after authenticated resync"
+        expect_log_grew "$n" 'prior quarantined data is retained' "$before_retained" \
+            "successful authenticated resync must report retained evidence"
+        find "$dir/state_sync_abandoned" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q . \
+            || fail "faults: node$n deleted abandoned data after authenticated resync"
 
         # 4. A node that is far behind state-syncs while transactions are pending.
         # The plugin used to answer "build a block" during the sync; the host's
@@ -2854,9 +2854,9 @@ PY
             || fail "faults: node$n accepted no transaction while it synced, so this stage cannot show the stall (it proves nothing)"
 
         # Do not pass this stage on block catch-up. Require the node to enter and
-        # finish an actual snapshot sync, and sample a serving validator while
-        # that sync is in progress. This makes the reported server-side liveness
-        # property a real assertion instead of a note when no summary was offered.
+        # finish an actual snapshot sync, and sample a peer validator while it
+        # runs. Chunk serving itself is cheap; the unresolved liveness risk is
+        # the validator that stops answering polls while it syncs.
         sync_started=0
         for _ in $(seq 1 300); do
             if [[ "$(log_count "$n" 'starting state sync')" -gt "$sync_started_before" ]]; then
@@ -2865,27 +2865,27 @@ PY
             fi
             sleep 0.1
         done
-        [[ "$sync_started" == 1 ]] || fail "faults: node$n did not start state sync; the server-side liveness check proved nothing"
-        serving_head_during="$(head_of "$rpc_url")"
-        serving_progress=0
+        [[ "$sync_started" == 1 ]] || fail "faults: node$n did not start state sync; the validator-poll liveness check proved nothing"
+        peer_head_during="$(head_of "$rpc_url")"
+        peer_progress=0
         sync_finished=0
         for _ in $(seq 1 600); do
             if [[ "$(log_count "$n" 'state sync finished')" -gt "$sync_finished_before" ]]; then
                 sync_finished=1
                 break
             fi
-            serving_head_now="$(head_of "$rpc_url")"
-            if [[ "$serving_head_now" -gt "$serving_head_during" ]]; then
-                serving_progress=1
+            peer_head_now="$(head_of "$rpc_url")"
+            if [[ "$peer_head_now" -gt "$peer_head_during" ]]; then
+                peer_progress=1
             fi
             sleep 0.1
         done
         [[ "$sync_finished" == 1 ]] || fail "faults: node$n did not finish its state sync within 60 seconds"
-        [[ "$serving_progress" == 1 ]] || fail "faults: serving validator made no block progress during node$n's state sync"
+        [[ "$peer_progress" == 1 ]] || fail "faults: peer validator made no block progress during node$n's state sync"
         timed_converge "node$n state-syncing with transactions pending"
         expect_log_unchanged "$n" 'unexpected message from the VM' "$before" \
             "the plugin sent a message the state syncer does not accept"
-        echo "handover: faults: node$n state-synced while transactions were pending; serving validator advanced from $serving_head_during during the sync"
+        echo "handover: faults: node$n state-synced while transactions were pending; peer validator advanced from $peer_head_during during the sync"
 
         # 5. A node only a few blocks behind catches up by fetching them and keeps
         # its block-log history; a snapshot install drops it.
