@@ -1817,7 +1817,7 @@ impl Controller {
             }
         }
 
-        self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)?;
+        self.validate_accepted_protocol_state()?;
         self.ensure_protocol_version_supported(self.last_accepted_block.block_num())?;
         let ram_usage_monitor_max_series = self
             .node_config
@@ -1868,46 +1868,18 @@ impl Controller {
             .collect()
     }
 
-    /// Bind the locally supplied schedule to the activation history committed
-    /// in chainbase. `allow_pending_descendants` is used only at Accept while
-    /// later verified blocks may still have live child undo sessions.
-    fn validate_persisted_protocol_state(
-        &self,
-        block_height: u32,
-        allow_pending_descendants: bool,
-    ) -> Result<(), ChainError> {
+    /// Activation records are persisted on acceptance. A verified parent may
+    /// already use the new rules while its activation record is still pending.
+    fn validate_accepted_protocol_state(&self) -> Result<(), ChainError> {
+        let block_height = self.last_accepted_block.block_num();
         let stored = self.db.activated_protocol_features()?;
-        let expected = self.configured_protocol_records(block_height);
-        let configured = self
-            .protocol_upgrade_schedule
-            .protocol_upgrades
-            .iter()
-            .copied()
-            .map(ProtocolUpgrade::activation_record)
-            .collect::<Vec<_>>();
-        let matches = if allow_pending_descendants {
-            stored.starts_with(&expected) && configured.starts_with(&stored)
-        } else {
-            stored == expected
-        };
-        if !matches {
+        if stored != self.configured_protocol_records(block_height) {
             return Err(ChainError::BlockError(format!(
-                "configured protocol upgrade schedule does not match the {} activation record(s) persisted at chain height {block_height}",
+                "configured protocol upgrade schedule does not match the {} activation record(s) persisted at accepted chain height {block_height}",
                 stored.len()
             )));
         }
         Ok(())
-    }
-
-    /// Confirm that a candidate executes against the activation history of its
-    /// accepted parent. The record itself is persisted only after the candidate
-    /// has been committed, so a rejected speculative block cannot activate it.
-    fn prepare_protocol_execution(
-        &mut self,
-        context: ProtocolExecutionContext,
-    ) -> Result<(), ChainError> {
-        let block_height = context.block_height();
-        self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
     }
 
     pub fn shutdown(&mut self) -> Result<(), ChainError> {
@@ -1941,6 +1913,7 @@ impl Controller {
         let mut failed_transactions = Vec::new();
         let block_height = BlockHeader::num_from_id(&self.preferred_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.validate_accepted_protocol_state()?;
         let block_status = BlockStatus::Building;
 
         // The schedule active for this block is normally its parent's active
@@ -2021,10 +1994,6 @@ impl Controller {
 
         let mut db = self.db.clone();
         db.arena_start_undo_session(); // the block session; retained on the pending chain
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
-            db.arena_undo();
-            return Err(error);
-        }
 
         // Expiry clearing is part of the block's state, so it belongs inside the
         // block's session rather than before it.
@@ -2929,7 +2898,7 @@ impl Controller {
             self.db
                 .append_activated_protocol_feature(digest, activation_height)?;
         }
-        self.validate_persisted_protocol_state(block.block_num(), false)?;
+        self.validate_accepted_protocol_state()?;
 
         if accepted_schedule_state.active.version != self.active_schedule.version {
             info!(
@@ -3286,7 +3255,7 @@ impl Controller {
         let mut xpr_bot_oracle_cache = super::xpr_native_replay::DirectBotOracleCache::default();
         let mut dependency_reports = Vec::<TransactionDependencies>::new();
         let mut untracked_transactions = 0usize;
-        self.prepare_protocol_execution(protocol_context)?;
+        self.validate_accepted_protocol_state()?;
         self.blocks_executed += 1;
 
         let mut schedule_state = self.schedule_state_for_parent(block.previous_id())?;
@@ -3855,17 +3824,12 @@ impl Controller {
         self.replay_accepted_state_to(parent_id, block_status, &mut replay_mempool)?;
         let block_height = BlockHeader::num_from_id(&parent_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.validate_accepted_protocol_state()?;
         let schedule_state = self.schedule_state_for_parent(&parent_id)?;
         self.block_active_schedule = schedule_state.active;
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
-            // Admission executes the same activation boundary as block
-            // production, but its outer session is always discarded.
-            db.arena_undo();
-            return Err(error);
-        }
         let result = self.execute_transaction_with_protocol(
             transaction,
             protocol_context,
@@ -3900,15 +3864,12 @@ impl Controller {
         self.replay_accepted_state_to(parent_id, block_status, &mut replay_mempool)?;
         let block_height = BlockHeader::num_from_id(&parent_id) + 1;
         let protocol_context = self.ensure_protocol_version_supported(block_height)?;
+        self.validate_accepted_protocol_state()?;
         let schedule_state = self.schedule_state_for_parent(&parent_id)?;
         self.block_active_schedule = schedule_state.active;
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
-            db.arena_undo();
-            return Err(error);
-        }
         let result = self.execute_transaction_with_protocol(
             transaction,
             protocol_context,
@@ -4401,7 +4362,7 @@ impl Controller {
         // so unwind speculation before taking the physical arena snapshot.
         self.clear_pending()?;
         let height = self.last_accepted_block.block_num();
-        self.validate_persisted_protocol_state(height, false)?;
+        self.validate_accepted_protocol_state()?;
 
         // Reuse the cached snapshot while it still commits to the tip; otherwise
         // take a fresh one. Re-snapshotting scans the whole arena, so caching
@@ -7352,6 +7313,15 @@ mod tests {
     }
 
     fn init_test_controller() -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
+        let temp = get_temp_dir();
+        let (controller, key, chain_id) = open_test_controller(&temp, &[])?;
+        Ok((controller, key, chain_id, temp))
+    }
+
+    fn open_test_controller(
+        dir: &TempDir,
+        upgrades: &[u8],
+    ) -> Result<(Controller, PrivateKey, Id), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -7359,20 +7329,20 @@ mod tests {
             PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
         let mut controller = Controller::new();
         let genesis_bytes = generate_genesis(&private_key);
-        let temp_path = get_temp_dir();
         let config_bytes = json!({
             "producer_name": "pulse",
             "producer_key": private_key.to_string(),
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
+        controller.initialize_with_protocol_upgrades(
             &chain_id,
             &config_bytes,
-            &genesis_bytes.to_vec(),
-            temp_path.path().to_str().unwrap(),
+            &genesis_bytes,
+            upgrades,
+            dir.path().to_str().unwrap(),
         )?;
-        Ok((controller, private_key, chain_id, temp_path))
+        Ok((controller, private_key, chain_id))
     }
 
     #[tokio::test]
@@ -7990,6 +7960,48 @@ mod tests {
             "rejected block's state must not persist in the database"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_verifies_child_before_accepting_protocol_activation() -> Result<(), ChainError> {
+        let upgrades = br#"{"protocol_upgrades":[{"protocol_version":2,"activation_height":2}]}"#;
+        let producer_dir = get_temp_dir();
+        let peer_dir = get_temp_dir();
+        let (mut producer, key, chain_id) = open_test_controller(&producer_dir, upgrades)?;
+        let (mut peer, _, _) = open_test_controller(&peer_dir, upgrades)?;
+        let mut producer_pool = Mempool::new();
+        let mut peer_pool = Mempool::new();
+
+        producer_pool.add_transaction(create_account(&key, Name::from_str("aaa")?, chain_id)?);
+        let activation = producer.build_block(&mut producer_pool).await?;
+        assert_eq!(activation.block_num(), 2);
+        producer.accept_block(&activation.id()?, &mut producer_pool)?;
+        peer.verify_block(&activation, &mut peer_pool).await?;
+
+        producer_pool.add_transaction(create_account(&key, Name::from_str("bbb")?, chain_id)?);
+        let child = producer.build_block(&mut producer_pool).await?;
+        producer.accept_block(&child.id()?, &mut producer_pool)?;
+        peer.verify_block(&child, &mut peer_pool).await?;
+        assert_eq!(peer.last_accepted_block().block_num(), 1);
+        assert!(peer.db.activated_protocol_features()?.is_empty());
+
+        peer.accept_block(&activation.id()?, &mut peer_pool)?;
+        peer.accept_block(&child.id()?, &mut peer_pool)?;
+        let records = producer.db.activated_protocol_features()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(peer.db.activated_protocol_features()?, records);
+        assert_eq!(peer.db.arena_state_root(), producer.db.arena_state_root());
+        peer.shutdown()?;
+        drop(peer);
+
+        assert!(matches!(
+            open_test_controller(&peer_dir, &[]),
+            Err(ChainError::BlockError(message)) if message.contains("activation record(s)")
+        ));
+        let (restarted, _, _) = open_test_controller(&peer_dir, upgrades)?;
+        assert_eq!(restarted.last_accepted_block_id, child.id()?);
+        assert_eq!(restarted.db.activated_protocol_features()?, records);
         Ok(())
     }
 

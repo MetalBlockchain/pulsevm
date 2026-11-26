@@ -263,13 +263,18 @@ initialization. PulseVM validates those bytes and keeps the complete schedule in
 memory for that process lifetime. On every restart, it is loaded again from the
 new initialization request.
 
-When a candidate reaches an activation height, PulseVM writes a
-domain-separated digest of `(protocol_version, activation_height)` to
-chainbase's existing `protocol_state_object`. The write happens inside that
-block's undo session and before any new rule runs. A rejected block or losing
-fork rolls the record back; accepting the block commits it with the rest of
-state. The ordered records are included in physical snapshots and state-history
-deltas.
+PulseVM applies the scheduled rules while building or verifying the activation
+block. When MetalGo accepts that block, PulseVM persists the activation height
+and the digest of `(protocol_version, activation_height)` in
+`protocol_records.json` beside the arena. A node can verify descendants of the
+activation block before accepting it. During that interval, it selects each
+candidate's rules by its height and checks persisted records through its last
+accepted block. A rejected candidate leaves the accepted records unchanged.
+
+In v1.1.2, verifying a child while its activation block was still pending
+could report a schedule mismatch at the parent's height. Roll out the corrected
+binary across the network with the agreed activation height. Nodes can confirm
+their loaded schedule using `getInfo.protocol_upgrade_schedule_hash`.
 
 At startup, the persisted records must exactly equal the configured schedule
 prefix through the accepted head. This makes an activated entry immutable:
@@ -284,11 +289,11 @@ carry the active version plus a canonical activated-prefix hash. The leading
 marker makes pre-feature binaries reject the summary instead of ignoring an
 appended field and importing unsupported state. A current receiver compares the
 commitment with its local schedule before downloading or replacing state, and
-the physical snapshot carries the chainbase activation records. Legacy
+restores the accepted activation records from that matching schedule. Legacy
 summaries without a commitment are accepted only for pure version-1 history.
 
-Snapshot installation validates the staged arena's revision and activation
-records before replacing live state. Immediately before that replacement,
+Snapshot installation validates the staged arena's revision against the
+summary height before replacing live state. Immediately before that replacement,
 PulseVM durably creates a `state_sync_installing` marker. It then publishes the
 arena, re-bases the block log, clears the trace and chain-state logs, and writes
 an atomically replaced, checksummed producer-schedule base for the re-based log.
@@ -327,14 +332,14 @@ when the selected version is outside the binary's declared support range.
 |---|---|
 | Upgrade bytes are malformed or fail schedule validation | VM initialization fails |
 | A future unsupported version is scheduled but not active | Initialization and block processing continue under the current supported version |
-| The configured active prefix differs from chainbase's persisted activation records | Initialization or execution fails; accepted history is never reinterpreted |
+| The configured prefix through the last accepted block differs from the persisted activation records | Initialization or execution fails |
 | The schedule reaches a version excluded by this binary's Cargo profile | Unsupported-version failure before the new rules execute |
 | The last accepted block already requires an unsupported version | Restart/initialization fails |
 | The next block to build requires an unsupported version | Block building fails before block execution |
 | Transaction admission targets an unsupported next block | Admission fails before mempool insertion or gossip |
 | A candidate block requires an unsupported version | Verification fails before transaction execution |
 | A state-sync snapshot requires an unsupported version or has a mismatched activated-prefix commitment | The summary is rejected before download or local-state replacement |
-| A staged snapshot's arena revision or activation records disagree with its summary | Installation is rejected while the live database remains unchanged |
+| A staged snapshot's arena revision disagrees with its summary height | Installation is rejected while the live database remains unchanged |
 | Persistence fails after state sync or block acceptance has started publishing consensus state | The VM fail-stops without returning control to MetalGo; it must be recovered or resynced instead of continuing on a potentially split arena/log view |
 | Nodes load different future schedules that currently select the same version | Their schedule hashes, and usually their next-upgrade fields, differ before the boundary |
 
