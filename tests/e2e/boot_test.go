@@ -19,6 +19,7 @@ import (
 // the test harness itself.
 const bootBinary = "pulsevm-e2e-boot"
 const admissionSoakBinary = "pulsevm-e2e-admission-soak"
+const stressBinary = "pulsevm-e2e-stress"
 
 // bootStep is one entry of the helper's JSON report.
 type bootStep struct {
@@ -48,13 +49,24 @@ func AdmissionSoakBinaryPath() (string, error) {
 	return fixtureBinaryPath(admissionSoakBinary)
 }
 
+// StressBinaryPath locates the mixed-workload stress fixture.
+func StressBinaryPath() (string, error) {
+	return fixtureBinaryPath(stressBinary)
+}
+
 func fixtureBinaryPath(binary string) (string, error) {
 	root, err := RepoRoot()
 	if err != nil {
 		return "", err
 	}
+	// CARGO_TARGET_DIR relocates cargo's output; honor it so a shared or
+	// out-of-tree target directory works without copying binaries around.
+	targetDir := filepath.Join(root, "target")
+	if override := os.Getenv("CARGO_TARGET_DIR"); override != "" {
+		targetDir = override
+	}
 	for _, profile := range []string{"release", "debug"} {
-		path := filepath.Join(root, "target", profile, binary)
+		path := filepath.Join(targetDir, profile, binary)
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
 		}
