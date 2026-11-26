@@ -143,14 +143,16 @@ No migration doc is credible without this. Each risk names its backstop:
 - **Gateway flip goes wrong.** Routes flip one at a time, each with a
   smoke check and an abort that re-points that route at the XPR follow
   stack — which keeps running read-only for a week as the audit source
-  and instant fallback. A bad flip is a re-point, not an incident.
+  and instant fallback. A bad flip is a re-point, not an incident. The
+  frozen XPR full-replay index remains as the permanent pre-H archive.
 - **Exchange credits the wrong chain.** New chain ID makes protocol
   replay impossible; the remaining risk is a venue crediting an XPR-side
   deposit after H. Mitigation is the freeze procedure plus the negative
   replay tests every venue runs on staging first.
 - **Cost of the transition.** Parallel backends, reindex compute, and a
-  week of dual-running the follow stack. That spend is the price of the
-  fallback above; it ends when the follow stack archives.
+  week of dual-running the follow stack, plus long-term storage and restore
+  drills for the frozen pre-H archive. Measure archive size on mainnet data;
+  no production-size measurement is available yet.
 
 ## What changes for clients
 
@@ -166,9 +168,12 @@ Deliberately little, and every change is announced with a test path:
 - **APIs:** PulseVM JSON-RPC is primary; Leap-compatible routes
   (`v1/chain/*`, including `send_transaction`) stay enabled so existing
   wallets and `cleos` keep working without changes.
-- **History:** Hyperion is reindexed from the A-Chain from H-state.
-  Until row-count gates pass, history keeps serving from the XPR stack.
-  Explorers flip history source only after the gates.
+- **History:** Hyperion hydrates from A-Chain state at H and indexes H+1
+  onward. The XPR full-replay index is frozen at H and retained permanently.
+  A history router sends pre-H transaction queries there and newer queries
+  to A-Chain Hyperion. Providers must run the H+1 indexer and preserve a
+  tested backup of the XPR archive; no provider should assume it can discard
+  or reuse the old index.
 - **What does not happen:** no airdrop claim, no token swap, no new
   keys to generate. Anything asking for those during the migration is
   a scam — the announcement memo will say so explicitly.
@@ -200,8 +205,10 @@ date gets set once every box has something checkable in it.
 **Wallet, explorer, and indexer teams:**
 - [ ] Chain ID + BlockchainID behind a feature flag, tested against
   staging, with the flip procedure documented.
-- [ ] Hyperion reindex measured on a staging snapshot: hours from H,
-  plus the row-count gate query used to verify it.
+- [ ] Hyperion hydration from H plus SHiP ingestion from H+1 measured on a
+  staging snapshot, with row-count gates and the pre-H history router tested.
+- [ ] XPR full-replay archive size measured, backup restored in a drill, and
+  a named long-term host and storage owner assigned.
 - [ ] Explorer cutover order: RPC adapter first, history source
   second, each with its rollback step.
 - [ ] SHiP continuity check: overlapping block numbers between old
@@ -211,8 +218,10 @@ date gets set once every box has something checkable in it.
 - [ ] Named technical contact and staging endpoint credentials.
 - [ ] Ticker decision (same or new) applied on staging.
 - [ ] Test deposit landed and visible on staging.
-- [ ] Freeze height logic (H + 180 confirmations) implemented and
-  the negative replay tests passing both directions.
+- [ ] Freeze height uses the measured producer finality lag: at the reported
+  330-block lag, `P - H >= 2 × 330 + 12 = 672` blocks. Re-measure before T-14;
+  venue deposit/withdrawal suspension uses the agreed P, not H+180.
+  Negative replay tests pass both directions.
 - [ ] Balance snapshot query at H LIB, reconciled against staging.
 
 **Contract owners:**
@@ -235,8 +244,10 @@ date gets set once every box has something checkable in it.
 
 ## Timeline
 
-T-14 days: venues get chain ID, ticker plan, freeze procedure, staging
-endpoint. T-7: freeze implementations confirmed, negative tests replayed.
-H: halt commitment, export, boot, H+1. H+1 week stable: retire the follow
-stack, archive the audit snapshot. Every date is set backwards from the
+T-14 days: venues get the pinned Antelope signing chain ID, ticker plan,
+freeze procedure, and staging endpoint. The MetalGo platform ID is assigned
+after chain registration and distributed separately. T-7: freeze
+implementations confirmed, negative tests replayed. At H: halt commitment,
+export, boot, H+1. H+1 week stable: stop live XPR following while retaining
+the frozen pre-H archive and its verified backup permanently. Every date is set backwards from the
 inputs above — the day the last box is checked is the day we announce H.

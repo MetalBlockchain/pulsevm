@@ -93,26 +93,48 @@ fn names(height: u64) -> (String, String) {
 
 impl SummaryStore {
     /// Open (creating if needed) the store at `dir`, taking up the summaries a
-    /// previous run left. A half-written file from a run that was killed is
-    /// removed, and a pair that is not whole (a missing snapshot, a wrong length) is
-    /// ignored.
+    /// previous run left. Half-written files and orphaned/corrupt pairs are
+    /// removed; they can be rebuilt from the accepted state.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, ChainError> {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| io_error("create", &dir, e))?;
         let mut entries = Vec::new();
         let listing = fs::read_dir(&dir).map_err(|e| io_error("list", &dir, e))?;
-        for entry in listing.filter_map(Result::ok) {
+        let mut snapshots_with_valid_summaries = std::collections::BTreeSet::new();
+        for entry in listing {
+            let entry = entry.map_err(|e| io_error("list entry", &dir, e))?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".tmp") {
-                let _ = fs::remove_file(&path);
+                remove_if_present(&path)?;
                 continue;
             }
             if !name.ends_with(".summary") {
                 continue;
             }
             if let Some(summary) = Self::load(&dir, &path) {
+                snapshots_with_valid_summaries.insert(summary.height);
                 entries.push(summary);
+            } else {
+                if let Some(height) = name
+                    .strip_suffix(".summary")
+                    .and_then(|height| height.parse::<u64>().ok())
+                {
+                    let (snapshot_name, _) = names(height);
+                    remove_if_present(&dir.join(snapshot_name))?;
+                }
+                remove_if_present(&path)?;
+            }
+        }
+        for entry in fs::read_dir(&dir).map_err(|e| io_error("list", &dir, e))? {
+            let entry = entry.map_err(|e| io_error("list entry", &dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(height) = name
+                .strip_suffix(".snapshot")
+                .and_then(|height| height.parse::<u64>().ok())
+                && !snapshots_with_valid_summaries.contains(&height)
+            {
+                remove_if_present(&entry.path())?;
             }
         }
         entries.sort_by_key(|summary| summary.height);
@@ -263,6 +285,14 @@ impl SummaryStore {
     }
 }
 
+fn remove_if_present(path: &Path) -> Result<(), ChainError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove stale file", path, error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,9 +367,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // A kill after the snapshot rename but before the summary rename.
+        fs::write(path.join("400.snapshot"), b"orphan snapshot").unwrap();
         let reopened = SummaryStore::open(&path).unwrap();
         assert_eq!(reopened.heights(), vec![100, 200]);
         assert!(!path.join("300.snapshot.tmp").exists());
+        assert!(!path.join("400.snapshot").exists());
+        assert!(!path.join("999.summary").exists());
         assert_eq!(reopened.at(200).unwrap().bytes, vec![2u8; 40]);
     }
 

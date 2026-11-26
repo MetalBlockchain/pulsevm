@@ -163,21 +163,31 @@ fn state_sync_is_worth_it(target_height: u64, last_accepted: u64, min_blocks_beh
     target_height > last_accepted.saturating_add(min_blocks_behind)
 }
 
-fn dead_chain_timeout_reached(now_ms: u64, last_accept_ms: u64, timeout_ms: u64) -> bool {
-    timeout_ms > 0 && now_ms.saturating_sub(last_accept_ms) >= timeout_ms
+fn validate_dead_chain_shutdown_setting(config_bytes: &[u8]) -> Result<(), String> {
+    let timeout = serde_json::from_slice::<serde_json::Value>(config_bytes)
+        .ok()
+        .and_then(|config| config.get("dead_chain_shutdown_after_secs")?.as_u64())
+        .unwrap_or(0);
+    if timeout == 0 {
+        return Ok(());
+    }
+    Err("dead_chain_shutdown_after_secs is unsupported: the VM plugin cannot stop or unadvertise its MetalGo host; use a host-level health check and supervisor".into())
 }
 
 #[cfg(test)]
-mod dead_chain_watchdog_tests {
-    use super::dead_chain_timeout_reached;
+mod dead_chain_setting_tests {
+    use super::validate_dead_chain_shutdown_setting;
 
     #[test]
-    fn timeout_is_disabled_and_resets_on_each_accepted_block() {
-        assert!(!dead_chain_timeout_reached(10_000, 0, 0));
-        assert!(!dead_chain_timeout_reached(9_999, 0, 10_000));
-        assert!(dead_chain_timeout_reached(10_000, 0, 10_000));
-        assert!(!dead_chain_timeout_reached(10_000, 1, 10_000));
-        assert!(!dead_chain_timeout_reached(0, 1, 10_000));
+    fn refuses_the_unsafe_in_plugin_shutdown_setting() {
+        assert!(
+            validate_dead_chain_shutdown_setting(br#"{"dead_chain_shutdown_after_secs":0}"#)
+                .is_ok()
+        );
+        let error =
+            validate_dead_chain_shutdown_setting(br#"{"dead_chain_shutdown_after_secs":3600}"#)
+                .unwrap_err();
+        assert!(error.contains("cannot stop or unadvertise its MetalGo host"));
     }
 }
 
@@ -471,9 +481,6 @@ async fn shutdown_signal(vm: VirtualMachine) {
     tokio::select! {
         _ = terminate => {},
         _ = sigint => {},
-        _ = vm.shutdown_requested.notified() => {
-            info!("dead-chain watchdog requested a graceful shutdown");
-        },
     }
 }
 
@@ -498,18 +505,16 @@ pub struct VirtualMachine {
     rpc_service: chain::RpcService,
     block_timer: Arc<RwLock<BlockTimer>>,
     ready_to_terminate: Arc<AtomicBool>,
-    shutdown_requested: Arc<tokio::sync::Notify>,
     controller_shutdown: Arc<AtomicBool>,
-    last_block_accept_ms: Arc<std::sync::atomic::AtomicU64>,
     // Fired when a background state sync finishes applying, so `wait_for_event`
     // can report MESSAGE_STATE_SYNC_FINISHED to the engine.
     sync_finished: Arc<tokio::sync::Notify>,
     // True while the engine has put this VM in the state-syncing state. Read by
     // `wait_for_event`, which must report nothing but the end of the sync then.
     engine_state_syncing: Arc<AtomicBool>,
+    started: std::time::Instant,
     // Refused blocks above the head, gathered into a summary per window.
     refused_blocks: Arc<std::sync::Mutex<chain::RefusedBlocks>>,
-    started: std::time::Instant,
     // The state summaries this node offers, kept on disk (see chain::SummaryService).
     summaries: Arc<chain::SummaryService>,
 }
@@ -568,13 +573,11 @@ impl VirtualMachine {
             rpc_service: rpc_service,
             block_timer,
             ready_to_terminate: Arc::new(AtomicBool::new(false)),
-            shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             controller_shutdown: Arc::new(AtomicBool::new(false)),
-            last_block_accept_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_finished: Arc::new(tokio::sync::Notify::new()),
             engine_state_syncing: Arc::new(AtomicBool::new(false)),
-            refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
             started: std::time::Instant::now(),
+            refused_blocks: Arc::new(std::sync::Mutex::new(chain::RefusedBlocks::default())),
             summaries: Arc::new(chain::SummaryService::new()),
         })
     }
@@ -592,31 +595,6 @@ impl VirtualMachine {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         result
-    }
-
-    fn start_dead_chain_watchdog(&self, timeout_secs: u64) {
-        if timeout_secs == 0 {
-            return;
-        }
-        let timeout_ms = timeout_secs.saturating_mul(1000);
-        let last_accept = self.last_block_accept_ms.clone();
-        let requested = self.shutdown_requested.clone();
-        let started = self.started;
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tick.tick().await;
-                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                let last_ms = last_accept.load(std::sync::atomic::Ordering::Acquire);
-                if dead_chain_timeout_reached(now_ms, last_ms, timeout_ms) {
-                    warn!(
-                        "no block has been accepted for {timeout_secs} seconds; the opt-in dead-chain watchdog is shutting down"
-                    );
-                    requested.notify_one();
-                    break;
-                }
-            }
-        });
     }
 }
 
@@ -790,11 +768,7 @@ impl Vm for VirtualMachine {
             spdlog::default_logger().set_level_filter(log_level_filter(Some(&level)));
         }
         let summaries_dir = std::path::Path::new(&db_path).join("summaries");
-        let dead_chain_shutdown_after_secs =
-            serde_json::from_slice::<serde_json::Value>(&config_bytes)
-                .ok()
-                .and_then(|config| config.get("dead_chain_shutdown_after_secs")?.as_u64())
-                .unwrap_or(0);
+        validate_dead_chain_shutdown_setting(&config_bytes).map_err(Status::invalid_argument)?;
         let controller = self.controller.clone();
         // Restoring a full Arena checkpoint is CPU- and I/O-bound. Keep it off
         // the Tokio worker while MetalGo's RPC transport remains responsive.
@@ -842,11 +816,6 @@ impl Vm for VirtualMachine {
             }
             controller.mempool_admission_state()
         };
-        self.last_block_accept_ms.store(
-            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            std::sync::atomic::Ordering::Release,
-        );
-        self.start_dead_chain_watchdog(dead_chain_shutdown_after_secs);
         self.rpc_service.set_admission_state(admission_state);
         // A node that cannot keep summaries still runs; it just offers none.
         if let Err(error) = self.summaries.open(summaries_dir) {
@@ -1222,10 +1191,6 @@ impl Vm for VirtualMachine {
             }
             return Err(Status::internal(format!("could not accept block: {}", e)));
         }
-        self.last_block_accept_ms.store(
-            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            std::sync::atomic::Ordering::Release,
-        );
         debug!(
             "block accepted with id {}, returning from block_accept",
             block_id
@@ -1606,8 +1571,9 @@ impl Vm for VirtualMachine {
         &self,
         _request: Request<()>,
     ) -> Result<tonic::Response<vm::StateSyncEnabledResponse>, Status> {
+        let enabled = self.controller.read().await.state_sync_enabled();
         Ok(Response::new(vm::StateSyncEnabledResponse {
-            enabled: true,
+            enabled,
             err: 0,
         }))
     }
@@ -1634,6 +1600,14 @@ impl Vm for VirtualMachine {
         info!("received request: {:?}", request);
         let (tip, min_age) = {
             let controller = self.controller.read().await;
+            if !controller.state_sync_enabled() {
+                return Ok(Response::new(vm::GetLastStateSummaryResponse {
+                    id: vec![],
+                    height: 0,
+                    bytes: vec![],
+                    err: vm::Error::NotFound as i32,
+                }));
+            }
             (
                 u64::from(controller.last_accepted_block().block_num()),
                 controller.state_summary_min_age(),
@@ -1677,6 +1651,13 @@ impl Vm for VirtualMachine {
         request: Request<vm::GetStateSummaryRequest>,
     ) -> Result<tonic::Response<vm::GetStateSummaryResponse>, Status> {
         info!("received request: {:?}", request);
+        if !self.controller.read().await.state_sync_enabled() {
+            return Ok(Response::new(vm::GetStateSummaryResponse {
+                id: vec![],
+                bytes: vec![],
+                err: vm::Error::NotFound as i32,
+            }));
+        }
         // The host asks for the heights it chose when it voted; this node answers
         // for the fixed heights it keeps a summary for, and for no other.
         Ok(Response::new(
@@ -1700,6 +1681,13 @@ impl Vm for VirtualMachine {
         request: Request<vm::StateSummaryAcceptRequest>,
     ) -> Result<tonic::Response<vm::StateSummaryAcceptResponse>, Status> {
         info!("received state summary accept request");
+
+        if !self.controller.read().await.state_sync_enabled() {
+            return Ok(Response::new(vm::StateSummaryAcceptResponse {
+                mode: vm::state_summary_accept_response::Mode::Skipped as i32,
+                err: 0,
+            }));
+        }
 
         // Parse the commitment up front so a malformed summary is rejected here,
         // before we commit to the asynchronous DYNAMIC mode.
@@ -1750,15 +1738,18 @@ impl Vm for VirtualMachine {
         // Fetch each chunk from peers, verify the payload against the summary
         // hash, then apply it.
         let controller = self.controller.clone();
-        let quarantine_path = self.controller.read().await.state_sync_quarantine_path();
         let network = self.network_manager.clone();
         let sync_finished = self.sync_finished.clone();
         tokio::spawn(async move {
-            let net = network.clone();
             let height = target.height;
             let hash = target.hash;
-            let download =
-                pulsevm_core::state_sync::download_snapshot(&target, move |offset, len| {
+            let peers = network.read().await.connected_node_ids();
+            let mut download = Err(pulsevm_core::ChainError::NetworkError(
+                "state sync: no connected peers to fetch from".into(),
+            ));
+            for peer in peers {
+                let net = network.clone();
+                match pulsevm_core::state_sync::download_snapshot(&target, move |offset, len| {
                     let net = net.clone();
                     async move {
                         let req = pulsevm_core::state_sync::ChunkRequest {
@@ -1767,10 +1758,24 @@ impl Vm for VirtualMachine {
                             offset,
                             len,
                         };
-                        chain::NetworkManager::request_chunk(&net, &req).await
+                        chain::NetworkManager::request_chunk_from_peer(&net, peer, &req).await
                     }
                 })
-                .await;
+                .await
+                {
+                    Ok(envelope) => {
+                        download = Ok(envelope);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "state sync snapshot from peer {} failed integrity or transfer checks: {error}; trying another peer",
+                            hex::encode(peer.0)
+                        );
+                        download = Err(error);
+                    }
+                }
+            }
 
             match download {
                 Ok(envelope) => {
@@ -1785,19 +1790,9 @@ impl Vm for VirtualMachine {
                         Ok(()) => {
                             info!("state sync applied at height {}", height);
                             drop(controller);
-                            if let Some(path) = quarantine_path {
-                                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(
-                                    &path,
-                                ) {
-                                    Ok(()) => info!(
-                                        "removed abandoned pre-sync data after authenticated state sync"
-                                    ),
-                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(error) => warn!(
-                                        "state sync succeeded, but could not remove abandoned pre-sync data: {error}"
-                                    ),
-                                });
-                            }
+                            info!(
+                                "authenticated state sync succeeded; prior quarantined data is retained for operator recovery or cleanup"
+                            );
                         }
                         Err(e) if e.is_fatal_consistency() => {
                             // The arena or its companion metadata crossed a

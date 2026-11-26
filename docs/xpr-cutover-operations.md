@@ -17,8 +17,8 @@ named owner; nothing ships "when ready".
 | Ceremony contract account + code hash, voter release version | Chain ops | BPs verify the hash before deploying |
 | Roster snapshot method (producers table, frozen at H-K) | Chain ops | How the roster file is built, byte-exact |
 | Coordinator URLs (params + confirmations) | Chain ops | Or the manual file path; cross-checked against the node either way |
-| Successor chain id, or the pinned `chain_id` (U-1) | Chain ops + MetalGo team | Without U-1: published at H, wallets flip at H+ε |
-| Platform chain id | MetalGo team | Bound into every confirmation; the gate refuses without it |
+| Successor Antelope signing id (`chain_id`, U-1) | Chain ops | Pin and publish at T-14; wallets and exchanges can preconfigure it |
+| Platform chain id (MetalGo subnet id) | MetalGo team | Assigned after registration at H; bound into every confirmation and exposed separately as `platform_chain_id` |
 | Wallet/exchange test vectors (pre-H and post-H) | Wallet + exchange leads | Sign/verify fixtures on both chains before the window |
 | Stop window P (agreed stop height, P - H) | Chain ops | Measure the live head-minus-LIB gap at T-14 and set `P - H >= 2 x gap + 12`; a Leap snapshot of H only finalizes once H is irreversible, so a shorter window leaves no snapshot. `--preflight` refuses a short window |
 | Voter config per producer (producer name, keys, producer API URL) | Each BP | `--preflight` must print GO before the freeze |
@@ -66,6 +66,19 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
    platform mismatch. Any refusal is a stop-and-diagnose, never a retry
    with relaxed checks.
 
+6. **LIVE and CONFIRMED are operator signals.** Publish LIVE only after the
+   registered platform id is verified, at least two-thirds of validator stake
+   has booted on the pinned signing id, and the validator head has agreed for
+   30 consecutive blocks. Keep XPR recovery available during the one-hour
+   observation window. Publish CONFIRMED after that hour only if the A-Chain
+   remains healthy, the API and history continuity checks pass, and the
+   coordinator records the decision. A rollback to XPR is an operator decision
+   available only before CONFIRMED. After CONFIRMED, every XPR producer removes
+   its XPR signing key from the live host and stores any required recovery copy
+   offline under key-custody policy. PulseVM has no protocol-level LIVE or
+   CONFIRMED flag; coordinator identity, publication channel, and sign-off
+   owners must be assigned before T-14.
+
 **Superseded round.** If H+1 slips in before the pause (snapshot holds a
 head past H), the round is dead: the old declaration stays on-chain as
 superseded history and the ceremony restarts at a new H. Never reuse an
@@ -77,14 +90,13 @@ data disagreeing with the local node, tally short of 2/3 at H, or a
 confirmation that will not verify. A failed ceremony is a new governance
 decision, not a same-H retry.
 
-## Platform chain id ordering (testnet and mainnet)
+## Chain ids and platform ordering (testnet and mainnet)
 
-The platform id (MetalGo blockchain id) is a hash of the CreateChain
-transaction, whose genesis commits to the checkpoint hash. Both exist only
-after H is exported, so the id cannot be published at T-14 and cannot be
-pinned by U-1 (`chain_id_override` only names the PulseVM chain id for
-wallets). The real order is therefore the one the rehearsal harness calls
-learn-then-bind:
+The pinned Antelope signing id and platform id have different roles.
+`get_info.chain_id` and SHiP report the pinned id used by wallets to sign;
+`get_info.platform_chain_id` reports the MetalGo subnet id. The latter is a
+hash of the CreateChain transaction, whose genesis commits to the checkpoint,
+so it still exists only after H and is learned-then-bound by the ceremony:
 
 1. After H: export the checkpoint, build the migration genesis, register the
    chain on the MetalGo subnet. The first boot refuses at the restore gate
@@ -96,6 +108,22 @@ learn-then-bind:
 Plan the confirmation window (H..H+J) to include steps 1-2 end to end, and
 do not treat the step-1 refusal as an incident. A refusal for any other
 reason is a stop-and-diagnose.
+
+## API and history-only nodes
+
+API gateways and Hyperion/SHiP providers use the same verified migration
+bundle as validators: pinned genesis, protocol-upgrade schedule, checkpoint,
+and manifest. Start them from that checkpoint; do not join by state sync.
+Their node config keeps the canonical initial `producer_name`, sets
+`block_production_enabled=false`, omits `producer_key`, and sets
+`state_sync_enabled=false`. A Hyperion/SHiP provider also sets
+`state_history_enabled=true` before first boot so it records a contiguous
+history from H+1. An API-only node may disable history if it serves no SHiP
+clients. Compare `get_info.chain_id`, `platform_chain_id`,
+`block_production_enabled`, `state_sync_enabled`, and
+`state_summary_interval` with the release checklist. Publish the gateway only
+after the coordinator declares LIVE and the successor validator head passes the
+LIVE gate above.
 
 ## Admission lock and edge freeze (ceremony requirement)
 
@@ -287,13 +315,12 @@ weights, RAM and NET do not move. The checkpoint hash covers all of it
 The table compare applies the same transform to the nodeos side before it
 compares (`redenominate_source_tables`) for the three resource tables and prints
 a line saying so; every other byte and table is still compared exactly.
-`global_property` is the exception to a byte compare. PulseVM's row is 143 bytes
-and Leap's is 157: Leap prefixes the config with an optional proposed-schedule
-block number and a proposed producer schedule (6 bytes when empty) and carries
-two deferred-transaction fields, `deferred_trx_expiration_window` and
-`max_transaction_delay` (8 bytes), which PulseVM does not have. A byte compare
-can never match, so it used to end in FAILED and operators learned to accept
-it. The compare now decodes both rows with the importer's decoder and requires
+`global_property` is the exception to a byte compare. PulseVM's row is 145 bytes
+and Leap's is 157. PulseVM now writes the two absent optional proposed-schedule
+fields required by the SHiP ABI; the remaining 12-byte difference is Leap's
+deferred-transaction configuration, which PulseVM does not implement. A byte
+compare can never match, so it used to end in FAILED and operators learned to
+accept it. The compare now decodes both rows with the importer's decoder and requires
 the chain id and every other field to be equal (the CPU caps are read from the
 target as stored, so a wrong cap fails), then prints the two ignored values. A
 run that previously needed `global_property` and `contract_index_double`
@@ -854,23 +881,34 @@ Each finding below was checked against the code before it was acted on.
 
 **Remaining rehearsal blockers and operational limits:**
 
-- **A syncing validator still stalls its peers while MetalGo serves snapshot chunks.**
-  The reported 97 MB rehearsal stalled block production during snapshot transfer.
-  In the pinned MetalGo checkout, summary-frontier messages run under the chain
-  context lock, while `AppRequest` chunk messages are dispatched through the async
-  queue without that lock. The measurements establish the stall; they do not by
-  themselves identify a lock held while chunks are served. Profile the pinned host
-  under a mainnet-sized sync and fix the measured host bottleneck, then repeat the
-  multi-node rehearsal. PulseVM's fixed-height summaries and disk-backed chunks do
-  not remove that host-side throughput risk.
-- **A dead VM must take its MetalGo node out of polling.** PulseVM's
-  `dead_chain_shutdown_after_secs` watchdog and MetalGo's
-  `--shutdown-on-chain-creation-failure` shutdown-on-unhealthy option are both
-  opt-in. Configure the PulseVM timeout and enable the MetalGo option together:
-  the VM watchdog exits the plugin after the timeout, and MetalGo then shuts down
-  after three consecutive VM health-check failures. With either setting disabled,
-  the node can remain advertised after the chain stops making progress. The
-  rehearsal still needs to exercise this failure path on the pinned host.
+- **A validator that is itself state-syncing stops answering consensus polls.**
+  The corrected box test found that a non-validator downloaded the same 357 chunks
+  while five validators made 67–70 blocks, with 1.8% failed polls. A syncing
+  validator left the five-validator network at 0–12 blocks in each ~35-second
+  window, with 27% of one node's polls failing. Serving chunks is not the cause.
+  The 21-producer calculation suggests a 4.8% validator may be covered by the
+  8.33% max-benched-stake cap, but this has not been measured. The four-host
+  rehearsal must include a validator sync and record block production, poll
+  failures, bench state, and resume time. Do not claim mainnet-safe until the
+  21-producer or equivalent weight test passes.
+- **State-summary intervals are network-wide settings.** If validators use
+  different `state_summary_interval` values, they request different fixed heights;
+  the tested mismatch produced no state sync and a 3,546-block replay without a
+  useful diagnostic. Compare `get_info.state_summary_interval` on every validator
+  before the run and keep it identical. During bootstrap the VM now skips expensive
+  summary construction and resumes at the next aligned height after normal
+  operation.
+- **A damaged snapshot is retried from another peer.** Each transfer is pinned to
+  one peer so the final authenticated envelope hash identifies a bad source; on
+  transfer or integrity failure the VM retries the complete bounded snapshot from
+  another connected peer. Per-chunk proofs are still absent, so a bad peer can cost
+  one full transfer before it is identified. Block replay remains the final fallback.
+- **A VM that refuses to start or stops accepting blocks can still be counted by
+  MetalGo.** The plugin cannot stop MetalGo or remove the validator from polling.
+  The in-plugin watchdog was removed; a nonzero `dead_chain_shutdown_after_secs`
+  now fails initialization with an explicit explanation. Use a MetalGo-side
+  health integration or host supervisor that stops/restarts the host; this remains
+  external to this repo and is a rehearsal gate.
 - **The live five-node environment is not configured in this checkout.** The
   handover script can verify Pebble and synced writes on every live node, but that
   check has not been run against the rehearsal hosts here. Do not treat the local
@@ -882,7 +920,9 @@ Each finding below was checked against the code before it was acted on.
   the validator set or its consensus availability assumptions deliberately if that
   fault tolerance is not acceptable.
 - **A second round on a producer paused at an older P needs a coordinated operator
-  reset.** Do not auto-release an old pause for an unfinalized declaration. Stop the
+  reset.** A voter does not auto-release an old pause merely because local config
+  names a newer declaration; the new declaration must be independently verified
+  on-chain before release is automated. Until that proof path is rehearsed, stop the
   old voter on every validator, then run `xpr_cutover_voter --config voter.json
   --release-old-pause --expected-old-digest <old declaration digest>` on each
   producer host. It verifies the local pause record and producer/chain identity,
@@ -894,10 +934,10 @@ Each finding below was checked against the code before it was acted on.
   directory and boots fresh.** It does not guess which quarantined files form a
   usable checkpoint. The host must complete a new authenticated state sync. A cut
   during quarantine leaves a durable marker so startup can finish moving the files.
-- **Quarantine data is kept until authenticated state sync succeeds.** On successful
-  snapshot apply, PulseVM removes the abandoned pre-sync directory off the controller
-  lock. If cleanup fails, sync remains successful and the error is logged for disk
-  monitoring.
+- **Quarantined pre-sync data is retained for operator recovery.** Authenticated
+  state sync no longer deletes the `state_sync_abandoned/` directory. Keep it until
+  an operator has inspected the newest entry and explicitly removes it; monitor disk
+  usage and include retention in the data-volume budget.
 - **Not changed:** the freshness bounds in the manifest are asserted by the exporter,
   not committed by the ceremony; the multi-gigabyte checkpoint hash runs before the
   cheap pair verification; the declaration's source chain id is signed but not compared
@@ -975,21 +1015,19 @@ speed (roughly 0.5 to 1 s at 2 GB); that is an extrapolation, to be replaced by 
 measurement on the mainnet snapshot. Peak memory is lower than before but not small:
 the copy and the canonical bytes exist together while the copy is repacked.
 
-**Summaries at fixed heights (round 16).** Paul's measurements on the mainnet
-snapshot (2.09 GB arena) showed the copy was only about 30% of the hold: the state
-root (1.6 to 1.8 s) and the hash of the envelope (1.2 s) were full-state passes made
-under the controller, and `get_state_summary`, which every validator answers when
-voting, still built inline. The host accepts a summary only if more than half the
-validator weight returns the same summary id for the same height in one vote, with
-no retry. A summary of "the tip" cannot agree across validators whose tips differ by
-a block, and 30 of 53 vote requests on a serving node asked for a height other than
-its head and got `NotFound`, which is why about one sync in four fell back to replay.
+**Fixed-height summaries and the corrected sync finding.** Each validator builds a
+summary only at network-agreed multiples of `state_summary_interval`. `getInfo`
+reports this setting as `state_summary_interval`, so operators can compare it on
+every validator. All nodes must use the same value; a local mismatch silently
+changes available summary heights and can force block replay. The reported box test
+used 32 and 256; the production default 4096 was not observed to produce a summary
+within the test window.
 
-Now:
-
-- A summary is built for every block whose height is a multiple of
-  `state_summary_interval` (default 4096, about half an hour at two blocks a second;
-  0 turns summaries off). Every validator therefore offers the same heights.
+- A normal-operation node builds summaries at aligned heights (default 4096, about
+  half an hour at two blocks a second; 0 disables summaries). It skips expensive
+  summary work while MetalGo reports the VM bootstrapping or state-syncing, then
+  resumes at the next aligned height. This avoids generating every intermediate
+  snapshot during catch-up.
 - When the block at such a height is accepted, the controller copies the state out
   (the only work under the lock, about 1.2 s on the mainnet arena, once per interval on
   every validator at the same block). The state root, the repacking, the sparse encoding
@@ -1000,6 +1038,9 @@ Now:
   `state_summary_min_age` blocks (default 8) below the tip, or `NotFound`.
   `get_state_summary(height)` returns the kept summary for exactly that height, or
   `NotFound`. Neither builds anything or waits for a build.
+- Orphaned `.snapshot` files and invalid summary pairs are removed on store open;
+  they are rebuildable. Quarantine directories from interrupted installs are
+  retained after a later successful sync for operator inspection and cleanup.
 - Chunks are read from the snapshot file and need neither the controller nor a
   full-size copy in memory. A chunk request is limited to one chunk.
 - A node that joins when no summary is old enough catches up by fetching blocks, as
@@ -1007,17 +1048,23 @@ Now:
   from a migration checkpoint the first summary is at the first multiple of the interval
   above the restore height.
 
-What this does not yet establish: Paul measured near-zero block production on serving
-validators during state sync (about 37 s for 8 syncs at 97 MB, extrapolated to roughly 13
-minutes at mainnet size). The reported chain-lock explanation does not match the pinned
-MetalGo `v1.14.2-tahoe` source: `AppRequest` is routed through the asynchronous message
-queue and `executeAsyncMsg` calls the engine without taking the consensus context lock.
-The measurement remains a liveness concern, but the cause needs profiling before a code
-change can be chosen. The cutover faults stage now requires an actual snapshot sync to
-start and finish, and checks that a serving validator advances while it runs; block
-catch-up alone cannot pass the stage. The copy under the lock at each summary height, the cost of every
-kept summary on disk (about the size of the state, two kept), and the memory of a build
-(the copy and the canonical bytes together) remain costs of this design.
+The corrected box test showed that **the syncing validator** stalls consensus polls; a
+non-validator synced 357 chunks while the five validators produced 67–70 blocks with
+1.8% failed polls. Chunk serving itself was cheap. During a validator sync, peers made
+0–12 blocks in ~35 seconds and one node failed 27% of polls. The five-node rehearsal
+cannot establish mainnet behavior: with 21 equal validators, one has 4.8% stake, below
+the reported 8.33% max-benched-stake cap, but this must be measured at 21 validators.
+
+The measured 2.09 GB state costs 1.18–1.25 s for the held copy, 8.7–8.8 s for the
+background build, 2.4–2.8 s to write, and 7.56 GB peak memory. A corrupt snapshot is
+detected by its envelope hash only after downloading the full payload; per-chunk proofs
+is now retried from another peer after the full transfer fails integrity validation;
+per-chunk proofs would avoid that first wasted transfer. Plan large validator syncs and
+keep them rare until the validator-poll test is green. The cutover fault stage requires
+state sync to start and finish, but the 21-producer polling result remains unmeasured.
+The copy under the lock at each summary height, the cost of every kept summary on disk
+(about the size of the state, two kept), and the memory of a build (the copy and the
+canonical bytes together) remain costs of this design.
 
 ## The voter after a failure: restart, degraded mode, state file
 

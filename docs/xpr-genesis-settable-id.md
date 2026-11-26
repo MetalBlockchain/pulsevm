@@ -1,9 +1,10 @@
 # U-1: genesis-settable successor chain id — assessment
 
-Status: implemented in `GenesisState::chain_id_override`
-(`crates/pulsevm_chain_types/src/genesis.rs`), opt-in and bit-for-bit
-compatible when absent. The MetalGo launcher change (fixed chain
-registration) is still external.
+Status: implemented in genesis parsing and transaction signing. When the
+optional `chain_id` is present, it is the Antelope signing id reported by
+`get_info.chain_id` and SHiP; `get_info.platform_chain_id` reports the distinct
+MetalGo subnet id. Without the override, existing behavior is unchanged. Fixed
+chain registration in the MetalGo launcher remains external.
 
 ## Problem
 
@@ -64,10 +65,8 @@ bytes.
 
 ## Recommendation
 
-1. Add the optional `chain_id` genesis field behind the migration
-   extension (absent = current behavior, bit-for-bit).
-2. Publish the pinned id at T-14 with H, K, contract, and roster.
-3. Keep the confirmation's checkpoint binding unconditional: it is
+1. Publish the pinned id at T-14 with H, K, contract, and roster.
+2. Keep the confirmation's checkpoint binding unconditional: it is
    what makes a shared id safe.
-4. Coordinate the MetalGo launcher change before promising wallets a
+3. Coordinate the MetalGo launcher change before promising wallets a
    stable pre-H id.

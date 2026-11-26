@@ -106,15 +106,34 @@ State transfer is implemented and does not need reinventing:
    numeric `compression` (0/1) and the A-Chain chain ID enforced at the
    boundary. Test it with a low-value transfer before announcing
    general availability.
-3. Hyperion plus Elasticsearch is reindexed from the A-Chain SHiP stream
-   from genesis (which is H state). Until the reindex passes its row-count
-   gates, history requests keep serving from the XPR follow stack.
+3. Hyperion is hydrated from A-Chain state at H and starts consuming the
+   H+1 SHiP stream. Keep the XPR full-replay index frozen at H as the
+   permanent pre-cut archive. A history router serves pre-H transaction
+   lookups from that archive and H+1 onward from the new Hyperion. Do not
+   retire the archive with the one-week follow stack. Its production size
+   and storage cost are not measured yet; record both from a mainnet-sized
+   rehearsal before assigning a long-term host and retention budget.
+   Pin the exact Hyperion release and ClickHouse schema before the rehearsal.
+   Hyperion PR #6 is still open; its tests cover a synthetic indexed block and
+   integration against a live ClickHouse container, but it explicitly has no
+   load test at real chain volume. Do not treat it as production-ready until
+   merged, deployed, and measured with representative history volume.
 4. The Bloks explorer switches its PulseVM adapter to the A-Chain RPC and
    its history source to the new Hyperion only after gates pass. Producer
    tables and market data keep their existing presentation fallbacks.
 5. SHiP consumers re-point from the follow stream to the A-Chain stream;
    stream owners confirm continuity (no gap, no overlap) before the old
    stream is retired.
+
+**API and history node boot.** These nodes receive the same signed genesis,
+protocol-upgrade schedule, checkpoint and manifest as validators. Configure
+`block_production_enabled=false` with no `producer_key`, retain the canonical
+initial `producer_name`, and set `state_sync_enabled=false`. History providers
+also set `state_history_enabled=true` before first boot; joining by state sync
+would rebase the block and SHiP logs and discard the history they must serve.
+Expose the API only after the coordinator's LIVE announcement names the
+registered `platform_chain_id` and the successor validators agree on their
+head. LIVE is an operator/governance signal, not an on-chain protocol flag.
 
 ## 6. Gateways
 
@@ -130,9 +149,11 @@ cutover keeps every hostname and only re-points backends:
    until all flips complete.
 3. DNS and tunnels do not change; no client reconfiguration is required
    beyond the WebAuth submission endpoint already communicated.
-4. Keep the XPR follow stack (feed, replay, Hyperion) running read-only
-   for at least one week after the flip as the audit source and instant
-   fallback.
+4. Keep the XPR follow stack (feed, replay, Hyperion) read-only for the
+   one-week rollback window. At the end of that week stop live following,
+   but retain the H-frozen XPR full-replay index and its verified backup
+   permanently behind the pre-H history route. Archive storage ownership,
+   access control, restore drills, and funding must be assigned before LIVE.
 
 ## 7. Phases and gates
 
@@ -143,14 +164,15 @@ cutover keeps every hostname and only re-points backends:
 | Validator boot to H, two-thirds online | A-Chain validators | Same head block ID across quorum |
 | Private API verification | Migration operators | Low-value transfer round trip, Hyperion row counts |
 | Public gateway flip, route by route | Gateway operators | Per-route smoke checks green |
-| Retire follow stack | Migration operators | One week stable, audit snapshot archived |
+| Stop live XPR following | Migration operators | One week stable; frozen pre-H history archive and verified backup remain available |
 
 ## 8. Validation
 
 - `xpr_import_check` accepts the checkpoint plus manifest; genesis hash
   matches the manifest or startup refuses.
 - Two independent A-Chain nodes agree on head block ID from H forward.
-- `pulsevm.getInfo` reports the migration chain ID with H as base.
+- `pulsevm.getInfo.chain_id` and SHiP report the pinned Antelope signing ID;
+  `platform_chain_id` reports the distinct MetalGo subnet ID.
 - A low-value transfer submits, relays, and appears in an A-Chain block;
   its receipt root verifies.
 - Hyperion row counts reconcile against the export audit before history
@@ -226,20 +248,21 @@ name an owner and block the cited phase gate until closed.
 Named contact plus written acknowledgement per venue; silence is not
 consent and blocks the announcement phase.
 
-- T-14 days: send every venue the MetalGo blockchain (platform) ID —
-  known as soon as the A-Chain is created, which must happen before the
-  freeze — plus the ticker plan, the freeze/re-enable procedure below,
-  and a staging endpoint. The ceremony binds this id (not the
-  checkpoint-derived successor id, which only exists after the H export);
-  venues must reject anything signed under any other id. Require a named
-  contact and a test deposit on staging.
+- T-14 days: send every venue the pinned Antelope signing chain ID, which
+  wallets use in transaction signatures, plus the ticker plan, the
+  freeze/re-enable procedure below, and a staging endpoint. Send the MetalGo
+  platform ID separately once the subnet is registered; the ceremony binds
+  that platform ID and `get_info.platform_chain_id` reports it. Venues must
+  reject transactions signed under any other chain ID. Require a named contact
+  and a test deposit on staging.
 - T-7 days: confirm each venue's freeze implementation and replay the
   negative test: submit a known pre-H XPR transaction hash to the
   A-Chain and confirm rejection (wrong chain ID); submit an A-Chain
   transaction to XPR tooling and confirm rejection.
-- H: venues halt deposits and withdrawals at H plus 180 confirmations
-  (~90 seconds at 0.5-second blocks; adjust if block time changes) and
-  snapshot balances at the H LIB for reconciliation.
+- H: venues halt deposits and withdrawals at the agreed pause height P. For
+  the observed ~330-block head-minus-LIB lag, set `P - H >= 2 x 330 + 12 = 672`
+  blocks and re-measure at T-14; snapshot balances at the H LIB for
+  reconciliation. A fixed 180-confirmation delay may be shorter than finality.
 - Re-enable: deposits only carrying the A-Chain chain ID, under the
   agreed ticker. Post-H XPR deposits are never credited — the XPR chain
   keeps producing, so this rule must be explicit, not assumed.

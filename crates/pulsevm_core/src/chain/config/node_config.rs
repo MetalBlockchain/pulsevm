@@ -37,8 +37,13 @@ pub struct NodeConfig {
     pub allow_replay_recovery: bool,
     // Name of the block producer, must be a valid EOSIO name (up to 12 characters, a-z, 1-5)
     pub producer_name: Name,
-    // Private key of the block producer, used for signing blocks and transactions
-    pub producer_key: PrivateKey,
+    /// Private block-signing key. Required only when `block_production_enabled`
+    /// is true; API and history nodes must not need producer secrets.
+    #[serde(default)]
+    pub producer_key: Option<PrivateKey>,
+    /// Whether this node is allowed to construct and sign blocks.
+    #[serde(default = "default_block_production_enabled")]
+    pub block_production_enabled: bool,
     // Size of the memory mapped database in bytes
     #[serde(default = "default_db_size")]
     pub db_size: u64,
@@ -91,6 +96,12 @@ pub struct NodeConfig {
     #[serde(default = "default_state_sync_min_blocks_behind")]
     pub state_sync_min_blocks_behind: u64,
 
+    /// Whether this node may install remote state summaries. History providers
+    /// must disable this: snapshot installation rebases the block and SHiP logs,
+    /// discarding the block-by-block history they are expected to serve.
+    #[serde(default = "default_state_sync_enabled")]
+    pub state_sync_enabled: bool,
+
     /// A state summary is built for every block whose height is a multiple of this
     /// (when that block is accepted), and offered to peers that need to state-sync.
     /// The host takes a summary only if over half the validator weight returns the
@@ -115,10 +126,10 @@ pub struct NodeConfig {
     /// environment of its own.
     #[serde(default)]
     pub state_root_log_every: u64,
-    /// Shut this process down cleanly if it accepts no blocks for this many
-    /// seconds. Zero disables the watchdog. This is a node-local operational
-    /// safeguard for rehearsals and deliberately halted chains; it does not
-    /// affect block validity or consensus.
+    /// Legacy setting retained so the VM can return a targeted startup error.
+    /// Nonzero values are rejected: a plugin cannot stop or unadvertise its
+    /// MetalGo host, so an in-process shutdown leaves the validator lifecycle
+    /// in an unsafe state.
     #[serde(default)]
     pub dead_chain_shutdown_after_secs: u64,
     /// Log threshold: `trace`, `debug`, `info` (the default), `warn` or `error`.
@@ -138,6 +149,14 @@ fn default_state_summary_min_age() -> u64 {
 
 fn default_state_sync_min_blocks_behind() -> u64 {
     1024
+}
+
+fn default_state_sync_enabled() -> bool {
+    true
+}
+
+fn default_block_production_enabled() -> bool {
+    true
 }
 
 fn default_arena_wal_max_bytes() -> u64 {
@@ -187,12 +206,15 @@ mod tests {
         assert_eq!(cfg.dead_chain_shutdown_after_secs, 0);
         assert_eq!(cfg.log_level, None);
         assert_eq!(cfg.state_sync_min_blocks_behind, 1024);
+        assert!(cfg.state_sync_enabled);
         assert_eq!(cfg.state_summary_interval, 4096);
         assert_eq!(cfg.state_summary_min_age, 8);
+        assert!(cfg.block_production_enabled);
+        assert!(cfg.producer_key.is_some());
     }
 
     #[test]
-    fn dead_chain_shutdown_timeout_is_opt_in() {
+    fn legacy_dead_chain_shutdown_timeout_is_still_deserialized() {
         let cfg: NodeConfig = serde_json::from_str(
             r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","dead_chain_shutdown_after_secs":3600}"#,
         )
@@ -207,6 +229,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.state_sync_min_blocks_behind, 20);
+    }
+
+    #[test]
+    fn state_sync_can_be_disabled_for_history_providers() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","producer_key":"PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez","state_sync_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!cfg.state_sync_enabled);
+    }
+
+    #[test]
+    fn observer_can_start_without_a_producer_key() {
+        let cfg: NodeConfig = serde_json::from_str(
+            r#"{"producer_name":"pulse","block_production_enabled":false,"state_sync_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!cfg.block_production_enabled);
+        assert!(!cfg.state_sync_enabled);
+        assert!(cfg.producer_key.is_none());
     }
 
     #[test]

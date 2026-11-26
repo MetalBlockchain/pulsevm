@@ -16,6 +16,14 @@ pub struct GetInfoResponse {
     pub next_protocol_upgrade: Option<ProtocolUpgradeInfo>,
     pub server_time: BlockTimestamp,
     pub chain_id: Id,
+    /// MetalGo's subnet id. Usually equal to `chain_id`; migration chains may
+    /// use a pinned Antelope signing id and expose the host id separately.
+    pub platform_chain_id: Id,
+    /// Local snapshot offer interval. Operators must keep this identical across
+    /// validators; mismatches prevent the host from finding common summary heights.
+    pub state_summary_interval: u64,
+    pub state_sync_enabled: bool,
+    pub block_production_enabled: bool,
     pub head_block_num: u32,
     pub last_irreversible_block_num: u32,
     pub last_irreversible_block_id: Id,

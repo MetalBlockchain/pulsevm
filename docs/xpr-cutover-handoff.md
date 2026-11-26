@@ -194,10 +194,12 @@ against independently replayed XPR state:
   on explorers, meaningless for the cutover. Do not present this as a chain
   halt to operators; present it as a coordinated move with a dead
   origin chain.
-- **History.** The A-Chain serves blocks from H+1; pre-H history stays on
-  XPR archive nodes and the exported SHiP logs. There is no transaction
-  lookup index on the new chain until one is built — plan explorer coverage
-  accordingly.
+- **History.** Hyperion hydrates from A-Chain state at H and ingests H+1
+  onward. The XPR full-replay index is frozen at H and retained permanently
+  as the pre-cut archive; a history router sends pre-H transaction lookups
+  there and newer queries to A-Chain Hyperion. Live XPR following ends after
+  the one-week rollback window, but the archive remains backed up and
+  queryable. Its production size still needs a mainnet-volume measurement.
 
 ## 5. Files
 

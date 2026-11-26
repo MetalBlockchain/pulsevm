@@ -413,6 +413,17 @@ fn pin_abort_marker_path(config: &LoadedConfig) -> std::path::PathBuf {
     config.finalized_marker.with_file_name(name)
 }
 
+fn reject_pin_aborted_round(config: &LoadedConfig) -> Result<(), String> {
+    let marker = pin_abort_marker_path(config);
+    if marker.exists() {
+        return Err(format!(
+            "{PIN_ABORT_PREFIX}this declaration was durably aborted after its schedule pin changed; marker {} prevents a restart from re-arming it. Publish and configure a new ceremony digest before restarting",
+            marker.display()
+        ));
+    }
+    Ok(())
+}
+
 fn write_pin_abort_marker(config: &LoadedConfig) -> Result<std::path::PathBuf, String> {
     let path = pin_abort_marker_path(config);
     let tmp = path.with_extension("pin-abort.tmp");
@@ -2336,14 +2347,8 @@ fn confirmation_digest_json(
 /// policy as the submit path, so the agent and the voter can never
 /// disagree on what to sign).
 async fn print_digest(config: &LoadedConfig) -> Result<(), String> {
+    reject_pin_aborted_round(config)?;
     let client = build_client(config)?;
-    let abort_marker = pin_abort_marker_path(config);
-    if abort_marker.exists() {
-        return Err(format!(
-            "{PIN_ABORT_PREFIX}this declaration was durably aborted after its schedule pin changed; marker {} prevents a restart from re-arming it. Publish and configure a new ceremony digest before restarting",
-            abort_marker.display()
-        ));
-    }
     let view = read_view(&client, config).await?;
     let pause_height = config.inner.pause_height.unwrap_or(config.inner.height);
     // Before the ceremony finalizes there is only the declaration to sign.
@@ -2539,6 +2544,9 @@ async fn run_holding_the_recorded_pause(
     dry_run: bool,
     max_polls: u64,
 ) -> Result<(), String> {
+    // Gate the normal unattended process path as well as --print-digest. If a
+    // stale pin was observed before H, a restart must not re-arm that round.
+    reject_pin_aborted_round(config)?;
     match run(config, dry_run, max_polls).await {
         Err(error) if error.starts_with(CHANGED_ROUND_PREFIX) => {
             let Some(state) = read_pause_state(&config.finalized_marker) else {
@@ -4729,8 +4737,14 @@ mod tests {
         let path = write_pin_abort_marker(&config).unwrap();
         assert!(path.exists());
         assert_eq!(path, pin_abort_marker_path(&config));
+        assert!(
+            reject_pin_aborted_round(&config)
+                .unwrap_err()
+                .starts_with(PIN_ABORT_PREFIX)
+        );
         config.expected_digest[0] ^= 1;
         assert_ne!(path, pin_abort_marker_path(&config));
+        assert!(reject_pin_aborted_round(&config).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -174,14 +174,11 @@ fn wal_valid_record_follows(
     wal_valid_record_follows_within(data, key, from, WAL_DAMAGE_SCAN_BUDGET, expect)
 }
 
-/// What every record of a log starts with, as the last good one showed it: the
-/// revision it carried and how many tables it has a delta for. A genuine later
-/// record continues the sequence and has the same table count; almost nothing else
-/// does, which is what lets the damage scan skip hashing nearly every offset.
+/// The last durable revision available before the damaged tail. A candidate must
+/// contain a plausible later revision before its claimed payload is hashed.
 #[derive(Clone, Copy, Debug)]
 struct FramePrefix {
     last_revision: i64,
-    table_count: u64,
 }
 
 /// The furthest a later record's revision may be past the last good one. The next
@@ -192,27 +189,20 @@ impl FramePrefix {
     fn of(payload: &[u8]) -> Option<Self> {
         Some(Self {
             last_revision: i64::from_le_bytes(payload.get(0..8)?.try_into().ok()?),
-            table_count: u64::from_le_bytes(payload.get(8..16)?.try_into().ok()?),
         })
     }
 
     /// Whether a candidate record's payload could continue the log. Cheap: sixteen
     /// bytes, no hashing.
     fn could_follow(&self, candidate_payload: &[u8]) -> bool {
-        let (Some(revision), Some(count)) = (
-            candidate_payload
-                .get(0..8)
-                .and_then(|b| b.try_into().ok())
-                .map(i64::from_le_bytes),
-            candidate_payload
-                .get(8..16)
-                .and_then(|b| b.try_into().ok())
-                .map(u64::from_le_bytes),
-        ) else {
+        let Some(revision) = candidate_payload
+            .get(0..8)
+            .and_then(|b| b.try_into().ok())
+            .map(i64::from_le_bytes)
+        else {
             return false;
         };
-        count == self.table_count
-            && revision > self.last_revision
+        revision > self.last_revision
             && revision <= self.last_revision.saturating_add(WAL_MAX_REVISION_GAP)
     }
 }
@@ -300,6 +290,10 @@ struct WalScan {
 /// failure with intact data after it cannot be a crash: something altered the
 /// file, and applying what follows would build state on a hole, so it is refused.
 fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
+    scan_wal_after(data, None)
+}
+
+fn scan_wal_after(data: &[u8], checkpoint_revision: Option<i64>) -> Result<WalScan, DbError> {
     let mut scan = WalScan {
         records: Vec::new(),
         valid_len: 0,
@@ -348,7 +342,8 @@ fn scan_wal(data: &[u8]) -> Result<WalScan, DbError> {
             let expect = scan
                 .records
                 .last()
-                .and_then(|&(start, end)| FramePrefix::of(&data[start..end]));
+                .and_then(|&(start, end)| FramePrefix::of(&data[start..end]))
+                .or_else(|| checkpoint_revision.map(|last_revision| FramePrefix { last_revision }));
             match wal_valid_record_follows(data, key, pos + 1, expect) {
                 Follows::At(next) => {
                     return Err(DbError::Corrupted(format!(
@@ -992,7 +987,7 @@ impl Db {
             }
             Err(e) => return Err(DbError::Io(e.to_string())),
         };
-        let scan = scan_wal(&data)?;
+        let scan = scan_wal_after(&data, Some(after_revision))?;
         let mut outcome = WalReplay::default();
         let mut last_revision = after_revision;
         let mut applied_any = false;
@@ -1183,6 +1178,31 @@ mod damage_scan_tests {
         assert_eq!(scan.records.len(), 3);
     }
 
+    #[test]
+    fn an_honest_torn_first_record_after_a_fold_is_recovered() {
+        let (_dir, path) = log_with_frames(&[2_000_001]);
+        let mut data = std::fs::read(&path).unwrap();
+        let claimed: u64 = 512 * 1024;
+        data.truncate(WAL_HEADER_LEN);
+        data.extend_from_slice(&claimed.to_le_bytes());
+        // A first frame has no preceding WAL frame for sequence checks, but its
+        // checkpoint revision is known. Ordinary row bytes must not be mistaken
+        // for a million independent valid-length candidates.
+        for word in 0..(256 * 1024 / 8) {
+            let value = if word % 3 == 0 {
+                word as u64
+            } else {
+                0x5a5a_5a5a
+            };
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let scan = scan_wal_after(&data, Some(2_000_000))
+            .expect("a cut first frame after a fold must be recoverable");
+        assert!(scan.torn_tail);
+        assert!(scan.records.is_empty());
+        assert_eq!(scan.valid_len, WAL_HEADER_LEN);
+    }
+
     // The filter must not hide real damage: an intact later record continues the
     // sequence, so it is still found and the log refused.
     #[test]
@@ -1209,14 +1229,13 @@ mod damage_scan_tests {
         let key = [3u8; WAL_KEY_LEN];
         let expect = FramePrefix {
             last_revision: 2_000_000,
-            table_count: 19,
         };
         let len: u64 = 1 << 20;
         let mut data = Vec::new();
         while data.len() < 4 << 20 {
             data.extend_from_slice(&len.to_le_bytes());
             data.extend_from_slice(&(expect.last_revision + 1).to_le_bytes());
-            data.extend_from_slice(&expect.table_count.to_le_bytes());
+            data.extend_from_slice(&19u64.to_le_bytes());
             data.extend_from_slice(&[0u8; 8]);
         }
         assert_eq!(

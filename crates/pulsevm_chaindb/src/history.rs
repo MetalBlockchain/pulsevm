@@ -312,6 +312,11 @@ fn ser_generated_transaction(s: &mut Ser, db: &Db, r: &DeferredTransactionRow) {
 
 fn ser_global_property(s: &mut Ser, r: &GlobalPropertyRow, chain_id: &[u8; 32]) {
     s.uvar(1); // global_property_object history version = 1
+    // The v1 SHiP ABI includes two optional pending-schedule fields before
+    // chain_config. They are absent in this implementation, but their false
+    // presence bytes are still part of the row's ABI encoding.
+    s.bool(false); // proposed_schedule_block_num
+    s.bool(false); // proposed_schedule
     // chain_config (history version 1).
     s.uvar(1);
     s.u64(r.max_block_net_usage);
@@ -934,11 +939,11 @@ mod global_property_tests {
         let mut ser = Ser::new();
         ser_global_property(&mut ser, &row, &chain_id);
 
-        // The replay fixture uses the 143-byte historical row shape: the
-        // producer schedule and deferred-transaction fields are not present.
-        assert_eq!(ser.buf.len(), 143);
-        assert_eq!(&ser.buf[..4], &[1, 1, 0, 0]);
-        assert_eq!(&ser.buf[66..98], &chain_id);
+        // The SHiP v1 ABI declares both optional schedule fields even when
+        // absent, then the chain config, chain id, and WASM config.
+        assert_eq!(ser.buf.len(), 145);
+        assert_eq!(&ser.buf[..6], &[1, 0, 0, 1, 0, 0]);
+        assert_eq!(&ser.buf[68..100], &chain_id);
     }
 }
 

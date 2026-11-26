@@ -216,76 +216,61 @@ impl NetworkManager {
         Ok(AppSenderClient::new(channel))
     }
 
-    /// Request one snapshot chunk from a connected peer, over AppRequest.
-    ///
-    /// Registers a pending entry keyed by request id, sends the request, and
-    /// waits (with a timeout) for the AppResponse handler to complete it. Peers
-    /// are tried in turn until one answers; the network lock is never held across
-    /// the wait, so responses and peer churn proceed meanwhile. Each chunk is a
-    /// fresh call, so a long download always sees the current peer set.
-    pub async fn request_chunk(
+    /// Request a snapshot chunk from exactly one peer. Callers that validate a
+    /// whole snapshot can retry the complete transfer against a different peer
+    /// if its final authenticated hash fails.
+    pub async fn request_chunk_from_peer(
         net: &Arc<RwLock<Self>>,
+        peer: NodeId,
         req: &ChunkRequest,
     ) -> Result<Vec<u8>, ChainError> {
-        let (peers, server, pending, next_id) = {
+        let (server, pending, next_id) = {
             let g = net.read().await;
             (
-                g.connected_node_ids(),
                 g.server_address.clone(),
                 g.pending.clone(),
                 g.next_request_id.clone(),
             )
         };
-        if peers.is_empty() {
-            return Err(ChainError::NetworkError(
-                "state sync: no connected peers to fetch from".into(),
-            ));
-        }
-        let body = req.encode();
-        let mut last_err = String::from("no peer answered");
-        for peer in peers {
-            let request_id = next_id.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = oneshot::channel();
-            pending.lock().unwrap().insert(request_id, tx);
-
-            let mut client = match Self::connect_appsender(&server).await {
-                Ok(c) => c,
-                Err(e) => {
-                    pending.lock().unwrap().remove(&request_id);
-                    last_err = e.to_string();
-                    continue;
-                }
-            };
-            let sent = client
-                .send_app_request(Request::new(SendAppRequestMsg {
-                    node_ids: vec![peer.0.to_vec()],
-                    request_id,
-                    request: body.clone(),
-                }))
-                .await;
-            if let Err(e) = sent {
+        let request_id = next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert(request_id, tx);
+        let mut client = match Self::connect_appsender(&server).await {
+            Ok(client) => client,
+            Err(error) => {
                 pending.lock().unwrap().remove(&request_id);
-                last_err = e.to_string();
-                continue;
+                return Err(error);
             }
-
-            match tokio::time::timeout(Duration::from_secs(30), rx).await {
-                Ok(Ok(Ok(data))) => return Ok(data),
-                Ok(Ok(Err(e))) => last_err = e,
-                Ok(Err(_canceled)) => {
-                    pending.lock().unwrap().remove(&request_id);
-                    last_err = "response channel canceled".into();
-                }
-                Err(_timeout) => {
-                    pending.lock().unwrap().remove(&request_id);
-                    last_err = "chunk request timed out".into();
-                }
+        };
+        if let Err(error) = client
+            .send_app_request(Request::new(SendAppRequestMsg {
+                node_ids: vec![peer.0.to_vec()],
+                request_id,
+                request: req.encode(),
+            }))
+            .await
+        {
+            pending.lock().unwrap().remove(&request_id);
+            return Err(ChainError::NetworkError(format!(
+                "state sync: sending chunk request to peer failed: {error}"
+            )));
+        }
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(error))) => Err(ChainError::NetworkError(error)),
+            Ok(Err(_)) => {
+                pending.lock().unwrap().remove(&request_id);
+                Err(ChainError::NetworkError(
+                    "state sync: peer response channel canceled".into(),
+                ))
+            }
+            Err(_) => {
+                pending.lock().unwrap().remove(&request_id);
+                Err(ChainError::NetworkError(
+                    "state sync: chunk request timed out".into(),
+                ))
             }
         }
-        Err(ChainError::NetworkError(format!(
-            "state sync: chunk request failed on all peers: {}",
-            last_err
-        )))
     }
 
     /// Answer a peer's AppRequest with the chunk bytes it asked for.

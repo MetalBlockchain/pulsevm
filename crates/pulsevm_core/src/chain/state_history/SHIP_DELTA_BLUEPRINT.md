@@ -63,7 +63,7 @@ Sizes below are the golden's block-2 first-row lengths (all verified).
   primary_key:u64 + payer:u64 + value via `history_pack_big_bytes` (check: likely uvar len + bytes).
   code/scope/table come from the row's table_id (ContractKeyValueRow.t_id → ContractTableRow).
 - contract_index64/128/256 — context wrapper, same header + secondary_key (8/16/32 bytes). (empty at block 2)
-- global_property (143) = `01`(version 1!) + chain_config + chain_id:32 + wasm_config.
+- global_property (145) = `01`(version 1!) + absent proposed-schedule optionals (`00 00`) + chain_config + chain_id:32 + wasm_config.
   - chain_config (65) = `01`(version 1!) + max_block_net_usage:u64 +
     target_block_net_usage_pct:u32 + max_transaction_net_usage:u32 +
     base_per_transaction_net_usage:u32 + net_usage_leeway:u32 +

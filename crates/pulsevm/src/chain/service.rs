@@ -612,6 +612,10 @@ impl RpcServer for RpcService {
                 }),
             server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
+            platform_chain_id: controller.platform_chain_id().clone(),
+            state_summary_interval: controller.state_summary_interval(),
+            state_sync_enabled: controller.state_sync_enabled(),
+            block_production_enabled: controller.block_production_enabled(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block_id,
@@ -1134,6 +1138,10 @@ mod tests {
         );
         assert!(response.next_protocol_upgrade.is_none());
         assert_eq!(response.head_block_num, 1);
+        assert_eq!(response.chain_id, response.platform_chain_id);
+        assert_eq!(response.state_summary_interval, 4096);
+        assert!(response.state_sync_enabled);
+        assert!(response.block_production_enabled);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["protocol_version"], json!(1));
@@ -1143,6 +1151,54 @@ mod tests {
             json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
         );
         assert_eq!(json["next_protocol_upgrade"], serde_json::Value::Null);
+        assert_eq!(json["state_summary_interval"], json!(4096));
+        assert_eq!(json["state_sync_enabled"], json!(true));
+        assert_eq!(json["block_production_enabled"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn migration_chain_id_override_is_reported_for_signing_and_ship() {
+        let genesis_key = PrivateKey::from_str(GENESIS_KEY).unwrap();
+        let platform_chain_id =
+            Id::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let mut genesis: serde_json::Value =
+            serde_json::from_slice(&genesis_bytes(&genesis_key)).unwrap();
+        genesis["chain_id"] =
+            serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let genesis_bytes = serde_json::to_vec(&genesis).unwrap();
+        let signing_chain_id =
+            Id::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let config_bytes = json!({
+            "system_account": "pulse",
+            "native_system_contract": true,
+            "producer_name": "pulse",
+            "producer_key": genesis_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new();
+        controller
+            .initialize(
+                &platform_chain_id,
+                &config_bytes,
+                &genesis_bytes,
+                temp.path().to_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(controller.chain_id(), &signing_chain_id);
+        assert_eq!(controller.platform_chain_id(), &platform_chain_id);
+
+        let service = RpcService::new(
+            Arc::new(RwLock::new(Mempool::new())),
+            Arc::new(RwLock::new(controller)),
+            Arc::new(RwLock::new(NetworkManager::new())),
+        );
+        let response = service.get_info().await.unwrap();
+        assert_eq!(response.chain_id, signing_chain_id);
+        assert_eq!(response.platform_chain_id, platform_chain_id);
     }
 
     #[tokio::test]
@@ -1647,6 +1703,32 @@ mod tests {
         .await;
         assert_ne!(rows["error"]["name"], "parse_error", "{rows}");
         assert_ne!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn get_block_includes_structured_transactions_and_actions() {
+        let (service, mempool, genesis_key, chain_id, _temp) = service_with_genesis();
+        let packed = newaccount_tx(&genesis_key, &genesis_key, "blockreader", &chain_id);
+        service.admit_transaction(packed).await.unwrap();
+        let block = {
+            let mut controller = service.controller.write().await;
+            let mut mempool = mempool.write().await;
+            let block = controller.build_block(&mut mempool).await.unwrap();
+            controller
+                .accept_block(&block.id().unwrap(), &mut mempool)
+                .unwrap();
+            block
+        };
+
+        let returned = service
+            .get_block(block.block_num().to_string())
+            .await
+            .unwrap();
+        let json = serde_json::to_value(returned).unwrap();
+        let transaction = &json["transactions"][0]["trx"]["transaction"];
+        assert_eq!(transaction["actions"][0]["account"], "pulse");
+        assert_eq!(transaction["actions"][0]["name"], "newaccount");
+        assert!(transaction["actions"][0]["data"].is_string());
     }
 
     #[tokio::test]

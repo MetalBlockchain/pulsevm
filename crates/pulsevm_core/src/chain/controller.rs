@@ -612,11 +612,14 @@ pub struct Controller {
     preferred_id: Id,
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
+    /// Transaction-signing and Antelope chain id. For ordinary chains this
+    /// remains the host-provided id; a migration genesis may pin an override.
     chain_id: Id,
-    // The genesis-derived chain id (`sha256(pack(genesis))`), which is what the
-    // `global_property` state-history record commits to — distinct from
-    // `chain_id`, the id AvalancheGo configured the node with (equal in
-    // production; the replay test deliberately runs them apart).
+    /// Host-assigned MetalGo subnet id, kept separately because the migration
+    /// confirmation binds it even when wallets sign against a pinned chain id.
+    platform_chain_id: Id,
+    // The genesis-derived chain id (`sha256(pack(genesis))`), used by the
+    // `global_property` state-history record.
     genesis_chain_id: Id,
     state: vm::State,
 
@@ -1384,6 +1387,7 @@ impl Controller {
             db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+            platform_chain_id: Id::default(),
             genesis_chain_id: Id::default(),
             state: vm::State::Unspecified,
 
@@ -1605,10 +1609,43 @@ impl Controller {
             .unwrap_or(1024)
     }
 
+    pub fn state_sync_enabled(&self) -> bool {
+        self.node_config
+            .as_ref()
+            .is_none_or(|config| config.state_sync_enabled)
+    }
+
+    pub fn block_production_enabled(&self) -> bool {
+        self.node_config
+            .as_ref()
+            .is_none_or(|config| config.block_production_enabled)
+    }
+
     fn restoring_migration(&self) -> bool {
         self.node_config
             .as_ref()
             .is_some_and(|config| config.migration_checkpoint.is_some())
+    }
+
+    fn validate_migration_artifact_paths(config: &NodeConfig) -> Result<(), ChainError> {
+        for (label, path) in [
+            ("checkpoint", config.migration_checkpoint.as_deref()),
+            ("manifest", config.migration_manifest.as_deref()),
+        ] {
+            if let Some(path) = path {
+                let metadata = fs::metadata(path).map_err(|error| {
+                    ChainError::GenesisError(format!(
+                        "migration {label} {path} is unavailable: {error}; refusing before moving existing node data"
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(ChainError::GenesisError(format!(
+                        "migration {label} {path} is not a regular file; refusing before moving existing node data"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn initialize_with_protocol_upgrades_inner(
@@ -1635,6 +1672,18 @@ impl Controller {
             // serde's message already names the line and column.
             ChainError::ParseError(format!("failed to parse node config JSON: {e}"))
         })?);
+        let node_config = self.node_config.as_ref().unwrap();
+        if node_config.block_production_enabled && node_config.producer_key.is_none() {
+            return Err(ChainError::ParseError(
+                "block_production_enabled requires producer_key".into(),
+            ));
+        }
+        info!(
+            "state sync enabled: {}, state summary interval: {}",
+            node_config.state_sync_enabled, node_config.state_summary_interval
+        );
+
+        Self::validate_migration_artifact_paths(node_config)?;
 
         Self::quarantine_abandoned_state_sync(db_path)?;
         Self::ensure_no_incomplete_state_sync(db_path)?;
@@ -2095,13 +2144,17 @@ impl Controller {
         // Pure-Rust view of the genesis: the arena is authored directly from this,
         // and the schedule/timestamp below are read from it, so the initial state
         // never routes through C++.
-        self.chain_id = chain_id.clone();
-
         // The chain id is sha256(fc::raw::pack(genesis)); derive it from the
         // parsed genesis and check it against the id AvalancheGo handed us. They
         // must agree, or the genesis blob and the chain it is meant to bring up
         // have diverged — surface that rather than run under a silent mismatch.
         let derived_chain_id = Id::new(rust_genesis.compute_chain_id());
+        self.platform_chain_id = chain_id.clone();
+        self.chain_id = if rust_genesis.chain_id_override.is_some() {
+            derived_chain_id.clone()
+        } else {
+            chain_id.clone()
+        };
         self.genesis_chain_id = derived_chain_id.clone();
         if &derived_chain_id != chain_id {
             warn!(
@@ -2291,16 +2344,20 @@ impl Controller {
                     // Offline replay remains explicitly allowed to rewind; only
                     // the ordinary one-block crash window takes this path.
                     if one_block_ahead && !replay_recovery {
-                        self.pending_accepted_recovery = Some(
-                            self.read_logged_block(end)?.ok_or_else(|| {
-                                ChainError::DatabaseError(format!(
-                                    "the block log lists accepted block {end} ahead of Arena revision {revision}, but the entry is missing"
-                                ))
-                            })?,
-                        );
-                        warn!(
-                            "Arena revision {revision} is one accepted block behind the block log; will revalidate and replay block {end}"
-                        );
+                        match self.read_logged_block(end) {
+                            Ok(Some(block)) => {
+                                self.pending_accepted_recovery = Some(block);
+                                warn!(
+                                    "Arena revision {revision} is one accepted block behind the block log; will revalidate and replay block {end}"
+                                );
+                            }
+                            Ok(None) => warn!(
+                                "the one-ahead block-log entry at {end} is missing; dropping the damaged tail so MetalGo can refetch it"
+                            ),
+                            Err(error) => warn!(
+                                "the one-ahead block-log entry at {end} is damaged ({error}); dropping the tail so MetalGo can refetch it"
+                            ),
+                        }
                     }
                     if revision != end as i64 {
                         warn!(
@@ -2424,6 +2481,7 @@ impl Controller {
                 // entry whose last bytes were zeroed in place still has an intact
                 // header, and used to be kept and served without a word.
                 self.verify_block_log_tail(start, end, 16)?;
+                self.verify_trace_log_tail(start, end, 16)?;
 
                 info!("block log contains blocks from {} to {}", start, end);
 
@@ -2742,6 +2800,11 @@ impl Controller {
     }
 
     pub async fn build_block(&mut self, mempool: &mut Mempool) -> Result<SignedBlock, ChainError> {
+        if !self.block_production_enabled() {
+            return Err(ChainError::BlockError(
+                "block production is disabled for this node".into(),
+            ));
+        }
         let mut transaction_receipts: VecDeque<TransactionReceipt> = VecDeque::new();
         let mut transaction_traces: Vec<TransactionTrace> = Vec::new();
         let mut action_receipt_digests: VecDeque<Digest> = VecDeque::new();
@@ -3101,7 +3164,12 @@ impl Controller {
         // emitting an unverifiable block after a schedule change.
         let node = self.node_config.as_ref().unwrap();
         let producer = node.producer_name;
-        let signing_key = node.producer_key.get_public_key();
+        let producer_key = node.producer_key.as_ref().ok_or_else(|| {
+            ChainError::BlockError(
+                "block production is enabled but producer_key is not configured".into(),
+            )
+        })?;
+        let signing_key = producer_key.get_public_key();
         match block_schedule.block_signing_key(&producer) {
             Some(scheduled) if *scheduled == signing_key => {}
             _ => {
@@ -3124,7 +3192,7 @@ impl Controller {
         } else {
             block.signed_block_header.header.sig_digest()?
         };
-        block.signed_block_header.signature = node.producer_key.sign(&sig_digest)?;
+        block.signed_block_header.signature = producer_key.sign(&sig_digest)?;
 
         // We built this block so no need to verify it again. Delay exposing it
         // as verified until every fallible end-of-block write succeeds.
@@ -5224,6 +5292,71 @@ impl Controller {
         Ok(())
     }
 
+    /// Check the newest trace entries against their accepted blocks. The history
+    /// log framing has no checksum, so an in-place zero write leaves an intact
+    /// header and can otherwise be served as plausible empty traces.
+    fn verify_trace_log_tail(&self, start: u32, end: u32, count: u32) -> Result<(), ChainError> {
+        let Some(log) = self.trace_log.as_ref() else {
+            return Ok(());
+        };
+        let Some((trace_start, trace_end)) = log.range() else {
+            return Ok(());
+        };
+        let first = start
+            .max(trace_start)
+            .max(end.saturating_sub(count.saturating_sub(1)));
+        let last = end.min(trace_end);
+        if first > last {
+            return Ok(());
+        }
+        for height in first..=last {
+            let block = self.read_logged_block(height)?.ok_or_else(|| {
+                ChainError::DatabaseError(format!(
+                    "trace log entry at block {height} has no corresponding accepted block"
+                ))
+            })?;
+            let block_id = block.id()?;
+            let trace_id = log.get_block_id(height).map_err(|error| {
+                ChainError::DatabaseError(format!(
+                    "trace log has no readable block id at height {height}: {error}"
+                ))
+            })?;
+            if trace_id != block_id {
+                return Err(ChainError::DatabaseError(format!(
+                    "trace log block id at height {height} does not match the accepted block"
+                )));
+            }
+            let bytes = log.read_block(height).map_err(|error| {
+                ChainError::DatabaseError(format!("trace log cannot read block {height}: {error}"))
+            })?;
+            let mut pos = 0;
+            let traces = Vec::<crate::chain::transaction::TransactionTrace>::read(&bytes, &mut pos)
+                .map_err(|error| {
+                    ChainError::DatabaseError(format!(
+                        "trace log entry at block {height} is damaged: {error}"
+                    ))
+                })?;
+            if pos != bytes.len() {
+                return Err(ChainError::DatabaseError(format!(
+                    "trace log entry at block {height} has trailing bytes"
+                )));
+            }
+            if traces.len() != block.transactions.len()
+                || traces
+                    .iter()
+                    .zip(&block.transactions)
+                    .any(|(trace, receipt)| {
+                        trace.block_num != height || &trace.id != receipt.transaction_id()
+                    })
+            {
+                return Err(ChainError::DatabaseError(format!(
+                    "trace log entry at block {height} does not match the accepted block's transaction receipts"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     // ----- state sync (Avalanche StateSyncableVM) -------------------------
     //
     // The arena checkpoint is the canonical physical state payload (see
@@ -5241,7 +5374,20 @@ impl Controller {
     pub fn stage_summary_if_due(&mut self) -> Result<Option<StagedSummary>, ChainError> {
         let interval = self.state_summary_interval();
         let height = u64::from(self.last_accepted_block.block_num());
-        if interval == 0 || height % interval != 0 || self.bulk_replay_mode() {
+        // Snapshot construction pauses this validator for seconds at mainnet
+        // state size. A node still bootstrapping after a restart would otherwise
+        // build every aligned summary while replaying/catching up, then repeat
+        // the expensive work on its next interval. Resume summaries once the
+        // host reports normal operation.
+        if interval == 0
+            || height % interval != 0
+            || self.bulk_replay_mode()
+            || !self.state_sync_enabled()
+            || matches!(
+                self.state,
+                vm::State::Bootstrapping | vm::State::StateSyncing
+            )
+        {
             return Ok(None);
         }
         self.stage_summary_now().map(Some)
@@ -5280,14 +5426,6 @@ impl Controller {
             .as_ref()
             .map(|config| config.state_summary_interval)
             .unwrap_or(0)
-    }
-
-    /// Location of abandoned pre-sync data. Callers may remove it only after a
-    /// newly downloaded snapshot has passed the normal authenticated apply path.
-    pub fn state_sync_quarantine_path(&self) -> Option<std::path::PathBuf> {
-        self.db_path
-            .as_deref()
-            .map(|path| Path::new(path).join("state_sync_abandoned"))
     }
 
     /// How far below the tip a summary must be before it is offered.
@@ -6031,6 +6169,12 @@ impl Controller {
 
     pub fn chain_id(&self) -> &Id {
         &self.chain_id
+    }
+
+    /// The id assigned by the MetalGo subnet. This can differ from
+    /// [`Self::chain_id`] when a migration genesis pins the Antelope signing id.
+    pub fn platform_chain_id(&self) -> &Id {
+        &self.platform_chain_id
     }
 
     pub fn calculate_trx_merkle(
@@ -9901,6 +10045,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn an_in_place_zeroed_trace_entry_is_refused_on_restart() -> Result<(), ChainError> {
+        use std::io::{
+            Read as _,
+            Seek,
+            SeekFrom,
+            Write,
+        };
+
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "tracecheck").await?;
+        drop(controller);
+
+        let path = Path::new(chain.path()).join("trace_log.log");
+        let mut header = [0u8; 48];
+        let mut file =
+            fs::File::open(&path).map_err(|error| ChainError::InternalError(error.to_string()))?;
+        file.read_exact(&mut header)
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        let payload_len = u64::from_le_bytes(header[40..48].try_into().unwrap()) as usize;
+        drop(file);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        file.seek(SeekFrom::Start(48))
+            .and_then(|_| file.write_all(&vec![0u8; payload_len]))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+
+        match chain.open() {
+            Err(error) => assert!(
+                error.to_string().contains("trace log entry at block 2"),
+                "unexpected diagnostic: {error}"
+            ),
+            Ok(_) => panic!("a zeroed in-place trace entry must not be served"),
+        }
+        Ok(())
+    }
+
     // Abandoned installs are evidence and may contain usable checkpoint files;
     // restart never removes one before a successful resync is verified.
     #[tokio::test]
@@ -10166,6 +10351,62 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_history_provider_can_disable_state_sync_summaries() -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({
+            "state_summary_interval": 2,
+            "state_sync_enabled": false,
+        }))?;
+        let mut controller = chain.open()?;
+        assert!(!controller.state_sync_enabled());
+        for name in ["one", "two", "three", "four"] {
+            chain.accept(&mut controller, name).await?;
+            assert!(controller.stage_summary_if_due()?.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_observer_starts_without_a_signing_key_and_cannot_build_blocks()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({
+            "block_production_enabled": false,
+            "producer_key": null,
+            "state_sync_enabled": false,
+        }))?;
+        let mut controller = chain.open()?;
+        assert!(!controller.block_production_enabled());
+        let error = controller
+            .build_block(&mut Mempool::new())
+            .await
+            .expect_err("observer nodes must not build producer blocks");
+        assert!(error.to_string().contains("block production is disabled"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bootstrapping_node_defers_expensive_summaries_until_normal_operation()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({"state_summary_interval": 2}))?;
+        let mut controller = chain.open()?;
+        controller.set_state(vm::State::Bootstrapping);
+        for name in ["one", "two", "three"] {
+            chain.accept(&mut controller, name).await?;
+            assert!(controller.stage_summary_if_due()?.is_none());
+        }
+
+        controller.set_state(vm::State::NormalOp);
+        chain.accept(&mut controller, "four").await?;
+        assert!(controller.stage_summary_if_due()?.is_none());
+        chain.accept(&mut controller, "five").await?;
+        assert_eq!(
+            controller.stage_summary_if_due()?.unwrap().height(),
+            6,
+            "the next aligned height is produced after catch-up"
+        );
+        Ok(())
+    }
+
     // The point of fixed heights and of building off the controller: a summary for
     // an aligned height is built while the chain keeps accepting blocks, is offered
     // once it is old enough, is served from disk, and a fresh node that state-syncs
@@ -10310,6 +10551,60 @@ mod tests {
             reopened
                 .database()
                 .arena_account_exists(Name::from_str("lost")?.as_u64())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_damaged_one_ahead_block_is_dropped_for_host_refetch() -> Result<(), ChainError> {
+        use std::io::{
+            Read as _,
+            Seek,
+            SeekFrom,
+            Write,
+        };
+
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "kept").await?;
+        chain.accept(&mut controller, "refetchme").await?;
+        let serialized = controller.block_log()?.read_block(3).unwrap();
+        drop(controller);
+
+        // Simulate a kill after the block log was written but before the Arena
+        // WAL frame for block 3 became durable, then damage that logged block.
+        let ends = wal_frame_ends(chain.path());
+        let wal = Path::new(chain.path()).join("arena_wal.bin");
+        let file = fs::OpenOptions::new().write(true).open(wal).unwrap();
+        file.set_len(ends[0] as u64).unwrap();
+        drop(file);
+        let path = Path::new(chain.path()).join("block_log.log");
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let payload = bytes
+            .windows(serialized.len())
+            .position(|window| window == serialized)
+            .expect("the one-ahead block is present");
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start((payload + serialized.len() - 1) as u64))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+
+        let reopened = chain.open().map_err(|error| {
+            ChainError::InternalError(format!("damaged one-ahead tail should be dropped: {error}"))
+        })?;
+        assert_eq!(reopened.last_accepted_block().block_num(), 2);
+        assert_eq!(reopened.block_log()?.range().unwrap().1, 2);
+        assert_eq!(reopened.trace_log().unwrap().range().unwrap().1, 2);
+        assert_eq!(reopened.chain_state_log().unwrap().range().unwrap().1, 2);
+        assert!(
+            !reopened
+                .database()
+                .arena_account_exists(Name::from_str("refetchme")?.as_u64())
         );
         Ok(())
     }
@@ -13759,6 +14054,40 @@ mod tests {
         extra_producers: &[(&str, &pulsevm_crypto::k1::K1PrivateKey)],
     ) -> Result<(String, String, Vec<u8>, Id, Id, u32, i64, [u8; 32]), ChainError> {
         migration_checkpoint_with_options(temp, schedule_key, extra_producers, true).await
+    }
+
+    #[test]
+    fn missing_migration_checkpoint_is_reported_before_quarantining_node_data() {
+        let mut chain = CrashChain::new(json!({})).unwrap();
+        let missing_checkpoint = Path::new(chain.path()).join("missing-migration.snapshot");
+        let missing_manifest = Path::new(chain.path()).join("missing-migration.manifest.json");
+        chain.config = json!({
+            "producer_name": "pulse",
+            "producer_key": chain.private_key.to_string(),
+            "migration_checkpoint": missing_checkpoint,
+            "migration_manifest": missing_manifest,
+        })
+        .to_string()
+        .into_bytes();
+        let marker = Path::new(chain.path()).join(STATE_SYNC_INSTALL_MARKER_FILE);
+        fs::write(&marker, b"incomplete install").unwrap();
+
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(&chain.chain_id, &chain.config, &chain.genesis, chain.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("migration checkpoint"));
+        assert!(
+            error
+                .to_string()
+                .contains("before moving existing node data")
+        );
+        assert!(marker.exists(), "existing data must not be moved aside");
+        assert!(
+            !Path::new(chain.path())
+                .join("state_sync_abandoned")
+                .exists()
+        );
     }
 
     /// As above, with control over whether the checkpoint carries the source
