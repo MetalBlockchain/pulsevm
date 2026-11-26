@@ -1399,24 +1399,28 @@ mod tests {
 
         // Admission must recover transaction signatures with the published
         // Antelope signing id, not the distinct MetalGo subnet id.
-        assert!(service
-            .admit_transaction(newaccount_tx(
-                &genesis_key,
-                &genesis_key,
-                "alice",
-                &signing_chain_id,
-            ))
-            .await
-            .unwrap());
-        assert!(service
-            .admit_transaction(newaccount_tx(
-                &genesis_key,
-                &genesis_key,
-                "bob",
-                &platform_chain_id,
-            ))
-            .await
-            .is_err());
+        assert!(
+            service
+                .admit_transaction(newaccount_tx(
+                    &genesis_key,
+                    &genesis_key,
+                    "alice",
+                    &signing_chain_id,
+                ))
+                .await
+                .unwrap()
+        );
+        assert!(
+            service
+                .admit_transaction(newaccount_tx(
+                    &genesis_key,
+                    &genesis_key,
+                    "bob",
+                    &platform_chain_id,
+                ))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
