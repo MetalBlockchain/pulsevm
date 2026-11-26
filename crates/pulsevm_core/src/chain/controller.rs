@@ -625,11 +625,15 @@ pub struct Controller {
     preferred_id: Id,
     db: Database,
     verified_blocks: HashMap<Id, SignedBlock>,
+    // The chain ID supplied by MetalGo. It is retained as the transaction
+    // signing ID for compatibility with existing deployments.
     chain_id: Id,
-    // The genesis-derived chain id (`sha256(pack(genesis))`), which is what the
-    // `global_property` state-history record commits to — distinct from
-    // `chain_id`, the id AvalancheGo configured the node with (equal in
-    // production; the replay test deliberately runs them apart).
+    // The MetalGo-assigned platform blockchain ID. Kept separately so APIs and
+    // diagnostics can identify the host ID without conflating it with the
+    // Antelope genesis-derived ID below.
+    platform_chain_id: Id,
+    // The Antelope genesis-derived chain ID (`sha256(pack(genesis))`), which is
+    // what the `global_property` state-history record commits to.
     genesis_chain_id: Id,
     state: vm::State,
 
@@ -1136,6 +1140,7 @@ impl Controller {
             db: Database::default(),
             verified_blocks: HashMap::new(),
             chain_id: Id::default(),
+            platform_chain_id: Id::default(),
             genesis_chain_id: Id::default(),
             state: vm::State::Unspecified,
 
@@ -1485,17 +1490,19 @@ impl Controller {
         // and the schedule/timestamp below are read from it, so the initial state
         // never routes through C++.
         self.chain_id = chain_id.clone();
+        self.platform_chain_id = chain_id.clone();
 
-        // The chain id is sha256(fc::raw::pack(genesis)); derive it from the
-        // parsed genesis and check it against the id AvalancheGo handed us. They
-        // must agree, or the genesis blob and the chain it is meant to bring up
-        // have diverged — surface that rather than run under a silent mismatch.
+        // This Antelope ID and MetalGo's platform blockchain ID are separate
+        // identity domains. The host ID remains the transaction-signing ID for
+        // compatibility; the genesis-derived ID is committed to global_property
+        // state history. A mismatch is therefore diagnostic, not a startup
+        // failure.
         let derived_chain_id = Id::new(rust_genesis.compute_chain_id());
         self.genesis_chain_id = derived_chain_id.clone();
         if &derived_chain_id != chain_id {
-            warn!(
-                "genesis-derived chain id {} does not match the configured chain id {}",
-                derived_chain_id, chain_id
+            info!(
+                "MetalGo platform chain id {} differs from Antelope genesis-derived chain id {}; retaining the platform id for transaction signing",
+                chain_id, derived_chain_id
             );
         }
 
@@ -5059,6 +5066,11 @@ impl Controller {
         &self.chain_id
     }
 
+    /// The id assigned by MetalGo to this subnet blockchain.
+    pub fn platform_chain_id(&self) -> &Id {
+        &self.platform_chain_id
+    }
+
     pub fn calculate_trx_merkle(
         &self,
         receipts: &VecDeque<TransactionReceipt>,
@@ -7277,6 +7289,43 @@ mod tests {
                 .action_mroot,
             Digest(chain_id.0.0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn platform_chain_id_may_differ_from_genesis_derived_id() -> Result<(), ChainError> {
+        let platform_chain_id = Id::new([0x11; 32]);
+        let genesis_chain_id =
+            Id::from_str("384da888112027f0321850a169f737c33e53b388aad48b5adace4bab97f437e0")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let config_bytes = json!({
+            "system_account": "eosio",
+            "native_system_contract": false,
+            "antelope_block_signatures": true,
+            "producer_name": "eosio",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        let genesis_bytes =
+            include_bytes!("../../../../tools/xpr-chainbase-export/xpr-mainnet-genesis.json")
+                .to_vec();
+        let temp = get_temp_dir();
+        let mut controller = Controller::new();
+
+        controller.initialize(
+            &platform_chain_id,
+            &config_bytes,
+            &genesis_bytes,
+            temp.path().to_str().unwrap(),
+        )?;
+
+        assert_eq!(controller.chain_id(), &platform_chain_id);
+        assert_eq!(controller.platform_chain_id(), &platform_chain_id);
+        assert_eq!(controller.genesis_chain_id, genesis_chain_id);
+        assert_ne!(controller.platform_chain_id(), &controller.genesis_chain_id);
         Ok(())
     }
 

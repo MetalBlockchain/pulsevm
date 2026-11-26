@@ -13,6 +13,7 @@ authoritative and the document is a bug.
 
 | Document | Covers | Status |
 |---|---|---|
+| [chain-identities.md](./chain-identities.md) | MetalGo platform blockchain ID, transaction-signing ID, and Antelope genesis-derived ID | Current behavior |
 | [protocol-features.md](./protocol-features.md) | Compile-time feature availability, consensus-version selection, upgrade schedules, safe rollout, and activation testing | Framework implemented; only v1/Baseline |
 | [mempool-admission.md](./mempool-admission.md) | Local admission preflight, shared-state concurrency, detached batches, expiry, capacity, and observability | Current behavior |
 | [resource-model.md](./resource-model.md) | CPU, NET, and RAM accounting; WASM metering cost function; input vs implicit transaction billing | Draft |

@@ -736,6 +736,7 @@ impl RpcServer for RpcService {
                 }),
             server_time: TimePoint::now().into(),
             chain_id: controller.chain_id().clone(),
+            platform_chain_id: controller.platform_chain_id().clone(),
             head_block_num: head_block.block_num(),
             last_irreversible_block_num: head_block.block_num(),
             last_irreversible_block_id: head_block_id,
@@ -1274,10 +1275,15 @@ mod tests {
         );
         assert!(response.next_protocol_upgrade.is_none());
         assert_eq!(response.head_block_num, 1);
+        assert_eq!(response.platform_chain_id, response.chain_id);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["protocol_version"], json!(1));
         assert_eq!(json["supported_protocol_version"], json!(PROTOCOL_VERSION));
+        assert_eq!(
+            json["platform_chain_id"],
+            json!(response.chain_id.to_string())
+        );
         assert_eq!(
             json["protocol_upgrade_schedule_hash"],
             json!(EMPTY_PROTOCOL_SCHEDULE_HASH)
