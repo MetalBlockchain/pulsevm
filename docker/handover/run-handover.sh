@@ -2260,13 +2260,15 @@ EOF
     fi
     [[ -n "$rpc_url" ]] || fail "new network RPC never came up (see $WORK_DIR/five-node.log)"
     kill "${HEARTBEAT_PID:-}" 2>/dev/null || true
-    read -r new_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
-        | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["head_block_num"], r["head_block_id"])')"
-    [[ -n "${new_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
+    read -r new_chain new_platform_chain new_head new_head_id <<<"$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' \
+        | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["chain_id"], r["platform_chain_id"], r["head_block_num"], r["head_block_id"])')"
+    [[ -n "${new_chain:-}" && -n "${new_platform_chain:-}" && -n "${new_head_id:-}" ]] || fail "new network getInfo failed"
     if [[ -n "${PULSEVM_SIGNING_CHAIN_ID:-}" ]]; then
         [[ "$(printf '%s' "$new_chain" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$PULSEVM_SIGNING_CHAIN_ID" | tr '[:upper:]' '[:lower:]')" ]] \
             || fail "get_info.chain_id $new_chain does not match pinned signing id $PULSEVM_SIGNING_CHAIN_ID"
-        echo "handover: get_info signing id matches the published migration id"
+        [[ "$(printf '%s' "$new_platform_chain" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$new_chain" | tr '[:upper:]' '[:lower:]')" ]] \
+            || fail "get_info.platform_chain_id unexpectedly equals the pinned signing id"
+        echo "handover: get_info signing id matches; platform id remains distinct ($new_platform_chain)"
     fi
     # Optional chaos: drop one validator before the first transaction, so
     # H+1 must finalize on 4/5 quorum. Off by default; the dead node is left
