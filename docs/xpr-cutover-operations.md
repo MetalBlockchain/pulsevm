@@ -1199,11 +1199,19 @@ before CONFIRMED, user-visible A-Chain writes require reconciliation before any
 return to XPR. After CONFIRMED, remove participating operators' XPR keys under
 the custody policy; other parties may still extend XPR.
 
+State summaries now commit to a Merkle root over chunk-aligned leaves
+(`chunk_merkle` in `state_sync.rs`), and a downloading node authenticates each
+chunk against it as it arrives instead of only the whole file at the end: a
+damaged or malicious chunk fails at that chunk, not after downloading
+everything after it. This bumps the authenticated summary magic (`PVMSUM02` to
+`PVMSUM03`): every node in a sync exchange needs the new binary, the same
+coordinated-release requirement as a protocol feature. There is no fallback to
+whole-file-only checking for a mismatched pair; they simply cannot sync with
+each other until both are upgraded.
+
 Remaining evidence and work: the native API conformance report (279 differences)
 must be supplied before individual differences can be classified; the real
-frozen pre-cut index and mainnet provider sizes remain untested; chain-state-log
-payload damage needs stronger detection; snapshot chunks still have no individual
-authentication proof and a bad transfer can cost a full download. Real passkeys,
+frozen pre-cut index and mainnet provider sizes remain untested. Real passkeys,
 Anchor, Ledger, cleos, post-LIVE msig execution and the 21-producer availability
 run remain integration gates. The box soak is evidence for eb5f1ffb, not for the
 changes listed in this section.

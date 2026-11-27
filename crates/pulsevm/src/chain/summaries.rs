@@ -115,13 +115,18 @@ mod tests {
     };
 
     fn built(height: u64) -> BuiltSummary {
+        let envelope = vec![height as u8; 300];
+        let chunk_merkle_leaves = pulsevm_core::state_sync::chunk_leaves(&envelope);
+        let chunk_merkle_root = pulsevm_core::state_sync::chunk_merkle_root(&chunk_merkle_leaves);
         BuiltSummary {
             height,
             id: Id::new([height as u8; 32]),
             bytes: vec![height as u8; 16],
             hash: [height as u8 ^ 0x55; 32],
+            chunk_merkle_root,
+            chunk_merkle_leaves,
             state_root: [0; 32],
-            envelope: vec![height as u8; 300],
+            envelope,
         }
     }
 
@@ -177,9 +182,13 @@ mod tests {
     async fn a_chunk_is_served_from_the_file_and_a_wrong_hash_is_refused() {
         let (_dir, service) = service_with(&[4096]);
         let stored = service.offer_at(4096).unwrap();
-        let chunk = service.read_chunk(4096, stored.hash, 10, 20).await.unwrap();
+        // This fixture's envelope is 300 bytes, one chunk: offset 0 is the
+        // only chunk-aligned offset, and its proof is empty (a single-leaf
+        // tree's root is the leaf itself), so the response is exactly the
+        // requested bytes with no trailing proof.
+        let chunk = service.read_chunk(4096, stored.hash, 0, 20).await.unwrap();
         assert_eq!(chunk, vec![4096u64 as u8; 20]);
-        assert!(service.read_chunk(4096, [0; 32], 10, 20).await.is_err());
+        assert!(service.read_chunk(4096, [0; 32], 0, 20).await.is_err());
         assert!(
             service
                 .read_chunk(4096, stored.hash, 295, 20)

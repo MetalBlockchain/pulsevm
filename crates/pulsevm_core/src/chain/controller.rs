@@ -1280,6 +1280,13 @@ pub struct BuiltSummary {
     pub bytes: Vec<u8>,
     /// The hash of `envelope`, which the summary commits to.
     pub hash: [u8; 32],
+    /// Merkle root over `chunk_merkle_leaves`, which the summary also commits
+    /// to: lets a downloader authenticate each chunk as it arrives instead of
+    /// only the whole envelope at the end.
+    pub chunk_merkle_root: [u8; 32],
+    /// One leaf hash per chunk of `envelope`, kept so the store can answer a
+    /// chunk request with its Merkle proof without re-hashing the envelope.
+    pub chunk_merkle_leaves: Vec<[u8; 32]>,
     pub state_root: [u8; 32],
     /// The snapshot envelope a peer downloads in chunks.
     pub envelope: Vec<u8>,
@@ -1295,6 +1302,8 @@ impl StagedSummary {
     pub fn build(self) -> Result<BuiltSummary, ChainError> {
         let StagedSummary { job, pending } = self;
         let built = job.build()?;
+        let chunk_merkle_leaves = state_sync::chunk_leaves(&built.envelope);
+        let chunk_merkle_root = state_sync::chunk_merkle_root(&chunk_merkle_leaves);
         let summary = Controller::summary_from(
             &pending.block,
             &pending.schedule,
@@ -1302,12 +1311,15 @@ impl StagedSummary {
             built.state_root,
             built.envelope.len() as u64,
             &built.hash,
+            &chunk_merkle_root,
         )?;
         Ok(BuiltSummary {
             height: summary.height,
             id: summary.id,
             bytes: summary.bytes,
             hash: built.hash,
+            chunk_merkle_root,
+            chunk_merkle_leaves,
             state_root: built.state_root,
             envelope: built.envelope,
         })
@@ -5645,6 +5657,7 @@ impl Controller {
         state_root: [u8; 32],
         envelope_len: u64,
         hash: &[u8; 32],
+        chunk_merkle_root: &[u8; 32],
     ) -> Result<StateSummary, ChainError> {
         let block_bytes = block
             .pack()
@@ -5657,6 +5670,7 @@ impl Controller {
             &block_bytes,
             envelope_len,
             hash,
+            chunk_merkle_root,
             &state_root,
             protocol_commitment,
         );

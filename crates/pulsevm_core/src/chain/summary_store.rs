@@ -60,6 +60,11 @@ pub struct StoredSummary {
     pub hash: [u8; 32],
     /// The length of the snapshot envelope.
     pub len: u64,
+    /// One leaf hash per chunk, kept so a chunk request can be answered with
+    /// its Merkle proof without re-reading and re-hashing the whole snapshot
+    /// file (which the chunk itself already costs reading; the leaves are the
+    /// few-hundred-KB-to-few-MB of metadata the proof is built from).
+    chunk_merkle_leaves: Vec<[u8; 32]>,
     snapshot: PathBuf,
 }
 
@@ -70,6 +75,8 @@ struct Meta {
     summary: String,
     hash: String,
     len: u64,
+    #[serde(default)]
+    chunk_merkle_leaves: Vec<String>,
 }
 
 pub struct SummaryStore {
@@ -155,12 +162,26 @@ impl SummaryStore {
         }
         let id: [u8; 32] = hex::decode(&meta.id).ok()?.try_into().ok()?;
         let hash: [u8; 32] = hex::decode(&meta.hash).ok()?.try_into().ok()?;
+        let chunk_merkle_leaves: Vec<[u8; 32]> = meta
+            .chunk_merkle_leaves
+            .iter()
+            .map(|leaf| hex::decode(leaf).ok()?.try_into().ok())
+            .collect::<Option<_>>()?;
+        // A meta file from before this field existed, or a truncated one,
+        // leaves this empty or short: a pair this node cannot correctly answer
+        // chunk requests for, no different from a size mismatch above.
+        if chunk_merkle_leaves.len() as u64
+            != crate::chain::state_sync::chunk_count(meta.len)
+        {
+            return None;
+        }
         Some(StoredSummary {
             height: meta.height,
             id: Id::new(id),
             bytes: hex::decode(&meta.summary).ok()?,
             hash,
             len: meta.len,
+            chunk_merkle_leaves,
             snapshot,
         })
     }
@@ -187,6 +208,11 @@ impl SummaryStore {
             summary: hex::encode(&built.bytes),
             hash: hex::encode(built.hash),
             len: built.envelope.len() as u64,
+            chunk_merkle_leaves: built
+                .chunk_merkle_leaves
+                .iter()
+                .map(hex::encode)
+                .collect(),
         };
         let meta_bytes = serde_json::to_vec(&meta)
             .map_err(|e| ChainError::InternalError(format!("summary store: encode: {e}")))?;
@@ -198,6 +224,7 @@ impl SummaryStore {
             bytes: built.bytes,
             hash: built.hash,
             len: meta.len,
+            chunk_merkle_leaves: built.chunk_merkle_leaves,
             snapshot,
         };
         {
@@ -247,9 +274,13 @@ impl SummaryStore {
         entries.iter().map(|entry| entry.height).collect()
     }
 
-    /// One chunk of a kept snapshot, read from its file. At most
-    /// [`SNAPSHOT_CHUNK_LEN`] bytes: the length is chosen by the peer, and an
-    /// unclamped request used to copy up to the whole snapshot.
+    /// One chunk of a kept snapshot, read from its file, followed by its
+    /// Merkle proof against the summary's chunk commitment. At most
+    /// [`SNAPSHOT_CHUNK_LEN`] bytes of chunk data: the length is chosen by the
+    /// peer, and an unclamped request used to copy up to the whole snapshot.
+    /// The proof length is derived from the snapshot's own total size, which
+    /// the peer already knows from the summary it voted for, so it needs no
+    /// framing of its own.
     pub fn read_chunk(
         &self,
         height: u64,
@@ -274,6 +305,18 @@ impl SummaryStore {
             .checked_add(u64::from(len))
             .filter(|end| *end <= entry.len)
             .ok_or_else(|| ChainError::InternalError("serve chunk: out of range".into()))?;
+        if offset % u64::from(SNAPSHOT_CHUNK_LEN) != 0 {
+            return Err(ChainError::InternalError(
+                "serve chunk: offset is not chunk-aligned".into(),
+            ));
+        }
+        let index = (offset / u64::from(SNAPSHOT_CHUNK_LEN)) as usize;
+        if index >= entry.chunk_merkle_leaves.len() {
+            return Err(ChainError::InternalError(
+                "serve chunk: offset is out of range for this snapshot's chunk commitment".into(),
+            ));
+        }
+        let proof = crate::chain::state_sync::chunk_proof(&entry.chunk_merkle_leaves, index);
         let mut file =
             fs::File::open(&entry.snapshot).map_err(|e| io_error("open", &entry.snapshot, e))?;
         file.seek(SeekFrom::Start(offset))
@@ -281,6 +324,9 @@ impl SummaryStore {
         let mut chunk = vec![0u8; (end - offset) as usize];
         file.read_exact(&mut chunk)
             .map_err(|e| io_error("read", &entry.snapshot, e))?;
+        for sibling in &proof {
+            chunk.extend_from_slice(sibling);
+        }
         Ok(chunk)
     }
 }
@@ -298,13 +344,18 @@ mod tests {
     use super::*;
 
     fn built(height: u64, fill: u8, len: usize) -> BuiltSummary {
+        let envelope: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ fill).collect();
+        let chunk_merkle_leaves = crate::chain::state_sync::chunk_leaves(&envelope);
+        let chunk_merkle_root = crate::chain::state_sync::chunk_merkle_root(&chunk_merkle_leaves);
         BuiltSummary {
             height,
             id: Id::new([fill; 32]),
             bytes: vec![fill; 40],
             hash: [fill ^ 0x55; 32],
+            chunk_merkle_root,
+            chunk_merkle_leaves,
             state_root: [fill; 32],
-            envelope: (0..len).map(|i| (i % 251) as u8 ^ fill).collect(),
+            envelope,
         }
     }
 
@@ -363,6 +414,7 @@ mod tests {
                 summary: hex::encode([9u8; 4]),
                 hash: hex::encode([9u8; 32]),
                 len: 10,
+                chunk_merkle_leaves: vec![],
             })
             .unwrap(),
         )
@@ -383,33 +435,87 @@ mod tests {
         let store = SummaryStore::open(dir.path().join("summaries")).unwrap();
         let summary = built(100, 7, 3 * SNAPSHOT_CHUNK_LEN as usize);
         let envelope = summary.envelope.clone();
+        let leaves = summary.chunk_merkle_leaves.clone();
+        let root = summary.chunk_merkle_root;
         let stored = store.register(summary).unwrap();
         let chunk = SNAPSHOT_CHUNK_LEN;
-        assert_eq!(
-            store.read_chunk(100, &stored.hash, 0, chunk).unwrap(),
-            envelope[..chunk as usize]
-        );
-        assert_eq!(
+
+        // Every chunk-aligned request returns the chunk's bytes followed by a
+        // proof that verifies against the summary's own committed root.
+        for index in 0..3u64 {
+            let offset = index * u64::from(chunk);
+            let response = store.read_chunk(100, &stored.hash, offset, chunk).unwrap();
+            let (served_chunk, proof_bytes) = response.split_at(chunk as usize);
+            assert_eq!(
+                served_chunk,
+                &envelope[offset as usize..offset as usize + chunk as usize]
+            );
+            let proof: Vec<[u8; 32]> = proof_bytes
+                .chunks_exact(32)
+                .map(|s| s.try_into().unwrap())
+                .collect();
+            assert!(crate::chain::state_sync::verify_chunk_proof(
+                served_chunk,
+                index,
+                leaves.len() as u64,
+                &proof,
+                &root,
+            ));
+        }
+
+        // The last bytes, exactly to the end, and one past it. Not
+        // chunk-aligned (this snapshot is an exact multiple of the chunk
+        // length), so it refuses before even reaching the length check.
+        let len = envelope.len() as u64;
+        assert!(store.read_chunk(100, &stored.hash, len - 10, 10).is_err());
+        assert!(store.read_chunk(100, &stored.hash, len - 10, 11).is_err());
+        // A chunk-misaligned offset, more than a chunk, the wrong hash, and a
+        // height that is not kept are all refused.
+        assert!(
             store
                 .read_chunk(100, &stored.hash, u64::from(chunk) + 5, 100)
-                .unwrap(),
-            envelope[chunk as usize + 5..chunk as usize + 105]
+                .is_err()
         );
-        // The last bytes, exactly to the end, and one past it.
-        let len = envelope.len() as u64;
-        assert_eq!(
-            store
-                .read_chunk(100, &stored.hash, len - 10, 10)
-                .unwrap()
-                .len(),
-            10
-        );
-        assert!(store.read_chunk(100, &stored.hash, len - 10, 11).is_err());
-        // More than a chunk, the wrong hash, a height that is not kept.
         assert!(store.read_chunk(100, &stored.hash, 0, chunk + 1).is_err());
         assert!(store.read_chunk(100, &stored.hash, 0, u32::MAX).is_err());
         assert!(store.read_chunk(100, &[0u8; 32], 0, 10).is_err());
         assert!(store.read_chunk(101, &stored.hash, 0, 10).is_err());
         assert!(store.read_chunk(100, &stored.hash, u64::MAX, 10).is_err());
+    }
+
+    #[test]
+    fn a_chunk_is_read_with_the_exact_shorter_final_chunk_and_an_exact_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SummaryStore::open(dir.path().join("summaries")).unwrap();
+        // Not a multiple of the chunk length: the last chunk is short.
+        let total_len = 2 * SNAPSHOT_CHUNK_LEN as usize + 777;
+        let summary = built(100, 3, total_len);
+        let envelope = summary.envelope.clone();
+        let root = summary.chunk_merkle_root;
+        let leaf_count = summary.chunk_merkle_leaves.len() as u64;
+        assert_eq!(leaf_count, 3);
+        let stored = store.register(summary).unwrap();
+        let offset = 2 * u64::from(SNAPSHOT_CHUNK_LEN);
+        let response = store.read_chunk(100, &stored.hash, offset, 777).unwrap();
+        let (served_chunk, proof_bytes) = response.split_at(777);
+        assert_eq!(served_chunk, &envelope[offset as usize..]);
+        let proof: Vec<[u8; 32]> = proof_bytes
+            .chunks_exact(32)
+            .map(|s| s.try_into().unwrap())
+            .collect();
+        assert!(crate::chain::state_sync::verify_chunk_proof(
+            served_chunk,
+            2,
+            leaf_count,
+            &proof,
+            &root,
+        ));
+        // A full chunk length at the final, short chunk's offset is refused:
+        // it would read past the end of the file.
+        assert!(
+            store
+                .read_chunk(100, &stored.hash, offset, SNAPSHOT_CHUNK_LEN)
+                .is_err()
+        );
     }
 }

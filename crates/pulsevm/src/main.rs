@@ -2154,14 +2154,19 @@ mod state_summary_rpc_tests {
         let expected_id_bytes = [0x42; 32];
         let expected_id = Id::new(expected_id_bytes);
         let expected_bytes = vec![0x24; 16];
+        let envelope = vec![0x77u8; 300];
+        let chunk_merkle_leaves = pulsevm_core::state_sync::chunk_leaves(&envelope);
+        let chunk_merkle_root = pulsevm_core::state_sync::chunk_merkle_root(&chunk_merkle_leaves);
         vm.summaries
             .register_built_for_test(BuiltSummary {
                 height: 4096,
                 id: expected_id,
                 bytes: expected_bytes.clone(),
                 hash: [0x55; 32],
+                chunk_merkle_root,
+                chunk_merkle_leaves,
                 state_root: [0x66; 32],
-                envelope: vec![0x77; 300],
+                envelope,
             })
             .unwrap();
 
