@@ -198,7 +198,7 @@ against independently replayed XPR state:
   onward. The XPR full-replay index is frozen at H and retained permanently
   as the pre-cut archive; a history router sends pre-H transaction lookups
   there and newer queries to A-Chain Hyperion. Live XPR following ends after
-  the one-week rollback window, but the archive remains backed up and
+  the one-week observation window, but the archive remains backed up and
   queryable. Its production size still needs a mainnet-volume measurement.
 
 ## 5. Files

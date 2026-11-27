@@ -57,6 +57,9 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Check shared migration genesis recipe
+        run: bash scripts/test-migration-genesis.sh
+
       - name: Run workspace tests
         run: cargo test --workspace --locked
 

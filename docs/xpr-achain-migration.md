@@ -176,7 +176,7 @@ cutover keeps every hostname and only re-points backends:
 3. DNS and tunnels do not change; no client reconfiguration is required
    beyond the WebAuth submission endpoint already communicated.
 4. Keep the XPR follow stack (feed, replay, Hyperion) read-only for the
-   one-week rollback window. At the end of that week stop live following,
+   one-week observation window. At the end of that week stop live following,
    but retain the H-frozen XPR full-replay index and its verified backup
    permanently behind the pre-H history route. Archive storage ownership,
    access control, restore drills, and funding must be assigned before LIVE.

@@ -532,12 +532,7 @@ fn header_cpu_limit_points(
     max_cpu_usage_ms: u8,
 ) -> Result<i64, ChainError> {
     if protocol.feature_enabled(ProtocolFeature::CpuUnitsInPoints) {
-        #[cfg(feature = "protocol_feature_cpu_units_in_points")]
         return Ok(i64::from(max_cpu_usage_ms) * 1_000 * crate::config::POINTS_PER_US as i64);
-        #[cfg(not(feature = "protocol_feature_cpu_units_in_points"))]
-        return Err(ChainError::BlockError(
-            "CPU units in points was not compiled into this binary".into(),
-        ));
     }
     Ok(i64::from(max_cpu_usage_ms))
 }
@@ -2178,7 +2173,6 @@ mod header_cpu_limit_tests {
         assert_eq!(header_cpu_limit_points(genesis, 255).unwrap(), 255);
     }
 
-    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
     #[test]
     fn from_the_activation_the_header_byte_is_milliseconds_of_reference_compute() {
         let schedule = br#"{"protocol_upgrades":[{"protocol_version":3,"activation_height":100}]}"#;

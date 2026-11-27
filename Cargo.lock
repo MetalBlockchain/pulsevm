@@ -3866,6 +3866,7 @@ dependencies = [
  "num-bigint",
  "p256",
  "proptest",
+ "pulsevm_abi",
  "pulsevm_billable_size",
  "pulsevm_chain_types",
  "pulsevm_constants",

@@ -226,11 +226,10 @@ fn wal_valid_record_follows_within(
         {
             // A real torn record is a block's row data, full of small integers that
             // look like lengths, and hashing a candidate costs its whole claimed
-            // length. So a candidate is looked at cheaply first: the sixteen bytes
-            // that start every record must continue the log (the next revision, the
-            // same table count). Honest data almost never does; only then is it
-            // hashed. (Without this, an honest torn record of 256 KiB or more
-            // exhausted the budget below and the node refused to start.)
+            // length. Check the revision first and then the complete table
+            // envelope. Only structurally plausible candidates are hashed. (Without this, an honest
+            // torn record of 256 KiB or more exhausted the budget below and the node
+            // refused to start.)
             let plausible = match expect {
                 Some(prefix) => data
                     .get(pos + 8..)
@@ -238,6 +237,27 @@ fn wal_valid_record_follows_within(
                 None => true, // nothing before it to compare with
             };
             if plausible {
+                if expect.is_some() {
+                    let Some(end) = (pos + 8).checked_add(len as usize) else {
+                        pos += 1;
+                        continue;
+                    };
+                    let Some(payload) = data.get(pos + 8..end) else {
+                        pos += 1;
+                        continue;
+                    };
+                    // Row bytes often imitate a revision. Require a complete
+                    // table envelope before hashing megabytes at that offset.
+                    // This accepts registry changes between genuine records.
+                    match wal_frame_shape(payload, &mut hashed, budget) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            pos += 1;
+                            continue;
+                        }
+                        Err(()) => return Follows::BudgetExhausted,
+                    }
+                }
                 // A transaction can put chosen bytes into the log, including a
                 // plausible prefix, so what is hashed is still bounded: past the
                 // budget the answer is "cannot rule out damage", which refuses the
@@ -254,6 +274,38 @@ fn wal_valid_record_follows_within(
         pos += 1;
     }
     Follows::No
+}
+
+// Check only the table envelope, without allocating or inspecting row bodies.
+// Charge each header visited to the same work budget as checksum hashing.
+fn wal_frame_shape(payload: &[u8], work: &mut u64, budget: u64) -> Result<bool, ()> {
+    let Some(count) = try_read_u64(payload, 8) else {
+        return Ok(false);
+    };
+    if payload.len() < 16 || count > ((payload.len() - 16) / 10) as u64 {
+        return Ok(false);
+    }
+    let mut offset = 16usize;
+    for _ in 0..count {
+        *work = work.saturating_add(10);
+        if *work > budget {
+            return Err(());
+        }
+        let Some(size) = try_read_u64(payload, offset + 2) else {
+            return Ok(false);
+        };
+        let Ok(size) = usize::try_from(size) else {
+            return Ok(false);
+        };
+        let Some(end) = offset.checked_add(10).and_then(|v| v.checked_add(size)) else {
+            return Ok(false);
+        };
+        if end > payload.len() {
+            return Ok(false);
+        }
+        offset = end;
+    }
+    Ok(offset == payload.len())
 }
 
 /// The most bytes the damage scan will hash. A torn record is one block's change,
@@ -1137,7 +1189,11 @@ mod damage_scan_tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&revision.to_le_bytes());
         frame.extend_from_slice(&tables.to_le_bytes());
-        frame.extend(std::iter::repeat_n(0x5Au8, filler));
+        for table in 0..tables {
+            frame.extend_from_slice(&(table as u16).to_le_bytes());
+            frame.extend_from_slice(&(filler as u64).to_le_bytes());
+            frame.extend(std::iter::repeat_n(0x5Au8, filler));
+        }
         frame
     }
 
@@ -1153,16 +1209,38 @@ mod damage_scan_tests {
     // The failure Paul measured on real data: an honest torn record of 256 KiB or
     // more was refused by the scan budget, because the row data in it is full of
     // small integers that look like lengths and each one was hashed over its claimed
-    // length. A candidate must now first continue the log (next revision, same table
-    // count), which almost no row data does.
+    // length. A candidate must now first continue the log (plausible revision and complete table
+    // envelope), which almost no row data does.
+    #[test]
+    fn table_envelope_scan_is_bounded_and_accepts_registry_changes() {
+        let mut payload = 2_000_004i64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&99u16.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(wal_frame_shape(&payload, &mut 0, 9), Err(()));
+        assert_eq!(wal_frame_shape(&payload, &mut 0, 10), Ok(true));
+        let (_dir, path) = log_with_frames(&[2_000_001, 2_000_002]);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xff; 16])
+            .unwrap();
+        append_frame(&path, &payload).unwrap();
+        // A genuine later frame must prove middle damage even when its
+        // registered table count differs from earlier frames.
+        assert!(scan_wal(&std::fs::read(path).unwrap()).is_err());
+    }
+
     #[test]
     fn an_honest_torn_record_full_of_plausible_lengths_is_recovered_whatever_its_size() {
         let (_dir, path) = log_with_frames(&[2_000_001, 2_000_002, 2_000_003]);
         let good_len = std::fs::metadata(&path).unwrap().len();
         let mut data = std::fs::read(&path).unwrap();
-        // A record that claims 512 KiB and has 90% of it: u64 words that are all
+        // A record that claims 4 MiB and has 90% of it: u64 words that are all
         // plausible lengths, like the integers in real row data.
-        let claimed: u64 = 512 * 1024;
+        let claimed: u64 = 4 * 1024 * 1024;
         data.extend_from_slice(&claimed.to_le_bytes());
         let mut word = 7u64;
         while data.len() < good_len as usize + 8 + (claimed as f64 * 0.9) as usize {
@@ -1182,7 +1260,7 @@ mod damage_scan_tests {
     fn an_honest_torn_first_record_after_a_fold_is_recovered() {
         let (_dir, path) = log_with_frames(&[2_000_001]);
         let mut data = std::fs::read(&path).unwrap();
-        let claimed: u64 = 512 * 1024;
+        let claimed: u64 = 4 * 1024 * 1024;
         data.truncate(WAL_HEADER_LEN);
         data.extend_from_slice(&claimed.to_le_bytes());
         // A first frame has no preceding WAL frame for sequence checks, but its
@@ -1225,7 +1303,7 @@ mod damage_scan_tests {
     // every candidate. That is still bounded by the budget and still refused, not
     // hashed in full.
     #[test]
-    fn a_tail_that_imitates_the_start_of_a_record_still_hits_the_budget() {
+    fn a_tail_that_only_imitates_the_prefix_is_filtered_before_hashing() {
         let key = [3u8; WAL_KEY_LEN];
         let expect = FramePrefix {
             last_revision: 2_000_000,
@@ -1240,7 +1318,7 @@ mod damage_scan_tests {
         }
         assert_eq!(
             wal_valid_record_follows_within(&data, &key, 0, 4 << 20, Some(expect)),
-            Follows::BudgetExhausted
+            Follows::No
         );
         // The same bytes without that imitation are not even looked at.
         let plain = vec![0xA5u8; 4 << 20];

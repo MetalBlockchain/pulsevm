@@ -1689,6 +1689,15 @@ impl Controller {
             ChainError::ParseError(format!("failed to parse node config JSON: {e}"))
         })?);
         let node_config = self.node_config.as_ref().unwrap();
+        if node_config.history_provider
+            && (node_config.state_sync_enabled
+                || node_config.block_production_enabled
+                || !node_config.state_history_enabled)
+        {
+            return Err(ChainError::ParseError(
+                "history_provider requires state_sync_enabled=false, block_production_enabled=false and state_history_enabled=true".into(),
+            ));
+        }
         if node_config.block_production_enabled && node_config.producer_key.is_none() {
             return Err(ChainError::ParseError(
                 "block_production_enabled requires producer_key".into(),
@@ -1881,6 +1890,16 @@ impl Controller {
                     Some(&chain_id.0.0),
                 )
                 .map_err(ChainError::GenesisError)?;
+                // A valid quorum can still sign an unsafe replay domain. Wallet
+                // signatures must never be reusable on the source chain.
+                let signing_id = if rust_genesis.chain_id_override.is_some() {
+                    rust_genesis.compute_chain_id()
+                } else {
+                    chain_id.0.0
+                };
+                if let Some(declaration) = &manifest.halt_declaration {
+                    declaration.validate_successor_signing_id(&signing_id)?;
+                }
                 migration_roster = Some(roster);
                 // Audit trail: what the old schedule committed to, in
                 // whose favor, over which terminal block — re-derivable
@@ -2758,15 +2777,12 @@ impl Controller {
         Ok(())
     }
 
-    /// Confirm that a candidate executes against the activation history of its
-    /// accepted parent. The record itself is persisted only after the candidate
-    /// has been committed, so a rejected speculative block cannot activate it.
-    fn prepare_protocol_execution(
-        &mut self,
-        context: ProtocolExecutionContext,
-    ) -> Result<(), ChainError> {
-        let block_height = context.block_height();
-        self.validate_persisted_protocol_state(block_height.saturating_sub(1), false)
+    /// Validate durable history through the accepted tip. Candidate execution
+    /// separately selects its support-checked protocol context by height.
+    fn prepare_protocol_execution(&self) -> Result<(), ChainError> {
+        // Activation records become durable only at acceptance; verified
+        // ancestors can already cross the upgrade boundary.
+        self.validate_persisted_protocol_state(self.last_accepted_block.block_num(), false)
     }
 
     /// Finish the single accepted-block recovery staged by [`Self::initialize`].
@@ -2924,7 +2940,7 @@ impl Controller {
 
         let mut db = self.db.clone();
         db.arena_start_undo_session(); // the block session; retained on the pending chain
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             db.arena_undo();
             return Err(error);
         }
@@ -3201,14 +3217,18 @@ impl Controller {
         let rejected_batch_without_deferred =
             rejected_input_transaction && !had_deferred_transactions;
 
-        // Keep ordinary empty-pool builds gated, but if this build was woken by
+        // Rate-limit empty-pool builds to one per five seconds (ten slots). This
+        // keeps head time current for clients after quiet periods. If woken by
         // transactions and every input transaction was rejected during
         // execution, return an empty block instead of an RPC build error.
         // Otherwise the VM reports a failed build after correctly dropping the
         // bad transactions; the engine may stop its current production attempt
         // even though the mempool is now clean. Empty blocks are valid on the
         // verification path.
-        if transaction_receipts.is_empty() && !rejected_batch_without_deferred {
+        if transaction_receipts.is_empty()
+            && !rejected_batch_without_deferred
+            && timestamp.slot().saturating_sub(parent_timestamp.slot()) < 10
+        {
             db.arena_undo(); // discard the empty block's session
             return Err(ChainError::NetworkError(format!(
                 "built block has no transactions"
@@ -4252,7 +4272,7 @@ impl Controller {
         let mut xpr_bot_oracle_cache = super::xpr_native_replay::DirectBotOracleCache::default();
         let mut dependency_reports = Vec::<TransactionDependencies>::new();
         let mut untracked_transactions = 0usize;
-        self.prepare_protocol_execution(protocol_context)?;
+        self.prepare_protocol_execution()?;
         self.blocks_executed += 1;
 
         let mut schedule_state = self.schedule_state_for_parent(block.previous_id())?;
@@ -4803,7 +4823,7 @@ impl Controller {
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             // Admission executes the same activation boundary as block
             // production, but its outer session is always discarded.
             db.arena_undo();
@@ -4848,7 +4868,7 @@ impl Controller {
         self.block_pending_schedule = schedule_state.pending;
         let db = self.db.clone();
         db.arena_start_undo_session();
-        if let Err(error) = self.prepare_protocol_execution(protocol_context) {
+        if let Err(error) = self.prepare_protocol_execution() {
             db.arena_undo();
             return Err(error);
         }
@@ -8736,6 +8756,12 @@ mod tests {
     }
 
     fn init_test_controller() -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
+        init_test_controller_with_protocol_upgrades(&[])
+    }
+
+    fn init_test_controller_with_protocol_upgrades(
+        upgrade_bytes: &[u8],
+    ) -> Result<(Controller, PrivateKey, Id, TempDir), ChainError> {
         let chain_id =
             Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
                 .unwrap();
@@ -8750,10 +8776,11 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        controller.initialize(
+        controller.initialize_with_protocol_upgrades(
             &chain_id,
             &config_bytes,
             &genesis_bytes.to_vec(),
+            upgrade_bytes,
             temp_path.path().to_str().unwrap(),
         )?;
         Ok((controller, private_key, chain_id, temp_path))
@@ -9333,9 +9360,10 @@ mod tests {
         let mut mempool = Mempool::new();
         mempool.add_transaction(expired.clone());
 
+        let heartbeat = controller.build_block(&mut mempool).await?;
         assert!(
-            controller.build_block(&mut mempool).await.is_err(),
-            "an expired-only mempool must not produce a block"
+            heartbeat.transactions.is_empty(),
+            "expired transactions must not be included"
         );
         assert!(
             !mempool.contains(expired.id()),
@@ -13586,6 +13614,7 @@ mod tests {
         .into_bytes();
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["chain_id"] = json!("66".repeat(32));
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         // The pair key was built up front so the checkpoint could stage
@@ -13758,6 +13787,7 @@ mod tests {
         .into_bytes();
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["chain_id"] = json!("66".repeat(32));
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         attach_halt_pair(
@@ -13852,6 +13882,7 @@ mod tests {
         .into_bytes();
         let mut migration_genesis: serde_json::Value =
             serde_json::from_slice(&generate_genesis(&private_key)).unwrap();
+        migration_genesis["chain_id"] = json!("66".repeat(32));
         migration_genesis["migration_checkpoint_sha256"] = json!(manifest.checkpoint_sha256);
         let mut migration_genesis = serde_json::to_vec(&migration_genesis).unwrap();
         attach_halt_pair(
@@ -14665,6 +14696,86 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn history_provider_refuses_settings_that_discard_or_disable_history() {
+        let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")
+            .unwrap();
+        for (sync, production, history) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let temp = get_temp_dir();
+            let config = json!({"producer_name":"pulse", "history_provider":true,
+                "state_sync_enabled":sync, "block_production_enabled":production,
+                "state_history_enabled":history})
+            .to_string()
+            .into_bytes();
+            let error = Controller::new()
+                .initialize(
+                    &Id::default(),
+                    &config,
+                    &generate_genesis(&key),
+                    temp.path().to_str().unwrap(),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("history_provider requires"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_refuses_source_id_even_with_a_valid_signed_confirmation()
+    -> Result<(), ChainError> {
+        let key = PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let temp = get_temp_dir();
+        let (checkpoint, manifest, mut genesis, platform, source_block, height, _, source_id) =
+            migration_checkpoint_with_schedule_key(&temp, &key, &[]).await?;
+        let mut value: serde_json::Value = serde_json::from_slice(&genesis).unwrap();
+        value["chain_id"] = json!(hex::encode(source_id));
+        genesis = serde_json::to_vec(&value).unwrap();
+        let signer = pulsevm_crypto::K1PrivateKey::from_string(&key.to_string()).unwrap();
+        // Sign the unsafe identity correctly: refusal must come from domain
+        // separation, rather than a stale confirmation or bad signature.
+        attach_halt_pair(
+            &manifest,
+            &mut genesis,
+            &source_id,
+            height,
+            &source_block,
+            &[signer],
+            &["pulse"],
+            &[0],
+            &platform.0.0,
+        )?;
+        let config = json!({
+            "producer_name":"pulse", "producer_key":key.to_string(),
+            "migration_checkpoint":checkpoint,
+            "migration_manifest":manifest,
+            "migration_local_checkpoint_sha256":local_checkpoint_sha256(&checkpoint),
+        })
+        .to_string()
+        .into_bytes();
+        let target = temp.path().join("unsafe-target");
+        let mut controller = Controller::new();
+        let error = controller
+            .initialize(&platform, &config, &genesis, target.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must differ from the source chain id"),
+            "{error}"
+        );
+        assert!(
+            !controller.db.arena_account_exists(PULSE_NAME.as_u64()),
+            "unsafe checkpoint must not be installed"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn migration_restore_builds_with_matching_schedule_key() -> Result<(), ChainError> {
         let schedule_key =
@@ -14988,7 +15099,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
     #[tokio::test]
     async fn an_imported_deferred_transaction_with_a_header_cap_runs_at_the_activation_height()
     -> Result<(), ChainError> {
@@ -15039,7 +15149,7 @@ mod tests {
     // the boot check then refused to start. The first block of a cutover chain is
     // that block. Recording it on start is safe only for the last block this node
     // itself executed; anything older is the stale-schedule case and stays refused.
-    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+
     #[tokio::test]
     async fn a_kill_before_the_activation_record_is_written_does_not_stop_the_node()
     -> Result<(), ChainError> {
@@ -15094,7 +15204,7 @@ mod tests {
     // is correct to refuse (the chain never ran version 3 below H) but the
     // message must say what to do, and H+1 must boot, switch at the right
     // block, run a header-capped transaction, and survive a kill.
-    #[cfg(feature = "protocol_feature_cpu_units_in_points")]
+
     #[tokio::test]
     async fn a_restored_chain_activates_version_three_at_h_plus_one_not_before()
     -> Result<(), ChainError> {
@@ -15235,7 +15345,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            mut migration_genesis,
+            migration_genesis,
             chain_id,
             source_block_id,
             source_block_num,
@@ -16139,7 +16249,7 @@ mod tests {
         let (
             checkpoint,
             manifest_path,
-            mut migration_genesis,
+            migration_genesis,
             chain_id,
             _source_block_id,
             _source_block_num,
@@ -16748,6 +16858,93 @@ mod tests {
             "node must refuse to produce a block it cannot validly sign"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_upgrade_activation_does_not_reject_child_block() -> Result<(), ChainError> {
+        let upgrades = json!({
+            "protocol_upgrades": [{
+                "protocol_version": 2,
+                "activation_height": 2,
+            }],
+        })
+        .to_string();
+        let (mut producer, private_key, chain_id, _producer_temp) =
+            init_test_controller_with_protocol_upgrades(upgrades.as_bytes())?;
+        let mut producer_mempool = Mempool::new();
+
+        // The first produced block is the activation block at height 2. The
+        // producer accepts it before building its child, so its durable history
+        // already contains that activation when it builds height 3.
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradeone")?,
+            chain_id,
+        )?);
+        let activation = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(activation.block_num(), 2);
+        producer.accept_block(&activation.id()?, &mut producer_mempool)?;
+        producer.set_preferred_id(activation.id()?);
+
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradetwo")?,
+            chain_id,
+        )?);
+        let activation_child = producer.build_block(&mut producer_mempool).await?;
+        producer.accept_block(&activation_child.id()?, &mut producer_mempool)?;
+        producer.set_preferred_id(activation_child.id()?);
+        assert_eq!(producer.db.activated_protocol_features()?.len(), 1);
+
+        producer_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("upgradethree")?,
+            chain_id,
+        )?);
+        let child = producer.build_block(&mut producer_mempool).await?;
+        assert_eq!(child.block_num(), 4);
+
+        // A peer may receive and verify the activation block and its child
+        // before consensus accepts either. The child must still verify against
+        // the same configured schedule, even though the durable record is not
+        // written until the activation block is accepted.
+        let (mut validator, _validator_key, _validator_chain_id, _validator_temp) =
+            init_test_controller_with_protocol_upgrades(upgrades.as_bytes())?;
+        let mut validator_mempool = Mempool::new();
+        validator
+            .verify_block(&activation, &mut validator_mempool)
+            .await?;
+        validator
+            .verify_block(&activation_child, &mut validator_mempool)
+            .await?;
+        assert!(validator.db.activated_protocol_features()?.is_empty());
+        validator
+            .verify_block(&child, &mut validator_mempool)
+            .await?;
+
+        // Once the common prefix is accepted, the durable record is appended at
+        // the activation height and descendants remain valid.
+        validator.accept_block(&activation.id()?, &mut validator_mempool)?;
+        validator.accept_block(&activation_child.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.db.activated_protocol_features()?.len(), 1);
+        validator.accept_block(&child.id()?, &mut validator_mempool)?;
+        assert_eq!(validator.last_accepted_block().block_num(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quiet_chain_heartbeat_refreshes_head_and_validates_on_peer() -> Result<(), ChainError>
+    {
+        let (mut producer, _, _, _producer_temp) = init_test_controller()?;
+        let mut pool = Mempool::new();
+        let block = producer.build_block(&mut pool).await?;
+        assert!(block.transactions.is_empty());
+        let (mut peer, _, _, _peer_temp) = init_test_controller()?;
+        peer.verify_block(&block, &mut pool).await?;
+        peer.accept_block(&block.id()?, &mut pool)?;
+        producer.accept_block(&block.id()?, &mut pool)?;
+        assert_eq!(peer.db.arena_state_root(), producer.db.arena_state_root());
         Ok(())
     }
 

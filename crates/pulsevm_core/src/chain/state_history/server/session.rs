@@ -159,7 +159,14 @@ impl Session {
                                 GetBlocksRequestV0::read(&b, &mut 1).map_err(|e| {
                                     anyhow!("failed to parse GetBlocksRequestV0: {:?}", e)
                                 })?;
-                            self.update_current_request(&mut request).await?;
+                            if let Err(error) = self.update_current_request(&mut request).await {
+                                warn!("SHiP request rejected: {error}");
+                                let _ = tx_out.send(Message::Close(Some(tungstenite::protocol::CloseFrame {
+                                    code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+                                    reason: "requested history unavailable; inspect get_status ranges".into(),
+                                }))).await;
+                                break;
+                            }
 
                             // Initialize window (fallback if zero)
                             let window = if request.max_messages_in_flight == 0 {
@@ -378,6 +385,26 @@ impl Session {
             }
         }
 
+        let requested = self.to_send_block_num;
+        for (fetch, log, label) in [
+            (req.fetch_traces, controller.trace_log(), "trace"),
+            (
+                req.fetch_deltas,
+                controller.chain_state_log(),
+                "chain-state",
+            ),
+        ] {
+            if fetch {
+                let (begin, _) = ship_log_range(log);
+                if (begin == 0 && requested <= controller.last_accepted_block().block_num())
+                    || (begin > 0 && requested < begin)
+                {
+                    return Err(anyhow!(
+                        "requested {label} history at {requested} is unavailable (begin {begin})"
+                    ));
+                }
+            }
+        }
         self.current_request = Some(req.clone());
 
         Ok(())
@@ -579,5 +606,26 @@ mod tests {
             (status.chain_state_begin_block, status.chain_state_end_block),
             (400, 402)
         );
+        let mut session = session;
+        let mut request = GetBlocksRequestV0 {
+            start_block_num: 399,
+            end_block_num: 0,
+            max_messages_in_flight: 1,
+            have_positions: vec![],
+            irreversible_only: true,
+            fetch_block: true,
+            fetch_traces: true,
+            fetch_deltas: true,
+        };
+        assert!(
+            session
+                .update_current_request(&mut request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+        request.start_block_num = 401;
+        session.update_current_request(&mut request).await.unwrap();
     }
 }

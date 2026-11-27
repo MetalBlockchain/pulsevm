@@ -382,8 +382,6 @@ pub const SHIP_ABI: &str = r#"
                 { "type": "uint32", "name": "max_transaction_cpu_usage" },
                 { "type": "uint32", "name": "min_transaction_cpu_usage" },
                 { "type": "uint32", "name": "max_transaction_lifetime" },
-                { "type": "uint32", "name": "deferred_trx_expiration_window" },
-                { "type": "uint32", "name": "max_transaction_delay" },
                 { "type": "uint32", "name": "max_inline_action_size" },
                 { "type": "uint16", "name": "max_inline_action_depth" },
                 { "type": "uint16", "name": "max_authority_depth" },
@@ -415,7 +413,7 @@ pub const SHIP_ABI: &str = r#"
         {
             "name": "global_property_v1", "fields": [
                 { "type": "uint32?", "name": "proposed_schedule_block_num" },
-                { "type": "producer_authority_schedule", "name": "proposed_schedule" },
+                { "type": "producer_authority_schedule?", "name": "proposed_schedule" },
                 { "type": "chain_config", "name": "configuration" },
                 { "type": "checksum256", "name": "chain_id" },
                 { "type": "wasm_config$", "name": "wasm_configuration" }
@@ -613,3 +611,34 @@ pub const SHIP_ABI: &str = r#"
     ]
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use pulsevm_serialization::Write;
+
+    #[test]
+    fn served_abi_decodes_the_145_byte_global_property_row() {
+        let mut json: serde_json::Value = serde_json::from_str(super::SHIP_ABI).unwrap();
+        // SHiP table metadata uses key_names; the contract ABI packer uses
+        // index_type. Only structs and variants are needed to decode a row.
+        json["tables"] = serde_json::json!([]);
+        for item in json["structs"].as_array_mut().unwrap() {
+            item["base"] = serde_json::json!("");
+        }
+        let definition: crate::abi::AbiDefinition = serde_json::from_value(json).unwrap();
+        let abi = pulsevm_abi::Abi::from_bytes(&definition.pack().unwrap()).unwrap();
+        // global_property v1, no proposed schedule, chain_config v1, 64-byte
+        // config, chain ID, wasm_config v0 and eleven u32 limits.
+        let mut row = vec![0; 145];
+        row[0] = 1;
+        row[3] = 1;
+        row[68..100].fill(0x42);
+        let mut remaining = row.as_slice();
+        let value = abi.bin_to_json("global_property", &mut remaining).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "ABI must consume exactly the serialized row"
+        );
+        assert!(value.to_string().contains(&"42".repeat(32)));
+    }
+}

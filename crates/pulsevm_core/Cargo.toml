@@ -56,16 +56,15 @@ default = []
 # which implementations are compiled; the chain schedule still controls when
 # compiled behavior activates.
 nightly = [
-    "protocol_feature_cpu_units_in_points",
     "protocol_feature_wasm_start_sections",
 ]
-# Protocol version 3: CPU figures a transaction header or a governance call
-# states are metering points, not microseconds. See docs/protocol-features.md.
+# Compatibility flag; protocol v3 is compiled in every build.
 protocol_feature_cpu_units_in_points = []
 # Protocol version 2: new contract code may declare a WASM start section.
 protocol_feature_wasm_start_sections = []
 arena-shadow = []
 [dev-dependencies]
+pulsevm_abi = { path = "../pulsevm_abi" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 wat = "1"

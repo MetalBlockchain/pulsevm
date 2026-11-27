@@ -829,6 +829,7 @@ impl Vm for VirtualMachine {
 
         let block_timer = self.block_timer.clone();
         let mut block_timer = block_timer.write().await;
+        block_timer.production_enabled = controller.block_production_enabled();
         block_timer.start(server_addr.clone()).await;
 
         let last_accepted_block_id = controller.last_accepted_block().id().map_err(|e| {

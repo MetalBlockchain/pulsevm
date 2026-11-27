@@ -2038,12 +2038,9 @@ cmd_checkpoint() {
         if [[ -n "$signing_chain_id" && ! "$signing_chain_id" =~ ^[[:xdigit:]]{64}$ ]]; then
             fail "PULSEVM_SIGNING_CHAIN_ID must be 64 hexadecimal characters"
         fi
-        jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-            --arg schedule_sha256 "$SCHEDULE_SHA256" \
-            --arg initial_key "$GENESIS_KEY" \
-            --arg signing_chain_id "$signing_chain_id" \
-            '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key} | if $signing_chain_id == "" then . else . + {chain_id: $signing_chain_id} end' \
-            "$GENESIS_BASE" >"$WORK_DIR/migration.genesis.json" || fail "migration genesis build failed"
+        source "$REPO_ROOT/scripts/lib/migration-genesis.sh"
+        build_migration_genesis "$GENESIS_BASE" "$WORK_DIR/migration.genesis.json" \
+            "$CHECKPOINT_SHA256" "$SCHEDULE_SHA256" "$GENESIS_KEY" || fail "migration genesis build failed"
         if [[ -n "$signing_chain_id" ]]; then
             echo "handover: migration signing chain id pinned to $signing_chain_id"
         fi
@@ -2180,6 +2177,13 @@ cmd_boot() {
     # Linux and macOS (which ships no `setsid` binary, hence python3).
     export METALGO_EXEC_PATH="${METALGO_EXEC_PATH:-$REPO_ROOT/../metalgo-tahoe/build/metalgo}"
     export PULSEVM_MIGRATION_CHECKPOINT="$checkpoint"
+    # Exercise the production CPU rule at the first successor block in CI,
+    # not only in a preview-profile unit test.
+    local activation_height
+    activation_height="$(( $(cat "$WORK_DIR/H") + 1 ))"
+    export PULSEVM_UPGRADE_PATH="$WORK_DIR/upgrade.json"
+    jq -cn --argjson height "$activation_height" \
+        '{protocol_upgrades:[{protocol_version:3,activation_height:$height}]}' > "$PULSEVM_UPGRADE_PATH"
     PULSEVM_LOCAL_CHECKPOINT_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/local-checkpoint.sha256")" \
         || fail "no locally derived checkpoint hash recorded"
     PULSEVM_SCHEDULE_SHA256="$(tr -d '[:space:]' <"$WORK_DIR/schedule.sha256")" \
@@ -2218,8 +2222,8 @@ EOF
     (cd "$REPO_ROOT" && cargo build --locked --release -p pulsevm_core --example make_probe_tx) \
         || fail "probe tool build failed"
     PROBE_BIN="$REPO_ROOT/target/release/examples/make_probe_tx"
-    # The new network only builds on demand: empty blocks are gated, so H+1
-    # needs a transaction. Submit the network's first transaction itself.
+    # Quiet chains now build heartbeats too. Still submit real transactions
+    # and require their accepted inclusion before passing the boundary audit.
     echo "handover: waiting for the new network RPC..."
     # Heartbeat: proves the harness itself is alive during the long silent
     # waits. Background the loop directly (never `( ... & )`): a job
@@ -2271,13 +2275,13 @@ EOF
         echo "handover: get_info signing id matches; platform id remains distinct ($new_platform_chain)"
     fi
     # Optional chaos: drop one validator before the first transaction, so
-    # H+1 must finalize on 4/5 quorum. Off by default; the dead node is left
+    # New blocks and transaction inclusions must finalize on 4/5 quorum. Off by default; the dead node is left
     # down (a restart path is future work).
     if [[ "${CHAOS_KILL_NODE:-0}" == 1 ]]; then
         victim="$(pgrep -f 'node5/configs' | head -1 || true)"
         [[ -n "$victim" ]] || victim="$(pgrep -f 'metalgo-tahoe' | head -1 || true)"
         [[ -n "$victim" ]] || fail "chaos requested but no node process found"
-        kill -9 "$victim" && echo "handover: chaos: killed node pid $victim; H+1 must land on 4/5"
+        kill -9 "$victim" && echo "handover: chaos: killed node pid $victim; new blocks must land on 4/5"
     fi
     echo "handover: new network at head $new_head; submitting its first transactions..."
     # Timestamp-suffixed names stay unique across reboots of one checkpoint.
@@ -2312,6 +2316,7 @@ print(s)")"
     echo "handover: boundary phase 3 submitted; waiting for the new network to pass H..."
     wait_iters=60
     [[ "${CHAOS_KILL_NODE:-0}" == 1 ]] && wait_iters=150
+    local boot_head="$new_head"
     rpc_url=""
     new_head=0
     for i in $(seq 1 $wait_iters); do
@@ -2319,11 +2324,11 @@ print(s)")"
         [[ -n "$rpc_url" ]] || { sleep 5; continue; }
         new_head="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["head_block_num"])' 2>/dev/null || echo 0)"
-        [[ "$new_head" -gt "$H" ]] && break
+        [[ "$new_head" -gt "$boot_head" ]] && break
         [[ $((i % 6)) == 0 ]] && echo "handover: still at $new_head, waiting for H+1 ($i/$wait_iters)..."
         sleep 5
     done
-    [[ "$new_head" -gt "$H" ]] || fail "new network never passed H=$H (see $WORK_DIR/five-node.log)"
+    [[ "$new_head" -gt "$boot_head" ]] || fail "new network never advanced past boot head $boot_head (see $WORK_DIR/five-node.log)"
     # block_num_or_id must be a string: the endpoint rejects a bare integer
     # with "Invalid params", which would fail closed under set -e here.
     next_id="$(rpc_call "$rpc_url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getBlock","params":{"block_num_or_id":"'"$((H + 1))"'"}}' \
@@ -2428,10 +2433,18 @@ phase1 = {t["txid"] for t in rec.get("phase1", [])}
 phase3 = {t["txid"] for t in rec.get("phase3", [])}
 old_ids = set(rec.get("old_ids", []))
 new_ids = set()
-head = post(rpc, {"jsonrpc": "2.0", "id": 1, "method": "pulsevm.getInfo",
-                  "params": {}})["result"]["head_block_num"]
-for num in range(H + 1, head + 1):
-    new_ids |= pulse_trx_ids(rpc, num)
+import time
+deadline = time.monotonic() + 300
+cursor = H + 1
+while True:
+    head = post(rpc, {"jsonrpc": "2.0", "id": 1, "method": "pulsevm.getInfo",
+                      "params": {}})["result"]["head_block_num"]
+    for num in range(cursor, head + 1):
+        new_ids |= pulse_trx_ids(rpc, num)
+    cursor = head + 1
+    if phase3 <= new_ids or time.monotonic() >= deadline:
+        break
+    time.sleep(0.5)
 print(f"  old chain pre-halt scan: {len(old_ids)} txs; new chain blocks [{H + 1},{head}]: {len(new_ids)} txs")
 bad = 0
 for tid in sorted(phase1):
@@ -2929,7 +2942,7 @@ PY
         builds=""
         for url in $(node_rpc_urls); do
             info="$(rpc_call "$url" '{"jsonrpc":"2.0","id":1,"method":"pulsevm.getInfo","params":{}}' 2>/dev/null \
-                | python3 -c 'import json,sys; b=json.load(sys.stdin)["result"]["pulsevm_build"]; print(b["build_id"], b["wal_format"], b["state_hash_format"])' 2>/dev/null)" \
+                | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; b=r["pulsevm_build"]; print(b["build_id"], b["wal_format"], b["state_hash_format"], r["state_summary_interval"])' 2>/dev/null)" \
                 || fail "check_one_build: a node did not report its build (pulsevm_build is missing from getInfo)"
             builds="$builds$info"$'\n'
         done
@@ -2941,7 +2954,7 @@ PY
         [[ "$reported" -ge 5 ]] \
             || fail "check_one_build: only $reported of 5 nodes reported a build"
         [[ "$(wc -l <<<"$distinct" | tr -d ' ')" == "1" ]] \
-            || fail "check_one_build: the nodes run different builds: $(tr '\n' ';' <<<"$distinct")"
+            || fail "check_one_build: nodes disagree on build, persistence format or state-summary interval: $(tr '\n' ';' <<<"$distinct")"
         # A binary built outside a git checkout reports "unknown", and five of
         # those cannot be told apart. The rehearsal builds from git, so this is
         # an error there; set PULSEVM_ALLOW_UNKNOWN_BUILD=1 to rehearse from a tarball.

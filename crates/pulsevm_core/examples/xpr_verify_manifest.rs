@@ -271,6 +271,16 @@ fn run(
             return fail(error);
         }
         let new_chain_id = genesis.compute_ceremony_chain_id();
+        let signing_id = if genesis.chain_id_override.is_some() {
+            Some(genesis.compute_chain_id())
+        } else {
+            platform_chain_id.copied()
+        };
+        if let (Some(declaration), Some(signing_id)) = (&manifest.halt_declaration, signing_id)
+            && let Err(error) = declaration.validate_successor_signing_id(&signing_id)
+        {
+            return fail(error.to_string());
+        }
         let header_schedule_version = match manifest
             .source_block
             .as_deref()

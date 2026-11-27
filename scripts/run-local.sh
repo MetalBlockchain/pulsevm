@@ -206,19 +206,9 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
   # key (e.g. with the source fixture's key for rehearsals, or the real
   # producer key in a migration ceremony): without it the schedule names a
   # key no node holds and every build fails closed at the signing gate.
-  if [[ -n "${PULSEVM_GENESIS_INITIAL_KEY:-}" ]]; then
-    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
-      --arg initial_key "$PULSEVM_GENESIS_INITIAL_KEY" \
-      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256, initial_key: $initial_key}' \
-      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
-    echo "==> Migration genesis initial key overridden with PULSEVM_GENESIS_INITIAL_KEY"
-  else
-    jq --arg checkpoint_sha256 "$CHECKPOINT_SHA256" \
-      --arg schedule_sha256 "$PULSEVM_SCHEDULE_SHA256" \
-      '. + {migration_checkpoint_sha256: $checkpoint_sha256, migration_schedule_sha256: $schedule_sha256}' \
-      "$GENESIS_PATH" > "$MIGRATION_GENESIS"
-  fi
+  source "$REPO/scripts/lib/migration-genesis.sh"
+  build_migration_genesis "$GENESIS_PATH" "$MIGRATION_GENESIS" \
+    "$CHECKPOINT_SHA256" "$PULSEVM_SCHEDULE_SHA256" "${PULSEVM_GENESIS_INITIAL_KEY:-}"
   # This development key corresponds to genesis.json's initial_key. Override it
   # for a real producer deployment; it is part of the node-local VM config.
   CHAIN_CONFIG="$(jq -cn \
@@ -237,6 +227,11 @@ if [[ -n "${PULSEVM_MIGRATION_CHECKPOINT:-}" ]]; then
     '[{vm_name: "pulsevm", genesis: $genesis, chain_config: $chain_config, blockchain_alias: "pulse-xpr-migration"}]')"
   echo "==> Configured all VM nodes to restore $PULSEVM_MIGRATION_CHECKPOINT"
   echo "==> Generated migration-specific genesis committed to $CHECKPOINT_SHA256"
+fi
+
+if [[ -n "${PULSEVM_UPGRADE_PATH:-}" ]]; then
+  [[ -f "$PULSEVM_UPGRADE_PATH" ]] || { echo "error: PULSEVM_UPGRADE_PATH is not a file" >&2; exit 1; }
+  BLOCKCHAIN_SPECS="$(jq -c --arg upgrade "$PULSEVM_UPGRADE_PATH" 'map(. + {network_upgrade: $upgrade})' <<<"$BLOCKCHAIN_SPECS")"
 fi
 
 echo "==> Starting metal-network-runner server (background)"

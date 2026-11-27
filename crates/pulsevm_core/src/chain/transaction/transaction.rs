@@ -145,8 +145,18 @@ impl<'de> Deserialize<'de> for Transaction {
         #[derive(Deserialize)]
         struct TransactionHelper {
             expiration: TimePointSec,
+            #[serde(default)]
+            ref_block_num: u16,
+            #[serde(default)]
+            ref_block_prefix: u32,
+            #[serde(default)]
             max_net_usage_words: VarUint32,
+            #[serde(default)]
             max_cpu_usage_ms: u8,
+            #[serde(default)]
+            delay_sec: VarUint32,
+            #[serde(default)]
+            context_free_actions: Vec<Action>,
             actions: Vec<Action>,
         }
 
@@ -155,13 +165,13 @@ impl<'de> Deserialize<'de> for Transaction {
         Ok(Transaction::new(
             TransactionHeader::new(
                 helper.expiration,
-                0, // ref_block_num
-                0, // ref_block_prefix
+                helper.ref_block_num,
+                helper.ref_block_prefix,
                 helper.max_net_usage_words,
                 helper.max_cpu_usage_ms,
-                VarUint32(0), // delay_sec
+                helper.delay_sec,
             ),
-            vec![], // context_free_actions
+            helper.context_free_actions,
             helper.actions,
         ))
     }

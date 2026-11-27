@@ -29,6 +29,10 @@ pub struct NodeConfig {
     /// blocks requires rebasing the state-history logs at the current revision.
     #[serde(default = "default_state_history_enabled")]
     pub state_history_enabled: bool,
+    /// Preserve continuous history; initialization rejects production or state
+    /// sync on this role so a provider cannot silently discard its archive.
+    #[serde(default)]
+    pub history_provider: bool,
     /// Allow a replay process to truncate accepted block-log entries newer
     /// than its durable Arena revision and replay those blocks from its source.
     /// This is only for explicit offline/follow replay jobs; normal nodes keep

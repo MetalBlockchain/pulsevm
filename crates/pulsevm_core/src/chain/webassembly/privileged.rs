@@ -260,7 +260,7 @@ pub fn get_blockchain_parameters_packed(
 /// field that cannot be mistaken for anything else is the minimum bill, so it is
 /// the guard: a minimum under one microsecond of metering is a microsecond
 /// value, not a point value.
-#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+
 fn validate_cpu_parameters_in_points(cfg: &ChainConfigV0) -> Result<(), ChainError> {
     let floor = crate::config::POINTS_PER_US;
     if u64::from(cfg.min_transaction_cpu_usage) < floor {
@@ -301,12 +301,12 @@ fn validate_cpu_parameters_in_points(cfg: &ChainConfigV0) -> Result<(), ChainErr
 }
 
 /// How many minimum-sized transactions the block CPU cap must be able to hold.
-#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+
 const MIN_BLOCK_CAP_MULTIPLE: u64 = 1000;
 
 /// How many minimum-sized transactions the transaction CPU cap must be able to
 /// hold. A guard against unit mistakes, deliberately far below any real ratio.
-#[cfg(feature = "protocol_feature_cpu_units_in_points")]
+
 const MIN_CAP_MULTIPLE: u64 = 100;
 
 pub fn set_blockchain_parameters_packed(
@@ -338,12 +338,7 @@ pub fn set_blockchain_parameters_packed(
     cfg.validate()?;
     let context = env_data.apply_context_mut();
     if context.protocol_feature_enabled(ProtocolFeature::CpuUnitsInPoints) {
-        #[cfg(feature = "protocol_feature_cpu_units_in_points")]
         validate_cpu_parameters_in_points(&cfg)?;
-        #[cfg(not(feature = "protocol_feature_cpu_units_in_points"))]
-        return Err(RuntimeError::new(
-            "CPU units in points was not compiled into this binary",
-        ));
     }
     context.set_global_properties(&cfg)?;
     Ok(())

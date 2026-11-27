@@ -35,7 +35,7 @@ pub const GENESIS_PROTOCOL_VERSION: ProtocolVersion = 1;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = 1;
 
 /// Newest protocol version compiled into a normal production build.
-const STABLE_PROTOCOL_VERSION: ProtocolVersion = 2;
+const STABLE_PROTOCOL_VERSION: ProtocolVersion = 3;
 
 /// Newest protocol version compiled by the aggregate `nightly` Cargo feature.
 ///
@@ -356,12 +356,9 @@ mod tests {
         // These are deliberate release declarations, not values derived from
         // the condition under test. Change them only with the corresponding
         // stable/nightly implementation and boundary-test updates.
-        assert_eq!(STABLE_PROTOCOL_VERSION, 2);
+        assert_eq!(STABLE_PROTOCOL_VERSION, 3);
         assert_eq!(NIGHTLY_PROTOCOL_VERSION, 3);
-        assert_eq!(
-            PROTOCOL_VERSION,
-            if cfg!(feature = "nightly") { 3 } else { 2 }
-        );
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

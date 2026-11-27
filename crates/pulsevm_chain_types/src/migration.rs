@@ -679,6 +679,18 @@ impl HaltDeclaration {
         Ok(())
     }
 
+    /// Require a distinct transaction replay domain for the successor chain.
+    pub fn validate_successor_signing_id(&self, signing_id: &[u8; 32]) -> Result<(), ChainError> {
+        let source = decode_hex_32(&self.source_chain_id)
+            .map_err(|e| ChainError::GenesisError(format!("invalid source chain id: {e}")))?;
+        if source == *signing_id {
+            return Err(ChainError::GenesisError(
+                "successor signing chain id must differ from the source chain id".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Signing digest for this declaration.
     pub fn digest(&self) -> Result<[u8; 32], ChainError> {
         let source_chain_id = decode_hex_32(&self.source_chain_id).map_err(|e| {
@@ -1741,6 +1753,27 @@ mod tests {
 
     fn declared_digest(declaration: &HaltDeclaration) -> [u8; 32] {
         declaration.digest().expect("declaration digest must parse")
+    }
+
+    #[test]
+    fn successor_signing_domain_must_differ_from_source() {
+        let mut declaration = declared(vec![]);
+        assert!(
+            declaration
+                .validate_successor_signing_id(&[0x11; 32])
+                .is_err()
+        );
+        assert!(
+            declaration
+                .validate_successor_signing_id(&[0x22; 32])
+                .is_ok()
+        );
+        declaration.source_chain_id = "not a chain id".into();
+        assert!(
+            declaration
+                .validate_successor_signing_id(&[0x22; 32])
+                .is_err()
+        );
     }
 
     /// Pause head the confirmation tests attest: three blocks past H, so

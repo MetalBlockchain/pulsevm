@@ -19,10 +19,9 @@ runtime experiments, contract-controlled activations, or a replacement for
 deploying code that implements the new rules.
 
 > **Current status:** genesis and minimum-supported protocol versions are `1`;
-> stable builds support through version `2`, which enables metered WASM start
-> sections. The `nightly` profile supports through version `3`, which separately
-> enables CPU accounting in points. Keep version `3` unscheduled on production
-> chains until the CPU-units rule is promoted to stable. Each activation still
+> stable and `nightly` builds support through version `3`. Version `2` enables
+> metered WASM start sections; version `3` separately
+> enables CPU accounting in points. The cutover schedules version `3` at H+1. Each activation still
 > requires a common `protocol_upgrades` schedule and all validators running a
 > binary that reports support for the target version.
 
@@ -52,7 +51,7 @@ safe rollout into a chain halt.
 | `PLUGIN_VERSION` | Compatibility version for the rpcchainvm connection between MetalGo and the PulseVM process. It does not select chain rules. |
 | `GENESIS_PROTOCOL_VERSION` | Protocol version used before the first scheduled upgrade. It is currently `1`. |
 | `MIN_SUPPORTED_PROTOCOL_VERSION` | Oldest chain protocol this binary can execute. It is currently `1`. |
-| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `2`. |
+| `STABLE_PROTOCOL_VERSION` | Newest version compiled into a normal production build. It is currently `3`. |
 | `NIGHTLY_PROTOCOL_VERSION` | Newest version compiled when the aggregate `nightly` Cargo feature is enabled. It is currently `3`. |
 | `PROTOCOL_VERSION` | Newest version this particular binary can execute: stable maximum normally, nightly maximum in a `nightly` build. It is not the version active at the current head. |
 | `protocol_feature_*` Cargo feature | Temporary compile-time gate that includes one unfinished implementation. It does not activate the implementation. |
@@ -208,9 +207,8 @@ JSON object with this shape:
 }
 ```
 
-This example explains the schema. The current binary supports versions `1` and
-`2`; version `3` in this example is therefore not executable at activation
-until a binary supporting it is deployed. The file may contain a future version
+This example explains the schema. The current binary supports versions `1`,
+`2` and `3`. Versions above `3` require a newer supporting release. The file may contain a future version
 before the binary can execute it, but at activation the unsupported-version behavior in
 [section 6](#6-failure-behavior) applies to startup, building, verification, and
 state sync.
@@ -437,10 +435,10 @@ rollout normally means two rolling restarts: one to deploy supporting code, then
 one to load the canonical schedule. Leave enough time between those phases to
 verify every node before activation.
 
-This binary supports the first post-genesis feature version, `2`. Operators may
-schedule it only after every validator has the supporting binary installed and
-all nodes report the same schedule hash. Start sections remain rejected before
-the configured activation height.
+This binary supports through version `3`. Schedule it only after every validator
+has the supporting binary installed and all nodes report the same schedule hash.
+Start sections remain rejected before v2, and CPU accounting retains the legacy
+header rule before v3.
 
 ## 9. Adding a protocol feature
 
@@ -750,12 +748,11 @@ migration. A configuration that passes the checks can still be wrong; after a
 `setparams`, compare `block_cpu_limit` and `virtual_block_cpu_limit` in
 `getInfo`.
 
-The points rule is protocol version `3` and is compiled only by the
-`protocol_feature_cpu_units_in_points` flag, included in `nightly`. Stable
-builds support through version `2`; nightly builds support through version `3`.
-Do not schedule version `3` on a production chain until every validator has a
-release that supports it and the activation is coordinated. Version `2` is the
-separate metered WASM start-section rule, already compiled into stable builds.
+The points rule is protocol version `3`, compiled into stable and nightly builds.
+Cutover operators must schedule version `3` at H+1 on every validator. Version
+`2` remains the separate metered WASM start-section rule. Activation of v3 also
+enables the earlier v2 feature. All validators must deploy this release before
+that coordinated activation.
 Tests covering the CPU conversion and parameter bounds are
 `header_cpu_limit_tests` in `transaction_context.rs` and the CPU parameter
 tests in `webassembly/tests/privileged.rs`.

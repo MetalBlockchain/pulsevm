@@ -18,6 +18,7 @@ use tokio::{
 
 #[derive(Clone)]
 pub struct BlockTimer {
+    pub production_enabled: bool,
     pub mempool: Arc<RwLock<Mempool>>,
     pub notify_block_build: Arc<Notify>,
     pub server_address: Arc<RwLock<Option<String>>>,
@@ -27,6 +28,7 @@ pub struct BlockTimer {
 impl BlockTimer {
     pub fn new(mempool: Arc<RwLock<Mempool>>) -> Self {
         BlockTimer {
+            production_enabled: true,
             mempool,
             notify_block_build: Arc::new(Notify::new()),
             server_address: Arc::new(RwLock::new(None)),
@@ -46,7 +48,9 @@ impl BlockTimer {
     }
 
     pub async fn request_block_build(&self) {
-        self.notify_block_build.notify_one();
+        if self.production_enabled {
+            self.notify_block_build.notify_one();
+        }
     }
 
     pub async fn check_block_build(&self) {
@@ -78,9 +82,32 @@ impl BlockTimer {
 async fn build_block_timer(timer: BlockTimer) -> JoinHandle<()> {
     return tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(500));
+        let mut heartbeat = interval(Duration::from_secs(5));
         loop {
-            ticker.tick().await;
-            timer.check_block_build().await;
+            tokio::select! {
+                _ = ticker.tick() => timer.check_block_build().await,
+                // Refresh head time on quiet chains so head-relative client
+                // expirations remain usable. The controller rate-limits empty
+                // builds against the parent timestamp.
+                _ = heartbeat.tick() => timer.request_block_build().await,
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    #[tokio::test]
+    async fn observers_do_not_request_heartbeat_or_transaction_builds() {
+        let mut timer = BlockTimer::new(Arc::new(RwLock::new(Mempool::new())));
+        timer.production_enabled = false;
+        timer.request_block_build().await;
+        assert!(timer.wait_for_block_build().now_or_never().is_none());
+        timer.production_enabled = true;
+        timer.request_block_build().await;
+        assert!(timer.wait_for_block_build().now_or_never().is_some());
+    }
 }

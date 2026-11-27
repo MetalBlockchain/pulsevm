@@ -309,7 +309,6 @@ fn before_protocol_v3_microsecond_parameters_are_still_accepted() {
     assert_eq!(h.db.chain_config().unwrap().min_transaction_cpu_usage, 100);
 }
 
-#[cfg(feature = "protocol_feature_cpu_units_in_points")]
 mod protocol_v3 {
     use super::*;
     use crate::chain::protocol_features::ProtocolUpgradeSchedule;

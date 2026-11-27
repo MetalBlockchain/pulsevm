@@ -536,6 +536,10 @@ pub fn unlinkauth(
 }
 
 fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Result<(), ChainError> {
+    crate::chain::authorization_manager::validate_protocol_key_features(
+        db,
+        &auth.keys().iter().map(|key| key.key.clone()).collect(),
+    )?;
     for a in auth.accounts() {
         // C++ does a throwing `get<account_object>` purely to assert existence;
         // is_account is the same predicate and is served off the arena.
@@ -567,4 +571,30 @@ fn validate_authority_precondition(db: &mut Database, auth: &Authority) -> Resul
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod authority_feature_tests {
+    use super::*;
+
+    #[test]
+    fn account_authority_cannot_install_webauthn_before_activation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = Database::new(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        let authority = Authority::new(
+            1,
+            vec![crate::authority::KeyWeight::new(
+                pulsevm_crypto::AuthorityPublicKey::WebAuthn {
+                    point: [2; 33],
+                    user_presence: 1,
+                    rpid: "example.com".into(),
+                },
+                1,
+            )],
+            vec![],
+            vec![],
+        );
+        let error = validate_authority_precondition(&mut db, &authority).unwrap_err();
+        assert!(error.to_string().contains("WEBAUTHN_KEY"));
+    }
 }

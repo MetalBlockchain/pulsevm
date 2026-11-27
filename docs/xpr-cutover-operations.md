@@ -72,8 +72,9 @@ Phases, in order. The voter enforces timing; the operator enforces judgment.
    30 consecutive blocks. Keep XPR recovery available during the one-hour
    observation window. Publish CONFIRMED after that hour only if the A-Chain
    remains healthy, the API and history continuity checks pass, and the
-   coordinator records the decision. A rollback to XPR is an operator decision
-   available only before CONFIRMED. After CONFIRMED, participating XPR
+   coordinator records the decision. Returning to XPR is safe only before
+   user-visible writes on A-Chain; LIVE writes require reconciliation and a
+   governance recovery decision even before CONFIRMED. After CONFIRMED, participating XPR
    producers should remove their XPR signing keys from live hosts under the
    key-custody policy. This retires keys for those operators; it cannot prevent
    another party from restarting XPR or producing a fork. PulseVM has no
@@ -118,7 +119,7 @@ and manifest. Start them from that checkpoint; do not join by state sync.
 Their node config keeps the canonical initial `producer_name`, sets
 `block_production_enabled=false`, omits `producer_key`, and sets
 `state_sync_enabled=false`. A Hyperion/SHiP provider also sets
-`state_history_enabled=true` before first boot so it records a contiguous
+`state_history_enabled=true` and `history_provider=true` before first boot so it records a contiguous
 history from H+1. An API-only node may disable history if it serves no SHiP
 clients. Compare `get_info.chain_id`, `platform_chain_id`,
 `block_production_enabled`, `state_sync_enabled`, and
@@ -387,12 +388,13 @@ the target alike.
 - **A transaction header's `max_cpu_usage_ms`** was used as a point count, so a
   transaction that set it (imported multisig proposals, deferred transactions)
   got at most 255 points and could never pay the minimum bill. Leap multiplies
-  by 1000. Fixed by protocol version 2 (`CpuUnitsInPoints`,
+  by 1000. Fixed by protocol version 3 (`CpuUnitsInPoints`,
   `docs/protocol-features.md` section 13); it is not active on a chain until its
-  upgrade schedule says so, and it needs a `nightly` build today.
+  upgrade schedule says so. Schedule version 3 at H+1 on every node; the
+  cutover release includes this rule in stable builds.
 - **A later `setparams`** applies whatever it is given. The chain only checks
   relations between fields, so XPR's microsecond values (a minimum bill of 100)
-  would be accepted and put every cap back to a few microseconds. Version 2
+  would be accepted and put every cap back to a few microseconds. Version 3
   refuses a minimum under `POINTS_PER_US`. Until it is active, any `setparams`
   after the cut must carry point values, and `getInfo` (`block_cpu_limit`,
   `virtual_block_cpu_limit`) should be checked after it. The system contract's
@@ -1130,3 +1132,70 @@ canonical bytes together) remain costs of this design.
   `dry_run` in a config that parses) makes it log what it would pause and send
   nothing. A config that does not parse cannot say it asked for a dry run, so
   only the flag counts then.
+
+## Follow-up to the unpatched eb5f1ffb rehearsal
+
+The next cutover release supports protocol v3 in normal builds. Schedule
+`{"protocol_upgrades":[{"protocol_version":3,"activation_height":H_PLUS_ONE}]}`
+with the numeric H+1 substituted, identically on every validator. V2 enables
+WASM start sections; it does not fix CPU units. The v3 boundary tests now run in
+normal builds too. Never add a retroactive activation at H or below.
+
+The restore gate rejects a successor transaction-signing ID equal to the source
+ID, even with a correctly signed confirmation. The offline verifier makes the
+same check when genesis pins the signing ID or the platform ID is supplied.
+Both ceremony and launcher use `scripts/lib/migration-genesis.sh` so their
+checkpoint, schedule, key and signing-ID fields cannot drift independently.
+
+The builder can emit an empty block after five seconds without a block; the
+normal-operation timer requests one every five seconds. The actual accepted
+block timestamp stays the source of `head_block_time`. This refreshes client
+expiry anchors after idle periods. Empty blocks run onblock and consume history
+storage; their cadence is a local production policy, not a new validation rule.
+
+For a continuous-history provider configure `history_provider=true`,
+`block_production_enabled=false`, `state_sync_enabled=false`, and
+`state_history_enabled=true`, with no producer key. Use the same canonical
+`producer_name` as the validators (for XPR migration, `eosio`); it currently also
+seeds the initial verification schedule when production is disabled. The
+explicit provider role rejects settings that would state-sync away its history.
+SHiP requests below retained history receive a policy-close response; inspect
+`get_status` ranges and select the archive endpoint rather than waiting forever.
+The served ABI now matches the 145-byte global_property envelope.
+
+This release also validates WebAuthn keys in native newaccount authorities
+against WEBAUTHN_KEY, matching the permission-update requirement. This tightens
+native action validity, so deploy the release across all validators together
+before the cutover. Do not mix it with older validators on an active chain.
+
+The checkpoint and manifest are still startup dependencies. Retain them at the
+configured paths on every node, including after restart; do not remove them as
+part of cleanup. Remove the retired `dead_chain_shutdown_after_secs` setting
+from old chain configs before upgrading. No dead-chain shutdown guarantee is
+provided by that removed setting.
+
+The restore gate and empty-block changes do **not** establish tolerance of a
+silent validator. MetalGo computes the benching cap as
+`(1 - alpha_confidence / k) / 3`. With the reported settings that is 8.33%; one
+of five equal validators has 20% and cannot be benched. One of 21 equal
+validators has about 4.76%. Record the actual subnet parameters and weights,
+then rehearse a silent validator, a syncing validator, and a plugin startup
+refusal at 21-validator-equivalent weights. Require continued inclusions and
+measure poll failures, benching and rejoin time. That remains a release gate.
+
+A new declaration alone cannot release the prior round's persisted pause.
+Use the coordinated reset procedure above after explicitly abandoning that
+round; resuming XPR automatically after A-Chain writes would discard value.
+CONFIRMED is a named operator decision after the observation checks. Even
+before CONFIRMED, user-visible A-Chain writes require reconciliation before any
+return to XPR. After CONFIRMED, remove participating operators' XPR keys under
+the custody policy; other parties may still extend XPR.
+
+Remaining evidence and work: the native API conformance report (279 differences)
+must be supplied before individual differences can be classified; the real
+frozen pre-cut index and mainnet provider sizes remain untested; chain-state-log
+payload damage needs stronger detection; snapshot chunks still have no individual
+authentication proof and a bad transfer can cost a full download. Real passkeys,
+Anchor, Ledger, cleos, post-LIVE msig execution and the 21-producer availability
+run remain integration gates. The box soak is evidence for eb5f1ffb, not for the
+changes listed in this section.

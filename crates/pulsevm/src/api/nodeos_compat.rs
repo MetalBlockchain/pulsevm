@@ -787,6 +787,25 @@ mod tests {
     }
 
     #[test]
+    fn required_keys_accepts_client_defaults_and_preserves_tapos() {
+        let req: RequiredKeysRequest = parse(
+            r#"{
+            "transaction": {
+                "expiration":"2026-11-27T00:00:00",
+                "ref_block_num":42,"ref_block_prefix":12345,
+                "actions":[]
+            },
+            "available_keys":[]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(req.transaction.header.ref_block_num, 42);
+        assert_eq!(req.transaction.header.ref_block_prefix, 12345);
+        assert_eq!(req.transaction.header.max_cpu_usage, 0);
+        assert_eq!(req.transaction.header.delay_sec.0, 0);
+    }
+
+    #[test]
     fn required_keys_accepts_legacy_and_modern_key_spellings() {
         let legacy = "EOS5XPRJt1zUiLH98rtDLj9TnPi52DLQ7gTZbkRvBGJXLv6ak6Cdq";
         let modern = AuthorityPublicKey::from_string(legacy).unwrap().to_string();
