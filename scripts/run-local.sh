@@ -240,10 +240,11 @@ ANR_PID=$!
 trap 'rm -f -- "$MIGRATION_GENESIS"; kill $ANR_PID 2>/dev/null || true' EXIT
 sleep 3
 
-echo "==> Launching a 5-node cluster running PulseVM"
+NODE_COUNT="${PULSEVM_NODE_COUNT:-5}"
+echo "==> Launching a $NODE_COUNT-node cluster running PulseVM"
 "$NETWORK_RUNNER" control start --log-level info \
   --endpoint="$RUNNER_ENDPOINT" \
-  --number-of-nodes=5 \
+  --number-of-nodes="$NODE_COUNT" \
   "$RUNNER_NODE_BINARY_FLAG" "$METALGO_EXEC_PATH" \
   --plugin-dir "$PLUGIN_DIR" \
   "${RUNNER_START_ARGS[@]}" \
@@ -251,12 +252,13 @@ echo "==> Launching a 5-node cluster running PulseVM"
 
 echo
 if [[ "${PULSEVM_VERIFY_FIVE_NODE:-true}" == "true" ]]; then
-  echo "==> Verifying all five custom-chain RPCs and replaying the common head"
+  echo "==> Verifying all $NODE_COUNT custom-chain RPCs and replaying the common head"
   PULSEVM_FIVE_NODE_REPORT="${PULSEVM_FIVE_NODE_REPORT:-$BUILD_DIR/five-node-replay.json}" \
+  PULSEVM_EXPECTED_NODES="$NODE_COUNT" \
     "$REPO/scripts/verify-five-node-replay.sh" \
     "$RUNNER_ENDPOINT"
 else
-  echo "Cluster starting; five-node verification disabled (PULSEVM_VERIFY_FIVE_NODE=false)."
+  echo "Cluster starting; node-count verification disabled (PULSEVM_VERIFY_FIVE_NODE=false)."
 fi
 echo
 echo "The live gate proves five nodes independently decode and converge on one"

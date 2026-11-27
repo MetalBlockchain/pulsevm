@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Verify that all five live runner nodes have booted PulseVM, converged on the
-# same head, and can independently decode that head block. This is the live
+# Verify that all live runner nodes (five by default; see
+# PULSEVM_EXPECTED_NODES) have booted PulseVM, converged on the same head, and
+# can independently decode that head block. This is the live
 # replay/convergence gate; it intentionally uses the node RPCs rather than the
 # runner's in-memory status only.
 #
@@ -17,6 +18,7 @@ RUNNER_ENDPOINT="${1:-${METAL_NETWORK_RUNNER_ENDPOINT:-localhost:8080}}"
 EXPECTED_CHAIN_ID="${2:-${PULSEVM_CHAIN_ID:-}}"
 TIMEOUT="${PULSEVM_RPC_TIMEOUT:-10}"
 REPORT="${PULSEVM_FIVE_NODE_REPORT:-}"
+EXPECTED_NODES="${PULSEVM_EXPECTED_NODES:-5}"
 
 if [[ ! -x "$RUNNER" ]]; then
   echo "error: metal-network-runner is not executable: $RUNNER" >&2
@@ -25,7 +27,7 @@ fi
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 
-echo "==> Waiting for the five-node cluster and PulseVM VM"
+echo "==> Waiting for the $EXPECTED_NODES-node cluster and PulseVM VM"
 "$RUNNER" control wait-for-healthy --endpoint="$RUNNER_ENDPOINT" --request-timeout=10m >/dev/null
 
 RPC_TEXT=$("$RUNNER" control list-rpcs --endpoint="$RUNNER_ENDPOINT")
@@ -47,8 +49,8 @@ RPCS=()
 while IFS= read -r rpc; do
   [[ -n "$rpc" ]] && RPCS+=("$rpc")
 done < <(printf '%s\n' "$RPC_TEXT_CLEAN" | sed -nE 's/.*node[0-9]+: (https?:\/\/[^[:space:]]+).*/\1/p' | sort)
-if [[ "${#RPCS[@]}" -ne 5 ]]; then
-  echo "error: expected five custom-chain RPCs, found ${#RPCS[@]}" >&2
+if [[ "${#RPCS[@]}" -ne "$EXPECTED_NODES" ]]; then
+  echo "error: expected $EXPECTED_NODES custom-chain RPCs, found ${#RPCS[@]}" >&2
   printf '%s\n' "$RPC_TEXT" >&2
   exit 1
 fi
@@ -81,7 +83,7 @@ done
 
 unique_heads=$(jq '[.[].head_block_id] | unique | length' <<<"$heads")
 if [[ "$unique_heads" != 1 ]]; then
-  echo "error: five nodes are not on one head" >&2
+  echo "error: $EXPECTED_NODES nodes are not on one head" >&2
   jq . <<<"$heads" >&2
   exit 1
 fi
@@ -96,5 +98,5 @@ if [[ -n "$REPORT" ]]; then
   cp "$tmp_report" "$REPORT"
 fi
 
-echo "five-node live replay passed: chain=$CHAIN_ID nodes=5 head=$head_num/$head_id"
+echo "live replay passed: chain=$CHAIN_ID nodes=$EXPECTED_NODES head=$head_num/$head_id"
 [[ -n "$REPORT" ]] && echo "report=$REPORT"

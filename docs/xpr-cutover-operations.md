@@ -1076,12 +1076,13 @@ cannot establish mainnet behavior: with 21 equal validators, one has 4.8% stake,
 the reported 8.33% max-benched-stake cap, but this must be measured at 21 validators.
 
 The measured 2.09 GB state costs 1.18–1.25 s for the held copy, 8.7–8.8 s for the
-background build, 2.4–2.8 s to write, and 7.56 GB peak memory. A corrupt snapshot is
-detected by its envelope hash only after downloading the full payload; per-chunk proofs
-is now retried from another peer after the full transfer fails integrity validation;
-per-chunk proofs would avoid that first wasted transfer. Plan large validator syncs and
-keep them rare until the validator-poll test is green. The cutover fault stage requires
-state sync to start and finish, but the 21-producer polling result remains unmeasured.
+background build, 2.4–2.8 s to write, and 7.56 GB peak memory. A corrupt chunk is now
+caught by its own Merkle proof as it arrives, not only by the envelope hash after the
+full payload downloads; a damaged peer costs one bad chunk, not one full transfer.
+Plan large validator syncs and keep them rare until the validator-poll test is green.
+The cutover fault stage requires state sync to start and finish; the 21-equal-weight
+kill scenario is measured weekly (`benching-scale.yml`), but a 21-producer validator
+*sync* stall, specifically, remains unmeasured.
 The copy under the lock at each summary height, the cost of every kept summary on disk
 (about the size of the state, two kept), and the memory of a build (the copy and the
 canonical bytes together) remain costs of this design.
@@ -1197,10 +1198,20 @@ The restore gate and empty-block changes do **not** establish tolerance of a
 silent validator. MetalGo computes the benching cap as
 `(1 - alpha_confidence / k) / 3`. With the reported settings that is 8.33%; one
 of five equal validators has 20% and cannot be benched. One of 21 equal
-validators has about 4.76%. Record the actual subnet parameters and weights,
-then rehearse a silent validator, a syncing validator, and a plugin startup
-refusal at 21-validator-equivalent weights. Require continued inclusions and
-measure poll failures, benching and rejoin time. That remains a release gate.
+validators has about 4.76%. The 21-equal-validator case now runs as its own
+scheduled CI job (`.github/workflows/benching-scale.yml`, weekly plus
+`workflow_dispatch`, since 21 real node processes is materially heavier than
+the 5-node cutover rehearsal): a plain-genesis 21-node cluster, one validator
+killed, the other 20 required to keep advancing within 90s
+(`scripts/verify-benching-at-scale.sh`). It uses the reported settings' cap
+math, not the real subnet's own consensus-poll parameters, and it does not
+rehearse a syncing validator or a plugin startup refusal at this scale, nor
+the exact mainnet weight distribution (one of 21 equal validators is a
+stand-in for "no single validator holds enough weight to resist benching,"
+not a proof that the real, unequal weight distribution behaves the same way).
+Record the real subnet parameters and weights and extend this job, or add
+others, to close those gaps before treating 21-validator availability as a
+release gate this closes rather than narrows.
 
 A new declaration alone cannot release the prior round's persisted pause.
 Use the coordinated reset procedure above after explicitly abandoning that
@@ -1223,6 +1234,9 @@ each other until both are upgraded.
 Remaining evidence and work: the native API conformance report (279 differences)
 must be supplied before individual differences can be classified; the real
 frozen pre-cut index and mainnet provider sizes remain untested. Real passkeys,
-Anchor, Ledger, cleos, post-LIVE msig execution and the 21-producer availability
-run remain integration gates. The box soak is evidence for eb5f1ffb, not for the
-changes listed in this section.
+Anchor, Ledger, cleos, and post-LIVE msig execution remain integration gates.
+A 21-equal-weight-validator silent-validator kill now runs weekly in CI
+(`benching-scale.yml`); a syncing validator and a plugin startup refusal at
+that scale, and the real (unequal) mainnet weight distribution, do not and
+remain gates. The box soak is evidence for eb5f1ffb, not for the changes
+listed in this section.
