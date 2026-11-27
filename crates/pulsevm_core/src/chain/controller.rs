@@ -2352,53 +2352,60 @@ impl Controller {
             active: self.active_schedule.clone(),
             pending: self.pending_schedule.clone(),
         };
-        if *parent_id == self.last_accepted_block_id {
-            return Ok(state);
-        }
-        for pending in &self.pending_chain {
-            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
-                ChainError::BlockError(format!(
-                    "pending block {} is missing while deriving producer schedule state",
-                    pending.id
-                ))
-            })?;
+        let path = self.verified_path_from_accepted(parent_id).ok_or_else(|| {
+            ChainError::BlockError(format!(
+                "cannot resolve producer schedule: parent {} is unknown",
+                parent_id
+            ))
+        })?;
+        for block in path {
             state.apply_header(&block.signed_block_header.header)?;
-            if pending.id == *parent_id {
-                return Ok(state);
-            }
         }
-        // The parent is neither the last accepted block nor a pending ancestor, so
-        // we can't resolve its schedule. In-order consensus verifies a parent
-        // before its child, so this only happens for an unknown/detached parent.
-        Err(ChainError::BlockError(format!(
-            "cannot resolve producer schedule: parent {} is unknown",
-            parent_id
-        )))
+        Ok(state)
+    }
+
+    // The verified, not-yet-accepted blocks from just after the last accepted
+    // block up to and including `tip_id`, oldest first; empty when `tip_id` is the
+    // last accepted block. `None` when `tip_id` does not descend from it through
+    // verified blocks.
+    //
+    // This walks `verified_blocks` rather than `pending_chain` on purpose. The
+    // pending chain only holds the blocks whose state is currently materialized,
+    // and accepting a block unwinds every speculative descendant from it while
+    // those descendants stay verified. Consensus keeps pipelining, so the next
+    // block to verify can be the child of one of them; resolving its parent from
+    // the pending chain alone rejects it as unknown and the chain stops.
+    fn verified_path_from_accepted(&self, tip_id: &Id) -> Option<Vec<&SignedBlock>> {
+        let mut path = Vec::new();
+        let mut cursor = *tip_id;
+        while cursor != self.last_accepted_block_id {
+            // A verified chain can never be longer than the verified set; this
+            // only bounds the walk if the map were ever corrupted into a cycle.
+            if path.len() > self.verified_blocks.len() {
+                return None;
+            }
+            let block = self.verified_blocks.get(&cursor)?;
+            cursor = *block.previous_id();
+            path.push(block);
+        }
+        path.reverse();
+        Some(path)
     }
 
     fn header_signing_state_for_parent(
         &self,
         parent_id: &Id,
     ) -> Result<HeaderSigningState, ChainError> {
-        if *parent_id == self.last_accepted_block_id {
-            return Ok(self.header_signing_state.clone());
-        }
+        let path = self.verified_path_from_accepted(parent_id).ok_or_else(|| {
+            ChainError::BlockError(format!(
+                "cannot resolve Antelope signing state for unknown parent {parent_id}"
+            ))
+        })?;
         let mut state = self.header_signing_state.clone();
-        for pending in &self.pending_chain {
-            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
-                ChainError::BlockError(format!(
-                    "pending block {} is missing while deriving Antelope signing state",
-                    pending.id
-                ))
-            })?;
+        for block in path {
             state.accept(block)?;
-            if pending.id == *parent_id {
-                return Ok(state);
-            }
         }
-        Err(ChainError::BlockError(format!(
-            "cannot resolve Antelope signing state for unknown parent {parent_id}"
-        )))
+        Ok(state)
     }
 
     fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
@@ -8424,6 +8431,243 @@ mod tests {
             error
                 .to_string()
                 .contains("database revision 2 does not match block log end 3")
+        );
+        Ok(())
+    }
+
+    // Consensus pipelines: while b2 is being accepted, b3 is already verified and
+    // b4 (built on b3) arrives for verification. Accepting b2 unwinds the pending
+    // chain, so b3 is no longer on it, but it is still a verified block and b4's
+    // parent. Verification must resolve b4's parent from the verified blocks
+    // rather than only the pending chain; otherwise the node rejects b4 with
+    // "parent is unknown" and the chain stops making progress.
+    #[tokio::test]
+    async fn test_verify_child_of_verified_block_after_ancestor_accept() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        let mut blocks = Vec::new();
+        for name in ["aaa", "bbb", "ccc"] {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.set_preferred_id(block.id()?);
+            blocks.push(block);
+        }
+        let (b2, b3, b4) = (&blocks[0], &blocks[1], &blocks[2]);
+        assert_eq!(b4.previous_id(), &b3.id()?);
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(b2, &mut v_mempool).await?;
+        validator.verify_block(b3, &mut v_mempool).await?;
+        validator.accept_block(&b2.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+
+        validator.verify_block(b4, &mut v_mempool).await?;
+        validator.accept_block(&b3.id()?, &mut v_mempool)?;
+        validator.accept_block(&b4.id()?, &mut v_mempool)?;
+
+        assert_eq!(validator.last_accepted_block_id, b4.id()?);
+        let db = validator.database();
+        for name in ["aaa", "bbb", "ccc"] {
+            assert!(
+                db.arena_account_exists(Name::from_str(name)?.as_u64()),
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    // The sequence a live testnet logged (heights 115 to 118). The last accepted
+    // block is N, N+1 and N+2 are verified, and N+3, the child of N+2, arrives
+    // for verification right after N is accepted. Its parent is two blocks ahead of
+    // the last accepted block, which is the depth the old lookup could not see.
+    #[tokio::test]
+    async fn test_verify_child_two_ahead_of_last_accepted_block() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        let mut blocks = Vec::new();
+        for name in ["aaa", "bbb", "ccc", "ddd"] {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.set_preferred_id(block.id()?);
+            blocks.push(block);
+        }
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(&blocks[0], &mut v_mempool).await?;
+        validator.verify_block(&blocks[1], &mut v_mempool).await?;
+        validator.verify_block(&blocks[2], &mut v_mempool).await?;
+        validator.accept_block(&blocks[0].id()?, &mut v_mempool)?;
+        // Accepting the oldest unwound its two verified descendants.
+        assert!(validator.pending_chain.is_empty());
+        assert_eq!(validator.last_accepted_block_id, blocks[0].id()?);
+
+        validator.verify_block(&blocks[3], &mut v_mempool).await?;
+        for block in &blocks[1..] {
+            validator.accept_block(&block.id()?, &mut v_mempool)?;
+        }
+        assert_eq!(validator.last_accepted_block_id, blocks[3].id()?);
+        Ok(())
+    }
+
+    // The parent's producer schedule and signing state are derived by replaying the
+    // headers of the blocks between the last accepted block and the parent. That
+    // derivation must not depend on whether those blocks happen to sit on the
+    // pending chain: accepting an ancestor unwinds them, and the result for the
+    // same parent has to be identical before and after.
+    #[tokio::test]
+    async fn test_parent_state_is_the_same_on_and_off_the_pending_chain() -> Result<(), ChainError>
+    {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        let mut blocks = Vec::new();
+        for name in ["aaa", "bbb", "ccc"] {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.set_preferred_id(block.id()?);
+            blocks.push(block);
+        }
+        let parent = blocks[2].id()?;
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        for block in &blocks {
+            validator.verify_block(block, &mut v_mempool).await?;
+        }
+        assert_eq!(validator.pending_chain.len(), 3);
+        let schedule_on_chain = format!("{:?}", validator.schedule_state_for_parent(&parent)?);
+        let signing_on_chain = format!("{:?}", validator.header_signing_state_for_parent(&parent)?);
+
+        validator.accept_block(&blocks[0].id()?, &mut v_mempool)?;
+        assert!(
+            !validator.pending_chain.iter().any(|p| p.id == parent),
+            "the parent should have been unwound from the pending chain"
+        );
+        // The base moved up one block, so the replay now starts from block 1; the
+        // state for the same parent must still come out the same.
+        assert_eq!(
+            format!("{:?}", validator.schedule_state_for_parent(&parent)?),
+            schedule_on_chain
+        );
+        assert_eq!(
+            format!("{:?}", validator.header_signing_state_for_parent(&parent)?),
+            signing_on_chain
+        );
+        Ok(())
+    }
+
+    // The fix must not make verification more permissive: a parent that was never
+    // verified here, and does not lead back to the last accepted block through
+    // verified blocks, is still refused with the same error.
+    #[tokio::test]
+    async fn test_verify_still_rejects_a_parent_that_was_never_verified() -> Result<(), ChainError>
+    {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        let mut blocks = Vec::new();
+        for name in ["aaa", "bbb", "ccc"] {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.set_preferred_id(block.id()?);
+            blocks.push(block);
+        }
+
+        // The validator saw block 1 only; block 3's parent (block 2) is unknown.
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(&blocks[0], &mut v_mempool).await?;
+        let error = validator
+            .verify_block(&blocks[2], &mut v_mempool)
+            .await
+            .expect_err("a block whose parent was never verified must be refused");
+        assert!(
+            error.to_string().contains("is unknown"),
+            "unexpected error: {error}"
+        );
+        // And it left nothing behind that could be mistaken for a verified block.
+        assert!(!validator.verified_blocks.contains_key(&blocks[2].id()?));
+        Ok(())
+    }
+
+    // With a fork, the parent has to be resolved along its own branch. b3 and b3'
+    // are siblings; b4' is built on b3'. After b2 is accepted, b4' must verify
+    // against b3''s ancestry, and the losing branch must leave no trace.
+    #[tokio::test]
+    async fn test_verified_parent_resolves_along_its_own_fork() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("aaa")?,
+            chain_id,
+        )?);
+        let b2 = producer.build_block(&mut p_mempool).await?;
+
+        producer.set_preferred_id(b2.id()?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("bbb")?,
+            chain_id,
+        )?);
+        let b3 = producer.build_block(&mut p_mempool).await?;
+
+        producer.set_preferred_id(b2.id()?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("ccc")?,
+            chain_id,
+        )?);
+        let b3_alt = producer.build_block(&mut p_mempool).await?;
+        assert_ne!(b3.id()?, b3_alt.id()?);
+
+        producer.set_preferred_id(b3_alt.id()?);
+        p_mempool.add_transaction(create_account(
+            &private_key,
+            Name::from_str("ddd")?,
+            chain_id,
+        )?);
+        let b4_alt = producer.build_block(&mut p_mempool).await?;
+        assert_eq!(b4_alt.previous_id(), &b3_alt.id()?);
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(&b2, &mut v_mempool).await?;
+        validator.verify_block(&b3, &mut v_mempool).await?;
+        validator.verify_block(&b3_alt, &mut v_mempool).await?;
+        validator.accept_block(&b2.id()?, &mut v_mempool)?;
+
+        validator.verify_block(&b4_alt, &mut v_mempool).await?;
+        validator.accept_block(&b3_alt.id()?, &mut v_mempool)?;
+        validator.accept_block(&b4_alt.id()?, &mut v_mempool)?;
+
+        assert_eq!(validator.last_accepted_block_id, b4_alt.id()?);
+        let db = validator.database();
+        for name in ["aaa", "ccc", "ddd"] {
+            assert!(
+                db.arena_account_exists(Name::from_str(name)?.as_u64()),
+                "{name} is on the accepted branch"
+            );
+        }
+        assert!(
+            !db.arena_account_exists(Name::from_str("bbb")?.as_u64()),
+            "bbb belongs to the losing branch"
         );
         Ok(())
     }
