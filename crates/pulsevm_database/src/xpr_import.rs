@@ -5293,7 +5293,7 @@ fn inflate_bounded(compressed: &[u8], claimed: Option<u64>) -> Result<Vec<u8>, X
     Ok(raw)
 }
 
-fn parse_table_deltas(bytes: &[u8]) -> Result<Vec<TableDelta>, XprImportError> {
+pub fn parse_table_deltas(bytes: &[u8]) -> Result<Vec<TableDelta>, XprImportError> {
     let mut cursor = Cursor::new(bytes);
     let table_count = cursor.varuint()?;
     let table_count = usize::try_from(table_count)

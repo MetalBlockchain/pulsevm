@@ -2517,6 +2517,7 @@ impl Controller {
                 // header, and used to be kept and served without a word.
                 self.verify_block_log_tail(start, end, 16)?;
                 self.verify_trace_log_tail(start, end, 16)?;
+                self.verify_chain_state_log_tail(start, end, 16)?;
 
                 info!("block log contains blocks from {} to {}", start, end);
 
@@ -3002,9 +3003,12 @@ impl Controller {
         // digests come first in the action merkle — matching what validators
         // recompute in `execute_block`.
         let previous = self.preferred_id;
-        let (onblock_digests, _proposed_schedule) =
+        let (onblock_digests, _proposed_schedule, onblock_trace) =
             self.run_onblock(protocol_context, &timestamp, previous, &block_status, false)?;
         action_receipt_digests.extend(onblock_digests);
+        if let Some(trace) = onblock_trace {
+            transaction_traces.push(trace);
+        }
 
         // Scheduled transactions are selected from durable Arena state, never
         // from the mempool. Their raw transaction bytes have no signatures: the
@@ -4046,7 +4050,14 @@ impl Controller {
         previous: Id,
         block_status: &BlockStatus,
         historical_replay: bool,
-    ) -> Result<(VecDeque<Digest>, Option<Vec<ProducerKey>>), ChainError> {
+    ) -> Result<
+        (
+            VecDeque<Digest>,
+            Option<Vec<ProducerKey>>,
+            Option<TransactionTrace>,
+        ),
+        ChainError,
+    > {
         // Antelope's implicit onblock action carries the exact header of the
         // current head (the parent), not a partially assembled header for the
         // block being executed. This distinction is consensus-visible through
@@ -4171,7 +4182,14 @@ impl Controller {
                     direct_profile.total =
                         direct_started.map_or(Duration::ZERO, |started| started.elapsed());
                     super::replay_profile::record_native_onblock(direct_profile);
-                    return Ok((digests, None));
+                    // This fast path reproduces XPR's historical replay corpus
+                    // without allocating the implicit TransactionContext/trace
+                    // graph, so it has no TransactionTrace to hand back. A
+                    // SHiP consumer following a chain running with native
+                    // replay enabled sees the same sequence-number gap this
+                    // function closes for the general path below; this is a
+                    // narrower, known residual limited to that offline mode.
+                    return Ok((digests, None, None));
                 }
                 Ok(None) => self.db.arena_undo(),
                 Err(error) => {
@@ -4211,7 +4229,11 @@ impl Controller {
         match executed {
             Ok(result) => {
                 self.db.arena_squash(); // fold onblock into the block
-                Ok((result.action_receipt_digests, result.proposed_schedule))
+                Ok((
+                    result.action_receipt_digests,
+                    result.proposed_schedule,
+                    Some(result.trace),
+                ))
             }
             Err(e) => {
                 // onblock is invoked speculatively at the head of every block, but
@@ -4229,7 +4251,7 @@ impl Controller {
                     warn!("onblock failed, skipping: {}", e);
                 }
                 self.db.arena_undo(); // a failed onblock leaves no trace
-                Ok((VecDeque::new(), None))
+                Ok((VecDeque::new(), None, None))
             }
         }
     }
@@ -4351,7 +4373,7 @@ impl Controller {
         // onblock heads the block: its action digests precede every transaction's.
         let header = &block.signed_block_header.header;
         let onblock_started = replay_profiling.then(Instant::now);
-        let (onblock_digests, mut proposed_schedule) = self.run_onblock(
+        let (onblock_digests, mut proposed_schedule, onblock_trace) = self.run_onblock(
             protocol_context,
             &header.timestamp,
             header.previous,
@@ -4360,6 +4382,11 @@ impl Controller {
         )?;
         let onblock_elapsed = onblock_started.map_or(Duration::ZERO, |started| started.elapsed());
         action_receipt_digests.extend(onblock_digests);
+        if collect_transaction_traces
+            && let Some(trace) = onblock_trace
+        {
+            transaction_traces.push(trace);
+        }
         if schedule_promoted {
             let producers = self.block_active_schedule.producers.clone();
             self.update_producers_authority(&producers)?;
@@ -5432,18 +5459,102 @@ impl Controller {
                     "trace log entry at block {height} has trailing bytes"
                 )));
             }
-            if traces.len() != block.transactions.len()
-                || traces
-                    .iter()
-                    .zip(&block.transactions)
-                    .any(|(trace, receipt)| {
-                        trace.block_num != height || &trace.id != receipt.transaction_id()
-                    })
+            // onblock heads every block's trace entry when the system contract
+            // implements it, so a successful block has one more trace than it
+            // has transactions. A chain whose system contract does not
+            // implement onblock never gets that extra entry (see
+            // `run_onblock`'s "unknown action" case), so both counts are
+            // legitimate; anything else is damage.
+            let system = self.db.system_accounts().system;
+            let onblock_trace = match traces.len().checked_sub(block.transactions.len()) {
+                Some(1) => Some(&traces[0]),
+                Some(0) => None,
+                _ => {
+                    return Err(ChainError::DatabaseError(format!(
+                        "trace log entry at block {height} does not match the accepted block's transaction receipts"
+                    )));
+                }
+            };
+            if let Some(onblock_trace) = onblock_trace
+                && (onblock_trace.block_num != height
+                    || onblock_trace.action_traces.len() != 1
+                    || onblock_trace.action_traces[0].act.account != system
+                    || onblock_trace.action_traces[0].act.name != ONBLOCK_NAME)
+            {
+                return Err(ChainError::DatabaseError(format!(
+                    "trace log entry at block {height} has a malformed leading onblock trace"
+                )));
+            }
+            let ordinary_traces = &traces[onblock_trace.is_some() as usize..];
+            if ordinary_traces
+                .iter()
+                .zip(&block.transactions)
+                .any(|(trace, receipt)| {
+                    trace.block_num != height || &trace.id != receipt.transaction_id()
+                })
             {
                 return Err(ChainError::DatabaseError(format!(
                     "trace log entry at block {height} does not match the accepted block's transaction receipts"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Check the newest chain-state entries for the same in-place-zero-write
+    /// failure `verify_trace_log_tail` catches: an intact header over a
+    /// truncated or zeroed body. There is no block-local oracle for table
+    /// content the way trace entries have the block's own receipts, so this
+    /// checks what is independently verifiable: the entry's block id matches
+    /// the accepted block, and the payload decodes as a complete,
+    /// unterminated-early `table_delta[]` sequence (the same decoder
+    /// `pack_deltas`'s own round-trip test uses).
+    fn verify_chain_state_log_tail(
+        &self,
+        start: u32,
+        end: u32,
+        count: u32,
+    ) -> Result<(), ChainError> {
+        let Some(log) = self.chain_state_log.as_ref() else {
+            return Ok(());
+        };
+        let Some((state_start, state_end)) = log.range() else {
+            return Ok(());
+        };
+        let first = start
+            .max(state_start)
+            .max(end.saturating_sub(count.saturating_sub(1)));
+        let last = end.min(state_end);
+        if first > last {
+            return Ok(());
+        }
+        for height in first..=last {
+            let block = self.read_logged_block(height)?.ok_or_else(|| {
+                ChainError::DatabaseError(format!(
+                    "chain state log entry at block {height} has no corresponding accepted block"
+                ))
+            })?;
+            let block_id = block.id()?;
+            let state_id = log.get_block_id(height).map_err(|error| {
+                ChainError::DatabaseError(format!(
+                    "chain state log has no readable block id at height {height}: {error}"
+                ))
+            })?;
+            if state_id != block_id {
+                return Err(ChainError::DatabaseError(format!(
+                    "chain state log block id at height {height} does not match the accepted block"
+                )));
+            }
+            let bytes = log.read_block(height).map_err(|error| {
+                ChainError::DatabaseError(format!(
+                    "chain state log cannot read block {height}: {error}"
+                ))
+            })?;
+            pulsevm_database::parse_table_deltas(&bytes).map_err(|error| {
+                ChainError::DatabaseError(format!(
+                    "chain state log entry at block {height} is damaged: {error}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -10144,6 +10255,68 @@ mod tests {
         Ok(())
     }
 
+    // A system contract that implements onblock gets one more trace entry per
+    // block than it has transactions (onblock heads it). Paul's rehearsal
+    // report found SHiP sequences had "one gap per block (the missing
+    // onblock)": run_onblock computed the receipt digests for the action
+    // merkle but never kept the TransactionTrace docode produces, so onblock
+    // never reached trace_log. Confirms it is now recorded, named and
+    // addressed correctly, and that the corresponding tail check on restart
+    // (which must now expect one extra entry) still passes.
+    #[tokio::test]
+    async fn onblock_gets_its_own_trace_entry_when_the_system_contract_implements_it()
+    -> Result<(), ChainError> {
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        let mut mempool = Mempool::new();
+        // Dispatches every action as a no-op, so onblock never hits "unknown
+        // action" the way a bare genesis system account does.
+        let noop = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "apply") (param i64 i64 i64)))
+            "#;
+        mempool.add_transaction(set_code(
+            &chain.private_key,
+            PULSE_NAME,
+            wat::parse_str(noop).expect("valid noop contract"),
+            chain.chain_id,
+        )?);
+        let deployment = controller.build_block(&mut mempool).await?;
+        controller.accept_block(&deployment.id()?, &mut mempool)?;
+        controller.set_preferred_id(deployment.id()?);
+
+        // onblock now dispatches into the deployed contract, alongside one
+        // ordinary transaction: proves both the count (two entries, not one)
+        // and the ordering (onblock first).
+        mempool.add_transaction(create_account(
+            &chain.private_key,
+            Name::from_str("carol")?,
+            chain.chain_id,
+        )?);
+        let mixed = controller.build_block(&mut mempool).await?;
+        let mixed_num = mixed.block_num();
+        assert_eq!(mixed.transactions.len(), 1);
+        controller.accept_block(&mixed.id()?, &mut mempool)?;
+
+        let system = controller.database().system_accounts().system;
+        let bytes = controller.trace_log().unwrap().read_block(mixed_num).unwrap();
+        let mut pos = 0;
+        let mixed_traces = Vec::<TransactionTrace>::read(&bytes, &mut pos).unwrap();
+        assert_eq!(mixed_traces.len(), 2);
+        assert_eq!(mixed_traces[0].action_traces.len(), 1);
+        assert_eq!(mixed_traces[0].action_traces[0].act.account, system);
+        assert_eq!(mixed_traces[0].action_traces[0].act.name, ONBLOCK_NAME);
+        assert_ne!(mixed_traces[1].action_traces[0].act.name, ONBLOCK_NAME);
+
+        drop(controller);
+        // The startup tail check must accept the onblock-plus-ordinary shape,
+        // having just computed the exact same counts as above from the
+        // persisted log.
+        chain.open()?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn an_in_place_zeroed_trace_entry_is_refused_on_restart() -> Result<(), ChainError> {
         use std::io::{
@@ -10181,6 +10354,53 @@ mod tests {
                 "unexpected diagnostic: {error}"
             ),
             Ok(_) => panic!("a zeroed in-place trace entry must not be served"),
+        }
+        Ok(())
+    }
+
+    // Mirrors an_in_place_zeroed_trace_entry_is_refused_on_restart: the same
+    // physical log framing and the same failure mode (an intact header over a
+    // zeroed payload), but on chain_state_log.log, which Paul's rehearsal
+    // report found was "kept silently" where the trace log was already
+    // refused.
+    #[tokio::test]
+    async fn an_in_place_zeroed_chain_state_entry_is_refused_on_restart() -> Result<(), ChainError>
+    {
+        use std::io::{
+            Read as _,
+            Seek,
+            SeekFrom,
+            Write,
+        };
+
+        let chain = CrashChain::new(json!({}))?;
+        let mut controller = chain.open()?;
+        chain.accept(&mut controller, "statecheck").await?;
+        drop(controller);
+
+        let path = Path::new(chain.path()).join("chain_state_log.log");
+        let mut header = [0u8; 48];
+        let mut file =
+            fs::File::open(&path).map_err(|error| ChainError::InternalError(error.to_string()))?;
+        file.read_exact(&mut header)
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        let payload_len = u64::from_le_bytes(header[40..48].try_into().unwrap()) as usize;
+        drop(file);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+        file.seek(SeekFrom::Start(48))
+            .and_then(|_| file.write_all(&vec![0u8; payload_len]))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| ChainError::InternalError(error.to_string()))?;
+
+        match chain.open() {
+            Err(error) => assert!(
+                error.to_string().contains("chain state log entry at block 2"),
+                "unexpected diagnostic: {error}"
+            ),
+            Ok(_) => panic!("a zeroed in-place chain-state entry must not be served"),
         }
         Ok(())
     }
@@ -17068,7 +17288,7 @@ mod tests {
         let previous = controller.preferred_id;
         let protocol_context = controller
             .ensure_protocol_version_supported(BlockHeader::num_from_id(&previous) + 1)?;
-        let (digests, _) = controller.run_onblock(
+        let (digests, _, _) = controller.run_onblock(
             protocol_context,
             &timestamp,
             previous,
@@ -17180,7 +17400,7 @@ mod tests {
         let previous = controller.preferred_id;
         let protocol_context = controller
             .ensure_protocol_version_supported(BlockHeader::num_from_id(&previous) + 1)?;
-        let (digests, _) = controller.run_onblock(
+        let (digests, _, _) = controller.run_onblock(
             protocol_context,
             &timestamp,
             previous,
@@ -17244,7 +17464,7 @@ mod tests {
         // must fail internally but run_onblock must return Ok with no digests.
         let timestamp: BlockTimestamp = TimePoint::now().into();
         let previous = controller.preferred_id;
-        let (digests, _) = controller.run_onblock(
+        let (digests, _, _) = controller.run_onblock(
             controller.ensure_protocol_version_supported(2)?,
             &timestamp,
             previous,

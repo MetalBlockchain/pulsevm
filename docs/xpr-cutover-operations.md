@@ -1156,9 +1156,12 @@ storage; their cadence is a local production policy, not a new validation rule.
 For a continuous-history provider configure `history_provider=true`,
 `block_production_enabled=false`, `state_sync_enabled=false`, and
 `state_history_enabled=true`, with no producer key. Use the same canonical
-`producer_name` as the validators (for XPR migration, `eosio`); it currently also
-seeds the initial verification schedule when production is disabled. The
-explicit provider role rejects settings that would state-sync away its history.
+`producer_name` as the validators (for XPR migration, `eosio`): it seeds the
+initial verification schedule even when production is disabled, so any other
+name makes the node refuse its first block with `block producer <name> is not
+in the active schedule` — a symptom of a misconfigured `producer_name`, not a
+corrupt checkpoint or a schedule problem on the chain itself. The explicit
+provider role rejects settings that would state-sync away its history.
 SHiP requests below retained history receive a policy-close response; inspect
 `get_status` ranges and select the archive endpoint rather than waiting forever.
 The served ABI now matches the 145-byte global_property envelope.
@@ -1168,11 +1171,16 @@ against WEBAUTHN_KEY, matching the permission-update requirement. This tightens
 native action validity, so deploy the release across all validators together
 before the cutover. Do not mix it with older validators on an active chain.
 
-The checkpoint and manifest are still startup dependencies. Retain them at the
-configured paths on every node, including after restart; do not remove them as
-part of cleanup. Remove the retired `dead_chain_shutdown_after_secs` setting
-from old chain configs before upgrading. No dead-chain shutdown guarantee is
-provided by that removed setting.
+The checkpoint and manifest are still startup dependencies, checked on every
+restart, not only the first. This is intended: a node that lost its checkpoint
+file, or whose file was swapped for a different one, must fail closed on the
+next restart rather than keep running silently on whatever state it already
+has. The cost is permanent: every node retains the (potentially large)
+checkpoint and manifest at their configured paths forever, including long
+after the migration is history. Do not remove them as part of cleanup.
+Remove the retired `dead_chain_shutdown_after_secs` setting from old chain
+configs before upgrading. No dead-chain shutdown guarantee is provided by
+that removed setting.
 
 The restore gate and empty-block changes do **not** establish tolerance of a
 silent validator. MetalGo computes the benching cap as

@@ -1642,6 +1642,12 @@ impl Vm for VirtualMachine {
     ) -> Result<tonic::Response<vm::ParseStateSummaryResponse>, Status> {
         let (id, height) = Controller::parse_state_summary(&request.get_ref().bytes)
             .map_err(|e| Status::invalid_argument(format!("invalid state summary: {}", e)))?;
+        let interval = self.controller.read().await.state_summary_interval();
+        if summary_height_mismatches_interval(height, interval) {
+            warn!(
+                "received a state summary at height {height}, which is not a multiple of this node's configured state_summary_interval ({interval}): the offering peer may be configured with a different interval"
+            );
+        }
         Ok(Response::new(vm::ParseStateSummaryResponse {
             id: id.into(),
             height,
@@ -1819,6 +1825,15 @@ impl Vm for VirtualMachine {
             err: 0,
         }))
     }
+}
+
+/// A peer's offered summary height that is not a multiple of this node's own
+/// `state_summary_interval` is the cheapest local signal of a fleet-wide
+/// configuration mismatch: every node picks its own offer heights as
+/// multiples of its interval, so a different interval anywhere shows up here
+/// first. `0` (unset) never flags, since there is nothing to compare against.
+fn summary_height_mismatches_interval(height: u64, interval: u64) -> bool {
+    interval != 0 && height != 0 && height % interval != 0
 }
 
 #[tonic::async_trait]
@@ -2114,6 +2129,21 @@ mod state_summary_rpc_tests {
             .into_inner();
         assert_eq!(requested.err, vm::Error::NotFound as i32);
         assert!(requested.bytes.is_empty());
+    }
+
+    // Paul's rehearsal report: "the summary interval shows in getInfo, but a
+    // mismatch between nodes is still silent". A different interval across
+    // the fleet first shows up here: every node offers only at multiples of
+    // its own interval, so an accepted peer offer that isn't a multiple of
+    // this node's own interval means the two nodes disagree about it.
+    #[test]
+    fn summary_height_mismatch_detects_a_different_configured_interval() {
+        assert!(!summary_height_mismatches_interval(4096, 4096));
+        assert!(!summary_height_mismatches_interval(8192, 4096));
+        assert!(!summary_height_mismatches_interval(100, 0), "unset never flags");
+        assert!(!summary_height_mismatches_interval(0, 4096), "height 0 never flags");
+        assert!(summary_height_mismatches_interval(8192, 3000));
+        assert!(summary_height_mismatches_interval(2048, 4096));
     }
 
     #[tokio::test]
