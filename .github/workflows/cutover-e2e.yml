@@ -26,6 +26,7 @@ on:
     paths:
       - 'docker/handover/**'
       - 'scripts/run-local.sh'
+      - 'scripts/verify-five-node-replay.sh'
       - 'contracts/cutover/**'
       - 'tools/xpr-chainbase-export/localnet/**'
       - 'crates/pulsevm/**'
