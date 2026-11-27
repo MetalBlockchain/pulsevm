@@ -2894,20 +2894,41 @@ PY
             sleep 0.1
         done
         [[ "$sync_started" == 1 ]] || fail "faults: node$n did not start state sync; the validator-poll liveness check proved nothing"
-        peer_head_during="$(head_of "$rpc_url")"
+        # Paul's rehearsal report measured this as "0 blocks in each of three
+        # ~35s windows", not a one-off dip: a single pass/fail over the whole
+        # 60s budget would miss a validator that is dead for most of it and
+        # only ticks over once near the end. Split the same 60s budget into
+        # 10s windows and require every one of them, individually, to show at
+        # least one block of peer progress while node$n is still syncing.
+        window_len_iters=100 # 10s at the 0.1s poll below
+        window_index=1
+        window_elapsed=0
+        window_start_head="$(head_of "$rpc_url")"
         peer_progress=0
         sync_finished=0
+        stalled_window=""
         for _ in $(seq 1 600); do
             if [[ "$(log_count "$n" 'state sync finished')" -gt "$sync_finished_before" ]]; then
                 sync_finished=1
                 break
             fi
             peer_head_now="$(head_of "$rpc_url")"
-            if [[ "$peer_head_now" -gt "$peer_head_during" ]]; then
+            if [[ "$peer_head_now" -gt "$window_start_head" ]]; then
                 peer_progress=1
+            fi
+            window_elapsed=$((window_elapsed + 1))
+            if [[ "$window_elapsed" -ge "$window_len_iters" ]]; then
+                if [[ "$peer_head_now" -le "$window_start_head" ]]; then
+                    stalled_window="$window_index (head stayed at $peer_head_now)"
+                    break
+                fi
+                window_index=$((window_index + 1))
+                window_start_head="$peer_head_now"
+                window_elapsed=0
             fi
             sleep 0.1
         done
+        [[ -n "$stalled_window" ]] && fail "faults: peer validator made zero block progress in ~10s window $stalled_window while node$n state-synced — this is the validator stall Paul's rehearsal measured, not a one-off dip"
         [[ "$sync_finished" == 1 ]] || fail "faults: node$n did not finish its state sync within 60 seconds"
         [[ "$peer_progress" == 1 ]] || fail "faults: peer validator made no block progress during node$n's state sync"
         timed_converge "node$n state-syncing with transactions pending"
