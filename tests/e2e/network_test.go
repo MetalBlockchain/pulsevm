@@ -29,6 +29,10 @@ const (
 	// BootstrapTimeoutEnvName overrides defaultBootstrapTimeout.
 	BootstrapTimeoutEnvName = "PULSEVM_BOOTSTRAP_TIMEOUT"
 
+	// DiskWarningPercentEnvName lowers metalgo's free-disk health threshold
+	// (percent) for local runs on a nearly full disk. Unset in CI.
+	DiskWarningPercentEnvName = "PULSEVM_E2E_DISK_WARNING_PERCENT"
+
 	teardownTimeout = 2 * time.Minute
 )
 
@@ -68,9 +72,20 @@ func StartNetwork(t *testing.T) *tmpnet.Network {
 	subnet, err := NewSubnet(nodes...)
 	require.NoError(err)
 
+	flags := tmpnet.DefaultE2EFlags()
+	// Local-only escape hatch. metalgo reports a node unhealthy when the volume
+	// is under 10% free, which wedges bootstrap on a nearly full dev disk. CI
+	// leaves this unset and keeps the default.
+	if percent := os.Getenv(DiskWarningPercentEnvName); percent != "" {
+		// metalgo rejects a warning threshold below the required one (default
+		// 3%), so both have to come down together.
+		flags["system-tracker-disk-warning-available-space-percentage"] = percent
+		flags["system-tracker-disk-required-available-space-percentage"] = percent
+	}
+
 	network := &tmpnet.Network{
 		Owner:        "pulsevm-e2e",
-		DefaultFlags: tmpnet.DefaultE2EFlags(),
+		DefaultFlags: flags,
 		DefaultRuntimeConfig: tmpnet.NodeRuntimeConfig{
 			Process: &tmpnet.ProcessRuntimeConfig{
 				AvalancheGoPath: metalGoPath,

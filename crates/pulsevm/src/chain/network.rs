@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        OnceLock,
         atomic::{
             AtomicU32,
             Ordering,
@@ -122,6 +123,7 @@ pub struct NetworkManager {
     server_address: String,
     pending: PendingChunks,
     next_request_id: Arc<AtomicU32>,
+    appsender: OnceLock<tonic::transport::Channel>,
 }
 
 impl NetworkManager {
@@ -131,6 +133,7 @@ impl NetworkManager {
             server_address: String::new(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: Arc::new(AtomicU32::new(1)),
+            appsender: OnceLock::new(),
         }
     }
 
@@ -145,6 +148,7 @@ impl NetworkManager {
 
     pub fn set_server_address(&mut self, address: String) {
         self.server_address = address;
+        self.appsender = OnceLock::new();
     }
 
     pub fn connected_node_ids(&self) -> Vec<NodeId> {
@@ -165,17 +169,38 @@ impl NetworkManager {
         }
     }
 
-    pub async fn gossip(&self, gossipable: Gossipable) -> Result<(), ChainError> {
-        let channel =
+    /// The shared channel to the engine's app sender. It connects on first use and
+    /// reconnects by itself, and cloning it is cheap, so every gossip multiplexes
+    /// over one connection.
+    ///
+    /// This used to dial a fresh connection per gossip. A burst of `issueTx`
+    /// calls then opened hundreds at once, some failed with `transport error`,
+    /// and the RPC reported an error for a transaction it had already admitted.
+    pub fn appsender_channel(&self) -> Result<tonic::transport::Channel, ChainError> {
+        if let Some(channel) = self.appsender.get() {
+            return Ok(channel.clone());
+        }
+        let endpoint =
             tonic::transport::Endpoint::from_shared(format!("http://{}", self.server_address))
                 .map_err(|e| ChainError::NetworkError(format!("bad appsender address: {}", e)))?
                 .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(5)) // applies to all requests on this channel
-                .connect()
-                .await
-                .map_err(|e| {
-                    ChainError::NetworkError(format!("failed to connect to appsender: {}", e))
-                })?;
+                .timeout(Duration::from_secs(5)); // applies to all requests on this channel
+        Ok(self
+            .appsender
+            .get_or_init(|| endpoint.connect_lazy())
+            .clone())
+    }
+
+    pub async fn gossip(&self, gossipable: Gossipable) -> Result<(), ChainError> {
+        Self::send_gossip(self.appsender_channel()?, gossipable).await
+    }
+
+    /// Sends `gossipable` over an already obtained channel, so callers can drop
+    /// their lock on the manager before waiting on the network.
+    pub async fn send_gossip(
+        channel: tonic::transport::Channel,
+        gossipable: Gossipable,
+    ) -> Result<(), ChainError> {
         let mut client = AppSenderClient::new(channel);
         let msg = gossipable.pack().map_err(|e| {
             ChainError::NetworkError(format!("failed to serialize gossipable: {}", e))

@@ -2352,53 +2352,60 @@ impl Controller {
             active: self.active_schedule.clone(),
             pending: self.pending_schedule.clone(),
         };
-        if *parent_id == self.last_accepted_block_id {
-            return Ok(state);
-        }
-        for pending in &self.pending_chain {
-            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
-                ChainError::BlockError(format!(
-                    "pending block {} is missing while deriving producer schedule state",
-                    pending.id
-                ))
-            })?;
+        let path = self.verified_path_from_accepted(parent_id).ok_or_else(|| {
+            ChainError::BlockError(format!(
+                "cannot resolve producer schedule: parent {} is unknown",
+                parent_id
+            ))
+        })?;
+        for block in path {
             state.apply_header(&block.signed_block_header.header)?;
-            if pending.id == *parent_id {
-                return Ok(state);
-            }
         }
-        // The parent is neither the last accepted block nor a pending ancestor, so
-        // we can't resolve its schedule. In-order consensus verifies a parent
-        // before its child, so this only happens for an unknown/detached parent.
-        Err(ChainError::BlockError(format!(
-            "cannot resolve producer schedule: parent {} is unknown",
-            parent_id
-        )))
+        Ok(state)
+    }
+
+    // The verified, not-yet-accepted blocks from just after the last accepted
+    // block up to and including `tip_id`, oldest first; empty when `tip_id` is the
+    // last accepted block. `None` when `tip_id` does not descend from it through
+    // verified blocks.
+    //
+    // This walks `verified_blocks` rather than `pending_chain` on purpose. The
+    // pending chain only holds the blocks whose state is currently materialized,
+    // and accepting a block unwinds every speculative descendant from it while
+    // those descendants stay verified. Consensus keeps pipelining, so the next
+    // block to verify can be the child of one of them; resolving its parent from
+    // the pending chain alone rejects it as unknown and the chain stops.
+    fn verified_path_from_accepted(&self, tip_id: &Id) -> Option<Vec<&SignedBlock>> {
+        let mut path = Vec::new();
+        let mut cursor = *tip_id;
+        while cursor != self.last_accepted_block_id {
+            // A verified chain can never be longer than the verified set; this
+            // only bounds the walk if the map were ever corrupted into a cycle.
+            if path.len() > self.verified_blocks.len() {
+                return None;
+            }
+            let block = self.verified_blocks.get(&cursor)?;
+            cursor = *block.previous_id();
+            path.push(block);
+        }
+        path.reverse();
+        Some(path)
     }
 
     fn header_signing_state_for_parent(
         &self,
         parent_id: &Id,
     ) -> Result<HeaderSigningState, ChainError> {
-        if *parent_id == self.last_accepted_block_id {
-            return Ok(self.header_signing_state.clone());
-        }
+        let path = self.verified_path_from_accepted(parent_id).ok_or_else(|| {
+            ChainError::BlockError(format!(
+                "cannot resolve Antelope signing state for unknown parent {parent_id}"
+            ))
+        })?;
         let mut state = self.header_signing_state.clone();
-        for pending in &self.pending_chain {
-            let block = self.verified_blocks.get(&pending.id).ok_or_else(|| {
-                ChainError::BlockError(format!(
-                    "pending block {} is missing while deriving Antelope signing state",
-                    pending.id
-                ))
-            })?;
+        for block in path {
             state.accept(block)?;
-            if pending.id == *parent_id {
-                return Ok(state);
-            }
         }
-        Err(ChainError::BlockError(format!(
-            "cannot resolve Antelope signing state for unknown parent {parent_id}"
-        )))
+        Ok(state)
     }
 
     fn timestamp_for_parent(&self, parent_id: &Id) -> Result<BlockTimestamp, ChainError> {
@@ -7117,6 +7124,99 @@ mod tests {
         Ok(())
     }
 
+    // The reference token contract keeps its supply rows in a table named `stats`
+    // (scope: symbol code), where the nodeos-standard `eosio.token` uses `stat`.
+    // getCurrencyStats must read whichever the token actually uses, or supply
+    // comes back as `{}` for a token that demonstrably has one.
+    #[tokio::test]
+    async fn get_currency_stats_reads_the_reference_token_supply() -> Result<(), ChainError> {
+        let chain_id =
+            Id::from_str("c8c4a47932fc0a938972f48f32489e7e91f024697e498ceb3d3c3afcf28f68b6")
+                .unwrap();
+        let private_key =
+            PrivateKey::from_str("PVT_K1_5G7JEG7CWZkGfnaQePCcJSNgocGFoeCxG1pU7r1B6rY2gueez")?;
+        let mut controller = Controller::new();
+        let genesis_bytes = generate_genesis(&private_key);
+        let temp_path = get_temp_dir();
+        let config_bytes = json!({
+            "producer_name": "pulse",
+            "producer_key": private_key.to_string(),
+        })
+        .to_string()
+        .into_bytes();
+        controller.initialize(
+            &chain_id,
+            &config_bytes,
+            &genesis_bytes.to_vec(),
+            temp_path.path().to_str().unwrap(),
+        )?;
+        let pending_block_timestamp = controller.last_accepted_block().timestamp().clone();
+        let chain_id = controller.chain_id().clone();
+        let block_status = BlockStatus::Building;
+        let token = Name::from_str("glenn")?;
+        controller.execute_transaction(
+            &create_account(&private_key, token, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let token_wasm =
+            fs::read(root.join(Path::new("reference_contracts/pulse_token.wasm"))).unwrap();
+        controller.execute_transaction(
+            &set_code(&private_key, token, token_wasm, chain_id)?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        // Parsed rather than a raw `Symbol(..)` literal so the code is really "PLUS".
+        let max_supply = Asset::from_str("10000.0000 PLUS").unwrap();
+        let issued = Asset::from_str("100.0000 PLUS").unwrap();
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                token,
+                Name::from_str("create")?,
+                &Create {
+                    issuer: token,
+                    max_supply,
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+        controller.execute_transaction(
+            &call_contract(
+                &private_key,
+                token,
+                Name::from_str("issue")?,
+                &Issue {
+                    to: token,
+                    quantity: issued,
+                    memo: "supply".to_string(),
+                },
+                chain_id,
+            )?,
+            &pending_block_timestamp,
+            &block_status,
+        )?;
+
+        let stats: serde_json::Value = serde_json::from_str(
+            &controller
+                .database()
+                .get_currency_stats(token.as_u64(), "PLUS")?,
+        )
+        .unwrap();
+        // max_supply is deliberately not asserted: the reference contract stores
+        // 0 there regardless of what `create` was given.
+        assert_eq!(stats["PLUS"]["supply"], "100.0000 PLUS", "{stats}");
+        assert_eq!(stats["PLUS"]["issuer"], "glenn", "{stats}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn protocol_feature_activation_round_trips_through_built_block() -> Result<(), ChainError>
     {
@@ -8425,6 +8525,52 @@ mod tests {
                 .to_string()
                 .contains("database revision 2 does not match block log end 3")
         );
+        Ok(())
+    }
+
+    // Consensus pipelines: while b2 is being accepted, b3 is already verified and
+    // b4 (built on b3) arrives for verification. Accepting b2 unwinds the pending
+    // chain, so b3 is no longer on it, but it is still a verified block and b4's
+    // parent. Verification must resolve b4's parent from the verified blocks
+    // rather than only the pending chain; otherwise the node rejects b4 with
+    // "parent is unknown" and the chain stops making progress.
+    #[tokio::test]
+    async fn test_verify_child_of_verified_block_after_ancestor_accept() -> Result<(), ChainError> {
+        let (mut producer, private_key, chain_id, _p_temp) = init_test_controller()?;
+        let mut p_mempool = Mempool::new();
+        let mut blocks = Vec::new();
+        for name in ["aaa", "bbb", "ccc"] {
+            p_mempool.add_transaction(create_account(
+                &private_key,
+                Name::from_str(name)?,
+                chain_id,
+            )?);
+            let block = producer.build_block(&mut p_mempool).await?;
+            producer.set_preferred_id(block.id()?);
+            blocks.push(block);
+        }
+        let (b2, b3, b4) = (&blocks[0], &blocks[1], &blocks[2]);
+        assert_eq!(b4.previous_id(), &b3.id()?);
+
+        let (mut validator, _pk, _cid, _v_temp) = init_test_controller()?;
+        let mut v_mempool = Mempool::new();
+        validator.verify_block(b2, &mut v_mempool).await?;
+        validator.verify_block(b3, &mut v_mempool).await?;
+        validator.accept_block(&b2.id()?, &mut v_mempool)?;
+        assert!(validator.pending_chain.is_empty());
+
+        validator.verify_block(b4, &mut v_mempool).await?;
+        validator.accept_block(&b3.id()?, &mut v_mempool)?;
+        validator.accept_block(&b4.id()?, &mut v_mempool)?;
+
+        assert_eq!(validator.last_accepted_block_id, b4.id()?);
+        let db = validator.database();
+        for name in ["aaa", "bbb", "ccc"] {
+            assert!(
+                db.arena_account_exists(Name::from_str(name)?.as_u64()),
+                "{name}"
+            );
+        }
         Ok(())
     }
 
