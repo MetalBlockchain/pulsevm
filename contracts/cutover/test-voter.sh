@@ -891,4 +891,226 @@ FAIL_LINE="$(grep -n "confirmation failed" "$WORK/hang.log" | head -1 | cut -d: 
     || fail "pause (line $PAUSE_LINE) came after the hung confirmation (line $FAIL_LINE)"
 pass "pause fires before the coordinator, which never answered"
 
+echo "cutover-voter-test: second round on the same host: a fresh contract deadlocks until --release-old-pause..."
+# cutover.cpp's init refuses to re-freeze a voted ceremony for vote_window_us
+# (7 real days) unless the window expired, so the only way to redo a voted
+# round quickly is a fresh contract account. classify_recorded_round's chain
+# check re-reads the OLD contract specifically, by design (it is telling a
+# genuinely-replaced declaration apart from a config typo that names nothing
+# real), so a brand-new account's ceremony is invisible to it: the old
+# contract's row never changes, so the chain always still answers "finalized".
+# This is the exact second-round deadlock the rehearsal report found;
+# --release-old-pause is the documented, sanctioned way out of it. Nothing
+# here claims the voter is broken: the refusal is what the design requires
+# until an operator verifies the round really moved.
+
+# A stateful stub: pause/resume actually flip persisted state (start_stub's
+# replies are fixed for the whole process), so one instance can be paused by
+# round 1, found still paused when round 2 starts, resumed by
+# --release-old-pause, and re-paused by round 2's own confirmation.
+cat >"$WORK/stub-producer-stateful.py" <<'PYEOF'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+state_path, hits_path, port_path = sys.argv[1], sys.argv[2], sys.argv[3]
+open(state_path, "w").write("false")
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(ln)
+        if self.path.endswith("/v1/producer/pause"):
+            open(state_path, "w").write("true")
+            open(hits_path, "a").write("pause\n")
+            data = b"{}"
+        elif self.path.endswith("/v1/producer/resume"):
+            open(state_path, "w").write("false")
+            open(hits_path, "a").write("resume\n")
+            data = b"{}"
+        elif self.path.endswith("/v1/producer/paused"):
+            data = open(state_path).read().strip().encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+server = HTTPServer(("127.0.0.1", 0), H)
+open(port_path, "w").write(str(server.server_address[1]))
+server.serve_forever()
+PYEOF
+start_stateful_stub() { # $1=state-file $2=hits-file $3=port-file -> pid in STATEFUL_STUB_PID
+    python3 "$WORK/stub-producer-stateful.py" "$1" "$2" "$3" >>"$WORK/stub-stateful.log" 2>&1 &
+    STATEFUL_STUB_PID=$!
+    for _ in $(seq 1 30); do
+        [[ -s "$3" ]] && break
+        kill -0 "$STATEFUL_STUB_PID" 2>/dev/null || fail "stateful producer stub died on startup: $(cat "$WORK/stub-stateful.log")"
+        sleep 1
+    done
+}
+mk_config_at() { # $1=path $2=contract $3=height $4=coord-port $5=producer-api-url
+    cat >"$1" <<EOF
+{"nodeos_url":"http://127.0.0.1:${PORT}","contract":"$2","producer":"eosio",
+ "source_chain_id":"$CHAIN_ID","height":$3,"pause_height":$(($3 + PAUSE_K)),"schedule_version":$SCHED_VERSION,"roster_file":"$WORK/roster.json",
+ "vote_key_file":"$WORK/vote.key","payer_account":"eosio","payer_key_file":"$WORK/payer.key",
+ "poll_secs":1,"dry_run":false,"enabled":true,
+ "confirmation":{"coordinator_url":"http://127.0.0.1:$4","out_file":"$WORK/confirmation-$3.json",
+  "schedule_sha256":"$SCHEDULE_SHA256","migration_genesis":"$GENESIS","checkpoint_sha256":"abababababababababababababababababababababababababababababababab","platform_chain_id":"$PLATFORM"},
+ "stop_producer":{"at_pause":true,"producer_api_url":"$5"}}
+EOF
+}
+
+start_stateful_stub "$WORK/stateful.state" "$WORK/stateful-hits" "$WORK/stateful.port"
+STATEFUL_PORT="$(cat "$WORK/stateful.port")"
+STATEFUL_URL="http://127.0.0.1:${STATEFUL_PORT}"
+
+echo "cutover-voter-test: round 1: vote, confirm and arm a live pause against the stateful stub..."
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-round1.jsonl" "$H" "$WORK/coord-round1.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-round1.log" 2>&1 &
+ROUND1_COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-round1.port" ]] && break
+    kill -0 "$ROUND1_COORD_PID" 2>/dev/null || fail "round1 coordinator died on startup"
+    sleep 1
+done
+ROUND1_COORD_PORT="$(cat "$WORK/coord-round1.port")"
+# A fixed path matters: the finalized-pause record lives next to the config
+# file (<path>.finalized), so round 2 must reuse this exact path to find it,
+# the way a real host's one voter.json does across rounds.
+ROUND_CFG="$WORK/round-voter.json"
+mk_config_at "$ROUND_CFG" cutover "$H" "$ROUND1_COORD_PORT" "$STATEFUL_URL"
+"$VOTER_BIN" --config "$ROUND_CFG" >"$WORK/round1.log" 2>&1 &
+ROUND1_VOTER_PID=$!
+ROUND1_PAUSED=""
+for _ in $(seq 1 60); do
+    grep -q "local producer paused at P=" "$WORK/round1.log" 2>/dev/null && { ROUND1_PAUSED=1; break; }
+    kill -0 "$ROUND1_VOTER_PID" 2>/dev/null || break
+    sleep 1
+done
+[[ -n "$ROUND1_PAUSED" ]] || fail "round 1 never paused: $(tail -10 "$WORK/round1.log")"
+[[ "$(cat "$WORK/stateful.state")" == "true" ]] || fail "stub does not show the producer paused after round 1"
+[[ -f "$ROUND_CFG.finalized" ]] || fail "round 1 left no finalized pause record"
+ROUND1_DIGEST="$FROZEN_DIGEST"
+pass "round 1 voted, confirmed and paused the (stubbed) producer"
+
+echo "cutover-voter-test: stopping the round 1 voter (the operator's first step for any new round)..."
+kill "$ROUND1_VOTER_PID" 2>/dev/null || true
+wait "$ROUND1_VOTER_PID" 2>/dev/null || true
+kill "$ROUND1_COORD_PID" 2>/dev/null || true
+wait "$ROUND1_COORD_PID" 2>/dev/null || true
+
+echo "cutover-voter-test: freezing round 2 on a fresh contract account (cutover2)..."
+mk_push newaccount "$CHAIN_ID" "$DEV_WIF" cutover2 >/dev/null
+mk_push setcode "$CHAIN_ID" "$DEV_WIF" cutover2 "$SCRIPT_DIR/cutover.wasm" >/dev/null
+mk_push setabi "$CHAIN_ID" "$DEV_WIF" cutover2 "$SCRIPT_DIR/cutover.abi" >/dev/null
+H2="$(rpc /v1/chain/get_info '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_block_num"])')"
+mk_push raw "$CHAIN_ID" "$DEV_WIF" cutover2 init cutover2 \
+    "$(python3 - "$H2" "$CHAIN_ID" "$SCHED_VERSION" "eosio" "$PUB33" <<'PYEOF'
+import struct, sys
+def varuint(v):
+    out = b""
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out += bytes([b | 0x80])
+        else:
+            return out + bytes([b])
+def name_to_u64(s):
+    def sym(c):
+        if "a" <= c <= "z":
+            return ord(c) - ord("a") + 6
+        if "1" <= c <= "5":
+            return ord(c) - ord("1") + 1
+        return 0
+    v = 0
+    for i in range(12):
+        v = (v << 5) | sym(s[i] if i < len(s) else ".")
+    return (v << 4) | (sym(s[12]) if len(s) == 13 else 0)
+out = bytearray(struct.pack("<I", int(sys.argv[1])) + bytes.fromhex(sys.argv[2]) + struct.pack("<I", int(sys.argv[3])))
+out += varuint(1) + struct.pack("<Q", name_to_u64(sys.argv[4])) + varuint(0) + bytes.fromhex(sys.argv[5])
+print(bytes(out).hex())
+PYEOF
+)" >/dev/null
+ROUND2_DIGEST="$(table_rows cutover2 cutover2 ceremony | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["declaration_digest"])')"
+[[ -n "$ROUND2_DIGEST" ]] || fail "no frozen round 2 ceremony"
+[[ "$ROUND2_DIGEST" != "$ROUND1_DIGEST" ]] || fail "round 2's digest must differ from round 1's"
+pass "round 2 frozen on cutover2 at H2=$H2, digest differs from round 1"
+
+echo "cutover-voter-test: round 2, started naively, holds round 1's pause forever and casts no vote..."
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-round2.jsonl" "$H2" "$WORK/coord-round2.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-round2.log" 2>&1 &
+ROUND2_COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-round2.port" ]] && break
+    kill -0 "$ROUND2_COORD_PID" 2>/dev/null || fail "round2 coordinator died on startup"
+    sleep 1
+done
+ROUND2_COORD_PORT="$(cat "$WORK/coord-round2.port")"
+# Same config path as round 1 (so it finds round 1's record), overwritten with
+# round 2's contract, height and coordinator; same stub, still paused.
+mk_config_at "$ROUND_CFG" cutover2 "$H2" "$ROUND2_COORD_PORT" "$STATEFUL_URL"
+# The deadlock is not a crash: run_holding_the_recorded_pause catches the
+# "changed round" refusal from run() and degrades into run_pause_only, which
+# re-asserts round 1's OWN pause_height (not round 2's) and exits 0 once
+# max-polls is reached. The real stuck state is that round 2's own vote is
+# never cast -- check the chain, not just the exit code.
+ROUND2_NAIVE_STATUS=0
+timeout 30 "$VOTER_BIN" --config "$ROUND_CFG" --max-polls 3 >"$WORK/round2-naive.log" 2>&1 || ROUND2_NAIVE_STATUS=$?
+[[ "$ROUND2_NAIVE_STATUS" == 0 ]] || fail "a degraded hold must still exit 0 (bounded by --max-polls), got $ROUND2_NAIVE_STATUS: $(cat "$WORK/round2-naive.log")"
+grep -q "event=cutover.voter_changed_round" "$WORK/round2-naive.log" \
+    || fail "round 2 did not log the changed-round alarm: $(cat "$WORK/round2-naive.log")"
+grep -q "Holding the pause recorded for P=$((H + PAUSE_K))" "$WORK/round2-naive.log" \
+    || fail "round 2 did not report holding round 1's own P, not its own: $(cat "$WORK/round2-naive.log")"
+grep -q "from the recorded state" "$WORK/round2-naive.log" \
+    || fail "round 2 did not re-assert round 1's pause from the recorded state: $(cat "$WORK/round2-naive.log")"
+VOTED2_NAIVE="$(table_rows cutover2 cutover2 members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
+[[ "$VOTED2_NAIVE" == "False" || "$VOTED2_NAIVE" == "0" ]] \
+    || fail "round 2's vote must never land while round 1's pause is held (voted=$VOTED2_NAIVE)"
+[[ -f "$ROUND_CFG.finalized" ]] || fail "round 1's record must still be there, untouched, after the naive attempt"
+[[ ! -f "$ROUND_CFG.finalized.superseded" ]] || fail "round 2 must not supersede round 1's record on its own"
+[[ "$(cat "$WORK/stateful.state")" == "true" ]] || fail "the producer must still be (stub-)paused: nothing was signed to change that"
+kill "$ROUND2_COORD_PID" 2>/dev/null || true
+wait "$ROUND2_COORD_PID" 2>/dev/null || true
+pass "round 2 deadlocks exactly as documented: holds round 1's pause, casts no vote, round 1's record untouched"
+
+echo "cutover-voter-test: --release-old-pause resumes the producer and archives round 1's record..."
+timeout 30 "$VOTER_BIN" --config "$ROUND_CFG" --release-old-pause --expected-old-digest "$ROUND1_DIGEST" \
+    >"$WORK/release.log" 2>&1 || fail "release-old-pause failed: $(cat "$WORK/release.log")"
+[[ "$(cat "$WORK/stateful.state")" == "false" ]] || fail "release-old-pause did not resume the (stub) producer"
+grep -q "^resume$" "$WORK/stateful-hits" || fail "the stub's resume endpoint was never called"
+[[ ! -f "$ROUND_CFG.finalized" ]] || fail "release-old-pause must remove the active record"
+[[ -f "$ROUND_CFG.finalized.superseded" ]] || fail "release-old-pause must archive round 1's record, not discard it"
+pass "release-old-pause verified the digest, resumed the producer, and archived round 1's record"
+
+echo "cutover-voter-test: round 2 now completes: votes, confirms and arms its own pause..."
+python3 "$WORK/coordinator.py" "$API" good "$WORK/confirmations-round2b.jsonl" "$H2" "$WORK/coord-round2b.port" "$PLATFORM" "$NEW_CHAIN" >>"$WORK/coordinator-round2b.log" 2>&1 &
+ROUND2B_COORD_PID=$!
+for _ in $(seq 1 30); do
+    [[ -s "$WORK/coord-round2b.port" ]] && break
+    kill -0 "$ROUND2B_COORD_PID" 2>/dev/null || fail "round2b coordinator died on startup"
+    sleep 1
+done
+ROUND2B_COORD_PORT="$(cat "$WORK/coord-round2b.port")"
+mk_config_at "$ROUND_CFG" cutover2 "$H2" "$ROUND2B_COORD_PORT" "$STATEFUL_URL"
+"$VOTER_BIN" --config "$ROUND_CFG" >"$WORK/round2-final.log" 2>&1 &
+ROUND2_VOTER_PID=$!
+ROUND2_PAUSED=""
+for _ in $(seq 1 60); do
+    grep -q "local producer paused at P=" "$WORK/round2-final.log" 2>/dev/null && { ROUND2_PAUSED=1; break; }
+    kill -0 "$ROUND2_VOTER_PID" 2>/dev/null || break
+    sleep 1
+done
+[[ -n "$ROUND2_PAUSED" ]] || fail "round 2 never completed and paused: $(tail -10 "$WORK/round2-final.log")"
+[[ "$(cat "$WORK/stateful.state")" == "true" ]] || fail "stub does not show the producer paused after round 2"
+VOTED2="$(table_rows cutover2 cutover2 members | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["voted"])')"
+[[ "$VOTED2" == "True" || "$VOTED2" == "1" ]] || fail "round 2's vote was never recorded on-chain"
+kill "$ROUND2_VOTER_PID" 2>/dev/null || true
+wait "$ROUND2_VOTER_PID" 2>/dev/null || true
+kill "$ROUND2B_COORD_PID" 2>/dev/null || true
+wait "$ROUND2B_COORD_PID" 2>/dev/null || true
+kill "$STATEFUL_STUB_PID" 2>/dev/null || true
+wait "$STATEFUL_STUB_PID" 2>/dev/null || true
+pass "round 2 completed end to end after the sanctioned reset: voted, confirmed, paused"
+
 echo "cutover-voter-test: PASS"

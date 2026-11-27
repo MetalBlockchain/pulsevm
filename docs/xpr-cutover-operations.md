@@ -929,16 +929,27 @@ Each finding below was checked against the code before it was acted on.
   the validator set or its consensus availability assumptions deliberately if that
   fault tolerance is not acceptable.
 - **A second round on a producer paused at an older P needs a coordinated operator
-  reset.** A voter does not auto-release an old pause merely because local config
-  names a newer declaration; the new declaration must be independently verified
-  on-chain before release is automated. Until that proof path is rehearsed, stop the
-  old voter on every validator, then run `xpr_cutover_voter --config voter.json
-  --release-old-pause --expected-old-digest <old declaration digest>` on each
-  producer host. It verifies the local pause record and producer/chain identity,
-  resumes that producer, verifies the API response, and archives the old record.
-  Only then create and finalize the new declaration, install the new voter config,
-  and start the voters together. This is an explicit operator break-glass path, not
-  automatic agreement that a new declaration may replace an old one.
+  reset.** `cutover.cpp`'s `init` refuses to re-freeze a ceremony that already
+  collected a vote for 7 real days (`vote_window_us`) unless that window expired,
+  so the only practical way to redo a voted round quickly is a fresh ceremony
+  contract account. A voter does not auto-release an old pause merely because
+  local config names a newer declaration on a different contract; the chain
+  check that could tell them apart re-reads the *recorded* contract specifically
+  (by design, to tell a genuinely-replaced declaration from a config typo that
+  matches nothing), so it never sees the new account's ceremony. Naively
+  restarting the voter against the new round does not crash: it degrades into
+  holding round 1's own pause height and casts no vote for round 2 — a real
+  stuck state, just a quiet one, not a loud one. Stop the old voter on every
+  validator, then run `xpr_cutover_voter --config voter.json --release-old-pause
+  --expected-old-digest <old declaration digest>` on each producer host. It
+  verifies the local pause record and producer/chain identity, resumes that
+  producer, verifies the API response, and archives the old record. Only then
+  create and finalize the new declaration, install the new voter config, and
+  start the voters together. This is an explicit operator break-glass path, not
+  automatic agreement that a new declaration may replace an old one. This whole
+  cycle (round 1 pause, a naive round 2 holding it with no vote cast,
+  `--release-old-pause`, round 2 completing) now runs end to end in CI against
+  a stubbed producer API, in `contracts/cutover/test-voter.sh`.
 - **A missing Arena checkpoint with old logs now quarantines the whole data
   directory and boots fresh.** It does not guess which quarantined files form a
   usable checkpoint. The host must complete a new authenticated state sync. A cut
